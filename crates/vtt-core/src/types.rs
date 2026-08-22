@@ -14,6 +14,7 @@ pub enum Ability {
 }
 
 impl Ability {
+    #[inline]
     pub fn modifier(score: i32) -> i32 {
         (score - 10).div_euclid(2)
     }
@@ -59,7 +60,20 @@ impl AbilityScores {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmorType {
+    Unarmored,
+    BarbarianUnarmored,
+    MonkUnarmored,
+    NaturalArmor,
+    LightArmor,
+    MediumArmor,
+    HeavyArmor,
+    Shield,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Condition {
     Blinded,
@@ -77,6 +91,91 @@ pub enum Condition {
     Stunned,
     Unconscious,
     Exhaustion(u8),
+}
+
+impl Condition {
+    pub fn is_incapacitated(&self) -> bool {
+        matches!(
+            self,
+            Condition::Incapacitated
+                | Condition::Paralyzed
+                | Condition::Petrified
+                | Condition::Stunned
+                | Condition::Unconscious
+        )
+    }
+
+    pub fn grants_advantage_to_attacker(&self, distance_feet: f32) -> bool {
+        match self {
+            Condition::Blinded
+            | Condition::Paralyzed
+            | Condition::Petrified
+            | Condition::Restrained
+            | Condition::Stunned
+            | Condition::Unconscious => true,
+            Condition::Prone => distance_feet <= 5.0,
+            _ => false,
+        }
+    }
+
+    pub fn inflicts_disadvantage_on_attacker(&self, distance_feet: f32) -> bool {
+        match self {
+            Condition::Invisible => true,
+            Condition::Prone => distance_feet > 5.0,
+            _ => false,
+        }
+    }
+
+    pub fn inflicts_disadvantage_on_attacks(&self) -> bool {
+        match self {
+            Condition::Blinded
+            | Condition::Frightened
+            | Condition::Poisoned
+            | Condition::Prone
+            | Condition::Restrained => true,
+            Condition::Exhaustion(level) => *level >= 3,
+            _ => false,
+        }
+    }
+
+    pub fn fails_str_dex_saves(&self) -> bool {
+        matches!(
+            self,
+            Condition::Paralyzed | Condition::Petrified | Condition::Stunned | Condition::Unconscious
+        )
+    }
+
+    pub fn grants_auto_crit_within_5ft(&self, distance_feet: f32) -> bool {
+        matches!(self, Condition::Paralyzed | Condition::Unconscious) && distance_feet <= 5.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeathSaveState {
+    pub successes: u8,
+    pub failures: u8,
+    pub is_stabilized: bool,
+    pub is_dead: bool,
+}
+
+impl Default for DeathSaveState {
+    fn default() -> Self {
+        Self {
+            successes: 0,
+            failures: 0,
+            is_stabilized: false,
+            is_dead: false,
+        }
+    }
+}
+
+impl DeathSaveState {
+    pub fn reset(&mut self) {
+        self.successes = 0;
+        self.failures = 0;
+        self.is_stabilized = false;
+        self.is_dead = false;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

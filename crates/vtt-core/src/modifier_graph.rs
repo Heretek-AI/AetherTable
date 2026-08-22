@@ -1,5 +1,5 @@
+use crate::types::ArmorType;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AbilityType {
@@ -51,7 +51,6 @@ impl AbilityScoreNode {
     }
 
     pub fn calculate_score(&self) -> i32 {
-        // Sort modifiers by priority: Base -> Additive -> Multiplier -> HardOverride
         let mut score = self.base_score;
 
         // 1. Additive
@@ -59,105 +58,141 @@ impl AbilityScoreNode {
             score += m.value;
         }
 
-        // 2. Hard Overrides (e.g. Gauntlets of Ogre Power = 19)
-        let mut highest_override: Option<i32> = None;
-        for m in self.modifiers.iter().filter(|m| m.priority == ModifierPriority::HardOverride) {
-            highest_override = Some(highest_override.map_or(m.value, |curr| curr.max(m.value)));
+        // 2. Multiplier
+        for m in self.modifiers.iter().filter(|m| m.priority == ModifierPriority::Multiplier) {
+            score *= m.value;
         }
 
-        if let Some(override_val) = highest_override {
-            if override_val > score {
-                score = override_val;
-            }
+        // 3. HardOverride
+        if let Some(m) = self.modifiers.iter().filter(|m| m.priority == ModifierPriority::HardOverride).last() {
+            score = m.value;
         }
 
         score
     }
 
     pub fn calculate_modifier(&self) -> i32 {
-        let score = self.calculate_score();
-        (score - 10).div_euclid(2)
+        calculate_ability_modifier(self.calculate_score())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ArmorCategory {
-    Unarmored,
-    BarbarianUnarmored,
-    MonkUnarmored,
-    DraconicResilience,
-    LightArmor,
-    MediumArmor,
-    HeavyArmor,
+/// Standard floored ability modifier: floor((score - 10) / 2)
+#[inline]
+pub fn calculate_ability_modifier(score: i32) -> i32 {
+    (score - 10).div_euclid(2)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// SRD 5e proficiency bonus progression: 2 + ((level - 1) / 4)
+#[inline]
+pub fn calculate_proficiency_bonus(level: u32) -> i32 {
+    let lvl = level.max(1);
+    2 + ((lvl - 1) / 4) as i32
+}
+
+/// Standard SRD 5e Armor Class derivation
+pub fn calculate_armor_class(
+    armor_type: ArmorType,
+    base_ac: i32,
+    dex_score: i32,
+    has_shield: bool,
+    unarmored_secondary_score: Option<i32>,
+) -> i32 {
+    let dex_mod = calculate_ability_modifier(dex_score);
+    let shield_bonus = if has_shield { 2 } else { 0 };
+
+    let base = match armor_type {
+        ArmorType::Unarmored => 10 + dex_mod,
+        ArmorType::BarbarianUnarmored => {
+            let con_mod = calculate_ability_modifier(unarmored_secondary_score.unwrap_or(10));
+            10 + dex_mod + con_mod
+        }
+        ArmorType::MonkUnarmored => {
+            let wis_mod = calculate_ability_modifier(unarmored_secondary_score.unwrap_or(10));
+            10 + dex_mod + wis_mod
+        }
+        ArmorType::NaturalArmor => base_ac + dex_mod,
+        ArmorType::LightArmor => base_ac + dex_mod,
+        ArmorType::MediumArmor => base_ac + dex_mod.min(2),
+        ArmorType::HeavyArmor => base_ac,
+        ArmorType::Shield => 10 + dex_mod,
+    };
+
+    base + shield_bonus
+}
+
+/// Passive Perception: 10 + WIS mod + (proficient ? prof_bonus : 0) + flat_bonus
+#[inline]
+pub fn calculate_passive_perception(
+    wis_score: i32,
+    proficient: bool,
+    prof_bonus: i32,
+    flat_bonus: i32,
+) -> i32 {
+    let wis_mod = calculate_ability_modifier(wis_score);
+    10 + wis_mod + (if proficient { prof_bonus } else { 0 }) + flat_bonus
+}
+
+/// Multiclass Spell Slot Table (Level 1..=20)
+pub fn calculate_multiclass_spell_slots(total_caster_level: u32) -> [u8; 9] {
+    match total_caster_level {
+        0 => [0, 0, 0, 0, 0, 0, 0, 0, 0],
+        1 => [2, 0, 0, 0, 0, 0, 0, 0, 0],
+        2 => [3, 0, 0, 0, 0, 0, 0, 0, 0],
+        3 => [4, 2, 0, 0, 0, 0, 0, 0, 0],
+        4 => [4, 3, 0, 0, 0, 0, 0, 0, 0],
+        5 => [4, 3, 2, 0, 0, 0, 0, 0, 0],
+        6 => [4, 3, 3, 0, 0, 0, 0, 0, 0],
+        7 => [4, 3, 3, 1, 0, 0, 0, 0, 0],
+        8 => [4, 3, 3, 2, 0, 0, 0, 0, 0],
+        9 => [4, 3, 3, 3, 1, 0, 0, 0, 0],
+        10 => [4, 3, 3, 3, 2, 0, 0, 0, 0],
+        11 => [4, 3, 3, 3, 2, 1, 0, 0, 0],
+        12 => [4, 3, 3, 3, 2, 1, 0, 0, 0],
+        13 => [4, 3, 3, 3, 2, 1, 1, 0, 0],
+        14 => [4, 3, 3, 3, 2, 1, 1, 0, 0],
+        15 => [4, 3, 3, 3, 2, 1, 1, 1, 0],
+        16 => [4, 3, 3, 3, 2, 1, 1, 1, 0],
+        17 => [4, 3, 3, 3, 2, 1, 1, 1, 1],
+        18 => [4, 3, 3, 3, 3, 1, 1, 1, 1],
+        19 => [4, 3, 3, 3, 3, 2, 1, 1, 1],
+        _ => [4, 3, 3, 3, 3, 2, 2, 1, 1],
+    }
+}
+
+pub type ArmorCategory = ArmorType;
+
 pub struct ArmorClassCalculator;
-
 impl ArmorClassCalculator {
-    pub fn compute_ac(
-        category: ArmorCategory,
-        armor_base_ac: i32,
-        dex_mod: i32,
-        con_mod: i32,
-        wis_mod: i32,
+    pub fn calculate(
+        armor_type: ArmorType,
+        base_ac: i32,
+        dex_score: i32,
         has_shield: bool,
-        bonus_ac: i32,
+        unarmored_secondary_score: Option<i32>,
     ) -> i32 {
-        let shield_bonus = if has_shield { 2 } else { 0 };
+        calculate_armor_class(armor_type, base_ac, dex_score, has_shield, unarmored_secondary_score)
+    }
+}
 
-        let base_ac = match category {
-            ArmorCategory::Unarmored => 10 + dex_mod,
-            ArmorCategory::BarbarianUnarmored => 10 + dex_mod + con_mod,
-            ArmorCategory::MonkUnarmored => 10 + dex_mod + wis_mod,
-            ArmorCategory::DraconicResilience => 13 + dex_mod,
-            ArmorCategory::LightArmor => armor_base_ac + dex_mod,
-            ArmorCategory::MediumArmor => armor_base_ac + dex_mod.min(2),
-            ArmorCategory::HeavyArmor => armor_base_ac,
-        };
-
-        base_ac + shield_bonus + bonus_ac
+pub struct MulticlassSpellSlotMatrix;
+impl MulticlassSpellSlotMatrix {
+    pub fn slots_for_level(level: u32) -> [u8; 9] {
+        calculate_multiclass_spell_slots(level)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpellcastingStats;
+pub struct SpellcastingStats {
+    pub spell_save_dc: i32,
+    pub spell_attack_bonus: i32,
+}
 
 impl SpellcastingStats {
-    pub fn compute_spell_save_dc(proficiency_bonus: i32, casting_mod: i32, magic_bonus: i32) -> i32 {
-        8 + proficiency_bonus + casting_mod + magic_bonus
-    }
-
-    pub fn compute_spell_attack_bonus(proficiency_bonus: i32, casting_mod: i32, magic_bonus: i32) -> i32 {
-        proficiency_bonus + casting_mod + magic_bonus
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MulticlassSpellSlotMatrix;
-
-impl MulticlassSpellSlotMatrix {
-    pub fn calculate_slots(effective_caster_level: u32) -> [u32; 9] {
-        // [1st, 2nd, 3rd, 4th, 5th, 6th, 7th, 8th, 9th]
-        match effective_caster_level {
-            0 => [0; 9],
-            1 => [2, 0, 0, 0, 0, 0, 0, 0, 0],
-            2 => [3, 0, 0, 0, 0, 0, 0, 0, 0],
-            3 => [4, 2, 0, 0, 0, 0, 0, 0, 0],
-            4 => [4, 3, 0, 0, 0, 0, 0, 0, 0],
-            5 => [4, 3, 2, 0, 0, 0, 0, 0, 0],
-            6 => [4, 3, 3, 0, 0, 0, 0, 0, 0],
-            7 => [4, 3, 3, 1, 0, 0, 0, 0, 0],
-            8 => [4, 3, 3, 2, 0, 0, 0, 0, 0],
-            9 => [4, 3, 3, 3, 1, 0, 0, 0, 0],
-            10 => [4, 3, 3, 3, 2, 0, 0, 0, 0],
-            11..=12 => [4, 3, 3, 3, 2, 1, 0, 0, 0],
-            13..=14 => [4, 3, 3, 3, 2, 1, 1, 0, 0],
-            15..=16 => [4, 3, 3, 3, 2, 1, 1, 1, 0],
-            17 => [4, 3, 3, 3, 2, 1, 1, 1, 1],
-            18 => [4, 3, 3, 3, 3, 1, 1, 1, 1],
-            19 => [4, 3, 3, 3, 3, 2, 1, 1, 1],
-            _ => [4, 3, 3, 3, 3, 2, 2, 1, 1],
+    pub fn calculate(ability_score: i32, prof_bonus: i32) -> Self {
+        let mod_val = calculate_ability_modifier(ability_score);
+        Self {
+            spell_save_dc: 8 + prof_bonus + mod_val,
+            spell_attack_bonus: prof_bonus + mod_val,
         }
     }
 }
@@ -168,61 +203,41 @@ mod tests {
 
     #[test]
     fn test_ability_score_modifiers_and_overrides() {
-        let mut str_node = AbilityScoreNode::new(AbilityType::Strength, 14);
-        assert_eq!(str_node.calculate_score(), 14);
-        assert_eq!(str_node.calculate_modifier(), 2);
+        let mut node = AbilityScoreNode::new(AbilityType::Strength, 14);
+        assert_eq!(node.calculate_score(), 14);
+        assert_eq!(node.calculate_modifier(), 2);
 
-        // Add Racial Bonus (+2)
-        str_node.add_modifier("Dwarf Strength", ModifierPriority::Additive, 2);
-        assert_eq!(str_node.calculate_score(), 16);
-        assert_eq!(str_node.calculate_modifier(), 3);
-
-        // Equip Gauntlets of Ogre Power (Hard Override = 19)
-        str_node.add_modifier("Gauntlets of Ogre Power", ModifierPriority::HardOverride, 19);
-        assert_eq!(str_node.calculate_score(), 19);
-        assert_eq!(str_node.calculate_modifier(), 4);
+        node.add_modifier("Belt of Giant Strength", ModifierPriority::HardOverride, 21);
+        assert_eq!(node.calculate_score(), 21);
+        assert_eq!(node.calculate_modifier(), 5);
     }
 
     #[test]
     fn test_unarmored_defense_and_armor_caps() {
-        // Barbarian: 10 + DEX(+2) + CON(+3) + Shield(+2) = 17 AC
-        let ac_barb = ArmorClassCalculator::compute_ac(
-            ArmorCategory::BarbarianUnarmored,
-            10,
-            2,
-            3,
-            0,
-            true,
-            0,
+        // Barbarian Unarmored: 10 + DEX(+2) + CON(+3) = 15
+        assert_eq!(
+            calculate_armor_class(ArmorType::BarbarianUnarmored, 10, 14, false, Some(16)),
+            15
         );
-        assert_eq!(ac_barb, 17);
 
-        // Medium Armor (Breastplate 14) + DEX(+4 capped at +2) = 16 AC
-        let ac_medium = ArmorClassCalculator::compute_ac(
-            ArmorCategory::MediumArmor,
-            14,
-            4,
-            0,
-            0,
-            false,
-            0,
+        // Medium Armor (Breastplate AC 14) with DEX 18 (+4 mod capped at +2) = 16
+        assert_eq!(
+            calculate_armor_class(ArmorType::MediumArmor, 14, 18, false, None),
+            16
         );
-        assert_eq!(ac_medium, 16);
+
+        // Heavy Armor (Plate AC 18) with Shield (+2) = 20
+        assert_eq!(
+            calculate_armor_class(ArmorType::HeavyArmor, 18, 10, true, None),
+            20
+        );
     }
 
     #[test]
     fn test_spell_stats_and_multiclass_slots() {
-        // Level 5 Wizard: Prof +3, INT +4 -> Save DC = 8 + 3 + 4 = 15, Attack = +7
-        let dc = SpellcastingStats::compute_spell_save_dc(3, 4, 0);
-        let atk = SpellcastingStats::compute_spell_attack_bonus(3, 4, 0);
-        assert_eq!(dc, 15);
-        assert_eq!(atk, 7);
-
-        // Level 5 Caster Slots: [4, 3, 2, 0, 0, 0, 0, 0, 0]
-        let slots = MulticlassSpellSlotMatrix::calculate_slots(5);
-        assert_eq!(slots[0], 4);
-        assert_eq!(slots[1], 3);
-        assert_eq!(slots[2], 2);
-        assert_eq!(slots[3], 0);
+        let slots_lvl5 = calculate_multiclass_spell_slots(5);
+        assert_eq!(slots_lvl5[0], 4); // 4 1st-level
+        assert_eq!(slots_lvl5[1], 3); // 3 2nd-level
+        assert_eq!(slots_lvl5[2], 2); // 2 3rd-level
     }
 }

@@ -1,10 +1,32 @@
 use crate::dice::DiceEngine;
 use crate::types::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttackOutcome {
+    CriticalHit,
+    Hit,
+    Miss,
+    CriticalMiss,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttackResolution {
+    pub natural_roll: i32,
+    pub attack_modifier: i32,
+    pub total_to_hit: i32,
+    pub target_ac: i32,
+    pub outcome: AttackOutcome,
+    pub is_hit: bool,
+    pub is_critical: bool,
+    pub damage_dice_multiplier: u32,
+}
 
 pub struct ActionResolver;
 
 impl ActionResolver {
+    /// 4-tier task resolution (Rule of Cool / PbtA hybridized)
     pub fn resolve_check_4tier(
         dice: &mut DiceEngine,
         modifier: i32,
@@ -56,17 +78,141 @@ impl ActionResolver {
         }
     }
 
+    /// Full SRD Attack Roll Resolution with Condition & Critical Hit multipliers
+    pub fn resolve_attack(
+        natural_roll: i32,
+        attack_modifier: i32,
+        target_ac: i32,
+        _attacker_conditions: &[Condition],
+        target_conditions: &[Condition],
+        distance_feet: f32,
+    ) -> AttackResolution {
+        // Natural 1 is automatic miss
+        if natural_roll == 1 {
+            return AttackResolution {
+                natural_roll: 1,
+                attack_modifier,
+                total_to_hit: 1 + attack_modifier,
+                target_ac,
+                outcome: AttackOutcome::CriticalMiss,
+                is_hit: false,
+                is_critical: false,
+                damage_dice_multiplier: 1,
+            };
+        }
+
+        // Natural 20 is automatic hit and critical
+        let is_nat20 = natural_roll == 20;
+
+        // Check if target condition inflicts automatic critical hit (e.g. Paralyzed / Unconscious within 5ft)
+        let auto_crit = target_conditions
+            .iter()
+            .any(|c| c.grants_auto_crit_within_5ft(distance_feet));
+
+        let total = natural_roll + attack_modifier;
+        let is_hit = is_nat20 || total >= target_ac;
+
+        let is_critical = is_hit && (is_nat20 || auto_crit);
+
+        let outcome = if is_critical {
+            AttackOutcome::CriticalHit
+        } else if is_hit {
+            AttackOutcome::Hit
+        } else {
+            AttackOutcome::Miss
+        };
+
+        AttackResolution {
+            natural_roll,
+            attack_modifier,
+            total_to_hit: total,
+            target_ac,
+            outcome,
+            is_hit,
+            is_critical,
+            damage_dice_multiplier: if is_critical { 2 } else { 1 },
+        }
+    }
+
+    /// SRD Saving Throw Resolution
+    pub fn resolve_saving_throw(
+        natural_roll: i32,
+        save_modifier: i32,
+        dc: i32,
+        target_conditions: &[Condition],
+        ability: Ability,
+    ) -> (bool, i32) {
+        // Auto-fail Strength and Dexterity saves if Paralyzed / Petrified / Stunned / Unconscious
+        if (ability == Ability::Strength || ability == Ability::Dexterity)
+            && target_conditions.iter().any(|c| c.fails_str_dex_saves())
+        {
+            return (false, natural_roll + save_modifier);
+        }
+
+        let total = natural_roll + save_modifier;
+        let passed = total >= dc;
+        (passed, total)
+    }
+
+    /// SRD Concentration Check: CON save DC = max(10, damage / 2)
+    pub fn resolve_concentration_check(
+        con_save_roll: i32,
+        con_modifier: i32,
+        damage_taken: i32,
+    ) -> (bool, i32, i32) {
+        let dc = (damage_taken / 2).max(10);
+        let total = con_save_roll + con_modifier;
+        let passed = total >= dc;
+        (passed, total, dc)
+    }
+
+    /// SRD Death Saving Throw State Machine
+    pub fn resolve_death_save(state: &mut DeathSaveState, natural_roll: i32) -> &'static str {
+        if state.is_dead {
+            return "ALREADY_DEAD";
+        }
+        if state.is_stabilized {
+            return "ALREADY_STABILIZED";
+        }
+
+        if natural_roll == 20 {
+            state.is_stabilized = true;
+            return "CRITICAL_SUCCESS_REVIVED_1HP";
+        } else if natural_roll == 1 {
+            state.failures += 2;
+        } else if natural_roll >= 10 {
+            state.successes += 1;
+        } else {
+            state.failures += 1;
+        }
+
+        if state.failures >= 3 {
+            state.is_dead = true;
+            "DEAD"
+        } else if state.successes >= 3 {
+            state.is_stabilized = true;
+            "STABILIZED"
+        } else {
+            "PENDING"
+        }
+    }
+
+    /// Massive Damage Instant Death: excess damage >= max_hp when dropping to 0 HP
+    pub fn check_instant_death(damage_taken: i32, current_hp: i32, max_hp: i32) -> bool {
+        damage_taken >= current_hp + max_hp
+    }
+
     pub fn calculate_rule_of_cool_dc(
         base_dc: i32,
-        complexity_delta: i32,
-        spent_inspiration: bool,
-        resource_cost_bonus: i32,
-    ) -> (i32, i32) {
-        let delta_insp = if spent_inspiration { 5 } else { 0 };
-        let final_dc = (base_dc + complexity_delta - delta_insp - resource_cost_bonus).max(5);
-
-        let bonus_dice_count = ((final_dc - 10) / 5).max(0);
-        (final_dc, bonus_dice_count)
+        cinematic_praise: bool,
+        environmental_hazard_rating: i32,
+    ) -> i32 {
+        let mut dc = base_dc;
+        if cinematic_praise {
+            dc -= 2;
+        }
+        dc += environmental_hazard_rating;
+        dc.max(5)
     }
 }
 
@@ -76,19 +222,54 @@ mod tests {
 
     #[test]
     fn test_4tier_resolution() {
-        let mut dice = DiceEngine::with_seed(1234);
+        let mut dice = DiceEngine::with_seed(42);
         let result = ActionResolver::resolve_check_4tier(&mut dice, 5, 15, 3);
         assert!(result.total >= 6);
     }
 
     #[test]
-    fn test_rule_of_cool_formula() {
-        let (final_dc, bonus_dice) = ActionResolver::calculate_rule_of_cool_dc(15, 5, true, 2);
-        assert_eq!(final_dc, 13);
-        assert_eq!(bonus_dice, 0);
+    fn test_attack_and_auto_crit() {
+        // Attack vs Paralyzed within 5ft => Auto Crit
+        let res = ActionResolver::resolve_attack(
+            12,
+            5,
+            14,
+            &[],
+            &[Condition::Paralyzed],
+            5.0,
+        );
+        assert!(res.is_hit);
+        assert!(res.is_critical);
+        assert_eq!(res.damage_dice_multiplier, 2);
 
-        let (hard_dc, hard_dice) = ActionResolver::calculate_rule_of_cool_dc(20, 10, false, 0);
-        assert_eq!(hard_dc, 30);
-        assert_eq!(hard_dice, 4);
+        // Nat 1 is always critical miss
+        let miss_res = ActionResolver::resolve_attack(
+            1,
+            10,
+            10,
+            &[],
+            &[],
+            10.0,
+        );
+        assert!(!miss_res.is_hit);
+        assert_eq!(miss_res.outcome, AttackOutcome::CriticalMiss);
+    }
+
+    #[test]
+    fn test_concentration_and_death_saves() {
+        // Taking 30 damage requires DC 15 concentration check
+        let (passed, total, dc) = ActionResolver::resolve_concentration_check(11, 4, 30);
+        assert_eq!(dc, 15);
+        assert_eq!(total, 15);
+        assert!(passed);
+
+        // Death Save State Machine
+        let mut state = DeathSaveState::default();
+        ActionResolver::resolve_death_save(&mut state, 15); // 1 success
+        assert_eq!(state.successes, 1);
+        ActionResolver::resolve_death_save(&mut state, 1); // +2 failures
+        assert_eq!(state.failures, 2);
+        ActionResolver::resolve_death_save(&mut state, 20); // Nat 20 revives
+        assert!(state.is_stabilized);
     }
 }

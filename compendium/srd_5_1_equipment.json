@@ -1,0 +1,170 @@
+[
+  {
+    "id": "eq_dagger",
+    "name": "Dagger",
+    "category": "Weapon",
+    "cost_cp": 200,
+    "weight_lbs": 1.0,
+    "damage_formula": "1d4",
+    "damage_type": "piercing",
+    "properties": [
+      "Finesse",
+      "Light",
+      "Thrown (range 20/60)"
+    ]
+  },
+  {
+    "id": "eq_greataxe",
+    "name": "Greataxe",
+    "category": "Weapon",
+    "cost_cp": 3000,
+    "weight_lbs": 7.0,
+    "damage_formula": "1d12",
+    "damage_type": "slashing",
+    "properties": [
+      "Heavy",
+      "Two-Handed"
+    ]
+  },
+  {
+    "id": "eq_greatsword",
+    "name": "Greatsword",
+    "category": "Weapon",
+    "cost_cp": 5000,
+    "weight_lbs": 6.0,
+    "damage_formula": "2d6",
+    "damage_type": "slashing",
+    "properties": [
+      "Heavy",
+      "Two-Handed"
+    ]
+  },
+  {
+    "id": "eq_longsword",
+    "name": "Longsword",
+    "category": "Weapon",
+    "cost_cp": 1500,
+    "weight_lbs": 3.0,
+    "damage_formula": "1d8",
+    "damage_type": "slashing",
+    "properties": [
+      "Versatile (1d10)"
+    ]
+  },
+  {
+    "id": "eq_shortbow",
+    "name": "Shortbow",
+    "category": "Weapon",
+    "cost_cp": 2500,
+    "weight_lbs": 2.0,
+    "damage_formula": "1d6",
+    "damage_type": "piercing",
+    "properties": [
+      "Ammunition (range 80/320)",
+      "Two-Handed"
+    ]
+  },
+  {
+    "id": "eq_padded_armor",
+    "name": "Padded Armor",
+    "category": "Armor",
+    "cost_cp": 500,
+    "weight_lbs": 8.0,
+    "ac_base": 11,
+    "armor_category": "Light",
+    "stealth_disadvantage": true
+  },
+  {
+    "id": "eq_leather_armor",
+    "name": "Leather Armor",
+    "category": "Armor",
+    "cost_cp": 1000,
+    "weight_lbs": 10.0,
+    "ac_base": 11,
+    "armor_category": "Light",
+    "stealth_disadvantage": false
+  },
+  {
+    "id": "eq_studded_leather",
+    "name": "Studded Leather",
+    "category": "Armor",
+    "cost_cp": 4500,
+    "weight_lbs": 13.0,
+    "ac_base": 12,
+    "armor_category": "Light",
+    "stealth_disadvantage": false
+  },
+  {
+    "id": "eq_chain_shirt",
+    "name": "Chain Shirt",
+    "category": "Armor",
+    "cost_cp": 5000,
+    "weight_lbs": 20.0,
+    "ac_base": 13,
+    "armor_category": "Medium",
+    "stealth_disadvantage": false
+  },
+  {
+    "id": "eq_breastplate",
+    "name": "Breastplate",
+    "category": "Armor",
+    "cost_cp": 40000,
+    "weight_lbs": 20.0,
+    "ac_base": 14,
+    "armor_category": "Medium",
+    "stealth_disadvantage": false
+  },
+  {
+    "id": "eq_chain_mail",
+    "name": "Chain Mail",
+    "category": "Armor",
+    "cost_cp": 7500,
+    "weight_lbs": 55.0,
+    "ac_base": 16,
+    "armor_category": "Heavy",
+    "stealth_disadvantage": true,
+    "strength_requirement": 13
+  },
+  {
+    "id": "eq_plate_armor",
+    "name": "Plate Armor",
+    "category": "Armor",
+    "cost_cp": 150000,
+    "weight_lbs": 65.0,
+    "ac_base": 18,
+    "armor_category": "Heavy",
+    "stealth_disadvantage": true,
+    "strength_requirement": 15
+  },
+  {
+    "id": "eq_shield",
+    "name": "Shield",
+    "category": "Armor",
+    "cost_cp": 1000,
+    "weight_lbs": 6.0,
+    "ac_base": 2,
+    "armor_category": "Shield",
+    "stealth_disadvantage": false
+  },
+  {
+    "id": "eq_potion_healing",
+    "name": "Potion of Healing",
+    "category": "Magic Item",
+    "cost_cp": 5000,
+    "weight_lbs": 0.5,
+    "rarity": "Common",
+    "description": "You regain 2d4 + 2 hit points when you drink this potion."
+  },
+  {
+    "id": "eq_sunblade",
+    "name": "Sun Blade",
+    "category": "Magic Item",
+    "cost_cp": 500000,
+    "weight_lbs": 3.0,
+    "damage_formula": "1d8",
+    "damage_type": "radiant",
+    "rarity": "Rare",
+    "requires_attunement": true,
+    "description": "This item appears to be a longsword hilt. While grasping the hilt, you can use a bonus action to cause a blade of pure radiance to spring into existence."
+  }
+]

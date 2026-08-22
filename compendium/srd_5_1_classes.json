@@ -1,0 +1,268 @@
+[
+  {
+    "id": "class_barbarian",
+    "name": "Barbarian",
+    "hit_die": "d12",
+    "primary_ability": "Strength",
+    "saving_throw_proficiencies": [
+      "STR",
+      "CON"
+    ],
+    "armor_proficiencies": [
+      "Light Armor",
+      "Medium Armor",
+      "Shields"
+    ],
+    "weapon_proficiencies": [
+      "Simple Weapons",
+      "Martial Weapons"
+    ],
+    "spellcasting_ability": null,
+    "features": [
+      {
+        "name": "Rage",
+        "level": 1,
+        "description": "In battle, you fight with primal ferocity."
+      },
+      {
+        "name": "Unarmored Defense",
+        "level": 1,
+        "description": "While you are not wearing any armor, your Armor Class equals 10 + your Dexterity modifier + your Constitution modifier."
+      },
+      {
+        "name": "Reckless Attack",
+        "level": 2,
+        "description": "You can throw aside all concern for defense to attack with fierce desperation."
+      },
+      {
+        "name": "Danger Sense",
+        "level": 2,
+        "description": "You gain an uncanny sense of when things nearby aren't as they should be."
+      },
+      {
+        "name": "Extra Attack",
+        "level": 5,
+        "description": "You can attack twice whenever you take the Attack action on your turn."
+      }
+    ]
+  },
+  {
+    "id": "class_bard",
+    "name": "Bard",
+    "hit_die": "d8",
+    "primary_ability": "Charisma",
+    "saving_throw_proficiencies": [
+      "DEX",
+      "CHA"
+    ],
+    "armor_proficiencies": [
+      "Light Armor"
+    ],
+    "weapon_proficiencies": [
+      "Simple Weapons",
+      "Hand Crossbows",
+      "Longswords",
+      "Rapiers",
+      "Shortswords"
+    ],
+    "spellcasting_ability": "Charisma",
+    "features": [
+      {
+        "name": "Spellcasting",
+        "level": 1,
+        "description": "You have learned to untangle and reshape the fabric of reality in harmony with your wishes and music."
+      },
+      {
+        "name": "Bardic Inspiration",
+        "level": 1,
+        "description": "You can inspire others through stirring words or music (d6 die)."
+      },
+      {
+        "name": "Jack of All Trades",
+        "level": 2,
+        "description": "You can add half your proficiency bonus to any ability check that doesn't already include it."
+      },
+      {
+        "name": "Song of Rest",
+        "level": 2,
+        "description": "You can use soothing music or oration to help revitalize your wounded allies during a short rest."
+      },
+      {
+        "name": "Font of Inspiration",
+        "level": 5,
+        "description": "You regain all of your expended uses of Bardic Inspiration when you finish a short or long rest."
+      }
+    ]
+  },
+  {
+    "id": "class_cleric",
+    "name": "Cleric",
+    "hit_die": "d8",
+    "primary_ability": "Wisdom",
+    "saving_throw_proficiencies": [
+      "WIS",
+      "CHA"
+    ],
+    "armor_proficiencies": [
+      "Light Armor",
+      "Medium Armor",
+      "Shields"
+    ],
+    "weapon_proficiencies": [
+      "Simple Weapons"
+    ],
+    "spellcasting_ability": "Wisdom",
+    "features": [
+      {
+        "name": "Spellcasting",
+        "level": 1,
+        "description": "As a conduit for divine power, you can cast cleric spells."
+      },
+      {
+        "name": "Divine Domain",
+        "level": 1,
+        "description": "Choose one domain related to your deity (e.g. Life Domain)."
+      },
+      {
+        "name": "Channel Divinity",
+        "level": 2,
+        "description": "You gain the ability to channel divine energy directly from your deity."
+      },
+      {
+        "name": "Destroy Undead",
+        "level": 5,
+        "description": "When an undead fails its saving throw against your Turn Undead feature, the creature is instantly destroyed if its challenge rating is at or below a certain threshold."
+      }
+    ]
+  },
+  {
+    "id": "class_fighter",
+    "name": "Fighter",
+    "hit_die": "d10",
+    "primary_ability": "Strength or Dexterity",
+    "saving_throw_proficiencies": [
+      "STR",
+      "CON"
+    ],
+    "armor_proficiencies": [
+      "All Armor",
+      "Shields"
+    ],
+    "weapon_proficiencies": [
+      "Simple Weapons",
+      "Martial Weapons"
+    ],
+    "spellcasting_ability": null,
+    "features": [
+      {
+        "name": "Fighting Style",
+        "level": 1,
+        "description": "You adopt a particular style of fighting as your specialty."
+      },
+      {
+        "name": "Second Wind",
+        "level": 1,
+        "description": "You have a limited well of stamina that you can draw on to protect yourself from harm (1d10 + fighter level)."
+      },
+      {
+        "name": "Action Surge",
+        "level": 2,
+        "description": "You can push yourself beyond your normal limits for a moment, taking one additional action on your turn."
+      },
+      {
+        "name": "Martial Archetype",
+        "level": 3,
+        "description": "You choose an archetype that you strive to emulate in your combat styles (Champion)."
+      },
+      {
+        "name": "Extra Attack",
+        "level": 5,
+        "description": "You can attack twice, instead of once, whenever you take the Attack action on your turn."
+      }
+    ]
+  },
+  {
+    "id": "class_rogue",
+    "name": "Rogue",
+    "hit_die": "d8",
+    "primary_ability": "Dexterity",
+    "saving_throw_proficiencies": [
+      "DEX",
+      "INT"
+    ],
+    "armor_proficiencies": [
+      "Light Armor"
+    ],
+    "weapon_proficiencies": [
+      "Simple Weapons",
+      "Hand Crossbows",
+      "Longswords",
+      "Rapiers",
+      "Shortswords"
+    ],
+    "spellcasting_ability": null,
+    "features": [
+      {
+        "name": "Expertise",
+        "level": 1,
+        "description": "Choose two of your skill proficiencies; your proficiency bonus is doubled for any ability check you make that uses either chosen proficiency."
+      },
+      {
+        "name": "Sneak Attack",
+        "level": 1,
+        "description": "You know how to strike subtly and exploit a foe's distraction (+1d6 damage)."
+      },
+      {
+        "name": "Thieves' Cant",
+        "level": 1,
+        "description": "A secret mix of dialect, jargon, and code that allows you to hide messages in seemingly normal conversation."
+      },
+      {
+        "name": "Cunning Action",
+        "level": 2,
+        "description": "You can take a bonus action on each of your turns in combat to Dash, Disengage, or Hide."
+      },
+      {
+        "name": "Uncanny Dodge",
+        "level": 5,
+        "description": "When an attacker that you can see hits you with an attack, you can use your reaction to halve the attack's damage against you."
+      }
+    ]
+  },
+  {
+    "id": "class_wizard",
+    "name": "Wizard",
+    "hit_die": "d6",
+    "primary_ability": "Intelligence",
+    "saving_throw_proficiencies": [
+      "INT",
+      "WIS"
+    ],
+    "armor_proficiencies": [],
+    "weapon_proficiencies": [
+      "Daggers",
+      "Darts",
+      "Slings",
+      "Quarterstaffs",
+      "Light Crossbows"
+    ],
+    "spellcasting_ability": "Intelligence",
+    "features": [
+      {
+        "name": "Spellcasting",
+        "level": 1,
+        "description": "As a student of arcane magic, you have a spellbook containing spells that show the first glimmerings of your true power."
+      },
+      {
+        "name": "Arcane Recovery",
+        "level": 1,
+        "description": "You have learned to regain some of your magical energy by studying your spellbook during a short rest."
+      },
+      {
+        "name": "Arcane Tradition",
+        "level": 2,
+        "description": "You choose an arcane tradition, shaping your practice of magic (School of Evocation)."
+      }
+    ]
+  }
+]
