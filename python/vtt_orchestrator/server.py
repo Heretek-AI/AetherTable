@@ -1,10 +1,12 @@
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 
 from .routing.intent_router import IntentClassificationRouter, LiteLLMCircuitBreakerGateway
+from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
@@ -41,6 +43,7 @@ retry_controller = DiagnosticRetryController(auditor=auditor, max_retries=2)
 spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
+streaming_gateway = LLMStreamingGateway()
 
 
 class ClassifyRequest(BaseModel):
@@ -57,6 +60,12 @@ class NarrativeGenerateRequest(BaseModel):
     previous_entity_count: int = 4
     ingress_count: int = 0
     egress_count: int = 0
+
+
+class NarrativeStreamRequest(BaseModel):
+    user_intent: str
+    engine_execution_payload: Dict[str, Any]
+    context: Optional[Dict[str, Any]] = None
 
 
 class UtteranceRecordRequest(BaseModel):
@@ -76,6 +85,8 @@ def health_check():
         "status": "healthy",
         "service": "vtt-multi-agent-orchestrator",
         "version": "1.0.0",
+        "llm_provider": "live" if not streaming_gateway.config.is_mock else "mock_fallback",
+        "llm_model": streaming_gateway.config.model,
     }
 
 
@@ -100,6 +111,21 @@ def generate_narrative(req: NarrativeGenerateRequest):
         egress_count=req.egress_count,
     )
     return cycle_result
+
+
+@app.post("/api/v1/narrative/stream")
+async def stream_narrative(req: NarrativeStreamRequest):
+    """
+    Server-Sent Events (SSE) streaming endpoint returning real-time tokens.
+    """
+    return StreamingResponse(
+        streaming_gateway.stream_narrative(
+            user_intent=req.user_intent,
+            engine_payload=req.engine_execution_payload,
+            context=req.context,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 @app.post("/api/v1/lore/assert")

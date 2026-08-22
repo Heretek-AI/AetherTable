@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { Navbar, SaaSView } from './components/Navbar';
 import { TacticalCanvas, Token } from './components/TacticalCanvas';
 import { InitiativeTracker } from './components/InitiativeTracker';
@@ -8,6 +8,8 @@ import { SafetyModal } from './components/SafetyModal';
 import { CompendiumView } from './components/CompendiumView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
+import { ParticleFXManager } from './render/particle_effects';
+import { DiceBox3D } from './render/dice_box_3d';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
@@ -15,6 +17,10 @@ export default function App() {
   const [isRightDockCollapsed, setIsRightDockCollapsed] = useState(false);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
+  const [isStreamingResponse, setIsStreamingResponse] = useState(false);
+
+  const particleFXRef = useRef<ParticleFXManager | null>(null);
+  const diceBoxRef = useRef<DiceBox3D | null>(null);
 
   const [tokens, setTokens] = useState<Token[]>([
     {
@@ -134,6 +140,81 @@ export default function App() {
     ]);
   };
 
+  const streamNarrativeResponse = async (
+    userIntent: string,
+    enginePayload: any,
+    dmMessageId: string
+  ) => {
+    setIsStreamingResponse(true);
+    try {
+      const resp = await fetch('/api/v1/orchestrator/narrative/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_intent: userIntent,
+          engine_execution_payload: enginePayload,
+          context: { campaign: 'The Fall of Baron Vane', round: roundNumber },
+        }),
+      });
+
+      if (!resp.ok || !resp.body) {
+        throw new Error('Streaming failed');
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.token) {
+                accumulated += data.token;
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === dmMessageId ? { ...m, content: accumulated, isStreaming: true } : m
+                  )
+                );
+              }
+              if (data.done) {
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === dmMessageId ? { ...m, isStreaming: false } : m
+                  )
+                );
+              }
+            } catch (e) {
+              // ignore parse errors on partial frames
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Fallback
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === dmMessageId
+            ? {
+                ...m,
+                content: enginePayload.is_hit
+                  ? `With decisive momentum, the blow connects for ${enginePayload.total_damage} damage!`
+                  : `The attack deflects harmlessly off the opponent's defenses.`,
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+    } finally {
+      setIsStreamingResponse(false);
+    }
+  };
+
   const handleExecuteAttack = (actionName: string, damageFormula: string, damageType: string) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
     const roll = Math.floor(Math.random() * 20) + 1;
@@ -153,12 +234,24 @@ export default function App() {
           t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
         )
       );
+
+      // Trigger Visual Melee Impact
+      if (particleFXRef.current) {
+        particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
+      }
     }
 
-    const narrative = isHit
-      ? `Thorin delivers a crushing ${actionName}! The blade strikes true for ${dmg} ${damageType} damage against ${target.name}.`
-      : `Thorin lunges with ${actionName}, but ${target.name} deflects the assault with their shield!`;
+    // Trigger 3D Dice Roll
+    if (diceBoxRef.current) {
+      diceBoxRef.current.rollDice(
+        'd20',
+        roll,
+        (target.x + 0.5) * 60,
+        (target.y + 0.5) * 60
+      );
+    }
 
+    const dmMsgId = `dm_${Date.now() + 1}`;
     setMessages((prev) => [
       ...prev,
       {
@@ -174,11 +267,12 @@ export default function App() {
         },
       },
       {
-        id: `dm_${Date.now() + 1}`,
+        id: dmMsgId,
         sender: 'Encounter DM (AI)',
         role: 'dm',
-        content: narrative,
+        content: '...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isStreaming: true,
         diceRollDetails: isHit
           ? {
               total: dmg,
@@ -188,6 +282,12 @@ export default function App() {
           : undefined,
       },
     ]);
+
+    streamNarrativeResponse(
+      `I attack ${target.name} with ${actionName}`,
+      { action_name: actionName, is_hit: isHit, total_damage: dmg },
+      dmMsgId
+    );
   };
 
   const handleCastSpell = (spellId: string, spellName: string, level: number) => {
@@ -199,6 +299,15 @@ export default function App() {
       )
     );
 
+    // Trigger Spell Particle Shockwave & 3D Dice
+    if (particleFXRef.current) {
+      particleFXRef.current.spawnFireballShockwave((target.x + 0.5) * 60, (target.y + 0.5) * 60, 220);
+    }
+    if (diceBoxRef.current) {
+      diceBoxRef.current.rollDice('d20', 18, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
+    }
+
+    const dmMsgId = `dm_${Date.now() + 1}`;
     setMessages((prev) => [
       ...prev,
       {
@@ -209,19 +318,30 @@ export default function App() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
       {
-        id: `dm_${Date.now() + 1}`,
+        id: dmMsgId,
         sender: 'Encounter DM (AI)',
         role: 'dm',
-        content: `A searing eruption of flame engulfs ${target.name} for ${dmg} fire damage!`,
+        content: '...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isStreaming: true,
       },
     ]);
+
+    streamNarrativeResponse(
+      `I cast ${spellName} on ${target.name}`,
+      { action_name: spellName, is_hit: true, total_damage: dmg },
+      dmMsgId
+    );
   };
 
   const handleRollCheck = (skillName: string, modifier: number, dc: number) => {
     const roll = Math.floor(Math.random() * 20) + 1;
     const total = roll + modifier;
     const passed = total >= dc;
+
+    if (diceBoxRef.current && selectedToken) {
+      diceBoxRef.current.rollDice('d20', roll, (selectedToken.x + 0.5) * 60, (selectedToken.y + 0.5) * 60);
+    }
 
     setMessages((prev) => [
       ...prev,
@@ -250,6 +370,7 @@ export default function App() {
   };
 
   const handleSendMessage = (text: string) => {
+    const dmMsgId = `dm_${Date.now() + 1}`;
     setMessages((prev) => [
       ...prev,
       {
@@ -260,13 +381,20 @@ export default function App() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
       {
-        id: `dm_${Date.now() + 1}`,
+        id: dmMsgId,
         sender: 'Encounter DM (AI)',
         role: 'dm',
-        content: `The DM records: "${text}". The dungeon chambers respond to your declaration.`,
+        content: '...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isStreaming: true,
       },
     ]);
+
+    streamNarrativeResponse(
+      text,
+      { action_name: 'Custom Action', is_hit: true, total_damage: 10 },
+      dmMsgId
+    );
   };
 
   const handleSafetyRewind = (topic: string) => {
@@ -348,6 +476,8 @@ export default function App() {
                   selectedTokenId={selectedTokenId}
                   onSelectToken={(id) => setSelectedTokenId(id)}
                   walls={customWalls}
+                  particleFXRef={particleFXRef}
+                  diceBoxRef={diceBoxRef}
                 />
               </main>
 
@@ -367,6 +497,7 @@ export default function App() {
               messages={messages}
               onSendMessage={handleSendMessage}
               spotlightWeights={spotlightWeights}
+              isStreamingResponse={isStreamingResponse}
             />
           </div>
         )}

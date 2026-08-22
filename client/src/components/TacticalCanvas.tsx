@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Shield, 
   Compass, 
@@ -9,13 +9,12 @@ import {
   Skull, 
   Crosshair, 
   Flame, 
-  Eye, 
-  Maximize2,
   Circle,
   Square,
   Triangle,
-  Move
 } from 'lucide-react';
+import { ParticleFXManager } from '../render/particle_effects';
+import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
 
 export interface Token {
   id: string;
@@ -39,6 +38,8 @@ interface TacticalCanvasProps {
   gridWidth?: number;
   gridHeight?: number;
   walls?: { x: number; y: number }[];
+  particleFXRef?: React.MutableRefObject<ParticleFXManager | null>;
+  diceBoxRef?: React.MutableRefObject<DiceBox3D | null>;
 }
 
 export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
@@ -52,6 +53,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     { x: 8, y: 2 }, { x: 8, y: 3 }, { x: 8, y: 4 }, { x: 8, y: 5 }, { x: 8, y: 6 },
     { x: 4, y: 8 }, { x: 5, y: 8 }, { x: 6, y: 8 },
   ],
+  particleFXRef,
+  diceBoxRef,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -65,6 +68,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [measureTarget, setMeasureTarget] = useState<{ x: number; y: number } | null>(null);
   const [aoeShape, setAoeShape] = useState<'none' | 'sphere' | 'cone' | 'cube' | 'line'>('none');
   const [aoeOrigin, setAoeOrigin] = useState<{ x: number; y: number } | null>(null);
+
+  // FX Canvas Refs
+  const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const internalParticleFX = useRef<ParticleFXManager>(new ParticleFXManager());
+  const internalDiceBox = useRef<DiceBox3D>(new DiceBox3D());
+
+  if (particleFXRef) particleFXRef.current = internalParticleFX.current;
+  if (diceBoxRef) diceBoxRef.current = internalDiceBox.current;
 
   const [fogRevealed, setFogRevealed] = useState<boolean[][]>(() => {
     const grid = Array.from({ length: gridHeight }, () => Array(gridWidth).fill(false));
@@ -87,6 +98,36 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   });
 
   const cellSize = 60;
+
+  // Animation Loop for 3D Dice and Particle FX
+  useEffect(() => {
+    let animId: number;
+    const canvas = fxCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const renderLoop = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Render Particles
+      internalParticleFX.current.updateAndRender(ctx);
+
+      // Render 3D Dice
+      internalDiceBox.current.updateAndRender(ctx, (roll: ActiveDiceRoll) => {
+        if (roll.dieType === 'd20' && roll.targetValue === 20) {
+          internalParticleFX.current.spawnGoldCritBurst(roll.currentX, roll.currentY, 50);
+        } else {
+          internalParticleFX.current.spawnMeleeImpact(roll.currentX, roll.currentY);
+        }
+      });
+
+      animId = requestAnimationFrame(renderLoop);
+    };
+
+    renderLoop();
+    return () => cancelAnimationFrame(animId);
+  }, []);
 
   const isWall = (x: number, y: number) => {
     return walls.some((w) => w.x === x && w.y === y);
@@ -112,6 +153,13 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const handleCellClick = (x: number, y: number) => {
     if (aoeShape !== 'none') {
       setAoeOrigin({ x, y });
+      if (aoeShape === 'sphere') {
+        internalParticleFX.current.spawnFireballShockwave(
+          (x + 0.5) * cellSize,
+          (y + 0.5) * cellSize,
+          240
+        );
+      }
       return;
     }
 
@@ -275,11 +323,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               const wall = isWall(x, y);
               const revealed = fogRevealed[y] ? fogRevealed[y][x] : true;
               
-              // Check if inside active AoE
               let isInsideAoe = false;
               if (aoeOrigin && aoeShape === 'sphere') {
                 const dist = Math.sqrt((x - aoeOrigin.x) ** 2 + (y - aoeOrigin.y) ** 2);
-                isInsideAoe = dist <= 4.0; // 20ft sphere
+                isInsideAoe = dist <= 4.0;
               }
 
               return (
@@ -291,28 +338,24 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                       ? 'bg-slate-850 border-slate-700/80 shadow-inner'
                       : (x + y) % 2 === 0
                       ? 'bg-slate-900/90 hover:bg-slate-850'
-                      : 'bg-slate-900/60 hover:bg-slate-800/60'
+                      : 'bg-slate-900/60 hover:bg-slate-850/60'
                   }`}
                   style={{ width: cellSize, height: cellSize }}
                 >
-                  {/* Grid Cell Coordinate Label */}
                   <span className="absolute bottom-1 right-1 text-[8px] font-mono text-slate-700 select-none pointer-events-none">
                     {String.fromCharCode(65 + x)}{y + 1}
                   </span>
 
-                  {/* Fog of War */}
                   {!revealed && (
                     <div className="absolute inset-0 bg-slate-950/95 pointer-events-none backdrop-blur-[2px] transition-opacity duration-300" />
                   )}
 
-                  {/* Wall Texture Overlay */}
                   {wall && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none text-slate-600/70">
                       <Shield className="w-5 h-5 opacity-40" />
                     </div>
                   )}
 
-                  {/* AoE Projection Overlay */}
                   {isInsideAoe && (
                     <div className="absolute inset-0 bg-orange-500/30 border border-orange-400/60 pointer-events-none animate-pulse-glow" />
                   )}
@@ -344,12 +387,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   height: `${cellSize}px`,
                 }}
               >
-                {/* Active Selection Glow Ring */}
                 {isSelected && (
                   <div className="absolute inset-0.5 rounded-full border-2 border-purple-400 animate-pulse-glow" />
                 )}
 
-                {/* Token Badge */}
                 <div
                   className={`w-11 h-11 rounded-full flex items-center justify-center shadow-xl border-2 transition-transform ${
                     isSelected ? 'border-purple-400 scale-110 shadow-purple-500/50' : 'border-slate-300/80 shadow-black/80'
@@ -359,7 +400,6 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   {renderTokenIcon(token)}
                 </div>
 
-                {/* Micro HP Bar */}
                 <div className="w-10 h-1.5 bg-slate-950 rounded-full mt-1 overflow-hidden border border-slate-700 shadow-sm">
                   <div
                     className={`h-full transition-all duration-300 ${
@@ -373,13 +413,20 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   />
                 </div>
 
-                {/* Token Name Tag */}
                 <span className="text-[10px] font-mono font-semibold text-slate-200 px-1.5 py-0.5 bg-slate-950/90 border border-slate-800 rounded mt-0.5 backdrop-blur-md whitespace-nowrap shadow">
                   {token.name}
                 </span>
               </div>
             );
           })}
+
+          {/* 3D Dice & WebGL Particle FX Overlay Canvas */}
+          <canvas
+            ref={fxCanvasRef}
+            width={gridWidth * cellSize}
+            height={gridHeight * cellSize}
+            className="absolute inset-0 pointer-events-none z-40"
+          />
         </div>
       </div>
     </div>

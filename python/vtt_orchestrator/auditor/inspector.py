@@ -1,11 +1,11 @@
-import time
 import re
-from typing import Dict, Any, List, Optional
+import time
+from typing import Dict, Any, List, Optional, Tuple
 from ..schemas.models import (
+    AuditorDiagnosticReport,
+    ValidationFailure,
     InvariantViolationType,
     FailureSeverity,
-    ValidationFailure,
-    AuditorDiagnosticReport,
     EncounterDMContextUpdate,
 )
 from ..lore.epistemic_graph import EpistemicLoreGraphManager
@@ -13,7 +13,8 @@ from ..lore.epistemic_graph import EpistemicLoreGraphManager
 
 class PreCommitAuditorAgent:
     """
-    Second-Tier Pre-Commit Invariant Interceptor / World Inspector (<200ms SLA).
+    Authoritative Invariant Interceptor ("World Inspector").
+    Enforces 5 Invariant Vectors before any state commit or client broadcast.
     """
 
     def __init__(self, lore_graph: Optional[EpistemicLoreGraphManager] = None):
@@ -27,8 +28,8 @@ class PreCommitAuditorAgent:
         engine_execution_payload: Dict[str, Any],
         active_entity_count: int,
         previous_entity_count: int,
-        ingress_verified_count: int,
-        egress_verified_count: int,
+        ingress_verified_count: int = 0,
+        egress_verified_count: int = 0,
         movement_path_distance_feet: Optional[float] = None,
         entity_speed_budget_feet: Optional[float] = None,
     ) -> AuditorDiagnosticReport:
@@ -66,9 +67,11 @@ class PreCommitAuditorAgent:
         target_conscious = engine_execution_payload.get("target_is_conscious", True)
 
         if target_hp is not None and target_hp > 0 and target_conscious and not target_dead:
-            lethality_terms = ["dead", "decapitated", "slain", "lifeless", "killed instantly", "severed head", "corpse"]
-            for term in lethality_terms:
-                if re.search(r"\b" + re.escape(term) + r"\b", proposed_narrative, re.IGNORECASE):
+            lethality_patterns = [r"\bdead\b", r"\bdecapitat\w*", r"\bslain\b", r"\blifeless\b", r"\bkill\w*", r"\bcorpse\b"]
+            for pat in lethality_patterns:
+                match = re.search(pat, proposed_narrative, re.IGNORECASE)
+                if match:
+                    term = match.group(0)
                     failures.append(ValidationFailure(
                         violation_type=InvariantViolationType.MATH_NARRATIVE_CONTRADICTION,
                         severity=FailureSeverity.FATAL_REJECT,
@@ -128,10 +131,14 @@ class DiagnosticRetryController:
         previous_entity_count: int,
         ingress_count: int,
         egress_count: int,
+        movement_path_distance_feet: Optional[float] = None,
+        entity_speed_budget_feet: Optional[float] = None,
     ) -> Dict[str, Any]:
-        context_update = None
+        retry_count = 0
+        context_update: Optional[EncounterDMContextUpdate] = None
+        audit_history: List[AuditorDiagnosticReport] = []
 
-        for retry in range(self.max_retries + 1):
+        while retry_count <= self.max_retries:
             draft = dm_draft_generator(context_update)
             report = self.auditor.audit_proposal(
                 turn_index=turn_index,
@@ -142,36 +149,45 @@ class DiagnosticRetryController:
                 previous_entity_count=previous_entity_count,
                 ingress_verified_count=ingress_count,
                 egress_verified_count=egress_count,
+                movement_path_distance_feet=movement_path_distance_feet,
+                entity_speed_budget_feet=entity_speed_budget_feet,
             )
+            audit_history.append(report)
 
             if report.passed:
                 return {
                     "status": "COMMITTED",
                     "final_narrative": draft,
-                    "retry_count": retry,
-                    "auditor_report": report,
-                    "fallback_used": False,
+                    "retry_count": retry_count,
+                    "audit_report": report,
+                    "audit_history": audit_history,
                 }
 
-            if retry < self.max_retries:
+            # Retry Pass
+            retry_count += 1
+            if retry_count <= self.max_retries:
                 context_update = EncounterDMContextUpdate(
                     original_user_intent=user_intent,
                     rejected_draft=draft,
                     auditor_report=report,
-                    retry_count=retry + 1,
+                    retry_count=retry_count,
                 )
 
-        # Retries exhausted -> Fallback to Raw Deterministic Template
-        fallback_text = (
-            f"Action resolved: {engine_execution_payload.get('action_name', 'Action')} "
-            f"dealt {engine_execution_payload.get('total_damage', 0)} damage. "
-            f"Target HP remaining: {engine_execution_payload.get('target_hp_remaining', 'N/A')}."
-        )
+        # Fallback to Deterministic Raw Description
+        action_name = engine_execution_payload.get("action_name", "Action")
+        dmg = engine_execution_payload.get("total_damage", 0)
+        target_hp = engine_execution_payload.get("target_hp_remaining", 0)
+        is_hit = engine_execution_payload.get("is_hit", True)
+
+        if is_hit:
+            fallback_text = f"The {action_name} hits with mechanical precision, dealing {dmg} damage. Target remaining HP: {target_hp}."
+        else:
+            fallback_text = f"The {action_name} misses the target entirely."
 
         return {
             "status": "FALLBACK_COMMITTED",
             "final_narrative": fallback_text,
-            "retry_count": self.max_retries,
-            "auditor_report": report,
-            "fallback_used": True,
+            "retry_count": retry_count,
+            "audit_history": audit_history,
+            "fallback_applied": True,
         }

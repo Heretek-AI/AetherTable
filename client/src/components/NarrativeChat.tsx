@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Send, Bot, Dices, Volume2, Sparkles, ChevronUp, ChevronDown, User, MessageSquare } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Send, Bot, Dices, Volume2, ChevronUp, ChevronDown, User, Loader2 } from 'lucide-react';
 
 export interface ChatMessage {
   id: string;
@@ -7,6 +7,7 @@ export interface ChatMessage {
   role: 'dm' | 'player' | 'system';
   content: string;
   timestamp: string;
+  isStreaming?: boolean;
   diceRollDetails?: {
     total: number;
     expression: string;
@@ -18,15 +19,22 @@ interface NarrativeChatProps {
   messages: ChatMessage[];
   onSendMessage: (text: string) => void;
   spotlightWeights: { [player: string]: number };
+  isStreamingResponse?: boolean;
 }
 
 export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   messages,
   onSendMessage,
   spotlightWeights,
+  isStreamingResponse = false,
 }) => {
   const [inputText, setInputText] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, messages[messages.length - 1]?.content]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,13 +46,18 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
 
   return (
     <footer aria-label="Narrative & Chat Panel" className={`vtt-glass-panel border-t border-slate-800/80 flex flex-col justify-between transition-all shrink-0 ${
-      isExpanded ? 'h-80' : 'h-56'
+      isExpanded ? 'h-96' : 'h-64'
     }`}>
       {/* Top Banner: Voice Spotlight Agency Monitor & Expand Toggle */}
       <div className="px-4 py-1.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between text-xs font-mono">
         <div className="flex items-center gap-2 text-slate-400">
           <Volume2 className="w-3.5 h-3.5 text-purple-400" />
           <span className="text-slate-300 font-semibold">Conversational Agency:</span>
+          {isStreamingResponse && (
+            <span className="flex items-center gap-1 text-[10px] text-purple-400 animate-pulse ml-2 font-sans font-bold">
+              <Loader2 className="w-3 h-3 animate-spin" /> Live AI Inference
+            </span>
+          )}
         </div>
 
         {/* Agency Distribution Gauges */}
@@ -89,10 +102,13 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
               <span className="font-bold flex items-center gap-1.5 text-purple-300">
                 {msg.role === 'dm' ? <Bot className="w-3.5 h-3.5 text-purple-400" /> : <User className="w-3.5 h-3.5 text-sky-400" />}
                 {msg.sender}
+                {msg.isStreaming && (
+                  <span className="inline-block w-1.5 h-3 bg-purple-400 animate-pulse ml-1" />
+                )}
               </span>
               <span className="text-slate-500">{msg.timestamp}</span>
             </div>
-            <div className="font-sans leading-normal">{msg.content}</div>
+            <div className="font-sans leading-normal whitespace-pre-wrap">{msg.content}</div>
 
             {/* Attached Dice Breakdown */}
             {msg.diceRollDetails && (
@@ -106,6 +122,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
             )}
           </div>
         ))}
+        <div ref={messagesEndRef} />
       </div>
 
       {/* Input Bar */}

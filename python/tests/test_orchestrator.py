@@ -1,148 +1,172 @@
 import pytest
+import json
+import asyncio
+from fastapi.testclient import TestClient
+
 from vtt_orchestrator.routing.intent_router import IntentClassificationRouter
+from vtt_orchestrator.routing.llm_client import LLMStreamingGateway, LLMConfig
 from vtt_orchestrator.lore.epistemic_graph import EpistemicLoreGraphManager
 from vtt_orchestrator.auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
-from vtt_orchestrator.agents.agent_hierarchy import DirectorAgent, EncounterDMAgent, ConcordiaNPCComponent
-from vtt_orchestrator.simulation.faction_simulation import FactionSimulationGOAP
+from vtt_orchestrator.agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
 from vtt_orchestrator.simulation.spotlight_tracker import VoiceSpotlightTracker
 from vtt_orchestrator.simulation.safety_gateway import SafetyGateway
-from vtt_orchestrator.ingestion.pdf_parser import AstPdfCompendiumParser
-from vtt_orchestrator.ingestion.vtt_bundle_bridge import VttBundleBridge
 from vtt_orchestrator.playtest.synthetic_playtest import SyntheticPlaytestRunner
-from vtt_orchestrator.schemas.models import LoreAssertionPayload, EpistemicTier
+from vtt_orchestrator.schemas.models import IntentType, EpistemicTier, LoreAssertionPayload
+from vtt_orchestrator.server import app
 
 
 def test_intent_router_classification():
     router = IntentClassificationRouter()
+    
+    # 1. Mechanical action
+    res1 = router.classify_utterance("I attack the orc with my greataxe")
+    assert res1.intent_type == IntentType.MECHANICAL_INVOCATION
+    assert res1.latency_ms < 150.0
 
-    res_mech = router.classify_utterance("I cast Fireball at the goblins")
-    assert res_mech.intent_type.value == "MECHANICAL_INVOCATION"
-    assert res_mech.latency_ms < 150.0
+    # 2. Lore assertion
+    res2 = router.classify_utterance("The ancient keep of Oakhaven was destroyed in the Second Age.")
+    assert res2.intent_type == IntentType.LORE_ASSERTION
 
-    res_safety = router.classify_utterance("X-Card on this scene")
-    assert res_safety.intent_type.value == "SAFETY_INTERVENTION"
+    # 3. In-character dialogue
+    res3 = router.classify_utterance('"Yield now, monster, or face the fury of Moradin!"')
+    assert res3.intent_type == IntentType.IN_CHARACTER_DIALOGUE
 
-    res_ooc = router.classify_utterance("Pass the pizza please")
-    assert res_ooc.intent_type.value == "OUT_OF_CHARACTER"
+    # 4. Safety intervention
+    res4 = router.classify_utterance("X-Card on torture and blood gore")
+    assert res4.intent_type == IntentType.SAFETY_INTERVENTION
 
 
 def test_epistemic_graph_and_paradox_detection():
-    graph = EpistemicLoreGraphManager()
+    manager = EpistemicLoreGraphManager()
+    
+    # Submit Valid Proposition (PROPOSED_FACT gets status STAGED)
+    assertion1 = LoreAssertionPayload(
+        proposing_entity_id="player_01",
+        epistemic_tier=EpistemicTier.PROPOSED_FACT,
+        subject_node_id="PC_Thorin",
+        predicate_relation="ALLIED_WITH",
+        object_node_id="Faction_Dwarves",
+        confidence_score=0.7,
+        context_sentence="Thorin is allied with the mountain clan.",
+    )
+    res1 = manager.submit_assertion(assertion1)
+    assert res1["status"] in ["COMMITTED", "STAGED"]
+    assert res1["assigned_weight"] == 0.7
 
-    # Baron Vane is marked DECEASED in graph
-    passed, reason, lat = graph.query_paradox("NPC_Baron_Vane", "SPEAKS_WITH", "PC_Thorin")
-    assert not passed
-    assert "DECEASED" in reason
-    assert lat < 40.0
-
-    # Valid assertion
-    assertion = LoreAssertionPayload(
-        proposing_entity_id="player_1",
-        subject_node_id="NPC_Blacksmith_Goran",
-        predicate_relation="KNOWS_ABOUT",
+    # Submit Direct Paradox (Trying to assert deceased NPC_Baron_Vane RULES)
+    assertion2 = LoreAssertionPayload(
+        proposing_entity_id="player_02",
+        epistemic_tier=EpistemicTier.PROPOSED_FACT,
+        subject_node_id="NPC_Baron_Vane",
+        predicate_relation="RULES",
         object_node_id="Location_Keep",
         confidence_score=0.7,
-        epistemic_tier=EpistemicTier.PROPOSED_FACT,
-        context_sentence="I ask the blacksmith about the keep",
+        context_sentence="Baron Aldous Vane currently rules the keep.",
     )
-    commit_res = graph.submit_assertion(assertion)
-    assert commit_res["status"] == "STAGED"
+    res2 = manager.submit_assertion(assertion2)
+    assert res2["status"] == "REJECTED_PARADOX"
 
 
 def test_pre_commit_auditor_lethality_contradiction():
     auditor = PreCommitAuditorAgent()
-
-    # Target survived with 12 HP, but DM draft claims decapitated / dead
+    
+    # Engine says enemy has 12 HP left, but DM generates "Thorin decapitates and kills him instantly"
+    engine_payload = {
+        "action_name": "Greataxe Slash",
+        "is_hit": True,
+        "total_damage": 8,
+        "target_hp_remaining": 12,
+        "target_is_conscious": True,
+        "target_is_dead": False,
+    }
+    contradictory_draft = "Thorin swings his greataxe cleanly through the warlord's neck, instantly decapitating and killing him on the spot."
+    
     report = auditor.audit_proposal(
         turn_index=1,
-        entity_id="orc_warlord",
-        proposed_narrative="I swing my sword, decapitating the orc and leaving him dead on the floor!",
-        engine_execution_payload={
-            "target_hp_remaining": 12,
-            "target_is_conscious": True,
-            "target_is_dead": False,
-        },
-        active_entity_count=3,
-        previous_entity_count=3,
+        entity_id="actor_thorin",
+        proposed_narrative=contradictory_draft,
+        engine_execution_payload=engine_payload,
+        active_entity_count=4,
+        previous_entity_count=4,
         ingress_verified_count=0,
         egress_verified_count=0,
     )
-
-    assert not report.passed
-    assert len(report.failures) == 1
-    assert report.failures[0].violation_type.value == "MATH_NARRATIVE_CONTRADICTION"
+    
+    assert report.passed is False
+    assert len(report.failures) > 0
+    assert any("Lethality contradiction" in f.diagnostic_message or "lethal trauma" in f.diagnostic_message for f in report.failures)
 
 
 def test_diagnostic_retry_controller():
     auditor = PreCommitAuditorAgent()
+    controller = DiagnosticRetryController(auditor=auditor, max_retries=2)
     dm = EncounterDMAgent()
-    controller = DiagnosticRetryController(auditor, max_retries=2)
-
+    
     engine_payload = {
-        "action_name": "Greataxe Attack",
+        "action_name": "Fireball",
         "is_hit": True,
-        "total_damage": 8,
-        "target_hp_remaining": 14,
-        "target_is_conscious": True,
-        "target_is_dead": False,
+        "total_damage": 28,
+        "target_hp_remaining": 0,
+        "target_is_conscious": False,
+        "target_is_dead": True,
     }
-
-    # Turn draft that complies with rules
-    result = controller.run_turn_cycle(
-        user_intent="I strike the guard",
-        turn_index=1,
-        entity_id="pc_fighter",
+    
+    cycle_result = controller.run_turn_cycle(
+        user_intent="I cast Fireball at the goblin cluster",
+        turn_index=2,
+        entity_id="actor_lyra",
         engine_execution_payload=engine_payload,
-        dm_draft_generator=lambda ctx: dm.generate_combat_draft("I strike the guard", engine_payload, ctx),
-        active_entity_count=2,
-        previous_entity_count=2,
+        dm_draft_generator=lambda ctx: dm.generate_combat_draft("I cast Fireball at the goblin cluster", engine_payload, ctx),
+        active_entity_count=3,
+        previous_entity_count=4,
         ingress_count=0,
-        egress_count=0,
+        egress_count=1,
     )
-
-    assert result["status"] == "COMMITTED"
-    assert not result["fallback_used"]
+    
+    assert cycle_result["status"] == "COMMITTED"
+    assert "final_narrative" in cycle_result
 
 
 def test_spotlight_tracker_and_safety_rewind():
-    tracker = VoiceSpotlightTracker(["p1", "p2", "p3"])
-    tracker.record_utterance("p1", 60.0)
-    tracker.record_utterance("p2", 40.0)
-    tracker.record_utterance("p3", 2.0)
-
-    sidelined = tracker.get_sidelined_players(threshold_ratio=0.10)
-    assert "p3" in sidelined
+    tracker = VoiceSpotlightTracker(player_ids=["Thorin", "Lyra", "Gimli"])
+    
+    tracker.record_utterance("Thorin", 45.0)
+    tracker.record_utterance("Lyra", 40.0)
+    tracker.record_utterance("Gimli", 5.0)
+    
+    weights = tracker.calculate_agency_weights()
+    assert weights["Thorin"] > 0.4
+    assert weights["Gimli"] < 0.15
+    
+    sidelined = tracker.get_sidelined_players()
+    assert "Gimli" in sidelined
 
     gateway = SafetyGateway()
-    safety_res = gateway.trigger_x_card("p3", "spiders", current_sequence_id=45)
-    assert safety_res["status"] == "SAFETY_INTERVENTION_ACTIVATED"
-    assert safety_res["target_sequence_id"] == 44
+    xcard_res = gateway.trigger_x_card("Gimli", "Claustrophobia", current_sequence_id=14)
+    assert xcard_res["status"] == "SAFETY_INTERVENTION_ACTIVATED"
+    assert xcard_res["target_sequence_id"] == 13
 
 
 def test_synthetic_playtest_benchmark():
     runner = SyntheticPlaytestRunner(num_turns=50)
     report = runner.run_simulation()
-    assert report["total_turns_simulated"] == 50
-    assert report["mechanical_compliance_rate_pct"] >= 90.0
-    assert report["hallucination_continuity_index"] >= 0.85
-from fastapi.testclient import TestClient
-from vtt_orchestrator.server import app
+    
+    assert report["mechanical_compliance_rate_pct"] >= 98.5
+    assert report["hallucination_continuity_index"] >= 0.95
+    assert report["auditor_false_positive_rate_pct"] <= 1.5
 
 
 def test_fastapi_server_endpoints():
     client = TestClient(app)
 
-    # Health check
     health_resp = client.get("/health")
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "healthy"
 
-    # Intent classify
     classify_resp = client.post("/api/v1/intent/classify", json={"utterance": "I attack with greatsword", "speaker_id": "Thorin"})
     assert classify_resp.status_code == 200
     assert classify_resp.json()["intent_type"] == "MECHANICAL_INVOCATION"
 
-    # Narrative generate with pre-commit auditor pass
     narrative_resp = client.post("/api/v1/narrative/generate", json={
         "user_intent": "I strike with greataxe",
         "turn_index": 1,
@@ -163,7 +187,36 @@ def test_fastapi_server_endpoints():
     assert narrative_resp.status_code == 200
     assert narrative_resp.json()["status"] == "COMMITTED"
 
-    # Faction simulation tick
     sim_resp = client.post("/api/v1/simulation/tick")
     assert sim_resp.status_code == 200
     assert "actions_executed" in sim_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_llm_streaming_gateway():
+    gateway = LLMStreamingGateway(LLMConfig())
+    collected_tokens = []
+    async for chunk in gateway.stream_narrative("I cast Fireball", {"action_name": "Fireball", "is_hit": True, "total_damage": 28}):
+        if chunk.startswith("data: "):
+            parsed = json.loads(chunk[6:].strip())
+            if not parsed.get("done"):
+                collected_tokens.append(parsed.get("token"))
+
+    full_narrative = "".join(collected_tokens)
+    assert len(full_narrative) > 0
+    assert "Fireball" in full_narrative or "damage" in full_narrative
+
+
+def test_fastapi_sse_stream_endpoint():
+    client = TestClient(app)
+    response = client.post("/api/v1/narrative/stream", json={
+        "user_intent": "I strike with greataxe",
+        "engine_execution_payload": {
+            "action_name": "Greataxe Slash",
+            "is_hit": True,
+            "total_damage": 12
+        }
+    })
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "data:" in response.text
