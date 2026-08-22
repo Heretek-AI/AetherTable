@@ -9,6 +9,7 @@ import { CompendiumView } from './components/CompendiumView';
 import { CharacterBuilderView } from './components/CharacterBuilderView';
 import { LobbyView } from './components/LobbyView';
 import { DynastyView } from './components/DynastyView';
+import { BundleManagerView } from './components/BundleManagerView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
@@ -402,6 +403,20 @@ export function App() {
     addSystemMessage(`Hero ${newToken.name} crafted in Character Studio and deployed to the battlefield!`);
   };
 
+  const handleDeployFromBundleManager = (tokenData: Omit<Token, 'id' | 'x' | 'y'>) => {
+    const newId = `homebrew_${Date.now()}`;
+    const newToken: Token = {
+      ...tokenData,
+      id: newId,
+      x: 10,
+      y: 7,
+    };
+    setTokens((prev) => [...prev, newToken]);
+    setSelectedTokenId(newId);
+    setCurrentView('tabletop');
+    addSystemMessage(`Custom Homebrew Creature ${newToken.name} instantiated on the battlefield at [K8]!`);
+  };
+
   const handleLaunchFromLobby = (seatId: string) => {
     if (seatId === 'seat_gm') {
       setUserRole('gm');
@@ -521,6 +536,14 @@ export function App() {
 
         {currentView === 'dynasty' && (
           <DynastyView onInjectLoreToCampaign={handleInjectDynastyLore} />
+        )}
+
+        {currentView === 'bundles' && (
+          <BundleManagerView
+            tokens={tokens}
+            walls={customWalls}
+            onDeployToken={handleDeployFromBundleManager}
+          />
         )}
 
         {currentView === 'wfc' && (

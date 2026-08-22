@@ -17,6 +17,8 @@ from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
 from .simulation.dynasty_engine import global_dynasty_engine, DynastyEngine
 from .simulation.empirical_playtester import EmpiricalPlaytester
+from .compendium.bundle_packager import global_bundle_packager
+from .compendium.homebrew_parser import global_homebrew_parser
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .schemas.models import (
     IntentClassificationResult,
@@ -119,6 +121,22 @@ class DynastyInjectRequest(BaseModel):
     house_id: str
 
 
+class HomebrewParseRequest(BaseModel):
+    markdown_text: str
+
+
+class CampaignExportBundleRequest(BaseModel):
+    title: str = "The Fall of Baron Vane"
+    author: str = "AI Multi-Agent Director"
+    ruleset: str = "D&D 5e SRD + Homebrew"
+    grid_dimensions: Dict[str, int] = Field(default_factory=lambda: {"width": 16, "height": 12})
+    walls: List[Dict[str, int]] = Field(default_factory=list)
+    tokens: List[Dict[str, Any]] = Field(default_factory=list)
+    dynasties: Dict[str, Any] = Field(default_factory=dict)
+    lore_graph: Dict[str, Any] = Field(default_factory=dict)
+    loot_tables: Dict[str, Any] = Field(default_factory=dict)
+
+
 @app.get("/health")
 def health_check():
     return {
@@ -213,6 +231,24 @@ def inject_dynasty_lore(req: DynastyInjectRequest):
 @app.post("/api/v1/simulation/empirical-benchmark")
 def run_empirical_benchmark(simulations: int = Query(200, ge=10, le=1000)):
     return empirical_playtester.run_benchmark(simulations)
+
+
+@app.post("/api/v1/campaign/export-bundle")
+def export_campaign_bundle(req: CampaignExportBundleRequest):
+    try:
+        zip_bytes = global_bundle_packager.export_bundle(req.dict())
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{req.title.replace(" ", "_")}.vttbundle"'}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bundle packaging failed: {str(e)}")
+
+
+@app.post("/api/v1/homebrew/parse-markdown")
+def parse_homebrew_markdown(req: HomebrewParseRequest):
+    return global_homebrew_parser.parse_statblock(req.markdown_text)
 
 
 @app.post("/api/v1/narrative/generate")
