@@ -8,6 +8,7 @@ import { SafetyModal } from './components/SafetyModal';
 import { CompendiumView } from './components/CompendiumView';
 import { CharacterBuilderView } from './components/CharacterBuilderView';
 import { LobbyView } from './components/LobbyView';
+import { DynastyView } from './components/DynastyView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
@@ -415,6 +416,20 @@ export function App() {
     setCurrentView('tabletop');
   };
 
+  const handleInjectDynastyLore = (houseName: string, text: string) => {
+    addSystemMessage(`DYNASTY LORE ASSERTED: ${text}`);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `dm_${Date.now()}`,
+        sender: 'Encounter DM (AI)',
+        role: 'dm',
+        content: `The heralds proclaim the ancient standing of ${houseName}. The current political climate shifts as long-standing bloodline pacts take precedence.`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]);
+  };
+
   const handleApplyWfcMap = (matrix: number[][], width: number, height: number) => {
     const newWalls: { x: number; y: number }[] = [];
     for (let y = 0; y < height; y++) {
@@ -502,6 +517,10 @@ export function App() {
 
         {currentView === 'lobby' && (
           <LobbyView onLaunchCampaign={handleLaunchFromLobby} />
+        )}
+
+        {currentView === 'dynasty' && (
+          <DynastyView onInjectLoreToCampaign={handleInjectDynastyLore} />
         )}
 
         {currentView === 'wfc' && (

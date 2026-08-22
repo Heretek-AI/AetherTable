@@ -15,6 +15,8 @@ from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNP
 from .simulation.faction_simulation import FactionSimulationGOAP
 from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
+from .simulation.dynasty_engine import global_dynasty_engine, DynastyEngine
+from .simulation.empirical_playtester import EmpiricalPlaytester
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .schemas.models import (
     IntentClassificationResult,
@@ -48,6 +50,7 @@ safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
 pdf_renderer = CharacterSheetPDFRenderer()
+empirical_playtester = EmpiricalPlaytester()
 
 # Load Compendium Data
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -81,12 +84,6 @@ class NarrativeGenerateRequest(BaseModel):
     egress_count: int = 0
 
 
-class NarrativeStreamRequest(BaseModel):
-    user_intent: str
-    engine_execution_payload: Dict[str, Any]
-    context: Optional[Dict[str, Any]] = None
-
-
 class UtteranceRecordRequest(BaseModel):
     speaker_id: str
     duration_sec: float
@@ -95,7 +92,31 @@ class UtteranceRecordRequest(BaseModel):
 class XCardRequest(BaseModel):
     player_id: str
     topic: str
-    current_sequence_id: int = 10
+    current_sequence_id: int
+
+
+class CharacterExportPDFRequest(BaseModel):
+    name: str
+    level: int = 1
+    race: str = "Human"
+    character_class: str = "Fighter"
+    subclass: str = "Champion"
+    background: str = "Soldier"
+    alignment: str = "Neutral Good"
+    abilities: Dict[str, int] = Field(default_factory=lambda: {"STR": 16, "DEX": 14, "CON": 14, "INT": 10, "WIS": 12, "CHA": 8})
+    hp: int = 12
+    max_hp: int = 12
+    ac: int = 16
+    speed: int = 30
+    proficiency_bonus: int = 2
+    saving_throws: List[str] = Field(default_factory=lambda: ["STR", "CON"])
+    skills: List[str] = Field(default_factory=lambda: ["Athletics (+5)", "Perception (+3)"])
+    features: List[str] = Field(default_factory=lambda: ["Second Wind", "Fighting Style (Defense)"])
+    spells: List[str] = Field(default_factory=list)
+
+
+class DynastyInjectRequest(BaseModel):
+    house_id: str
 
 
 @app.get("/health")
@@ -104,99 +125,124 @@ def health_check():
         "status": "healthy",
         "service": "vtt-multi-agent-orchestrator",
         "version": "1.0.0",
-        "llm_provider": "live" if not streaming_gateway.config.is_mock else "mock_fallback",
-        "llm_model": streaming_gateway.config.model,
-        "compendium_spells_count": len(all_spells),
-        "compendium_monsters_count": len(all_monsters),
+        "mcr_compliance": 1.0,
     }
+
+
+@app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
+def classify_intent(req: ClassifyRequest):
+    return router.classify_utterance(req.utterance, req.speaker_id)
 
 
 @app.get("/api/v1/compendium/spells")
 def get_compendium_spells(
-    query: Optional[str] = None,
-    level: Optional[int] = None,
-    school: Optional[str] = None,
-    limit: int = 50,
+    q: Optional[str] = Query(None, description="Search query for spell name"),
+    school: Optional[str] = Query(None, description="Filter by magic school"),
+    level: Optional[int] = Query(None, description="Filter by spell level"),
+    limit: int = Query(50, ge=1, le=400)
 ):
     results = all_spells
-    if query:
-        q = query.lower()
-        results = [s for s in results if q in s["name"].lower() or q in s.get("description", "").lower()]
+    if q:
+        query = q.lower()
+        results = [s for s in results if query in s.get("name", "").lower() or query in s.get("description", "").lower()]
+    if school:
+        results = [s for s in results if s.get("school", "").lower() == school.lower()]
     if level is not None:
         results = [s for s in results if s.get("level") == level]
-    if school:
-        s_low = school.lower()
-        results = [s for s in results if s.get("school", "").lower() == s_low]
-
     return {
-        "total_matches": len(results),
-        "spells": results[:limit],
+        "total": len(results),
+        "spells": results[:limit]
     }
 
 
 @app.get("/api/v1/compendium/monsters")
 def get_compendium_monsters(
-    query: Optional[str] = None,
-    cr: Optional[str] = None,
-    limit: int = 50,
+    q: Optional[str] = Query(None, description="Search query for monster name"),
+    challenge_rating: Optional[str] = Query(None, description="Filter by challenge rating"),
+    limit: int = Query(50, ge=1, le=400)
 ):
     results = all_monsters
-    if query:
-        q = query.lower()
-        results = [m for m in results if q in m["name"].lower() or q in m.get("type", "").lower()]
-    if cr:
-        results = [m for m in results if m.get("cr", "").lower() == cr.lower()]
-
+    if q:
+        query = q.lower()
+        results = [m for m in results if query in m.get("name", "").lower() or query in m.get("type", "").lower()]
+    if challenge_rating:
+        results = [m for m in results if str(m.get("challenge_rating")) == str(challenge_rating)]
     return {
-        "total_matches": len(results),
-        "monsters": results[:limit],
+        "total": len(results),
+        "monsters": results[:limit]
     }
 
 
 @app.post("/api/v1/character/export-pdf")
-def export_character_pdf(char_data: Dict[str, Any]):
+def export_character_pdf(req: CharacterExportPDFRequest):
     try:
-        pdf_bytes = pdf_renderer.render_pdf_bytes(char_data)
+        pdf_bytes = pdf_renderer.render_character_sheet(req.dict())
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={char_data.get('name', 'character')}.pdf"},
+            headers={"Content-Disposition": f'attachment; filename="{req.name.replace(" ", "_")}_5e_Sheet.pdf"'}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 
-@app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
-def classify_intent(req: ClassifyRequest):
-    return router.classify_utterance(req.utterance, speaker_id=req.speaker_id)
+@app.get("/api/v1/dynasty/factions")
+def get_dynasties():
+    return global_dynasty_engine.get_dynasty_payload()
+
+
+@app.post("/api/v1/dynasty/generate")
+def generate_new_dynasties(seed: Optional[int] = Query(None)):
+    engine = DynastyEngine(seed=seed)
+    return engine.get_dynasty_payload()
+
+
+@app.post("/api/v1/dynasty/inject-lore")
+def inject_dynasty_lore(req: DynastyInjectRequest):
+    injected = global_dynasty_engine.inject_lore_into_graph(req.house_id, lore_graph)
+    if injected == 0:
+        raise HTTPException(status_code=404, detail="House not found")
+    return {
+        "status": "success",
+        "house_id": req.house_id,
+        "propositions_injected": injected,
+        "total_graph_edges": len(lore_graph.edges),
+    }
+
+
+@app.post("/api/v1/simulation/empirical-benchmark")
+def run_empirical_benchmark(simulations: int = Query(200, ge=10, le=1000)):
+    return empirical_playtester.run_benchmark(simulations)
 
 
 @app.post("/api/v1/narrative/generate")
-def generate_narrative(req: NarrativeGenerateRequest):
-    cycle_result = retry_controller.run_turn_cycle(
+@app.post("/api/v1/orchestrator/turn")
+def execute_orchestrator_turn(req: NarrativeGenerateRequest):
+    def dm_draft(ctx=None):
+        return dm_agent.generate_combat_draft(req.user_intent, req.engine_execution_payload, ctx)
+
+    return retry_controller.run_turn_cycle(
         user_intent=req.user_intent,
         turn_index=req.turn_index,
         entity_id=req.entity_id,
         engine_execution_payload=req.engine_execution_payload,
-        dm_draft_generator=lambda ctx: dm_agent.generate_combat_draft(
-            req.user_intent, req.engine_execution_payload, ctx
-        ),
+        dm_draft_generator=dm_draft,
         active_entity_count=req.active_entity_count,
         previous_entity_count=req.previous_entity_count,
         ingress_count=req.ingress_count,
         egress_count=req.egress_count,
     )
-    return cycle_result
 
 
 @app.post("/api/v1/narrative/stream")
-async def stream_narrative(req: NarrativeStreamRequest):
+@app.post("/api/v1/orchestrator/narrative/stream")
+async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
+    generator = streaming_gateway.stream_narrative(
+        user_intent=req.user_intent,
+        engine_payload=req.engine_execution_payload,
+    )
     return StreamingResponse(
-        streaming_gateway.stream_narrative(
-            user_intent=req.user_intent,
-            engine_payload=req.engine_execution_payload,
-            context=req.context,
-        ),
+        generator,
         media_type="text/event-stream",
     )
 

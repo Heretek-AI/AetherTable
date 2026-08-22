@@ -12,11 +12,12 @@ import {
   CheckCircle2, 
   Sparkles,
   UserCheck,
-  Users
+  Users,
+  Crown
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
-export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'lobby' | 'wfc' | 'analytics';
+export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'lobby' | 'dynasty' | 'wfc' | 'analytics';
 
 interface NavbarProps {
   currentView: SaaSView;
@@ -46,6 +47,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'compendium', label: 'Compendium Codex', icon: <BookOpen className="w-4 h-4" /> },
     { id: 'builder', label: 'Character Studio', icon: <UserCheck className="w-4 h-4" /> },
     { id: 'lobby', label: 'Campaign Lobby', icon: <Users className="w-4 h-4" /> },
+    { id: 'dynasty', label: 'Dynasty & Factions', icon: <Crown className="w-4 h-4" /> },
     { id: 'wfc', label: 'WFC Dungeon Studio', icon: <Layers className="w-4 h-4" /> },
     { id: 'analytics', label: 'SLA Telemetry', icon: <LineChart className="w-4 h-4" /> },
   ];
