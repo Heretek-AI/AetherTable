@@ -14,3 +14,4 @@ node_modules/
 mitm_mcp_traffic.db
 .DS_Store
 *.log
+client/*.png

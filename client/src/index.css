@@ -1,31 +1,47 @@
-/* Reset and Base Styles */
-*, *::before, *::after {
-  box-sizing: border-box;
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', -apple-system, sans-serif;
+    --font-body: 'Inter', -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  html, body, #root {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background-color: #030712;
+    color: #f8fafc;
+    font-family: var(--font-body);
+    user-select: none;
+  }
 }
 
-html, body, #root {
-  margin: 0;
-  padding: 0;
-  width: 100vw;
-  height: 100vh;
-  overflow: hidden;
-  background-color: #030712;
-  color: #f3f4f6;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  user-select: none;
-}
-
-/* Glassmorphism & Tactical Panels */
+/* Glassmorphism & SaaS Panels */
 .vtt-glass-panel {
   background: rgba(15, 23, 42, 0.85);
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px);
   border: 1px solid rgba(51, 65, 85, 0.6);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+  box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
+}
+
+.vtt-card-elevated {
+  background: rgba(30, 41, 59, 0.6);
+  border: 1px solid rgba(51, 65, 85, 0.7);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.vtt-card-elevated:hover {
+  background: rgba(51, 65, 85, 0.6);
+  border-color: rgba(167, 139, 250, 0.4);
+  box-shadow: 0 8px 24px rgba(124, 58, 237, 0.18);
 }
 
 .vtt-glow-border {
-  border-color: #8b5cf6;
-  box-shadow: 0 0 15px rgba(139, 92, 246, 0.3);
+  border-color: #7c3aed;
+  box-shadow: 0 0 18px rgba(124, 58, 237, 0.4);
 }
 
 .vtt-scrollbar::-webkit-scrollbar {
@@ -33,60 +49,31 @@ html, body, #root {
   height: 6px;
 }
 .vtt-scrollbar::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.5);
+  background: rgba(15, 23, 42, 0.6);
 }
 .vtt-scrollbar::-webkit-scrollbar-thumb {
   background: rgba(71, 85, 105, 0.8);
-  border-radius: 3px;
+  border-radius: 4px;
 }
 .vtt-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 1);
+  background: rgba(124, 58, 237, 0.9);
 }
 
 @keyframes pulseGlow {
-  0%, 100% { opacity: 0.9; transform: scale(1.02); }
-  50% { opacity: 0.4; transform: scale(0.98); }
+  0%, 100% { opacity: 0.95; transform: scale(1.03); filter: drop-shadow(0 0 8px rgba(124, 58, 237, 0.6)); }
+  50% { opacity: 0.5; transform: scale(0.98); filter: drop-shadow(0 0 2px rgba(124, 58, 237, 0.2)); }
 }
 
 .animate-pulse-glow {
-  animation: pulseGlow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation: pulseGlow 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
-/* Tailwind utility fallbacks for full styling fidelity */
-.flex { display: flex; }
-.flex-col { flex-direction: column; }
-.items-center { align-items: center; }
-.justify-between { justify-content: space-between; }
-.justify-center { justify-content: center; }
-.justify-end { justify-content: flex-end; }
-.gap-1 { gap: 0.25rem; }
-.gap-1\.5 { gap: 0.375rem; }
-.gap-2 { gap: 0.5rem; }
-.gap-3 { gap: 0.75rem; }
-.gap-4 { gap: 1rem; }
-.w-full { width: 100%; }
-.h-full { height: 100%; }
-.w-screen { width: 100vw; }
-.h-screen { height: 100vh; }
-.relative { position: relative; }
-.absolute { position: absolute; }
-.fixed { position: fixed; }
-.inset-0 { top: 0; right: 0; bottom: 0; left: 0; }
-.grid { display: grid; }
-.overflow-hidden { overflow: hidden; }
-.overflow-y-auto { overflow-y: auto; }
-.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.font-bold { font-weight: 700; }
-.font-medium { font-weight: 500; }
-.rounded { border-radius: 0.25rem; }
-.rounded-md { border-radius: 0.375rem; }
-.rounded-lg { border-radius: 0.5rem; }
-.rounded-xl { border-radius: 0.75rem; }
-.rounded-2xl { border-radius: 1rem; }
-.rounded-full { border-radius: 9999px; }
-.border { border-width: 1px; }
-.border-2 { border-width: 2px; }
-.border-b { border-bottom-width: 1px; }
-.border-t { border-top-width: 1px; }
-.border-l { border-left-width: 1px; }
-.border-r { border-right-width: 1px; }
+@keyframes diceRoll {
+  0% { transform: rotate(0deg) scale(0.8); }
+  50% { transform: rotate(180deg) scale(1.15); }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
+.animate-dice-roll {
+  animation: diceRoll 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
