@@ -8,6 +8,7 @@ import { SafetyModal } from './components/SafetyModal';
 import { AudioMixerModal } from './components/AudioMixerModal';
 import { CompendiumView } from './components/CompendiumView';
 import { CharacterBuilderView } from './components/CharacterBuilderView';
+import { EncounterBuilderView } from './components/EncounterBuilderView';
 import { LobbyView } from './components/LobbyView';
 import { DynastyView } from './components/DynastyView';
 import { BundleManagerView } from './components/BundleManagerView';
@@ -477,6 +478,34 @@ export function App() {
     setCurrentView('tabletop');
   };
 
+  const handleUpdateTokenElevation = (tokenId: string, newElevation: number) => {
+    setTokens((prev) =>
+      prev.map((t) => (t.id === tokenId ? { ...t, elevationFeet: newElevation } : t))
+    );
+    addSystemMessage(`Token elevation updated to ${newElevation}ft.`);
+  };
+
+  const handleLaunchEncounter = (
+    monsters: Omit<Token, 'id' | 'x' | 'y'>[],
+    customPositions?: { x: number; y: number }[]
+  ) => {
+    const newTokens: Token[] = monsters.map((m, idx) => {
+      const pos = customPositions && customPositions[idx] ? customPositions[idx] : { x: 8 + (idx % 4), y: 3 + Math.floor(idx / 4) * 2 };
+      return {
+        ...m,
+        id: `encounter_mob_${Date.now()}_${idx}`,
+        x: pos.x,
+        y: pos.y,
+      };
+    });
+
+    setTokens((prev) => [...prev.filter((t) => t.isPlayer), ...newTokens]);
+    setSelectedTokenId(newTokens[0]?.id || null);
+    setCurrentView('tabletop');
+    addSystemMessage(`⚔️ ENCOUNTER LAUNCHED: ${newTokens.length} hostile entities deployed to the battlefield!`);
+    globalSpatialAudio.playSpatialCreatureRoar(8, 4);
+  };
+
   const handleApplyWfcMap = (matrix: number[][], width: number, height: number) => {
     const newWalls: { x: number; y: number }[] = [];
     for (let y = 0; y < height; y++) {
@@ -528,6 +557,7 @@ export function App() {
                   onTokenMove={handleTokenMove}
                   selectedTokenId={selectedTokenId}
                   onSelectToken={(id) => setSelectedTokenId(id)}
+                  onUpdateTokenElevation={handleUpdateTokenElevation}
                   walls={customWalls}
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
@@ -561,6 +591,10 @@ export function App() {
 
         {currentView === 'builder' && (
           <CharacterBuilderView onDeployCharacter={handleDeployFromBuilder} />
+        )}
+
+        {currentView === 'encounters' && (
+          <EncounterBuilderView onLaunchEncounter={handleLaunchEncounter} />
         )}
 
         {currentView === 'lobby' && (

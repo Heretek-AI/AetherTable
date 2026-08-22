@@ -40,6 +40,7 @@ interface TacticalCanvasProps {
   onTokenMove: (tokenId: string, newX: number, newY: number) => void;
   selectedTokenId: string | null;
   onSelectToken: (tokenId: string) => void;
+  onUpdateTokenElevation?: (tokenId: string, newElevation: number) => void;
   gridWidth?: number;
   gridHeight?: number;
   walls?: { x: number; y: number }[];
@@ -54,6 +55,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   onTokenMove,
   selectedTokenId,
   onSelectToken,
+  onUpdateTokenElevation,
   gridWidth = 16,
   gridHeight = 12,
   walls = [
@@ -368,6 +370,33 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             <span>GM Sight</span>
           </button>
         </div>
+
+        {/* Token Elevation Stepper (Roll20 Style) */}
+        {selectedTokenId && onUpdateTokenElevation && (
+          <div className="flex items-center gap-1.5 bg-slate-900/90 px-2 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-amber-300">
+            <span>Elevation: {tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0}ft</span>
+            <button
+              onClick={() => {
+                const currentEl = tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0;
+                onUpdateTokenElevation(selectedTokenId, currentEl + 5);
+              }}
+              className="w-5 h-5 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-bold cursor-pointer"
+              title="Raise elevation +5ft"
+            >
+              +
+            </button>
+            <button
+              onClick={() => {
+                const currentEl = tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0;
+                onUpdateTokenElevation(selectedTokenId, Math.max(0, currentEl - 5));
+              }}
+              className="w-5 h-5 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-bold cursor-pointer"
+              title="Lower elevation -5ft"
+            >
+              -
+            </button>
+          </div>
+        )}
 
         {/* Center Button */}
         <button
