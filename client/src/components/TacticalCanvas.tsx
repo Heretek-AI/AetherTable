@@ -32,6 +32,7 @@ export interface Token {
   isPlayer: boolean;
   avatarIconType?: string;
   conditions?: string[];
+  elevationFeet?: number;
 }
 
 interface TacticalCanvasProps {
@@ -462,6 +463,12 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 {isSelected && (
                   <div className="absolute inset-0.5 rounded-full border-2 border-purple-400 animate-pulse-glow" />
                 )}
+
+                {token.elevationFeet && token.elevationFeet > 0 ? (
+                  <span className="absolute -top-1 -right-1 px-1.5 py-0.2 bg-amber-950/90 border border-amber-500/70 text-amber-300 text-[8px] font-mono font-bold rounded-full shadow-lg z-40">
+                    +{token.elevationFeet}ft
+                  </span>
+                ) : null}
 
                 <div
                   className={`w-11 h-11 rounded-full flex items-center justify-center shadow-xl border-2 transition-transform ${

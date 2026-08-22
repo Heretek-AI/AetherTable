@@ -326,6 +326,61 @@ def advance_faction_simulation():
     }
 
 
+from .simulation.quest_engine import (
+    QuestGraphGenerator,
+    ConcordiaPactEngine,
+    QuestGraph,
+)
+
+global_quest_generator = QuestGraphGenerator()
+global_concordia_engine = ConcordiaPactEngine()
+active_campaign_quest: Optional[QuestGraph] = None
+
+
+class QuestGenerateRequest(BaseModel):
+    campaign_theme: str = "The Iron Succession"
+    primary_house: str = "house_vane"
+    rival_house: str = "house_silverpeak"
+
+
+class ConcordiaNegotiateRequest(BaseModel):
+    house_a: str = "House Vane"
+    house_b: str = "House Silverpeak"
+    diplomacy_roll: int = 16
+    concessions_offered: str = "Equal trade tariff exemptions and shared mining rights"
+
+
+@app.post("/api/v1/quest/generate")
+def generate_quest(req: QuestGenerateRequest):
+    global active_campaign_quest
+    quest = global_quest_generator.generate_campaign_quest(
+        campaign_theme=req.campaign_theme,
+        primary_house=req.primary_house,
+        rival_house=req.rival_house,
+    )
+    active_campaign_quest = quest
+    return quest
+
+
+@app.get("/api/v1/quest/active")
+def get_active_quest():
+    global active_campaign_quest
+    if not active_campaign_quest:
+        active_campaign_quest = global_quest_generator.generate_campaign_quest()
+    return active_campaign_quest
+
+
+@app.post("/api/v1/quest/concordia-negotiate")
+def negotiate_concordia_pact(req: ConcordiaNegotiateRequest):
+    result = global_concordia_engine.negotiate_treaty(
+        house_a_name=req.house_a,
+        house_b_name=req.house_b,
+        player_diplomacy_roll=req.diplomacy_roll,
+        concessions_offered=req.concessions_offered,
+    )
+    return result
+
+
 def start_server():
     uvicorn.run(app, host="0.0.0.0", port=8000)
 

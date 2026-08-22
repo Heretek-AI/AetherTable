@@ -289,3 +289,51 @@ impl RulesEvaluator {
         })
     }
 }
+
+impl RulesEvaluator {
+    /// Calculates standard D&D 5e fall damage: 1d6 bludgeoning per 10 feet fallen (max 20d6).
+    /// Returns (damage_amount, knocked_prone).
+    pub fn calculate_fall_damage(
+        dice: &mut DiceEngine,
+        fall_distance_feet: f32,
+        dex_save_roll: Option<i32>,
+    ) -> (i32, bool) {
+        if fall_distance_feet < 10.0 {
+            return (0, false);
+        }
+
+        let num_dice = ((fall_distance_feet / 10.0).floor() as u32).min(20);
+        let mut total_dmg = 0;
+        for _ in 0..num_dice {
+            total_dmg += dice.roll_die(6);
+        }
+
+        // DC 15 Acrobatics check to land on feet
+        let avoids_prone = if let Some(save) = dex_save_roll {
+            save >= 15
+        } else {
+            false
+        };
+
+        (total_dmg, !avoids_prone)
+    }
+
+    /// Evaluates high-ground ranged attack bonus (+2 to-hit when >= 10ft higher than target)
+    pub fn calculate_high_ground_attack_bonus(attacker_z: f32, target_z: f32) -> i32 {
+        if attacker_z - target_z >= 10.0 {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// Evaluates plunge attack: converts half of falling kinetic energy into bonus melee damage
+    pub fn calculate_plunge_attack_bonus(
+        dice: &mut DiceEngine,
+        fall_distance_feet: f32,
+    ) -> (i32, i32) {
+        let (self_dmg, _) = Self::calculate_fall_damage(dice, fall_distance_feet, None);
+        let bonus_melee_dmg = self_dmg / 2;
+        (bonus_melee_dmg, self_dmg)
+    }
+}

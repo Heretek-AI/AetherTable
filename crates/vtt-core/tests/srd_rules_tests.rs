@@ -173,3 +173,21 @@ fn test_srd_concentration_and_death_saving_throws() {
     assert_eq!(ActionResolver::resolve_death_save(&mut death_state, 8), "DEAD"); // 3rd failure
     assert!(death_state.is_dead);
 }
+
+#[test]
+fn test_srd_3d_elevation_and_fall_damage() {
+    let mut dice = vtt_core::dice::DiceEngine::with_seed(42);
+
+    // Falling 30ft results in 3d6 bludgeoning damage
+    let (dmg_30ft, is_prone) = vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 30.0, None);
+    assert!(dmg_30ft >= 3 && dmg_30ft <= 18);
+    assert!(is_prone);
+
+    // Acrobatics save DC 15 lands on feet (not prone)
+    let (_, lands_on_feet) = vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 20.0, Some(16));
+    assert!(!lands_on_feet); // is_prone = false
+
+    // High ground advantage (+2 to hit when >= 10ft higher)
+    assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(20.0, 0.0), 2);
+    assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(5.0, 0.0), 0);
+}

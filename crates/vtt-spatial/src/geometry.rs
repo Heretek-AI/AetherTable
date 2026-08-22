@@ -106,3 +106,15 @@ impl AreaOfEffect {
         }
     }
 }
+
+impl Vector3 {
+    /// Evaluates if attacker holds high ground over defender by at least min_elevation_delta feet (default 10ft)
+    pub fn has_high_ground_advantage(&self, defender: &Vector3, min_elevation_delta: f32) -> bool {
+        (self.z - defender.z) >= min_elevation_delta
+    }
+
+    /// Computes delta elevation in feet
+    pub fn elevation_difference(&self, other: &Vector3) -> f32 {
+        self.z - other.z
+    }
+}

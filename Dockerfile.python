@@ -1,12 +1,22 @@
-FROM python:3.11-slim
-WORKDIR /app
+# ============================================================================
+# Python Multi-Agent Orchestrator & Invariant Auditor (:8000)
+# ============================================================================
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+FROM python:3.12-slim
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends curl gcc python3-dev && rm -rf /var/lib/apt/lists/*
 
 COPY python/pyproject.toml ./
+COPY compendium ./compendium
 COPY python/vtt_orchestrator ./vtt_orchestrator
 
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=5 CMD curl -f http://localhost:8000/api/v1/dynasty/factions || exit 1
+
 CMD ["uvicorn", "vtt_orchestrator.server:app", "--host", "0.0.0.0", "--port", "8000"]

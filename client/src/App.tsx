@@ -11,6 +11,7 @@ import { CharacterBuilderView } from './components/CharacterBuilderView';
 import { LobbyView } from './components/LobbyView';
 import { DynastyView } from './components/DynastyView';
 import { BundleManagerView } from './components/BundleManagerView';
+import { QuestDialogueView } from './components/QuestDialogueView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
@@ -20,6 +21,7 @@ import { globalWebRTCMesh } from './render/webrtc_mesh';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
+  const [campaignTitle, setCampaignTitle] = useState('The Fall of Baron Vane');
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
@@ -56,6 +58,7 @@ export function App() {
       color: '#8b5cf6',
       isPlayer: true,
       avatarIconType: 'caster',
+      elevationFeet: 15,
     },
     {
       id: 'orc_warlord_1',
@@ -457,6 +460,23 @@ export function App() {
     ]);
   };
 
+  const handleInjectQuest = (questTitle: string, initialObjective: string) => {
+    setCampaignTitle(questTitle);
+    addSystemMessage(`QUEST ACTIVATED: ${questTitle}`);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `quest_${Date.now()}`,
+        sender: 'Campaign Director (AI)',
+        role: 'system',
+        content: `⚔️ Quest Activated: "${questTitle}"\n\n${initialObjective}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]);
+    globalSpatialAudio.playSpatialCreatureRoar(4, 4);
+    setCurrentView('tabletop');
+  };
+
   const handleApplyWfcMap = (matrix: number[][], width: number, height: number) => {
     const newWalls: { x: number; y: number }[] = [];
     for (let y = 0; y < height; y++) {
@@ -480,7 +500,7 @@ export function App() {
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         latencyMs={latencyMs}
-        campaignName="The Fall of Baron Vane"
+        campaignName={campaignTitle}
       />
 
       {/* View Content */}
@@ -557,6 +577,10 @@ export function App() {
             walls={customWalls}
             onDeployToken={handleDeployFromBundleManager}
           />
+        )}
+
+        {currentView === 'quests' && (
+          <QuestDialogueView onInjectQuest={handleInjectQuest} />
         )}
 
         {currentView === 'wfc' && (

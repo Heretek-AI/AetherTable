@@ -1,17 +1,29 @@
-# Multi-stage Rust build for vtt-server
+# ============================================================================
+# Multi-Stage Rust Build for Authoritative VTT Engine (:8088)
+# ============================================================================
+
 FROM rust:1.85-slim-bookworm as builder
 
 WORKDIR /usr/src/vtt
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 RUN cargo build --release -p vtt-server
 
+# Minimal Runtime Container
 FROM debian:bookworm-slim
+
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/vtt/target/release/vtt-server /usr/local/bin/vtt-server
-EXPOSE 8080
+
+EXPOSE 8088
 ENV RUST_LOG=info
+ENV PORT=8088
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=5 CMD curl -f http://localhost:8088/health || exit 1
+
 CMD ["vtt-server"]

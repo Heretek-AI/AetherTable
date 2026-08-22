@@ -16,11 +16,12 @@ import {
   Crown, 
   Package, 
   Radio, 
-  Sliders 
+  Sliders,
+  Scroll
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
-export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'lobby' | 'dynasty' | 'bundles' | 'wfc' | 'analytics';
+export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics';
 
 interface NavbarProps {
   currentView: SaaSView;
@@ -54,6 +55,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'lobby', label: 'Campaign Lobby', icon: <Users className="w-4 h-4" /> },
     { id: 'dynasty', label: 'Dynasty & Factions', icon: <Crown className="w-4 h-4" /> },
     { id: 'bundles', label: 'Campaign Bundles', icon: <Package className="w-4 h-4" /> },
+    { id: 'quests', label: 'Quest & Dialogue', icon: <Scroll className="w-4 h-4" /> },
     { id: 'wfc', label: 'WFC Dungeon Studio', icon: <Layers className="w-4 h-4" /> },
     { id: 'analytics', label: 'SLA Telemetry', icon: <LineChart className="w-4 h-4" /> },
   ];
