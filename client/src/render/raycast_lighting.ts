@@ -128,30 +128,45 @@ export class RaycastLighting {
     height: number,
     radius: number = 380
   ) {
-    const poly = this.computeVisibilityPolygon(source, radius);
-    if (poly.length < 3) return;
+    this.renderMultiSourceLightingMask(ctx, [source], width, height, radius);
+  }
+
+  public renderMultiSourceLightingMask(
+    ctx: CanvasRenderingContext2D,
+    sources: Point[],
+    width: number,
+    height: number,
+    radius: number = 380
+  ) {
+    if (sources.length === 0) return;
 
     ctx.save();
     // Ambient darkness layer
-    ctx.fillStyle = 'rgba(3, 7, 18, 0.65)';
+    ctx.fillStyle = 'rgba(3, 7, 18, 0.70)';
     ctx.fillRect(0, 0, width, height);
 
-    // Punch out illuminated vision polygon
+    // Punch out illuminated vision polygons for each light source
     ctx.globalCompositeOperation = 'destination-out';
-    ctx.beginPath();
-    ctx.moveTo(poly[0].x, poly[0].y);
-    for (let i = 1; i < poly.length; i++) {
-      ctx.lineTo(poly[i].x, poly[i].y);
-    }
-    ctx.closePath();
 
-    // Radial gradient feather
-    const grad = ctx.createRadialGradient(source.x, source.y, 40, source.x, source.y, radius);
-    grad.addColorStop(0, 'rgba(0, 0, 0, 1.0)');
-    grad.addColorStop(0.85, 'rgba(0, 0, 0, 0.9)');
-    grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
-    ctx.fillStyle = grad;
-    ctx.fill();
+    sources.forEach((source) => {
+      const poly = this.computeVisibilityPolygon(source, radius);
+      if (poly.length < 3) return;
+
+      ctx.beginPath();
+      ctx.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) {
+        ctx.lineTo(poly[i].x, poly[i].y);
+      }
+      ctx.closePath();
+
+      // Radial gradient feather
+      const grad = ctx.createRadialGradient(source.x, source.y, 40, source.x, source.y, radius);
+      grad.addColorStop(0, 'rgba(0, 0, 0, 1.0)');
+      grad.addColorStop(0.85, 'rgba(0, 0, 0, 0.9)');
+      grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+    });
 
     ctx.restore();
   }

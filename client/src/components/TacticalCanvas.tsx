@@ -12,10 +12,12 @@ import {
   Circle,
   Square,
   Triangle,
+  Eye,
+  Users
 } from 'lucide-react';
 import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
-import { RaycastLighting } from '../render/raycast_lighting';
+import { RaycastLighting, Point } from '../render/raycast_lighting';
 import { globalAudio } from '../render/audio_manager';
 
 export interface Token {
@@ -44,6 +46,8 @@ interface TacticalCanvasProps {
   diceBoxRef?: React.MutableRefObject<DiceBox3D | null>;
 }
 
+export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
+
 export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   tokens,
   onTokenMove,
@@ -70,7 +74,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [measureTarget, setMeasureTarget] = useState<{ x: number; y: number } | null>(null);
   const [aoeShape, setAoeShape] = useState<'none' | 'sphere' | 'cone' | 'cube' | 'line'>('none');
   const [aoeOrigin, setAoeOrigin] = useState<{ x: number; y: number } | null>(null);
-  const [enableRaycastVision, setEnableRaycastVision] = useState(true);
+  const [visionPerspective, setVisionPerspective] = useState<VisionPerspective>('party');
 
   // FX Canvas Refs
   const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -118,14 +122,32 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         }
       });
 
-      // 2. Render 2D Raycast Lighting & Shadows
+      // 2. Render 2D Raycast Lighting & Shadows based on Perspective Mode
       lightCtx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
-      if (enableRaycastVision) {
-        const activePlayer = tokens.find((t) => t.id === selectedTokenId) || tokens.find((t) => t.isPlayer) || tokens[0];
-        if (activePlayer) {
-          const source = {
-            x: (activePlayer.x + 0.5) * cellSize,
-            y: (activePlayer.y + 0.5) * cellSize,
+
+      if (visionPerspective === 'party') {
+        const playerSources: Point[] = tokens
+          .filter((t) => t.isPlayer)
+          .map((t) => ({
+            x: (t.x + 0.5) * cellSize,
+            y: (t.y + 0.5) * cellSize,
+          }));
+        
+        if (playerSources.length > 0) {
+          raycastLighting.current.renderMultiSourceLightingMask(
+            lightCtx,
+            playerSources,
+            gridWidth * cellSize,
+            gridHeight * cellSize,
+            420
+          );
+        }
+      } else if (visionPerspective === 'selected') {
+        const active = tokens.find((t) => t.id === selectedTokenId) || tokens[0];
+        if (active) {
+          const source: Point = {
+            x: (active.x + 0.5) * cellSize,
+            y: (active.y + 0.5) * cellSize,
           };
           raycastLighting.current.renderLightingMask(
             lightCtx,
@@ -136,13 +158,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           );
         }
       }
+      // 'gm_omniscient' leaves the lighting layer unmasked (full sight)
 
       animId = requestAnimationFrame(renderLoop);
     };
 
     renderLoop();
     return () => cancelAnimationFrame(animId);
-  }, [tokens, selectedTokenId, enableRaycastVision, gridWidth, gridHeight]);
+  }, [tokens, selectedTokenId, visionPerspective, gridWidth, gridHeight]);
 
   const isWall = (x: number, y: number) => {
     return walls.some((w) => w.x === x && w.y === y);
@@ -292,16 +315,58 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
         </div>
 
-        {/* Raycast Vision Toggle */}
-        <button
-          onClick={() => setEnableRaycastVision(!enableRaycastVision)}
-          className={`px-2.5 py-1.5 rounded-lg transition text-xs font-semibold ${
-            enableRaycastVision ? 'bg-purple-900/80 text-purple-200 border border-purple-600' : 'bg-slate-900 text-slate-400 border border-slate-800'
-          }`}
-          title="Toggle 2D Raycast Line-of-Sight Shadows"
-        >
-          {enableRaycastVision ? 'Raycast Vision: ON' : 'Vision: Global'}
-        </button>
+        <div className="h-4 w-px bg-slate-800" />
+
+        {/* Multi-Player POV & Vision Perspective Selector */}
+        <div className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-lg border border-slate-800 text-[11px] font-mono">
+          <button
+            onClick={() => {
+              setVisionPerspective('party');
+              globalAudio.playTurnAdvance();
+            }}
+            className={`flex items-center gap-1 px-2 py-1 rounded transition ${
+              visionPerspective === 'party'
+                ? 'bg-purple-600 text-white font-bold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+            title="Party Shared Optical Vision"
+          >
+            <Users className="w-3 h-3" />
+            <span>Party Sight</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setVisionPerspective('selected');
+              globalAudio.playTurnAdvance();
+            }}
+            className={`flex items-center gap-1 px-2 py-1 rounded transition ${
+              visionPerspective === 'selected'
+                ? 'bg-purple-600 text-white font-bold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+            title="Individual Token Optical POV"
+          >
+            <Eye className="w-3 h-3" />
+            <span>Token POV</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setVisionPerspective('gm_omniscient');
+              globalAudio.playTurnAdvance();
+            }}
+            className={`flex items-center gap-1 px-2 py-1 rounded transition ${
+              visionPerspective === 'gm_omniscient'
+                ? 'bg-purple-600 text-white font-bold'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+            title="GM Master Sight (Unmasked Omniscient View)"
+          >
+            <Sparkles className="w-3 h-3" />
+            <span>GM Sight</span>
+          </button>
+        </div>
 
         {/* Center Button */}
         <button

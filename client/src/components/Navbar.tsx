@@ -11,11 +11,12 @@ import {
   VolumeX, 
   CheckCircle2, 
   Sparkles,
-  UserCheck
+  UserCheck,
+  Users
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
-export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'wfc' | 'analytics';
+export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'lobby' | 'wfc' | 'analytics';
 
 interface NavbarProps {
   currentView: SaaSView;
@@ -44,6 +45,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'tabletop', label: 'Tactical Tabletop', icon: <Swords className="w-4 h-4" /> },
     { id: 'compendium', label: 'Compendium Codex', icon: <BookOpen className="w-4 h-4" /> },
     { id: 'builder', label: 'Character Studio', icon: <UserCheck className="w-4 h-4" /> },
+    { id: 'lobby', label: 'Campaign Lobby', icon: <Users className="w-4 h-4" /> },
     { id: 'wfc', label: 'WFC Dungeon Studio', icon: <Layers className="w-4 h-4" /> },
     { id: 'analytics', label: 'SLA Telemetry', icon: <LineChart className="w-4 h-4" /> },
   ];
@@ -80,7 +82,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             <button
               key={item.id}
               onClick={() => onSelectView(item.id)}
-              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold font-mono transition-all duration-150 ${
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold font-mono transition-all duration-150 ${
                 isActive
                   ? 'bg-purple-600 text-white shadow-md shadow-purple-950 border border-purple-400/40'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'

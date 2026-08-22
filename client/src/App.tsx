@@ -7,6 +7,7 @@ import { NarrativeChat, ChatMessage } from './components/NarrativeChat';
 import { SafetyModal } from './components/SafetyModal';
 import { CompendiumView } from './components/CompendiumView';
 import { CharacterBuilderView } from './components/CharacterBuilderView';
+import { LobbyView } from './components/LobbyView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
@@ -16,6 +17,7 @@ export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
+  const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
 
   const [isLeftDockCollapsed, setIsLeftDockCollapsed] = useState(false);
   const [isRightDockCollapsed, setIsRightDockCollapsed] = useState(false);
@@ -399,6 +401,20 @@ export function App() {
     addSystemMessage(`Hero ${newToken.name} crafted in Character Studio and deployed to the battlefield!`);
   };
 
+  const handleLaunchFromLobby = (seatId: string) => {
+    if (seatId === 'seat_gm') {
+      setUserRole('gm');
+      addSystemMessage('Joined session as Game Master (Omniscient view enabled).');
+    } else if (seatId === 'seat_spectator') {
+      setUserRole('spectator');
+      addSystemMessage('Joined session as Spectator.');
+    } else {
+      setUserRole('player');
+      addSystemMessage(`Joined session as Player (Bound to active seat).`);
+    }
+    setCurrentView('tabletop');
+  };
+
   const handleApplyWfcMap = (matrix: number[][], width: number, height: number) => {
     const newWalls: { x: number; y: number }[] = [];
     for (let y = 0; y < height; y++) {
@@ -425,11 +441,11 @@ export function App() {
       />
 
       {/* View Content */}
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="flex-1 flex overflow-hidden relative min-h-0">
         {currentView === 'tabletop' && (
-          <div className="flex-1 flex flex-col h-full overflow-hidden">
+          <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0">
             {/* Tabletop Center Workspace */}
-            <div className="flex-1 flex overflow-hidden relative">
+            <div className="flex-1 flex overflow-hidden relative min-h-0">
               {/* Left Dock: Initiative Tracker */}
               <InitiativeTracker
                 tokens={tokens}
@@ -443,7 +459,7 @@ export function App() {
               />
 
               {/* Center Tactical Canvas */}
-              <main className="flex-1 h-full relative">
+              <main className="flex-1 h-full relative min-h-0 overflow-hidden">
                 <TacticalCanvas
                   tokens={tokens}
                   onTokenMove={handleTokenMove}
@@ -482,6 +498,10 @@ export function App() {
 
         {currentView === 'builder' && (
           <CharacterBuilderView onDeployCharacter={handleDeployFromBuilder} />
+        )}
+
+        {currentView === 'lobby' && (
+          <LobbyView onLaunchCampaign={handleLaunchFromLobby} />
         )}
 
         {currentView === 'wfc' && (
