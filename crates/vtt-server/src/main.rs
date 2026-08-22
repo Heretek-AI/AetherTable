@@ -350,6 +350,11 @@ async fn trigger_safety_rewind(
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8088);
+
     let state = web::Data::new(AppState {
         sessions: DashMap::new(),
         crdt_hub: Arc::new(CrdtRelayHub::new()),
@@ -361,7 +366,7 @@ async fn main() -> std::io::Result<()> {
         auditor_rejections: AtomicU64::new(0),
     });
 
-    log::info!("Starting AI-Native VTT Authoritative Engine Server on 0.0.0.0:8080");
+    log::info!("Starting AI-Native VTT Authoritative Engine Server on 0.0.0.0:{}", port);
 
     HttpServer::new(move || {
         let cors = Cors::permissive();
@@ -386,7 +391,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/scripts/rhai", web::post().to(execute_rhai_script))
             )
     })
-    .bind(("0.0.0.0", 8080))?
+    .bind(("0.0.0.0", port))?
     .run()
     .await
 }

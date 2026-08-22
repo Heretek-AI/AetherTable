@@ -13,11 +13,11 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api\/v1\/orchestrator/, '/api/v1'),
       },
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:8088',
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: 'ws://localhost:8088',
         ws: true,
       },
     },
