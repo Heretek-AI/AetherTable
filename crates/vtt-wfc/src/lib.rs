@@ -1,3 +1,10 @@
+//! # vtt-wfc: Procedural Map Synthesis via Wave Function Collapse
+//!
+//! Generates topological, fully playable dungeon layouts using:
+//! - Wave Function Collapse (WFC) socket-matching and entropy reduction
+//! - Room partitioning, corridor carving, and door placement
+//! - Automated dungeon dressing and loot table generation
+
 pub mod loot_tables;
 
 use rand::rngs::StdRng;

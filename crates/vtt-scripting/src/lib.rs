@@ -1,3 +1,10 @@
+//! # vtt-scripting: Sandboxed Wasmtime & Rhai Execution Sandbox
+//!
+//! Provides isolated, deterministic scripting for homebrew spells, custom items, and DM automation:
+//! - WebAssembly execution via Wasmtime with strict fuel-metering (50k fuel cap)
+//! - Protection against CPU exhaustion and infinite loops
+//! - Rhai script engine for custom narrative event hooks and trigger evaluations
+
 pub mod rhai_engine;
 pub mod wasm_engine;
 

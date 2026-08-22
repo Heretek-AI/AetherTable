@@ -1,0 +1,27 @@
+{
+  "name": "TTRPG",
+  "description": "Next-Gen AI-Native Virtual Tabletop (VTT) & Multi-Agent Game Master Engine powered by Rust, Python Invariant Auditors, WebRTC Spatial Audio, and Procedural WFC Map Synthesis.",
+  "homepage": "http://localhost:3000",
+  "private": false,
+  "has_issues": true,
+  "has_projects": true,
+  "has_wiki": true,
+  "topics": [
+    "vtt",
+    "virtual-tabletop",
+    "ttrpg",
+    "dnd-5e",
+    "rust",
+    "python",
+    "react",
+    "typescript",
+    "pixijs",
+    "wave-function-collapse",
+    "multi-agent-systems",
+    "webrtc",
+    "spatial-audio",
+    "procedural-generation",
+    "crdt",
+    "game-engine"
+  ]
+}

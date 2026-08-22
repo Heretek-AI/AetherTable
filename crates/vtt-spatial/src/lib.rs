@@ -1,3 +1,12 @@
+//! # vtt-spatial: High-Performance Spatial Geometry & Line-of-Sight Engine
+//!
+//! Provides deterministic spatial calculations:
+//! - Bresenham and SIMD raycasting on 3D discrete voxel/grid collision maps
+//! - Dynamic Cover calculation (No Cover, Half Cover +2 AC, Three-Quarters Cover +5 AC, Total Cover)
+//! - A* Pathfinding across variable-cost terrain grids
+//! - Topological Zone Graphs and distance range-bands (Engaged, Near, Far, Distant)
+//! - Standard D&D 5e area-of-effect templates (Sphere, Cone, Cylinder, Line, Cube)
+
 pub mod cover;
 pub mod geometry;
 pub mod pathfinding;

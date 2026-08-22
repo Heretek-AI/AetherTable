@@ -1,3 +1,11 @@
+//! # vtt-crdt-sync: Real-Time CRDT State Synchronization & Relay Server
+//!
+//! Provides conflict-free replicated data types (CRDT) for multi-client tabletop synchronization:
+//! - Last-Write-Wins (LWW) register resolution for token transforms and positions
+//! - Vector clock sequencing and millisecond timestamp arbitration
+//! - Fog of War exploration bitmasks and dynamic reveal syncing
+//! - Live multiplayer cursor broadcasting (<16ms relay latency)
+
 pub mod crdt;
 pub mod relay;
 
