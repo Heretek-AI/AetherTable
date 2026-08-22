@@ -1,0 +1,17 @@
+[package]
+name = "vtt-scripting"
+version = "0.1.0"
+edition = "2021"
+description = "Dual Scripting Architecture: Sandboxed Wasmtime Fuel-Metered & Rhai Story Engines"
+
+[dependencies]
+vtt-core = { path = "../vtt-core" }
+rhai = { version = "1.19", features = ["sync", "serde"] }
+wasmtime = "29.0"
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }

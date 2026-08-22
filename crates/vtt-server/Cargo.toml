@@ -1,0 +1,27 @@
+[package]
+name = "vtt-server"
+version = "0.1.0"
+edition = "2021"
+description = "High-Performance Unified Actix-Web Server for AI-Native VTT Engine"
+
+[dependencies]
+vtt-core = { path = "../vtt-core" }
+vtt-spatial = { path = "../vtt-spatial" }
+vtt-wfc = { path = "../vtt-wfc" }
+vtt-scripting = { path = "../vtt-scripting" }
+vtt-crdt-sync = { path = "../vtt-crdt-sync" }
+actix-web = "4.9"
+actix-cors = "0.7"
+actix-ws = "0.3"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+futures-util = { workspace = true }

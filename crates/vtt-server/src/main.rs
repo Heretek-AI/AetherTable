@@ -1,0 +1,392 @@
+use actix_cors::Cors;
+use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
+use dashmap::DashMap;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use vtt_core::{
+    ActionResolver, DamageType, DiceEngine, GameSession, RulesEvaluator,
+};
+use vtt_crdt_sync::CrdtRelayHub;
+use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
+use vtt_spatial::{AStarPathfinder, CoverCalculator, GridCollisionMap, Vector3};
+use vtt_wfc::{DungeonGenerator, RoomDescriptor};
+
+pub struct AppState {
+    pub sessions: DashMap<Uuid, Arc<RwLock<GameSession>>>,
+    pub crdt_hub: Arc<CrdtRelayHub>,
+    pub wasm_engine: Arc<SandboxedWasmEngine>,
+    pub rhai_engine: Arc<RhaiNarrativeEngine>,
+    pub total_action_requests: AtomicU64,
+    pub valid_action_executions: AtomicU64,
+    pub total_audits: AtomicU64,
+    pub auditor_rejections: AtomicU64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub service: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub mechanical_compliance_rate_pct: f64,
+    pub total_actions: u64,
+    pub valid_actions: u64,
+    pub auditor_rejection_rate_pct: f64,
+    pub target_sla_ms: u64,
+}
+
+async fn health_check() -> impl Responder {
+    HttpResponse::Ok().json(HealthResponse {
+        status: "healthy".to_string(),
+        service: "vtt-authoritative-engine".to_string(),
+        version: "1.0.0".to_string(),
+    })
+}
+
+async fn get_metrics(data: web::Data<AppState>) -> impl Responder {
+    let total_act = data.total_action_requests.load(Ordering::Relaxed);
+    let valid_act = data.valid_action_executions.load(Ordering::Relaxed);
+    let mcr = if total_act > 0 {
+        (valid_act as f64 / total_act as f64) * 100.0
+    } else {
+        100.0
+    };
+
+    let total_aud = data.total_audits.load(Ordering::Relaxed);
+    let audit_rej = data.auditor_rejections.load(Ordering::Relaxed);
+    let afpr = if total_aud > 0 {
+        (audit_rej as f64 / total_aud as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    HttpResponse::Ok().json(MetricsResponse {
+        mechanical_compliance_rate_pct: mcr,
+        total_actions: total_act,
+        valid_actions: valid_act,
+        auditor_rejection_rate_pct: afpr,
+        target_sla_ms: 10,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionReq {
+    pub campaign_id: Uuid,
+    pub session_name: String,
+}
+
+async fn create_session(
+    data: web::Data<AppState>,
+    req: web::Json<CreateSessionReq>,
+) -> impl Responder {
+    let session_id = Uuid::new_v4();
+    let session = GameSession::new(session_id, req.campaign_id, req.session_name.clone());
+    data.sessions.insert(session_id, Arc::new(RwLock::new(session)));
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "session_id": session_id,
+        "campaign_id": req.campaign_id,
+        "session_name": req.session_name,
+        "status": "created"
+    }))
+}
+
+async fn get_session(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> impl Responder {
+    let session_id = path.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let session = session_lock.read();
+        HttpResponse::Ok().json(&*session)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AttackActionReq {
+    pub attacker_id: Uuid,
+    pub target_id: Uuid,
+    pub attack_bonus: i32,
+    pub target_ac: i32,
+    pub damage_expression: String,
+    pub damage_type: DamageType,
+    pub advantage: bool,
+    pub disadvantage: bool,
+}
+
+async fn resolve_attack(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<AttackActionReq>,
+) -> impl Responder {
+    data.total_action_requests.fetch_add(1, Ordering::Relaxed);
+    let session_id = path.into_inner();
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        let campaign_id = session.campaign_id;
+        let mut dice = DiceEngine::new();
+
+        let (cur_hp, max_hp, temp_hp) = if let Some(target) = session.entities.get(&req.target_id) {
+            (target.current_hp, target.max_hp, target.temp_hp)
+        } else {
+            (20, 20, 0)
+        };
+
+        match RulesEvaluator::resolve_attack(
+            &mut dice,
+            req.attacker_id,
+            req.target_id,
+            req.attack_bonus,
+            req.target_ac,
+            &req.damage_expression,
+            req.damage_type,
+            cur_hp,
+            max_hp,
+            temp_hp,
+            &[],
+            &[],
+            &[],
+            req.advantage,
+            req.disadvantage,
+        ) {
+            Ok(res) => {
+                data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
+                if let Some(target) = session.entities.get_mut(&req.target_id) {
+                    target.current_hp = res.target_hp_remaining;
+                    target.is_conscious = res.target_is_conscious;
+                    target.is_dead = res.target_is_dead;
+                }
+
+                session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    req.attacker_id,
+                    "ATTACK_RESOLVED",
+                    serde_json::to_value(&res).unwrap_or_default(),
+                );
+
+                HttpResponse::Ok().json(res)
+            }
+            Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckActionReq {
+    pub modifier: i32,
+    pub dc: i32,
+    pub cost_margin: i32,
+}
+
+async fn resolve_check(
+    data: web::Data<AppState>,
+    req: web::Json<CheckActionReq>,
+) -> impl Responder {
+    data.total_action_requests.fetch_add(1, Ordering::Relaxed);
+    let mut dice = DiceEngine::new();
+    let res = ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
+    data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
+    HttpResponse::Ok().json(res)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LosReq {
+    pub attacker_pos: Vector3,
+    pub target_pos: Vector3,
+    pub target_radius: f32,
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub solid_cells: Vec<(usize, usize)>,
+}
+
+async fn compute_los(
+    req: web::Json<LosReq>,
+) -> impl Responder {
+    let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
+    for &(x, y) in &req.solid_cells {
+        grid.set_solid(x, y, 0, true);
+    }
+
+    let has_los = grid.has_line_of_sight(&req.attacker_pos, &req.target_pos);
+    let cover = CoverCalculator::calculate_cover(&grid, &req.attacker_pos, &req.target_pos, req.target_radius);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "has_line_of_sight": has_los,
+        "cover_type": cover,
+        "ac_bonus": cover.ac_bonus(),
+        "dex_save_bonus": cover.dex_save_bonus()
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PathReq {
+    pub start: Vector3,
+    pub end: Vector3,
+    pub speed_budget: f32,
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub solid_cells: Vec<(usize, usize)>,
+}
+
+async fn compute_path(
+    req: web::Json<PathReq>,
+) -> impl Responder {
+    let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
+    for &(x, y) in &req.solid_cells {
+        grid.set_solid(x, y, 0, true);
+    }
+
+    let path_res = AStarPathfinder::find_path(&grid, &req.start, &req.end, req.speed_budget);
+    HttpResponse::Ok().json(path_res)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WfcReq {
+    pub room_desc: RoomDescriptor,
+    pub seed: Option<u64>,
+}
+
+async fn generate_wfc_map(
+    req: web::Json<WfcReq>,
+) -> impl Responder {
+    match DungeonGenerator::generate_room(&req.room_desc, req.seed) {
+        Ok(tiles) => HttpResponse::Ok().json(serde_json::json!({
+            "width": req.room_desc.width,
+            "height": req.room_desc.height,
+            "tiles": tiles
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WasmScriptReq {
+    pub wat_source: String,
+    pub function_name: String,
+    pub params: Vec<i32>,
+    pub fuel_limit: u64,
+}
+
+async fn execute_wasm_script(
+    data: web::Data<AppState>,
+    req: web::Json<WasmScriptReq>,
+) -> impl Responder {
+    match data.wasm_engine.execute_wat(&req.wat_source, &req.function_name, &req.params, req.fuel_limit) {
+        Ok(res) => HttpResponse::Ok().json(res),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RhaiScriptReq {
+    pub script: String,
+    pub context: ScriptExecutionContext,
+}
+
+async fn execute_rhai_script(
+    data: web::Data<AppState>,
+    req: web::Json<RhaiScriptReq>,
+) -> impl Responder {
+    match data.rhai_engine.evaluate_spell_hook(&req.script, &req.context) {
+        Ok(res) => HttpResponse::Ok().json(serde_json::json!({"result": res.to_string()})),
+        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SafetyXCardReq {
+    pub player_id: String,
+    pub topic: String,
+    pub target_sequence_id: u64,
+}
+
+async fn trigger_safety_rewind(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<SafetyXCardReq>,
+) -> impl Responder {
+    let session_id = path.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        let campaign_id = session.campaign_id;
+        let reverted = session.ledger.rewind_to_sequence(req.target_sequence_id);
+
+        session.ledger.append_event(
+            session_id,
+            campaign_id,
+            Uuid::nil(),
+            "SAFETY_REWIND_APPLIED",
+            serde_json::json!({
+                "triggered_by": req.player_id,
+                "topic": req.topic,
+                "reverted_to_sequence": req.target_sequence_id,
+                "reverted_event_count": reverted.len()
+            }),
+        );
+
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "SAFETY_REWIND_SUCCESS",
+            "reverted_events": reverted
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+
+    let state = web::Data::new(AppState {
+        sessions: DashMap::new(),
+        crdt_hub: Arc::new(CrdtRelayHub::new()),
+        wasm_engine: Arc::new(SandboxedWasmEngine::new().expect("Failed Wasm engine init")),
+        rhai_engine: Arc::new(RhaiNarrativeEngine::new()),
+        total_action_requests: AtomicU64::new(0),
+        valid_action_executions: AtomicU64::new(0),
+        total_audits: AtomicU64::new(0),
+        auditor_rejections: AtomicU64::new(0),
+    });
+
+    log::info!("Starting AI-Native VTT Authoritative Engine Server on 0.0.0.0:8080");
+
+    HttpServer::new(move || {
+        let cors = Cors::permissive();
+
+        App::new()
+            .wrap(cors)
+            .wrap(Logger::default())
+            .app_data(state.clone())
+            .route("/health", web::get().to(health_check))
+            .route("/metrics", web::get().to(get_metrics))
+            .service(
+                web::scope("/api/v1")
+                    .route("/sessions", web::post().to(create_session))
+                    .route("/sessions/{id}", web::get().to(get_session))
+                    .route("/sessions/{id}/action/attack", web::post().to(resolve_attack))
+                    .route("/sessions/{id}/safety/x-card", web::post().to(trigger_safety_rewind))
+                    .route("/actions/check", web::post().to(resolve_check))
+                    .route("/spatial/los", web::post().to(compute_los))
+                    .route("/spatial/path", web::post().to(compute_path))
+                    .route("/maps/generate", web::post().to(generate_wfc_map))
+                    .route("/scripts/wasm", web::post().to(execute_wasm_script))
+                    .route("/scripts/rhai", web::post().to(execute_rhai_script))
+            )
+    })
+    .bind(("0.0.0.0", 8080))?
+    .run()
+    .await
+}

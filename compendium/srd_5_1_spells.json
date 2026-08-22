@@ -1,0 +1,77 @@
+[
+  {
+    "entity_id": "spell_magic_missile",
+    "entity_type": "spell",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Magic Missile",
+    "version": "1.0.0",
+    "properties": {
+      "level": 1,
+      "school": "Evocation",
+      "casting_time": "1 action",
+      "range_feet": 120,
+      "area_of_effect_shape": null,
+      "area_of_effect_size_feet": 0,
+      "verbal_component": true,
+      "somatic_component": true,
+      "material_component_desc": null,
+      "save_attribute": null,
+      "damage_formula": "3d4 + 3",
+      "damage_type": "force",
+      "duration_rounds": 0,
+      "is_concentration": false,
+      "is_ritual": false,
+      "description": "You create three glowing darts of magical force. Each dart hits a creature of your choice that you can see within range."
+    }
+  },
+  {
+    "entity_id": "spell_fireball",
+    "entity_type": "spell",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Fireball",
+    "version": "1.0.0",
+    "properties": {
+      "level": 3,
+      "school": "Evocation",
+      "casting_time": "1 action",
+      "range_feet": 150,
+      "area_of_effect_shape": "sphere",
+      "area_of_effect_size_feet": 20,
+      "verbal_component": true,
+      "somatic_component": true,
+      "material_component_desc": "A tiny ball of bat guano and sulfur",
+      "save_attribute": "DEX",
+      "damage_formula": "8d6",
+      "damage_type": "fire",
+      "duration_rounds": 0,
+      "is_concentration": false,
+      "is_ritual": false,
+      "description": "A bright streak flashes from your pointing finger to a point you choose within range and then blossoms with a low roar into an explosion of flame."
+    }
+  },
+  {
+    "entity_id": "spell_misty_step",
+    "entity_type": "spell",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Misty Step",
+    "version": "1.0.0",
+    "properties": {
+      "level": 2,
+      "school": "Conjuration",
+      "casting_time": "1 bonus action",
+      "range_feet": 30,
+      "area_of_effect_shape": null,
+      "area_of_effect_size_feet": 0,
+      "verbal_component": true,
+      "somatic_component": false,
+      "material_component_desc": null,
+      "save_attribute": null,
+      "damage_formula": null,
+      "damage_type": null,
+      "duration_rounds": 0,
+      "is_concentration": false,
+      "is_ritual": false,
+      "description": "Briefly surrounded by silvery mist, you teleport up to 30 feet to an unoccupied space that you can see."
+    }
+  }
+]

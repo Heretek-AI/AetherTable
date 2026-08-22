@@ -1,0 +1,34 @@
+{
+  "collections": [
+    {
+      "name": "compendium_rules",
+      "vectors": {
+        "size": 1536,
+        "distance": "Cosine"
+      },
+      "optimizers_config": {
+        "default_segment_number": 2
+      },
+      "payload_schema": {
+        "category": "keyword",
+        "system_id": "keyword",
+        "cr_level": "float",
+        "tags": "keyword"
+      }
+    },
+    {
+      "name": "episodic_session_memory",
+      "vectors": {
+        "size": 1536,
+        "distance": "Cosine"
+      },
+      "payload_schema": {
+        "session_id": "keyword",
+        "campaign_id": "keyword",
+        "round_number": "integer",
+        "epistemic_tier": "keyword",
+        "speaker_id": "keyword"
+      }
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+[
+  {
+    "entity_id": "monster_goblin_warrior",
+    "entity_type": "monster",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Goblin Warrior",
+    "version": "1.0.0",
+    "properties": {
+      "challenge_rating": 0.25,
+      "size_category": "Small",
+      "creature_type": "Humanoid (Goblinoid)",
+      "base_ac": 15,
+      "hit_dice_count": 2,
+      "hit_dice_sides": 6,
+      "base_speed": 30,
+      "burrow_speed": 0,
+      "fly_speed": 0,
+      "swim_speed": 0,
+      "str_score": 8,
+      "dex_score": 14,
+      "con_score": 10,
+      "int_score": 10,
+      "wis_score": 8,
+      "cha_score": 8,
+      "resistances": [],
+      "immunities": [],
+      "vulnerabilities": [],
+      "condition_immunities": [],
+      "action_deck": [
+        {
+          "name": "Scimitar",
+          "action_type": "melee_attack",
+          "attack_bonus": 4,
+          "damage_formula": "1d6 + 2",
+          "damage_type": "slashing",
+          "reach_feet": 5
+        },
+        {
+          "name": "Shortbow",
+          "action_type": "ranged_attack",
+          "attack_bonus": 4,
+          "damage_formula": "1d6 + 2",
+          "damage_type": "piercing",
+          "range_normal_feet": 80,
+          "range_long_feet": 320
+        }
+      ]
+    }
+  },
+  {
+    "entity_id": "monster_orc_warlord",
+    "entity_type": "monster",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Orc Warlord",
+    "version": "1.0.0",
+    "properties": {
+      "challenge_rating": 3.0,
+      "size_category": "Medium",
+      "creature_type": "Humanoid (Orc)",
+      "base_ac": 16,
+      "hit_dice_count": 8,
+      "hit_dice_sides": 8,
+      "base_speed": 30,
+      "burrow_speed": 0,
+      "fly_speed": 0,
+      "swim_speed": 0,
+      "str_score": 18,
+      "dex_score": 12,
+      "con_score": 16,
+      "int_score": 10,
+      "wis_score": 11,
+      "cha_score": 12,
+      "resistances": [],
+      "immunities": [],
+      "vulnerabilities": [],
+      "condition_immunities": [],
+      "action_deck": [
+        {
+          "name": "Greataxe",
+          "action_type": "melee_attack",
+          "attack_bonus": 6,
+          "damage_formula": "1d12 + 4",
+          "damage_type": "slashing",
+          "reach_feet": 5
+        }
+      ]
+    }
+  },
+  {
+    "entity_id": "monster_red_dragon_wyrmling",
+    "entity_type": "monster",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Red Dragon Wyrmling",
+    "version": "1.0.0",
+    "properties": {
+      "challenge_rating": 4.0,
+      "size_category": "Medium",
+      "creature_type": "Dragon",
+      "base_ac": 17,
+      "hit_dice_count": 10,
+      "hit_dice_sides": 8,
+      "base_speed": 30,
+      "burrow_speed": 15,
+      "fly_speed": 60,
+      "swim_speed": 0,
+      "str_score": 19,
+      "dex_score": 10,
+      "con_score": 17,
+      "int_score": 12,
+      "wis_score": 11,
+      "cha_score": 15,
+      "resistances": [],
+      "immunities": ["fire"],
+      "vulnerabilities": [],
+      "condition_immunities": [],
+      "action_deck": [
+        {
+          "name": "Bite",
+          "action_type": "melee_attack",
+          "attack_bonus": 6,
+          "damage_formula": "1d10 + 4",
+          "damage_type": "piercing",
+          "reach_feet": 5
+        },
+        {
+          "name": "Fire Breath",
+          "action_type": "area_effect",
+          "save_dc": 14,
+          "save_attribute": "DEX",
+          "damage_formula": "7d6",
+          "damage_type": "fire",
+          "shape": "cone",
+          "size_feet": 15
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,20 @@
+[package]
+name = "vtt-crdt-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Real-Time Distributed CRDT Synchronization Engine and State Relays"
+
+[dependencies]
+vtt-core = { path = "../vtt-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = "0.26"

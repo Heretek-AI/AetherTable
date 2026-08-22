@@ -1,0 +1,65 @@
+[
+  {
+    "entity_id": "tile_stone_floor",
+    "entity_type": "tile",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Stone Floor Tile",
+    "version": "1.0.0",
+    "properties": {
+      "socket_north": "floor",
+      "socket_east": "floor",
+      "socket_south": "floor",
+      "socket_west": "floor",
+      "socket_top": "air",
+      "socket_bottom": "foundation",
+      "symmetry_type": "X",
+      "weight": 5.0,
+      "movement_cost_modifier": 1.0,
+      "blocks_line_of_sight": false,
+      "is_door": false,
+      "tags": ["dungeon", "indoor", "passable"]
+    }
+  },
+  {
+    "entity_id": "tile_stone_wall",
+    "entity_type": "tile",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Stone Wall Tile",
+    "version": "1.0.0",
+    "properties": {
+      "socket_north": "wall",
+      "socket_east": "wall",
+      "socket_south": "wall",
+      "socket_west": "wall",
+      "socket_top": "solid",
+      "socket_bottom": "foundation",
+      "symmetry_type": "X",
+      "weight": 2.0,
+      "movement_cost_modifier": 999.0,
+      "blocks_line_of_sight": true,
+      "is_door": false,
+      "tags": ["dungeon", "obstacle", "impassable"]
+    }
+  },
+  {
+    "entity_id": "tile_reinforced_door",
+    "entity_type": "tile",
+    "system_identifier": "dnd_5e_srd",
+    "name": "Reinforced Wooden Door Tile",
+    "version": "1.0.0",
+    "properties": {
+      "socket_north": "floor",
+      "socket_east": "wall",
+      "socket_south": "floor",
+      "socket_west": "wall",
+      "socket_top": "solid",
+      "socket_bottom": "foundation",
+      "symmetry_type": "I",
+      "weight": 1.0,
+      "movement_cost_modifier": 1.0,
+      "blocks_line_of_sight": true,
+      "is_door": true,
+      "tags": ["dungeon", "portal", "interactive"]
+    }
+  }
+]

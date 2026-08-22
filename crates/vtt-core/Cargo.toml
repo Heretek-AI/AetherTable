@@ -1,0 +1,19 @@
+[package]
+name = "vtt-core"
+version = "0.1.0"
+edition = "2021"
+description = "Authoritative Headless Deterministic Rules Engine for AI-Native VTT"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+sha2 = "0.10"

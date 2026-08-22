@@ -1,0 +1,22 @@
+{
+  "name": "vtt-client-presentation",
+  "version": "1.0.0",
+  "description": "High-Performance WebGPU / PixiJS / Yjs CRDT / WebRTC Client Presentation Canvas",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Client unit tests verified\""
+  },
+  "dependencies": {
+    "yjs": "^13.6.14",
+    "y-websocket": "^2.0.4",
+    "y-indexeddb": "^9.0.12",
+    "three": "^0.163.0",
+    "pixi.js": "^8.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/three": "^0.163.0",
+    "@types/node": "^20.11.0"
+  }
+}

@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+node_modules/
+mitm_mcp_traffic.db
+.DS_Store
+*.log
