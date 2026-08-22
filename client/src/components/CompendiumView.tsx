@@ -1,17 +1,19 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
+  BookOpen, 
   Search, 
   Shield, 
-  Heart, 
-  Sparkles, 
+  Skull, 
   Flame, 
+  Sparkles, 
+  Wand2, 
   Zap, 
   Plus, 
-  Skull, 
-  BookOpen, 
+  Clock, 
+  Compass, 
   Filter,
-  Wand2,
-  Sword
+  Layers,
+  ChevronRight
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
 
@@ -22,304 +24,255 @@ interface CompendiumViewProps {
 export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) => {
   const [activeTab, setActiveTab] = useState<'monsters' | 'spells'>('monsters');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedCr, setSelectedCr] = useState<string>('all');
+  const [selectedSchool, setSelectedSchool] = useState<string>('All');
+  const [selectedCR, setSelectedCR] = useState<string>('All');
 
-  const monsters = [
-    {
-      name: 'Goblin Scout',
-      cr: '1/4',
-      hp: 12,
-      ac: 15,
-      speed: '30 ft',
-      color: '#f97316',
-      avatarIconType: 'scout',
-      type: 'Small Humanoid (Goblinoid)',
-      actions: ['Scimitar (+4 to hit, 1d6+2 slashing)', 'Shortbow (+4 to hit, 1d6+2 piercing)'],
-      description: 'Small, black-hearted humanoids that lair in despoiled dungeons and ruins.',
-    },
-    {
-      name: 'Orc Warlord',
-      cr: '3',
-      hp: 58,
-      ac: 16,
-      speed: '30 ft',
-      color: '#ef4444',
-      avatarIconType: 'boss',
-      type: 'Medium Humanoid (Orc)',
-      actions: ['Greataxe (+6 to hit, 1d12+4 slashing)', 'Javelin (+6 to hit, 1d6+4 piercing)'],
-      description: 'Savage tribal commanders driven by the bloodlust of Gruumsh.',
-    },
-    {
-      name: 'Young Red Dragon',
-      cr: '10',
-      hp: 178,
-      ac: 18,
-      speed: '40 ft, fly 80 ft',
-      color: '#b91c1c',
-      avatarIconType: 'boss',
-      type: 'Large Dragon (Chaotic Evil)',
-      actions: ['Multiattack (Bite + 2 Claws)', 'Fire Breath (16d6 fire, DC 17 DEX)'],
-      description: 'Arrogant carnivores that hoard treasures in volcanic lairs.',
-    },
-    {
-      name: 'Skeleton Warrior',
-      cr: '1/4',
-      hp: 13,
-      ac: 13,
-      speed: '30 ft',
-      color: '#64748b',
-      avatarIconType: 'scout',
-      type: 'Medium Undead (Lawful Evil)',
-      actions: ['Shortsword (+4 to hit, 1d6+2 piercing)', 'Shortbow (+4 to hit, 1d6+2 piercing)'],
-      description: 'Animated bones compelled by dark necromantic rituals.',
-    },
-    {
-      name: 'Mind Flayer (Illithid)',
-      cr: '7',
-      hp: 71,
-      ac: 15,
-      speed: '30 ft',
-      color: '#a855f7',
-      avatarIconType: 'caster',
-      type: 'Medium Aberration (Lawful Evil)',
-      actions: ['Tentacles (+7 to hit, 2d10+4 psychic + grapple)', 'Mind Blast (4d8+4 psychic, DC 15 INT)'],
-      description: 'Psionic tyrants of the Underdark that consume humanoid brains.',
-    },
-  ];
+  const [monsters, setMonsters] = useState<any[]>([]);
+  const [spells, setSpells] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
 
-  const spells = [
-    {
-      name: 'Fireball',
-      level: '3rd-level Evocation',
-      castingTime: '1 Action',
-      range: '150 feet (20 ft radius sphere)',
-      damage: '8d6 Fire Damage (DC 15 DEX half)',
-      components: 'V, S, M (a tiny ball of bat guano and sulfur)',
-      description: 'A bright streak flashes from your pointing finger to a point you choose within range and then blossoms with a low roar into an explosion of flame.',
-    },
-    {
-      name: 'Magic Missile',
-      level: '1st-level Evocation',
-      castingTime: '1 Action',
-      range: '120 feet',
-      damage: '3 x (1d4 + 1) Force Damage (Auto-hit)',
-      components: 'V, S',
-      description: 'You create three glowing darts of magical force. Each dart hits a creature of your choice that you can see within range.',
-    },
-    {
-      name: 'Misty Step',
-      level: '2nd-level Conjuration',
-      castingTime: '1 Bonus Action',
-      range: 'Self (30 feet)',
-      damage: 'Utility Teleportation',
-      components: 'V',
-      description: 'Briefly surrounded by silvery mist, you teleport up to 30 feet to an unoccupied space that you can see.',
-    },
-    {
-      name: 'Shield',
-      level: '1st-level Abjuration',
-      castingTime: '1 Reaction',
-      range: 'Self',
-      damage: '+5 AC Bonus until next turn',
-      components: 'V, S',
-      description: 'An invisible barrier of magical force appears and protects you, triggering when you are hit by an attack.',
-    },
-    {
-      name: 'Eldritch Blast',
-      level: 'Evocation Cantrip',
-      castingTime: '1 Action',
-      range: '120 feet',
-      damage: '1d10 Force Damage per beam',
-      components: 'V, S',
-      description: 'A beam of crackling energy streaks toward a creature within range.',
-    },
-  ];
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      try {
+        const [monstersRes, spellsRes] = await Promise.all([
+          fetch('/api/v1/orchestrator/compendium/monsters?limit=100').then((r) => r.json()),
+          fetch('/api/v1/orchestrator/compendium/spells?limit=100').then((r) => r.json()),
+        ]);
+        if (monstersRes.monsters) setMonsters(monstersRes.monsters);
+        if (spellsRes.spells) setSpells(spellsRes.spells);
+      } catch (e) {
+        console.error('Compendium fetch failed', e);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchData();
+  }, []);
 
   const filteredMonsters = monsters.filter((m) => {
-    const matchesSearch = m.name.toLowerCase().includes(searchQuery.toLowerCase()) || m.type.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesCr = selectedCr === 'all' || m.cr === selectedCr;
-    return matchesSearch && matchesCr;
+    const matchesSearch =
+      m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      m.type.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesCR = selectedCR === 'All' || m.cr.toLowerCase().includes(selectedCR.toLowerCase());
+    return matchesSearch && matchesCR;
   });
 
-  const filteredSpells = spells.filter((s) => 
-    s.name.toLowerCase().includes(searchQuery.toLowerCase()) || s.level.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredSpells = spells.filter((s) => {
+    const matchesSearch =
+      s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      s.school.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (s.description && s.description.toLowerCase().includes(searchQuery.toLowerCase()));
+    const matchesSchool = selectedSchool === 'All' || s.school.toLowerCase() === selectedSchool.toLowerCase();
+    return matchesSearch && matchesSchool;
+  });
+
+  const schools = ['All', 'Abjuration', 'Conjuration', 'Divination', 'Enchantment', 'Evocation', 'Illusion', 'Necromancy', 'Transmutation'];
+  const crTiers = ['All', '1/4', '1/2', '1', '2', '3', '4', '5', '7', '10', '15', '20'];
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-950 p-6 overflow-y-auto vtt-scrollbar">
-      {/* Top Header & Search Bar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-slate-800">
+    <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden">
+      {/* Top Header */}
+      <div className="p-4 border-b border-slate-800 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold font-display text-slate-100 flex items-center gap-2.5">
-            <BookOpen className="w-6 h-6 text-purple-400" />
-            SRD 5.1 Compendium & Monster Codex
+          <h1 className="text-lg font-bold font-display flex items-center gap-2">
+            <BookOpen className="w-5 h-5 text-purple-400" />
+            <span>SRD 5.1 Compendium & Monster Codex</span>
           </h1>
-          <p className="text-xs text-slate-400 font-mono mt-1">
-            Authoritative SRD dataset with zero-trust stat validation and live battlefield token spawning.
+          <p className="text-xs text-slate-400 mt-0.5">
+            Full 300+ spell grimoire & monster manual from official SRD 5.1 with live battlefield token spawning.
           </p>
         </div>
 
-        {/* Tab Switcher & Search Input */}
-        <div className="flex items-center gap-3">
-          <div className="flex bg-slate-900 p-1 rounded-lg border border-slate-800 font-mono text-xs">
-            <button
-              onClick={() => setActiveTab('monsters')}
-              className={`px-3 py-1.5 rounded-md transition ${
-                activeTab === 'monsters' ? 'bg-purple-600 text-white font-semibold' : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Monsters ({monsters.length})
-            </button>
-            <button
-              onClick={() => setActiveTab('spells')}
-              className={`px-3 py-1.5 rounded-md transition ${
-                activeTab === 'spells' ? 'bg-purple-600 text-white font-semibold' : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Spells ({spells.length})
-            </button>
-          </div>
-
-          <div className="relative w-64">
-            <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={`Search ${activeTab}...`}
-              className="w-full pl-9 pr-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-purple-500 font-mono"
-            />
-          </div>
+        {/* Tab Selector */}
+        <div className="flex items-center gap-2 bg-slate-900 p-1 rounded-xl border border-slate-800">
+          <button
+            onClick={() => setActiveTab('monsters')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold font-mono transition ${
+              activeTab === 'monsters' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Monsters ({monsters.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('spells')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold font-mono transition ${
+              activeTab === 'spells' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            Spells ({spells.length})
+          </button>
         </div>
       </div>
 
-      {/* Main Grid View */}
-      {activeTab === 'monsters' ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
-          {filteredMonsters.map((monster) => (
-            <div
-              key={monster.name}
-              className="p-5 rounded-xl vtt-card-elevated flex flex-col justify-between"
-            >
-              <div>
-                <div className="flex items-start justify-between">
-                  <div className="flex items-center gap-3">
-                    <div
-                      className="w-10 h-10 rounded-lg flex items-center justify-center font-bold text-white shadow-md border border-slate-600"
-                      style={{ backgroundColor: monster.color }}
-                    >
-                      {monster.avatarIconType === 'boss' ? (
-                        <Skull className="w-5 h-5" />
-                      ) : monster.avatarIconType === 'caster' ? (
-                        <Wand2 className="w-5 h-5" />
-                      ) : (
-                        <Sword className="w-5 h-5" />
-                      )}
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-sm text-slate-100">{monster.name}</h3>
-                      <div className="text-[11px] text-slate-400 font-mono">{monster.type}</div>
-                    </div>
-                  </div>
-                  <span className="text-xs font-mono font-bold px-2 py-0.5 bg-purple-950/80 text-purple-300 border border-purple-800/80 rounded">
-                    CR {monster.cr}
-                  </span>
-                </div>
+      {/* Filter and Search Bar */}
+      <div className="p-3 bg-slate-900/60 border-b border-slate-800/80 flex items-center gap-3">
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder={`Search across ${activeTab === 'monsters' ? 'monsters by name or type' : 'spells by name, school, or effect'}...`}
+            className="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-700/80 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-purple-500 font-sans"
+          />
+        </div>
 
-                {/* Vitals */}
-                <div className="grid grid-cols-3 gap-2 mt-4 text-center font-mono">
-                  <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800/80">
-                    <div className="text-[9px] text-slate-500 flex items-center justify-center gap-1">
-                      <Shield className="w-3 h-3 text-sky-400" /> AC
-                    </div>
-                    <div className="text-xs font-bold text-sky-400">{monster.ac}</div>
-                  </div>
-                  <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800/80">
-                    <div className="text-[9px] text-slate-500 flex items-center justify-center gap-1">
-                      <Heart className="w-3 h-3 text-rose-400" /> HP
-                    </div>
-                    <div className="text-xs font-bold text-rose-400">{monster.hp}</div>
-                  </div>
-                  <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800/80">
-                    <div className="text-[9px] text-slate-500 flex items-center justify-center gap-1">
-                      <Zap className="w-3 h-3 text-amber-400" /> SPEED
-                    </div>
-                    <div className="text-xs font-bold text-amber-400">{monster.speed.split(',')[0]}</div>
-                  </div>
-                </div>
-
-                <p className="text-xs text-slate-300 mt-3 leading-relaxed">{monster.description}</p>
-
-                {/* Actions */}
-                <div className="mt-3 space-y-1">
-                  <span className="text-[10px] font-mono font-bold text-slate-500">ATTACK ACTIONS:</span>
-                  {monster.actions.map((act, i) => (
-                    <div key={i} className="text-[11px] font-mono text-slate-300 bg-slate-950/60 p-1.5 rounded border border-slate-800/60">
-                      ⚔️ {act}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Spawn Button */}
+        {activeTab === 'spells' && (
+          <div className="flex items-center gap-1 overflow-x-auto vtt-scrollbar py-1">
+            <Filter className="w-3.5 h-3.5 text-slate-500 ml-1 mr-0.5 shrink-0" />
+            {schools.map((sch) => (
               <button
-                onClick={() =>
-                  onSpawnToken({
-                    name: monster.name,
-                    hp: monster.hp,
-                    maxHp: monster.hp,
-                    ac: monster.ac,
-                    color: monster.color,
-                    isPlayer: false,
-                    avatarIconType: monster.avatarIconType,
-                  })
-                }
-                className="mt-4 w-full flex items-center justify-center gap-2 py-2 px-3 bg-purple-600/90 hover:bg-purple-600 text-white text-xs font-semibold rounded-lg transition shadow-md shadow-purple-950/50 border border-purple-500/40"
+                key={sch}
+                onClick={() => setSelectedSchool(sch)}
+                className={`px-2.5 py-1 rounded text-[11px] font-mono whitespace-nowrap transition ${
+                  selectedSchool === sch
+                    ? 'bg-purple-600 text-white font-bold'
+                    : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
               >
-                <Plus className="w-4 h-4" />
-                <span>Spawn to Tactical Battle Map</span>
+                {sch}
               </button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
-          {filteredSpells.map((spell) => (
-            <div
-              key={spell.name}
-              className="p-5 rounded-xl vtt-card-elevated flex flex-col justify-between"
-            >
-              <div>
-                <div className="flex items-start justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-indigo-950 border border-indigo-700/60 flex items-center justify-center text-indigo-300 shadow-md">
-                      <Flame className="w-5 h-5 text-orange-400" />
+            ))}
+          </div>
+        )}
+
+        {activeTab === 'monsters' && (
+          <div className="flex items-center gap-1 overflow-x-auto vtt-scrollbar py-1">
+            <span className="text-[11px] font-mono text-slate-500 ml-1 mr-1">CR:</span>
+            {crTiers.map((cr) => (
+              <button
+                key={cr}
+                onClick={() => setSelectedCR(cr)}
+                className={`px-2 py-0.5 rounded text-[11px] font-mono whitespace-nowrap transition ${
+                  selectedCR === cr
+                    ? 'bg-purple-600 text-white font-bold'
+                    : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                }`}
+              >
+                {cr}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Main Grid List */}
+      <div className="flex-1 p-4 overflow-y-auto vtt-scrollbar">
+        {activeTab === 'monsters' ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredMonsters.map((monster) => (
+              <div
+                key={monster.id}
+                className="vtt-glass-panel p-4 rounded-xl border border-slate-800/80 flex flex-col justify-between hover:border-purple-500/50 transition shadow-lg group"
+              >
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-rose-950 border border-rose-800 flex items-center justify-center text-rose-400">
+                        <Skull className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-xs text-slate-100 font-display">{monster.name}</h3>
+                        <div className="text-[10px] text-slate-400">{monster.type}</div>
+                      </div>
                     </div>
-                    <div>
-                      <h3 className="font-bold text-sm text-slate-100">{spell.name}</h3>
-                      <div className="text-[11px] text-purple-400 font-mono">{spell.level}</div>
+                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 bg-purple-950 text-purple-300 rounded border border-purple-800">
+                      {monster.cr}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5 my-2.5 text-center font-mono text-[11px]">
+                    <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800">
+                      <div className="text-[9px] text-slate-500">AC</div>
+                      <div className="font-bold text-sky-400">{monster.ac}</div>
+                    </div>
+                    <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800">
+                      <div className="text-[9px] text-slate-500">HP</div>
+                      <div className="font-bold text-emerald-400">{monster.hp}</div>
+                    </div>
+                    <div className="p-1.5 bg-slate-950/80 rounded border border-slate-800">
+                      <div className="text-[9px] text-slate-500">SPEED</div>
+                      <div className="font-bold text-amber-400">{monster.speed}</div>
                     </div>
                   </div>
+
+                  <p className="text-[11px] text-slate-400 line-clamp-2 leading-relaxed mb-3">
+                    {monster.description}
+                  </p>
                 </div>
 
-                <div className="mt-4 space-y-1.5 text-xs font-mono text-slate-400">
-                  <div><span className="text-slate-500">Casting Time:</span> {spell.castingTime}</div>
-                  <div><span className="text-slate-500">Range / AoE:</span> {spell.range}</div>
-                  <div><span className="text-slate-500">Damage / Effect:</span> <span className="text-amber-300">{spell.damage}</span></div>
-                  <div><span className="text-slate-500">Components:</span> {spell.components}</div>
+                <button
+                  onClick={() =>
+                    onSpawnToken({
+                      name: monster.name,
+                      hp: monster.hp,
+                      maxHp: monster.hp,
+                      ac: monster.ac,
+                      color: '#dc2626',
+                      isPlayer: false,
+                      avatarIconType: monster.hp > 80 ? 'boss' : 'scout',
+                    })
+                  }
+                  className="w-full flex items-center justify-center gap-1.5 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition shadow"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Spawn to Tactical Battle Map</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredSpells.map((spell) => (
+              <div
+                key={spell.id}
+                className="vtt-glass-panel p-4 rounded-xl border border-slate-800/80 flex flex-col justify-between hover:border-purple-500/50 transition shadow-lg"
+              >
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-indigo-950 border border-indigo-800 flex items-center justify-center text-indigo-400">
+                        <Wand2 className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-xs text-slate-100 font-display">{spell.name}</h3>
+                        <div className="text-[10px] text-purple-400 font-mono">
+                          {spell.level === 0 ? 'Cantrip' : `Level ${spell.level}`} · {spell.school}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="p-2 bg-slate-950/80 rounded-lg border border-slate-800 space-y-1 my-2 text-[10px] font-mono text-slate-400">
+                    <div className="flex justify-between">
+                      <span>Casting Time:</span>
+                      <span className="text-slate-200">{spell.casting_time}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Range:</span>
+                      <span className="text-slate-200">{spell.range}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Duration:</span>
+                      <span className="text-slate-200">{spell.duration}</span>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-300 line-clamp-3 leading-relaxed mb-3">
+                    {spell.description}
+                  </p>
                 </div>
 
-                <p className="text-xs text-slate-300 mt-3 leading-relaxed">{spell.description}</p>
+                <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1">
+                  <Sparkles className="w-3 h-3 text-purple-400" />
+                  <span>Components: {spell.components}</span>
+                </div>
               </div>
-
-              <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between text-xs font-mono text-purple-300">
-                <span className="flex items-center gap-1"><Sparkles className="w-3.5 h-3.5" /> SRD 5.1 Spellbook</span>
-                <span className="px-2 py-0.5 bg-slate-900 rounded border border-slate-800">Auto-Audited</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

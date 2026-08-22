@@ -1,11 +1,13 @@
+import os
+import json
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 
-from .routing.intent_router import IntentClassificationRouter, LiteLLMCircuitBreakerGateway
+from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
@@ -44,6 +46,21 @@ spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
+
+# Load Compendium Data
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+SPELLS_FILE = os.path.join(DATA_DIR, "srd_spells.json")
+MONSTERS_FILE = os.path.join(DATA_DIR, "srd_monsters.json")
+
+all_spells: List[Dict[str, Any]] = []
+if os.path.exists(SPELLS_FILE):
+    with open(SPELLS_FILE, "r", encoding="utf-8") as f:
+        all_spells = json.load(f)
+
+all_monsters: List[Dict[str, Any]] = []
+if os.path.exists(MONSTERS_FILE):
+    with open(MONSTERS_FILE, "r", encoding="utf-8") as f:
+        all_monsters = json.load(f)
 
 
 class ClassifyRequest(BaseModel):
@@ -87,6 +104,50 @@ def health_check():
         "version": "1.0.0",
         "llm_provider": "live" if not streaming_gateway.config.is_mock else "mock_fallback",
         "llm_model": streaming_gateway.config.model,
+        "compendium_spells_count": len(all_spells),
+        "compendium_monsters_count": len(all_monsters),
+    }
+
+
+@app.get("/api/v1/compendium/spells")
+def get_compendium_spells(
+    query: Optional[str] = None,
+    level: Optional[int] = None,
+    school: Optional[str] = None,
+    limit: int = 50,
+):
+    results = all_spells
+    if query:
+        q = query.lower()
+        results = [s for s in results if q in s["name"].lower() or q in s.get("description", "").lower()]
+    if level is not None:
+        results = [s for s in results if s.get("level") == level]
+    if school:
+        s_low = school.lower()
+        results = [s for s in results if s.get("school", "").lower() == s_low]
+
+    return {
+        "total_matches": len(results),
+        "spells": results[:limit],
+    }
+
+
+@app.get("/api/v1/compendium/monsters")
+def get_compendium_monsters(
+    query: Optional[str] = None,
+    cr: Optional[str] = None,
+    limit: int = 50,
+):
+    results = all_monsters
+    if query:
+        q = query.lower()
+        results = [m for m in results if q in m["name"].lower() or q in m.get("type", "").lower()]
+    if cr:
+        results = [m for m in results if m.get("cr", "").lower() == cr.lower()]
+
+    return {
+        "total_matches": len(results),
+        "monsters": results[:limit],
     }
 
 
@@ -115,9 +176,6 @@ def generate_narrative(req: NarrativeGenerateRequest):
 
 @app.post("/api/v1/narrative/stream")
 async def stream_narrative(req: NarrativeStreamRequest):
-    """
-    Server-Sent Events (SSE) streaming endpoint returning real-time tokens.
-    """
     return StreamingResponse(
         streaming_gateway.stream_narrative(
             user_intent=req.user_intent,

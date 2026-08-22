@@ -15,6 +15,8 @@ import {
 } from 'lucide-react';
 import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
+import { RaycastLighting } from '../render/raycast_lighting';
+import { globalAudio } from '../render/audio_manager';
 
 export interface Token {
   id: string;
@@ -26,7 +28,7 @@ export interface Token {
   ac: number;
   color: string;
   isPlayer: boolean;
-  avatarIconType?: string; // 'fighter' | 'mage' | 'boss' | 'scout' | 'caster'
+  avatarIconType?: string;
   conditions?: string[];
 }
 
@@ -68,53 +70,47 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [measureTarget, setMeasureTarget] = useState<{ x: number; y: number } | null>(null);
   const [aoeShape, setAoeShape] = useState<'none' | 'sphere' | 'cone' | 'cube' | 'line'>('none');
   const [aoeOrigin, setAoeOrigin] = useState<{ x: number; y: number } | null>(null);
+  const [enableRaycastVision, setEnableRaycastVision] = useState(true);
 
   // FX Canvas Refs
   const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lightingCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
   const internalParticleFX = useRef<ParticleFXManager>(new ParticleFXManager());
   const internalDiceBox = useRef<DiceBox3D>(new DiceBox3D());
+  const raycastLighting = useRef<RaycastLighting>(new RaycastLighting());
 
   if (particleFXRef) particleFXRef.current = internalParticleFX.current;
   if (diceBoxRef) diceBoxRef.current = internalDiceBox.current;
 
-  const [fogRevealed, setFogRevealed] = useState<boolean[][]>(() => {
-    const grid = Array.from({ length: gridHeight }, () => Array(gridWidth).fill(false));
-    tokens.forEach((t) => {
-      if (t.isPlayer) {
-        for (let dy = -3; dy <= 3; dy++) {
-          for (let dx = -3; dx <= 3; dx++) {
-            const ny = Math.floor(t.y) + dy;
-            const nx = Math.floor(t.x) + dx;
-            if (ny >= 0 && ny < gridHeight && nx >= 0 && nx < gridWidth) {
-              if (Math.sqrt(dx * dx + dy * dy) <= 3.8) {
-                grid[ny][nx] = true;
-              }
-            }
-          }
-        }
-      }
-    });
-    return grid;
-  });
-
   const cellSize = 60;
 
-  // Animation Loop for 3D Dice and Particle FX
+  // Initialize and update raycast walls
+  useEffect(() => {
+    raycastLighting.current.updateWalls(walls, cellSize, gridWidth, gridHeight);
+  }, [walls, gridWidth, gridHeight]);
+
+  // Main Render Animation Loop for 3D Dice, Particle FX, and Dynamic 2D Raycast Vision
   useEffect(() => {
     let animId: number;
-    const canvas = fxCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const fxCanvas = fxCanvasRef.current;
+    const lightCanvas = lightingCanvasRef.current;
+    if (!fxCanvas || !lightCanvas) return;
+
+    const fxCtx = fxCanvas.getContext('2d');
+    const lightCtx = lightCanvas.getContext('2d');
+    if (!fxCtx || !lightCtx) return;
 
     const renderLoop = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // 1. Clear FX Canvas
+      fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
 
       // Render Particles
-      internalParticleFX.current.updateAndRender(ctx);
+      internalParticleFX.current.updateAndRender(fxCtx);
 
       // Render 3D Dice
-      internalDiceBox.current.updateAndRender(ctx, (roll: ActiveDiceRoll) => {
+      internalDiceBox.current.updateAndRender(fxCtx, (roll: ActiveDiceRoll) => {
+        globalAudio.playWeaponImpact();
         if (roll.dieType === 'd20' && roll.targetValue === 20) {
           internalParticleFX.current.spawnGoldCritBurst(roll.currentX, roll.currentY, 50);
         } else {
@@ -122,12 +118,31 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         }
       });
 
+      // 2. Render 2D Raycast Lighting & Shadows
+      lightCtx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
+      if (enableRaycastVision) {
+        const activePlayer = tokens.find((t) => t.id === selectedTokenId) || tokens.find((t) => t.isPlayer) || tokens[0];
+        if (activePlayer) {
+          const source = {
+            x: (activePlayer.x + 0.5) * cellSize,
+            y: (activePlayer.y + 0.5) * cellSize,
+          };
+          raycastLighting.current.renderLightingMask(
+            lightCtx,
+            source,
+            gridWidth * cellSize,
+            gridHeight * cellSize,
+            420
+          );
+        }
+      }
+
       animId = requestAnimationFrame(renderLoop);
     };
 
     renderLoop();
     return () => cancelAnimationFrame(animId);
-  }, []);
+  }, [tokens, selectedTokenId, enableRaycastVision, gridWidth, gridHeight]);
 
   const isWall = (x: number, y: number) => {
     return walls.some((w) => w.x === x && w.y === y);
@@ -153,6 +168,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const handleCellClick = (x: number, y: number) => {
     if (aoeShape !== 'none') {
       setAoeOrigin({ x, y });
+      globalAudio.playSpellCast();
       if (aoeShape === 'sphere') {
         internalParticleFX.current.spawnFireballShockwave(
           (x + 0.5) * cellSize,
@@ -175,21 +191,6 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     if (draggedTokenId) {
       if (!isWall(x, y)) {
         onTokenMove(draggedTokenId, x, y);
-        setFogRevealed((prev) => {
-          const next = prev.map((row) => [...row]);
-          for (let dy = -3; dy <= 3; dy++) {
-            for (let dx = -3; dx <= 3; dx++) {
-              const ny = y + dy;
-              const nx = x + dx;
-              if (ny >= 0 && ny < gridHeight && nx >= 0 && nx < gridWidth) {
-                if (Math.sqrt(dx * dx + dy * dy) <= 3.8) {
-                  next[ny][nx] = true;
-                }
-              }
-            }
-          }
-          return next;
-        });
       }
       setDraggedTokenId(null);
     }
@@ -291,6 +292,17 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
         </div>
 
+        {/* Raycast Vision Toggle */}
+        <button
+          onClick={() => setEnableRaycastVision(!enableRaycastVision)}
+          className={`px-2.5 py-1.5 rounded-lg transition text-xs font-semibold ${
+            enableRaycastVision ? 'bg-purple-900/80 text-purple-200 border border-purple-600' : 'bg-slate-900 text-slate-400 border border-slate-800'
+          }`}
+          title="Toggle 2D Raycast Line-of-Sight Shadows"
+        >
+          {enableRaycastVision ? 'Raycast Vision: ON' : 'Vision: Global'}
+        </button>
+
         {/* Center Button */}
         <button
           onClick={() => setPan({ x: 30, y: 30 })}
@@ -311,7 +323,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         }}
       >
         <div
-          className="grid relative rounded-xl border-2 border-slate-800 shadow-2xl bg-slate-950"
+          className="grid relative rounded-xl border-2 border-slate-800 shadow-2xl bg-slate-950 overflow-hidden"
           style={{
             gridTemplateColumns: `repeat(${gridWidth}, ${cellSize}px)`,
             gridTemplateRows: `repeat(${gridHeight}, ${cellSize}px)`,
@@ -321,7 +333,6 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           {Array.from({ length: gridHeight }).map((_, y) =>
             Array.from({ length: gridWidth }).map((_, x) => {
               const wall = isWall(x, y);
-              const revealed = fogRevealed[y] ? fogRevealed[y][x] : true;
               
               let isInsideAoe = false;
               if (aoeOrigin && aoeShape === 'sphere') {
@@ -345,10 +356,6 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   <span className="absolute bottom-1 right-1 text-[8px] font-mono text-slate-700 select-none pointer-events-none">
                     {String.fromCharCode(65 + x)}{y + 1}
                   </span>
-
-                  {!revealed && (
-                    <div className="absolute inset-0 bg-slate-950/95 pointer-events-none backdrop-blur-[2px] transition-opacity duration-300" />
-                  )}
 
                   {wall && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none text-slate-600/70">
@@ -419,6 +426,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               </div>
             );
           })}
+
+          {/* 2D Raycast Lighting & Line-of-Sight Mask Layer */}
+          <canvas
+            ref={lightingCanvasRef}
+            width={gridWidth * cellSize}
+            height={gridHeight * cellSize}
+            className="absolute inset-0 pointer-events-none z-20"
+          />
 
           {/* 3D Dice & WebGL Particle FX Overlay Canvas */}
           <canvas
