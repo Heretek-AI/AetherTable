@@ -125,3 +125,45 @@ def test_synthetic_playtest_benchmark():
     assert report["total_turns_simulated"] == 50
     assert report["mechanical_compliance_rate_pct"] >= 90.0
     assert report["hallucination_continuity_index"] >= 0.85
+from fastapi.testclient import TestClient
+from vtt_orchestrator.server import app
+
+
+def test_fastapi_server_endpoints():
+    client = TestClient(app)
+
+    # Health check
+    health_resp = client.get("/health")
+    assert health_resp.status_code == 200
+    assert health_resp.json()["status"] == "healthy"
+
+    # Intent classify
+    classify_resp = client.post("/api/v1/intent/classify", json={"utterance": "I attack with greatsword", "speaker_id": "Thorin"})
+    assert classify_resp.status_code == 200
+    assert classify_resp.json()["intent_type"] == "MECHANICAL_INVOCATION"
+
+    # Narrative generate with pre-commit auditor pass
+    narrative_resp = client.post("/api/v1/narrative/generate", json={
+        "user_intent": "I strike with greataxe",
+        "turn_index": 1,
+        "entity_id": "pc_thorin",
+        "engine_execution_payload": {
+            "action_name": "Greataxe Strike",
+            "is_hit": True,
+            "total_damage": 11,
+            "target_hp_remaining": 15,
+            "target_is_conscious": True,
+            "target_is_dead": False
+        },
+        "active_entity_count": 4,
+        "previous_entity_count": 4,
+        "ingress_count": 0,
+        "egress_count": 0
+    })
+    assert narrative_resp.status_code == 200
+    assert narrative_resp.json()["status"] == "COMMITTED"
+
+    # Faction simulation tick
+    sim_resp = client.post("/api/v1/simulation/tick")
+    assert sim_resp.status_code == 200
+    assert "actions_executed" in sim_resp.json()

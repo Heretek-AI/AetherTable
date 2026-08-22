@@ -1,0 +1,155 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vtt-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vtt_admin
+      POSTGRES_PASSWORD: vtt_secure_password_123
+      POSTGRES_DB: vtt_campaign_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./database/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vtt_admin -d vtt_campaign_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vtt-net
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: vtt-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/vtt_neo4j_password
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p vtt_neo4j_password 'RETURN 1;' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vtt-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: vtt-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vtt-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: vtt-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - vtt-net
+
+  vtt-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    container_name: vtt-engine
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info
+      DATABASE_URL: postgres://vtt_admin:vtt_secure_password_123@postgres:5432/vtt_campaign_db
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - vtt-net
+
+  vtt-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: vtt-orchestrator
+    restart: unless-stopped
+    environment:
+      ENGINE_API_URL: http://vtt-engine:8080
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: vtt_neo4j_password
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+    ports:
+      - "8000:8000"
+    depends_on:
+      vtt-engine:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - vtt-net
+
+  vtt-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: vtt-client
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      vtt-engine:
+        condition: service_healthy
+      vtt-orchestrator:
+        condition: service_healthy
+    networks:
+      - vtt-net
+
+volumes:
+  pgdata:
+  neo4jdata:
+  qdrantdata:
+  redisdata:
+
+networks:
+  vtt-net:
+    driver: bridge
