@@ -1,7 +1,7 @@
 import os
 import json
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -15,6 +15,7 @@ from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNP
 from .simulation.faction_simulation import FactionSimulationGOAP
 from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
+from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .schemas.models import (
     IntentClassificationResult,
     LoreAssertionPayload,
@@ -46,6 +47,7 @@ spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
+pdf_renderer = CharacterSheetPDFRenderer()
 
 # Load Compendium Data
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -149,6 +151,19 @@ def get_compendium_monsters(
         "total_matches": len(results),
         "monsters": results[:limit],
     }
+
+
+@app.post("/api/v1/character/export-pdf")
+def export_character_pdf(char_data: Dict[str, Any]):
+    try:
+        pdf_bytes = pdf_renderer.render_pdf_bytes(char_data)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={char_data.get('name', 'character')}.pdf"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
 
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)

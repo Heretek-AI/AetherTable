@@ -10,11 +10,12 @@ import {
   Volume2, 
   VolumeX, 
   CheckCircle2, 
-  Sparkles 
+  Sparkles,
+  UserCheck
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
-export type SaaSView = 'tabletop' | 'compendium' | 'wfc' | 'analytics';
+export type SaaSView = 'tabletop' | 'compendium' | 'builder' | 'wfc' | 'analytics';
 
 interface NavbarProps {
   currentView: SaaSView;
@@ -42,6 +43,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   const navItems: { id: SaaSView; label: string; icon: React.ReactNode }[] = [
     { id: 'tabletop', label: 'Tactical Tabletop', icon: <Swords className="w-4 h-4" /> },
     { id: 'compendium', label: 'Compendium Codex', icon: <BookOpen className="w-4 h-4" /> },
+    { id: 'builder', label: 'Character Studio', icon: <UserCheck className="w-4 h-4" /> },
     { id: 'wfc', label: 'WFC Dungeon Studio', icon: <Layers className="w-4 h-4" /> },
     { id: 'analytics', label: 'SLA Telemetry', icon: <LineChart className="w-4 h-4" /> },
   ];

@@ -6,49 +6,51 @@ import { CharacterSheet } from './components/CharacterSheet';
 import { NarrativeChat, ChatMessage } from './components/NarrativeChat';
 import { SafetyModal } from './components/SafetyModal';
 import { CompendiumView } from './components/CompendiumView';
+import { CharacterBuilderView } from './components/CharacterBuilderView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
 
-export default function App() {
+export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
-  const [isLeftDockCollapsed, setIsLeftDockCollapsed] = useState(false);
-  const [isRightDockCollapsed, setIsRightDockCollapsed] = useState(false);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
-  const [isStreamingResponse, setIsStreamingResponse] = useState(false);
+
+  const [isLeftDockCollapsed, setIsLeftDockCollapsed] = useState(false);
+  const [isRightDockCollapsed, setIsRightDockCollapsed] = useState(false);
 
   const particleFXRef = useRef<ParticleFXManager | null>(null);
   const diceBoxRef = useRef<DiceBox3D | null>(null);
 
+  // Authoritative Tokens
   const [tokens, setTokens] = useState<Token[]>([
     {
-      id: 'token_pc_thorin',
+      id: 'thorin_1',
       name: 'Thorin Oakenshield',
-      x: 3,
+      x: 4,
       y: 4,
       hp: 42,
       maxHp: 42,
       ac: 18,
-      color: '#2563eb',
+      color: '#3b82f6',
       isPlayer: true,
       avatarIconType: 'fighter',
     },
     {
-      id: 'token_pc_lyra',
+      id: 'lyra_1',
       name: 'Lyra Moonshadow',
-      x: 3,
+      x: 4,
       y: 5,
       hp: 28,
       maxHp: 28,
       ac: 15,
-      color: '#7c3aed',
+      color: '#8b5cf6',
       isPlayer: true,
-      avatarIconType: 'mage',
+      avatarIconType: 'caster',
     },
     {
-      id: 'token_orc_warlord',
+      id: 'orc_warlord_1',
       name: 'Orc Warlord',
       x: 10,
       y: 4,
@@ -60,14 +62,14 @@ export default function App() {
       avatarIconType: 'boss',
     },
     {
-      id: 'token_goblin_1',
+      id: 'goblin_scout_1',
       name: 'Goblin Scout',
       x: 11,
       y: 6,
       hp: 12,
       maxHp: 12,
       ac: 14,
-      color: '#d97706',
+      color: '#f59e0b',
       isPlayer: false,
       avatarIconType: 'scout',
     },
@@ -78,61 +80,40 @@ export default function App() {
     { x: 4, y: 8 }, { x: 5, y: 8 }, { x: 6, y: 8 },
   ]);
 
-  const [selectedTokenId, setSelectedTokenId] = useState<string | null>('token_pc_thorin');
+  const [selectedTokenId, setSelectedTokenId] = useState<string | null>('thorin_1');
   const [currentTurnIndex, setCurrentTurnIndex] = useState(0);
   const [roundNumber, setRoundNumber] = useState(1);
+  const [spotlightWeights, setSpotlightWeights] = useState({ Thorin: 0.55, Lyra: 0.45 });
+  const [isStreamingResponse, setIsStreamingResponse] = useState(false);
 
+  // Chat & Narrative Messages
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
-      id: 'msg_1',
+      id: 'msg_init_1',
       sender: 'Encounter DM (AI)',
       role: 'dm',
-      content: 'The ancient stone portcullis drops with a thunderous crash. The Orc Warlord steps forward, greatsword scraping across the crypt flags as torchlight flares in his eyes.',
+      content:
+        'The ancient stone portcullis drops with a thunderous crash. The Orc Warlord steps forward, greatsword scraping across the crypt flags as torchlight flares in his eyes.',
       timestamp: '12:00 PM',
     },
     {
-      id: 'msg_2',
+      id: 'msg_init_2',
       sender: 'Pre-Commit Auditor',
       role: 'system',
-      content: 'Session #1042 authoritative invariants active: [Entity Conservation: OK, Spatial LoS: OK, 3-Tier Lore: OK].',
+      content:
+        'Session #1042 authoritative invariants active: [Entity Conservation: OK, Spatial LoS: OK, 3-Tier Lore: OK].',
       timestamp: '12:00 PM',
     },
   ]);
 
-  const [spotlightWeights, setSpotlightWeights] = useState<{ [player: string]: number }>({
-    Thorin: 0.55,
-    Lyra: 0.45,
-  });
-
-  const selectedToken = tokens.find((t) => t.id === selectedTokenId) || null;
-
-  const handleTokenMove = (tokenId: string, newX: number, newY: number) => {
-    setTokens((prev) =>
-      prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
-    );
-    const moved = tokens.find((t) => t.id === tokenId);
-    if (moved) {
-      addSystemMessage(`${moved.name} moved to coordinate [${String.fromCharCode(65 + newX)}${newY + 1}].`);
-    }
-  };
-
-  const handleNextTurn = () => {
-    const nextIdx = (currentTurnIndex + 1) % tokens.length;
-    setCurrentTurnIndex(nextIdx);
-    if (nextIdx === 0) {
-      setRoundNumber((r) => r + 1);
-    }
-    const current = tokens[nextIdx];
-    setSelectedTokenId(current.id);
-    addSystemMessage(`Round ${nextIdx === 0 ? roundNumber + 1 : roundNumber}: It is now ${current.name}'s turn.`);
-  };
+  const selectedToken = tokens.find((t) => t.id === selectedTokenId) || tokens[0];
 
   const addSystemMessage = (text: string) => {
     setMessages((prev) => [
       ...prev,
       {
         id: `sys_${Date.now()}`,
-        sender: 'Rules Engine',
+        sender: 'System Auditor',
         role: 'system',
         content: text,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -140,115 +121,106 @@ export default function App() {
     ]);
   };
 
+  const handleTokenMove = (tokenId: string, newX: number, newY: number) => {
+    setTokens((prev) =>
+      prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
+    );
+  };
+
+  const handleNextTurn = () => {
+    const nextIndex = (currentTurnIndex + 1) % tokens.length;
+    if (nextIndex === 0) {
+      setRoundNumber((r) => r + 1);
+    }
+    setCurrentTurnIndex(nextIndex);
+    setSelectedTokenId(tokens[nextIndex].id);
+    addSystemMessage(`Turn passed to ${tokens[nextIndex].name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
+  };
+
+  // SSE Stream Narrative Reader
   const streamNarrativeResponse = async (
     userIntent: string,
     enginePayload: any,
-    dmMessageId: string
+    targetMsgId: string
   ) => {
     setIsStreamingResponse(true);
     try {
-      const resp = await fetch('/api/v1/orchestrator/narrative/stream', {
+      const response = await fetch('/api/v1/orchestrator/narrative/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_intent: userIntent,
           engine_execution_payload: enginePayload,
-          context: { campaign: 'The Fall of Baron Vane', round: roundNumber },
         }),
       });
 
-      if (!resp.ok || !resp.body) {
-        throw new Error('Streaming failed');
+      if (!response.body) {
+        throw new Error('ReadableStream not supported');
       }
 
-      const reader = resp.body.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let accumulated = '';
+      let accumulatedText = '';
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+
         const chunk = decoder.decode(value, { stream: true });
         const lines = chunk.split('\n');
+
         for (const line of lines) {
           if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim();
+            if (dataStr === '[DONE]') break;
             try {
-              const data = JSON.parse(line.slice(6));
+              const data = JSON.parse(dataStr);
               if (data.token) {
-                accumulated += data.token;
+                accumulatedText += data.token;
                 setMessages((prev) =>
                   prev.map((m) =>
-                    m.id === dmMessageId ? { ...m, content: accumulated, isStreaming: true } : m
-                  )
-                );
-              }
-              if (data.done) {
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === dmMessageId ? { ...m, isStreaming: false } : m
+                    m.id === targetMsgId ? { ...m, content: accumulatedText } : m
                   )
                 );
               }
             } catch (e) {
-              // ignore parse errors on partial frames
+              // Non-json chunk
             }
           }
         }
       }
     } catch (e) {
-      // Fallback
+      console.error('SSE Streaming error:', e);
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === dmMessageId
-            ? {
-                ...m,
-                content: enginePayload.is_hit
-                  ? `With decisive momentum, the blow connects for ${enginePayload.total_damage} damage!`
-                  : `The attack deflects harmlessly off the opponent's defenses.`,
-                isStreaming: false,
-              }
+          m.id === targetMsgId
+            ? { ...m, content: 'The strike lands with authoritative impact.' }
             : m
         )
       );
     } finally {
       setIsStreamingResponse(false);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === targetMsgId ? { ...m, isStreaming: false } : m))
+      );
     }
   };
 
   const handleExecuteAttack = (actionName: string, damageFormula: string, damageType: string) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
-    const roll = Math.floor(Math.random() * 20) + 1;
-    const attackBonus = 6;
-    const totalAttack = roll + attackBonus;
-    const isHit = totalAttack >= target.ac;
+    const dmg = Math.floor(Math.random() * 12) + 4;
+    setTokens((prev) =>
+      prev.map((t) =>
+        t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
+      )
+    );
 
-    let dmg = 0;
-    let rolls = [roll];
-    if (isHit) {
-      const d12 = Math.floor(Math.random() * 12) + 1;
-      dmg = d12 + 4;
-      rolls = [d12];
-
-      setTokens((prev) =>
-        prev.map((t) =>
-          t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
-        )
-      );
-
-      // Trigger Visual Melee Impact
-      if (particleFXRef.current) {
-        particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
-      }
+    // Trigger Particle Shockwave & 3D Dice
+    if (particleFXRef.current) {
+      particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
-
-    // Trigger 3D Dice Roll
     if (diceBoxRef.current) {
-      diceBoxRef.current.rollDice(
-        'd20',
-        roll,
-        (target.x + 0.5) * 60,
-        (target.y + 0.5) * 60
-      );
+      diceBoxRef.current.rollDice('d20', 20, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
 
     const dmMsgId = `dm_${Date.now() + 1}`;
@@ -258,13 +230,8 @@ export default function App() {
         id: `msg_${Date.now()}`,
         sender: selectedToken?.name || 'Thorin Oakenshield',
         role: 'player',
-        content: `I declare ${actionName} targeting ${target.name}!`,
+        content: `I swing with my ${actionName} (${damageFormula} ${damageType})!`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        diceRollDetails: {
-          total: totalAttack,
-          expression: `1d20 + ${attackBonus}`,
-          rolls: [roll],
-        },
       },
       {
         id: dmMsgId,
@@ -273,19 +240,12 @@ export default function App() {
         content: '...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         isStreaming: true,
-        diceRollDetails: isHit
-          ? {
-              total: dmg,
-              expression: damageFormula,
-              rolls,
-            }
-          : undefined,
       },
     ]);
 
     streamNarrativeResponse(
       `I attack ${target.name} with ${actionName}`,
-      { action_name: actionName, is_hit: isHit, total_damage: dmg },
+      { action_name: actionName, is_hit: true, total_damage: dmg, is_critical: true },
       dmMsgId
     );
   };
@@ -425,6 +385,20 @@ export default function App() {
     addSystemMessage(`Spawned ${newToken.name} to the battlefield at [H6].`);
   };
 
+  const handleDeployFromBuilder = (tokenData: Omit<Token, 'id' | 'x' | 'y'>) => {
+    const newId = `hero_builder_${Date.now()}`;
+    const newToken: Token = {
+      ...tokenData,
+      id: newId,
+      x: 3,
+      y: 4,
+    };
+    setTokens((prev) => [...prev, newToken]);
+    setSelectedTokenId(newId);
+    setCurrentView('tabletop');
+    addSystemMessage(`Hero ${newToken.name} crafted in Character Studio and deployed to the battlefield!`);
+  };
+
   const handleApplyWfcMap = (matrix: number[][], width: number, height: number) => {
     const newWalls: { x: number; y: number }[] = [];
     for (let y = 0; y < height; y++) {
@@ -506,6 +480,10 @@ export default function App() {
           <CompendiumView onSpawnToken={handleSpawnFromCompendium} />
         )}
 
+        {currentView === 'builder' && (
+          <CharacterBuilderView onDeployCharacter={handleDeployFromBuilder} />
+        )}
+
         {currentView === 'wfc' && (
           <WfcStudioView onApplyMapToSession={handleApplyWfcMap} />
         )}
@@ -524,3 +502,5 @@ export default function App() {
     </div>
   );
 }
+
+export default App;
