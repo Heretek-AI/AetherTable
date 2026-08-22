@@ -14,7 +14,9 @@ import {
   UserCheck, 
   Users, 
   Crown, 
-  Package 
+  Package, 
+  Radio, 
+  Sliders 
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
@@ -24,6 +26,7 @@ interface NavbarProps {
   currentView: SaaSView;
   onSelectView: (view: SaaSView) => void;
   onOpenSafety: () => void;
+  onOpenAudioMixer?: () => void;
   latencyMs: number;
   campaignName: string;
 }
@@ -32,6 +35,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   currentView,
   onSelectView,
   onOpenSafety,
+  onOpenAudioMixer,
   latencyMs,
   campaignName,
 }) => {
@@ -101,6 +105,18 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* Telemetry & Actions */}
       <div className="flex items-center gap-3">
+        {/* Audio Radar & Spatial Mixer Trigger */}
+        {onOpenAudioMixer && (
+          <button
+            onClick={onOpenAudioMixer}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/80 text-purple-300 border border-purple-800/80 text-xs font-mono transition shadow-sm"
+            title="3D Spatial Audio & Voice Radar Mixer"
+          >
+            <Radio className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+            <span className="hidden lg:inline text-[11px]">3D Audio Radar</span>
+          </button>
+        )}
+
         {/* Audio Mute Toggle */}
         <button
           onClick={toggleMute}

@@ -5,6 +5,7 @@ import { InitiativeTracker } from './components/InitiativeTracker';
 import { CharacterSheet } from './components/CharacterSheet';
 import { NarrativeChat, ChatMessage } from './components/NarrativeChat';
 import { SafetyModal } from './components/SafetyModal';
+import { AudioMixerModal } from './components/AudioMixerModal';
 import { CompendiumView } from './components/CompendiumView';
 import { CharacterBuilderView } from './components/CharacterBuilderView';
 import { LobbyView } from './components/LobbyView';
@@ -14,10 +15,13 @@ import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
+import { globalSpatialAudio } from './render/spatial_audio';
+import { globalWebRTCMesh } from './render/webrtc_mesh';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
+  const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
 
@@ -129,6 +133,7 @@ export function App() {
     setTokens((prev) =>
       prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
     );
+    globalWebRTCMesh.updatePeerPosition(tokenId, newX, newY);
   };
 
   const handleNextTurn = () => {
@@ -138,6 +143,7 @@ export function App() {
     }
     setCurrentTurnIndex(nextIndex);
     setSelectedTokenId(tokens[nextIndex].id);
+    globalSpatialAudio.setListenerPosition(tokens[nextIndex].x, tokens[nextIndex].y);
     addSystemMessage(`Turn passed to ${tokens[nextIndex].name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
   };
 
@@ -219,7 +225,8 @@ export function App() {
       )
     );
 
-    // Trigger Particle Shockwave & 3D Dice
+    // 3D Positional Audio + Particle Shockwave + 3D Dice
+    globalSpatialAudio.playSpatialImpact(target.x, target.y);
     if (particleFXRef.current) {
       particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
@@ -263,7 +270,8 @@ export function App() {
       )
     );
 
-    // Trigger Spell Particle Shockwave & 3D Dice
+    // 3D Positional Audio + Spell Particle Shockwave + 3D Dice
+    globalSpatialAudio.playSpatialSpell(target.x, target.y);
     if (particleFXRef.current) {
       particleFXRef.current.spawnFireballShockwave((target.x + 0.5) * 60, (target.y + 0.5) * 60, 220);
     }
@@ -302,6 +310,10 @@ export function App() {
     const roll = Math.floor(Math.random() * 20) + 1;
     const total = roll + modifier;
     const passed = total >= dc;
+
+    if (selectedToken) {
+      globalSpatialAudio.playSpatialDice(selectedToken.x, selectedToken.y);
+    }
 
     if (diceBoxRef.current && selectedToken) {
       diceBoxRef.current.rollDice('d20', roll, (selectedToken.x + 0.5) * 60, (selectedToken.y + 0.5) * 60);
@@ -466,6 +478,7 @@ export function App() {
         currentView={currentView}
         onSelectView={setCurrentView}
         onOpenSafety={() => setIsSafetyOpen(true)}
+        onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         latencyMs={latencyMs}
         campaignName="The Fall of Baron Vane"
       />
@@ -554,6 +567,14 @@ export function App() {
           <AnalyticsView />
         )}
       </div>
+
+      {/* 3D Spatial Audio & Radar Modal */}
+      <AudioMixerModal
+        isOpen={isAudioMixerOpen}
+        onClose={() => setIsAudioMixerOpen(false)}
+        tokens={tokens}
+        selectedTokenId={selectedTokenId}
+      />
 
       {/* Hardware Safety X-Card Modal */}
       <SafetyModal
