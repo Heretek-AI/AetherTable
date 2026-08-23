@@ -8,7 +8,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use vtt_core::{
-    ActionResolver, DamageType, DiceEngine, GameSession, RulesEvaluator,
+    Ability, ActionResolver, Condition, DamageType, DeathSaveState, DiceEngine, GameSession,
+    RulesEvaluator,
 };
 use vtt_crdt_sync::CrdtRelayHub;
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
@@ -189,6 +190,8 @@ pub struct CheckActionReq {
     pub modifier: i32,
     pub dc: i32,
     pub cost_margin: i32,
+    pub advantage: Option<bool>,
+    pub disadvantage: Option<bool>,
 }
 
 async fn resolve_check(
@@ -197,9 +200,150 @@ async fn resolve_check(
 ) -> impl Responder {
     data.total_action_requests.fetch_add(1, Ordering::Relaxed);
     let mut dice = DiceEngine::new();
-    let res = ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
+    // Honor advantage/disadvantage by pre-selecting the kept d20
+    // (tuples are (used_roll, r1, r2)) before 4-tier resolution.
+    let kept_roll = if req.disadvantage.unwrap_or(false) {
+        Some(dice.roll_d20_disadvantage().0)
+    } else if req.advantage.unwrap_or(false) {
+        Some(dice.roll_d20_advantage().0)
+    } else {
+        None
+    };
+    let res = if let Some(natural_roll) = kept_roll {
+        let total = natural_roll + req.modifier;
+        let outcome = if natural_roll == 20 || total >= req.dc + 10 {
+            "CRITICAL_SUCCESS"
+        } else if natural_roll == 1 || total < (req.dc - 5) {
+            "CRITICAL_FAILURE"
+        } else if total >= req.dc {
+            "SUCCESS"
+        } else if total >= req.dc - req.cost_margin {
+            "SUCCESS_AT_A_COST"
+        } else {
+            "CRITICAL_FAILURE"
+        };
+        serde_json::json!({
+            "roll": natural_roll,
+            "modifier": req.modifier,
+            "total": total,
+            "dc": req.dc,
+            "outcome": outcome,
+        })
+    } else {
+        let res = ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
+        serde_json::json!(res)
+    };
     data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
     HttpResponse::Ok().json(res)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveActionReq {
+    pub save_modifier: i32,
+    pub dc: i32,
+    pub ability: Option<Ability>,
+    pub advantage: Option<bool>,
+    pub disadvantage: Option<bool>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+}
+
+async fn resolve_save(
+    data: web::Data<AppState>,
+    req: web::Json<SaveActionReq>,
+) -> impl Responder {
+    data.total_action_requests.fetch_add(1, Ordering::Relaxed);
+    let mut dice = DiceEngine::new();
+    // Advantage tuples are (used_roll, r1, r2).
+    let natural_roll = if req.disadvantage.unwrap_or(false) {
+        dice.roll_d20_disadvantage().0
+    } else if req.advantage.unwrap_or(false) {
+        dice.roll_d20_advantage().0
+    } else {
+        dice.roll_d20()
+    };
+
+    let (passed, total) = ActionResolver::resolve_saving_throw(
+        natural_roll,
+        req.save_modifier,
+        req.dc,
+        &req.conditions,
+        req.ability.unwrap_or(Ability::Strength),
+    );
+    data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "ability": req.ability.unwrap_or(Ability::Strength),
+        "natural_roll": natural_roll,
+        "save_modifier": req.save_modifier,
+        "total": total,
+        "dc": req.dc,
+        "passed": passed,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConcentrationActionReq {
+    pub con_modifier: i32,
+    pub damage_taken: i32,
+}
+
+async fn resolve_concentration(
+    data: web::Data<AppState>,
+    req: web::Json<ConcentrationActionReq>,
+) -> impl Responder {
+    data.total_action_requests.fetch_add(1, Ordering::Relaxed);
+    let mut dice = DiceEngine::new();
+    let natural_roll = dice.roll_d20();
+    let (passed, total, dc) =
+        ActionResolver::resolve_concentration_check(natural_roll, req.con_modifier, req.damage_taken);
+    data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "natural_roll": natural_roll,
+        "con_modifier": req.con_modifier,
+        "total": total,
+        "dc": dc,
+        "damage_taken": req.damage_taken,
+        "passed": passed,
+        "concentration_maintained": passed,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeathSaveActionReq {
+    pub successes: u8,
+    pub failures: u8,
+    pub is_stabilized: Option<bool>,
+    pub is_dead: Option<bool>,
+    pub natural_roll: Option<i32>,
+}
+
+async fn resolve_death_save(
+    data: web::Data<AppState>,
+    req: web::Json<DeathSaveActionReq>,
+) -> impl Responder {
+    data.total_action_requests.fetch_add(1, Ordering::Relaxed);
+    let mut dice = DiceEngine::new();
+    let natural_roll = req.natural_roll.unwrap_or_else(|| dice.roll_d20());
+
+    let mut state = DeathSaveState {
+        successes: req.successes,
+        failures: req.failures,
+        is_stabilized: req.is_stabilized.unwrap_or(false),
+        is_dead: req.is_dead.unwrap_or(false),
+    };
+    let outcome = ActionResolver::resolve_death_save(&mut state, natural_roll);
+    data.valid_action_executions.fetch_add(1, Ordering::Relaxed);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "outcome": outcome,
+        "natural_roll": natural_roll,
+        "successes": state.successes,
+        "failures": state.failures,
+        "is_stabilized": state.is_stabilized,
+        "is_dead": state.is_dead,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +528,9 @@ async fn main() -> std::io::Result<()> {
                     .route("/sessions/{id}/action/attack", web::post().to(resolve_attack))
                     .route("/sessions/{id}/safety/x-card", web::post().to(trigger_safety_rewind))
                     .route("/actions/check", web::post().to(resolve_check))
+                    .route("/actions/save", web::post().to(resolve_save))
+                    .route("/actions/concentration", web::post().to(resolve_concentration))
+                    .route("/actions/death-save", web::post().to(resolve_death_save))
                     .route("/spatial/los", web::post().to(compute_los))
                     .route("/spatial/path", web::post().to(compute_path))
                     .route("/maps/generate", web::post().to(generate_wfc_map))

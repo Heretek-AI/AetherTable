@@ -9,6 +9,8 @@ from typing import Dict, Any, List, Optional
 
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
+from .routing import engine_client
+from .routing.engine_client import EngineUnavailableError
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
@@ -297,6 +299,125 @@ def get_compendium_glossary(
         "total": len(results),
         "glossary": results[:limit]
     }
+
+
+# --- Authoritative Rules Engine Proxy (/api/v1/engine/*) -------------------
+# The browser talks only to this orchestrator; all dice math resolves in the
+# Rust vtt-core engine via vtt-server (see routing/engine_client.py).
+
+class EngineSessionRequest(BaseModel):
+    campaign_id: str = "aethertable-default"
+    session_name: str = "Live Tabletop Session"
+
+
+class EngineAttackRequest(BaseModel):
+    session_id: str
+    attacker_id: str
+    target_id: str
+    attack_bonus: int
+    target_ac: int
+    damage_expression: str = "1d8+3"
+    damage_type: str = "slashing"
+    advantage: bool = False
+    disadvantage: bool = False
+
+
+class EngineCheckRequest(BaseModel):
+    modifier: int
+    dc: int
+    cost_margin: int = 3
+
+
+class EngineSaveRequest(BaseModel):
+    save_modifier: int
+    dc: int
+    ability: Optional[str] = None
+    advantage: bool = False
+    disadvantage: bool = False
+    conditions: List[str] = Field(default_factory=list)
+
+
+class EngineConcentrationRequest(BaseModel):
+    con_modifier: int
+    damage_taken: int
+
+
+class EngineDeathSaveRequest(BaseModel):
+    successes: int = 0
+    failures: int = 0
+    is_stabilized: bool = False
+    is_dead: bool = False
+    natural_roll: Optional[int] = None
+
+
+class EngineMapGenerateRequest(BaseModel):
+    width: int = Field(16, ge=4, le=64)
+    height: int = Field(12, ge=4, le=64)
+    seed: Optional[int] = None
+    theme: str = "dungeon"
+
+
+async def _engine_call(coro) -> Any:
+    try:
+        return await coro
+    except EngineUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/v1/engine/session")
+async def engine_create_session(req: EngineSessionRequest):
+    return await _engine_call(engine_client.create_session(req.campaign_id, req.session_name))
+
+
+@app.post("/api/v1/engine/attack")
+async def engine_resolve_attack(req: EngineAttackRequest):
+    action = req.model_dump(exclude={"session_id"})
+    # The engine's AttackActionReq types attacker/target as UUIDs and
+    # DamageType deserializes snake_case ("fire", "piercing", ...).
+    action["attacker_id"] = engine_client._coerce_uuid(action["attacker_id"])
+    action["target_id"] = engine_client._coerce_uuid(action["target_id"])
+    action["damage_type"] = action["damage_type"].lower()
+    return await _engine_call(engine_client.resolve_attack(req.session_id, action))
+
+
+@app.post("/api/v1/engine/check")
+async def engine_resolve_check(req: EngineCheckRequest):
+    return await _engine_call(engine_client.resolve_check(req.model_dump()))
+
+
+@app.post("/api/v1/engine/save")
+async def engine_resolve_save(req: EngineSaveRequest):
+    payload = req.model_dump()
+    if payload["ability"]:
+        # Engine Ability enum expects SCREAMING_SNAKE_CASE ("DEXTERITY").
+        payload["ability"] = payload["ability"].upper()
+    return await _engine_call(engine_client.resolve_save(payload))
+
+
+@app.post("/api/v1/engine/concentration")
+async def engine_resolve_concentration(req: EngineConcentrationRequest):
+    return await _engine_call(engine_client.resolve_concentration(req.model_dump()))
+
+
+@app.post("/api/v1/engine/death-save")
+async def engine_resolve_death_save(req: EngineDeathSaveRequest):
+    return await _engine_call(engine_client.resolve_death_save(req.model_dump()))
+
+
+@app.post("/api/v1/engine/map/generate")
+async def engine_generate_map(req: EngineMapGenerateRequest):
+    # Translate to the engine's RoomDescriptor contract
+    # ({room_id, x, y, width, height, theme}); tiles come back as a
+    # Vec<Vec<u8>> grid (0 floor, 1 wall, 2 door, 3 altar, 4 chest).
+    room_desc = {
+        "room_id": 1,
+        "x": 0,
+        "y": 0,
+        "width": req.width,
+        "height": req.height,
+        "theme": req.theme,
+    }
+    return await _engine_call(engine_client.generate_map({"room_desc": room_desc, "seed": req.seed}))
 
 
 @app.post("/api/v1/character/export-pdf")

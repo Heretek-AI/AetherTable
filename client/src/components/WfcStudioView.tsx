@@ -37,37 +37,26 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
     const newSeed = Math.floor(Math.random() * 999999);
     setSeed(newSeed);
 
-    // Call Rust WFC Engine REST endpoint if available or simulate procedural synthesis
+    // Call the Rust WFC engine (via orchestrator proxy) or fall back to local synthesis
     try {
-      const resp = await fetch('/api/v1/maps/generate', {
+      const resp = await fetch('/api/v1/engine/map/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          room_desc: {
-            width: gridWidth,
-            height: gridHeight,
-            door_count: 2,
-            min_open_ratio: 0.65,
-            theme_sockets: ['floor', 'wall_north', 'wall_south', 'wall_east', 'wall_west'],
-          },
+          width: gridWidth,
+          height: gridHeight,
           seed: newSeed,
+          theme: 'dungeon',
         }),
       });
 
       if (resp.ok) {
         const data = await resp.json();
-        if (data.tiles && Array.isArray(data.tiles)) {
-          // Convert tiles array to 2D matrix
-          const matrix: number[][] = [];
-          for (let y = 0; y < gridHeight; y++) {
-            const row: number[] = [];
-            for (let x = 0; x < gridWidth; x++) {
-              const tile = data.tiles[y * gridWidth + x];
-              row.push(tile && tile.is_solid ? 1 : 0);
-            }
-            matrix.push(row);
-          }
-          setGeneratedGrid(matrix);
+        // Engine returns a Vec<Vec<u8>> grid: 0 floor, 1 wall, 2 door.
+        if (Array.isArray(data.tiles) && Array.isArray(data.tiles[0])) {
+          setGeneratedGrid(
+            data.tiles.map((row: number[]) => row.map((cell: number) => (cell === 1 ? 1 : 0)))
+          );
         }
       } else {
         generateLocalFallback(newSeed);

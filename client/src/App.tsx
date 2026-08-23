@@ -36,6 +36,7 @@ import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
+import { engineAttack, engineCheck, localD20, formulaModifier } from './api/rules_engine';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
@@ -269,14 +270,30 @@ export function App() {
     }
   };
 
-  const handleExecuteAttack = (actionName: string, damageFormula: string, damageType: string) => {
+  const handleExecuteAttack = async (actionName: string, damageFormula: string, damageType: string) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
-    const dmg = Math.floor(Math.random() * 12) + 4;
-    setTokens((prev) =>
-      prev.map((t) =>
-        t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
-      )
-    );
+
+    // Authoritative resolution via the Rust rules engine; local dice fallback offline.
+    const result = await engineAttack({
+      attackerId: selectedToken?.id || 'thorin',
+      targetId: target.id,
+      attackBonus: 7,
+      targetAc: 15,
+      damageExpression: damageFormula,
+      damageType,
+    });
+    const isHit = result?.is_hit ?? true;
+    const isCritical = result?.is_critical_hit ?? false;
+    const naturalRoll = result?.natural_roll ?? localD20();
+    const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 12) + 4 : 0;
+
+    if (isHit && dmg > 0) {
+      setTokens((prev) =>
+        prev.map((t) =>
+          t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
+        )
+      );
+    }
 
     // 3D Positional Audio + Particle Shockwave + 3D Dice
     globalSpatialAudio.playSpatialImpact(target.x, target.y);
@@ -284,7 +301,7 @@ export function App() {
       particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
     if (diceBoxRef.current) {
-      diceBoxRef.current.rollDice('d20', 20, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
+      diceBoxRef.current.rollDice('d20', naturalRoll, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
 
     const dmMsgId = `dm_${Date.now() + 1}`;
@@ -296,6 +313,11 @@ export function App() {
         role: 'player',
         content: `I swing with my ${actionName} (${damageFormula} ${damageType})!`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        diceRollDetails: {
+          total: naturalRoll + 7,
+          expression: `1d20 + 7`,
+          rolls: [naturalRoll],
+        },
       },
       {
         id: dmMsgId,
@@ -309,19 +331,34 @@ export function App() {
 
     streamNarrativeResponse(
       `I attack ${target.name} with ${actionName}`,
-      { action_name: actionName, is_hit: true, total_damage: dmg, is_critical: true },
+      { action_name: actionName, is_hit: isHit, total_damage: dmg, is_critical: isCritical },
       dmMsgId
     );
   };
 
-  const handleCastSpell = (spellId: string, spellName: string, level: number) => {
+  const handleCastSpell = async (spellId: string, spellName: string, level: number) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
-    const dmg = Math.floor(Math.random() * 24) + 12;
-    setTokens((prev) =>
-      prev.map((t) =>
-        t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
-      )
-    );
+    // Approximate spell damage as a scaling fireball-style burst resolved by the engine.
+    const spellDamageExpression = `${Math.max(1, 2 * level - 1)}d6`;
+    const result = await engineAttack({
+      attackerId: selectedToken?.id || 'lyra',
+      targetId: target.id,
+      attackBonus: 8,
+      targetAc: 15,
+      damageExpression: spellDamageExpression,
+      damageType: 'fire',
+    });
+    const isHit = result?.is_hit ?? true;
+    const naturalRoll = result?.natural_roll ?? localD20();
+    const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 24) + 12 : 0;
+
+    if (isHit && dmg > 0) {
+      setTokens((prev) =>
+        prev.map((t) =>
+          t.id === target.id ? { ...t, hp: Math.max(0, t.hp - dmg) } : t
+        )
+      );
+    }
 
     // 3D Positional Audio + Spell Particle Shockwave + 3D Dice
     globalSpatialAudio.playSpatialSpell(target.x, target.y);
@@ -329,7 +366,7 @@ export function App() {
       particleFXRef.current.spawnFireballShockwave((target.x + 0.5) * 60, (target.y + 0.5) * 60, 220);
     }
     if (diceBoxRef.current) {
-      diceBoxRef.current.rollDice('d20', 18, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
+      diceBoxRef.current.rollDice('d20', naturalRoll, (target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
 
     const dmMsgId = `dm_${Date.now() + 1}`;
@@ -341,6 +378,11 @@ export function App() {
         role: 'player',
         content: `I invoke the arcane weave and unleash ${spellName} (Level ${level})!`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        diceRollDetails: {
+          total: naturalRoll + 8,
+          expression: `1d20 + 8`,
+          rolls: [naturalRoll],
+        },
       },
       {
         id: dmMsgId,
@@ -354,15 +396,17 @@ export function App() {
 
     streamNarrativeResponse(
       `I cast ${spellName} on ${target.name}`,
-      { action_name: spellName, is_hit: true, total_damage: dmg },
+      { action_name: spellName, is_hit: isHit, total_damage: dmg },
       dmMsgId
     );
   };
 
-  const handleRollCheck = (skillName: string, modifier: number, dc: number) => {
-    const roll = Math.floor(Math.random() * 20) + 1;
-    const total = roll + modifier;
-    const passed = total >= dc;
+  const handleRollCheck = async (skillName: string, modifier: number, dc: number) => {
+    // Authoritative d20 resolution via the rules engine (local fallback offline).
+    const result = await engineCheck({ modifier, dc });
+    const roll = result?.roll ?? localD20();
+    const total = result?.total ?? roll + modifier;
+    const passed = result ? ['SUCCESS', 'CRITICAL_SUCCESS', 'SUCCESS_AT_A_COST'].includes(result.outcome) : total >= dc;
 
     if (selectedToken) {
       globalSpatialAudio.playSpatialDice(selectedToken.x, selectedToken.y);
@@ -569,18 +613,21 @@ export function App() {
     addSystemMessage(`Applied procedural WFC dungeon layout (${width}x${height} tiles) to active session.`);
   };
 
-  const handleMacroRoll = (
+  const handleMacroRoll = async (
     macroName: string,
     formula: string,
     isWhisper: boolean,
     advDis: 'normal' | 'advantage' | 'disadvantage'
   ) => {
-    const d20Roll =
-      advDis === 'advantage'
-        ? Math.max(Math.floor(Math.random() * 20) + 1, Math.floor(Math.random() * 20) + 1)
-        : advDis === 'disadvantage'
-        ? Math.min(Math.floor(Math.random() * 20) + 1, Math.floor(Math.random() * 20) + 1)
-        : Math.floor(Math.random() * 20) + 1;
+    // Resolve the macro's d20 through the engine, honoring advantage state.
+    const result = await engineCheck({
+      modifier: formulaModifier(formula),
+      dc: 10,
+      advantage: advDis === 'advantage',
+      disadvantage: advDis === 'disadvantage',
+    });
+    const d20Roll = result?.roll ?? localD20();
+    const macroTotal = result?.total ?? d20Roll + formulaModifier(formula);
 
     if (diceBoxRef.current) {
       diceBoxRef.current.rollDice('d20', d20Roll, 400, 300);
@@ -596,7 +643,7 @@ export function App() {
         id: `macro_${Date.now()}`,
         sender: selectedToken?.name || 'Thorin',
         role: 'player',
-        content: `🎲 ${isWhisper ? '[WHISPER TO GM] ' : ''}Triggered Macro: ${macroName} (${formula}) [${advDis.toUpperCase()}] -> Result: ${d20Roll + 4}`,
+        content: `🎲 ${isWhisper ? '[WHISPER TO GM] ' : ''}Triggered Macro: ${macroName} (${formula}) [${advDis.toUpperCase()}] -> Result: ${macroTotal}`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
       {
@@ -610,8 +657,8 @@ export function App() {
     ]);
 
     streamNarrativeResponse(
-      `I execute ${macroName} with result ${d20Roll + 4}`,
-      { action_name: macroName, is_hit: true, total_damage: d20Roll + 4 },
+      `I execute ${macroName} with result ${macroTotal}`,
+      { action_name: macroName, is_hit: true, total_damage: macroTotal },
       dmMsgId
     );
   };

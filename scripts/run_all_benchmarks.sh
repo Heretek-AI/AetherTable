@@ -39,5 +39,5 @@ print(f"Benchmark Status: {status}")
 
 echo ""
 echo "================================================================="
-echo "  ALL PHASES 1-7 BENCHMARKS SUCCESSFULLY EXECUTED!"
+echo "  ALL BENCHMARKS PASSED (cargo tests, pytest, synthetic playtest)"
 echo "================================================================="
