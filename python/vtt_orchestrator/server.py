@@ -16,6 +16,7 @@ from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
 from .routing.engine_client import EngineUnavailableError
+from .storage import MemoryStore, PostgresStore, init_storage, public_user
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
@@ -214,15 +215,20 @@ def health_check():
     }
 
 
-# --- Identity & Sessions (/api/v1/auth/*) -----------------------------------
-# In-memory credential store with salted SHA-256 password hashes and
-# HMAC-signed session tokens (AUTH_SECRET env; swap for the Postgres
-# narrative_state schema when persistence lands in a later wave).
+# --- Identity, Sessions & Campaign Persistence (/api/v1/auth, /campaign) ----
+# Dual-mode storage: Postgres (asyncpg) when DATABASE_URL is reachable,
+# in-memory fallback otherwise. HMAC-signed session tokens (AUTH_SECRET env).
 
 AUTH_SECRET = os.environ.get("AUTH_SECRET", "aethertable-dev-secret")
 TOKEN_TTL_SECONDS = 12 * 3600
 
-user_registry: Dict[str, Dict[str, Any]] = {}  # email.lower() -> user record
+storage_backend: Any = MemoryStore()
+
+
+@app.on_event("startup")
+async def _init_storage_backend():
+    global storage_backend
+    storage_backend = await init_storage()
 
 
 class AuthSignupRequest(BaseModel):
@@ -236,10 +242,6 @@ class AuthSignupRequest(BaseModel):
 class AuthLoginRequest(BaseModel):
     email: str
     password: str
-
-
-def _hash_password(password: str, salt: bytes) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000).hex()
 
 
 def _sign_token(payload: Dict[str, Any]) -> str:
@@ -263,69 +265,108 @@ def _verify_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _auth_response(record: Dict[str, Any]) -> Dict[str, Any]:
+def _require_user_id(token: str) -> str:
+    payload = _verify_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return payload["user_id"]
+
+
+def _auth_response(profile: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
-    token = _sign_token({"user_id": record["id"], "exp": now + TOKEN_TTL_SECONDS})
-    profile = {k: v for k, v in record.items() if k not in ("salt", "password_hash")}
+    token = _sign_token({"user_id": profile["id"], "exp": now + TOKEN_TTL_SECONDS})
     return {"token": token, "expires_in": TOKEN_TTL_SECONDS, "user": profile}
 
 
 @app.post("/api/v1/auth/signup")
-def auth_signup(req: AuthSignupRequest):
+async def auth_signup(req: AuthSignupRequest):
     key = req.email.strip().lower()
     if not key or "@" not in key or len(req.password) < 4:
         raise HTTPException(status_code=400, detail="Valid email and password (4+ chars) required")
-    if key in user_registry:
+    if await storage_backend.get_user_by_email(key) is not None:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
-    salt = secrets.token_bytes(16)
-    record = {
-        "id": f"usr_{secrets.token_hex(6)}",
-        "email": key,
-        "username": req.username or key.split("@")[0],
-        "displayName": req.display_name or req.username or key.split("@")[0],
-        "role": req.role if req.role in ("gm", "player", "spectator", "admin") else "player",
-        "salt": salt,
-        "password_hash": _hash_password(req.password, salt),
-        "assignedTokenIds": [],
-        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    user_registry[key] = record
-    return _auth_response(record)
+    record = await storage_backend.create_user(
+        email=key,
+        username=req.username or key.split("@")[0],
+        display_name=req.display_name or req.username or key.split("@")[0],
+        role=req.role if req.role in ("gm", "player", "spectator", "admin") else "player",
+        password=req.password,
+        assigned_token_ids=[],
+    )
+    return _auth_response(public_user(record))
 
 
 @app.post("/api/v1/auth/login")
-def auth_login(req: AuthLoginRequest):
+async def auth_login(req: AuthLoginRequest):
     key = req.email.strip().lower()
-    record = user_registry.get(key)
+    record = await storage_backend.get_user_by_email(key)
     # Seed default GM account on first use so the demo flow works out of the box.
-    if key == "gm@aethertable.io" and record is None and req.password == "dragonlance":
-        salt = secrets.token_bytes(16)
-        record = {
-            "id": "usr_gm_001",
-            "email": key,
-            "username": "gm",
-            "displayName": "Lead GM",
-            "role": "gm",
-            "salt": salt,
-            "password_hash": _hash_password(req.password, salt),
-            "assignedTokenIds": ["*"],
-            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        user_registry[key] = record
-    if record is None or _hash_password(req.password, record["salt"]) != record["password_hash"]:
+    if record is None and key == "gm@aethertable.io" and req.password == "dragonlance":
+        record = await storage_backend.create_user(
+            email=key,
+            username="gm",
+            display_name="Lead GM",
+            role="gm",
+            password=req.password,
+            assigned_token_ids=["*"],
+        )
+    if record is None or not storage_backend.verify_password(record, req.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    return _auth_response(record)
+    return _auth_response(public_user(record))
 
 
 @app.get("/api/v1/auth/session")
-def auth_session(token: str = Query(...)):
-    payload = _verify_token(token)
-    if payload is None:
-        raise HTTPException(status_code=401, detail="Session expired or invalid")
-    for record in user_registry.values():
-        if record["id"] == payload["user_id"]:
-            return {"valid": True, "user": {k: v for k, v in record.items() if k not in ("salt", "password_hash")}}
-    raise HTTPException(status_code=401, detail="User no longer exists")
+async def auth_session(token: str = Query(...)):
+    user_id = _require_user_id(token)
+    record = await storage_backend.get_user_by_id(user_id)
+    if record is None:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return {"valid": True, "user": public_user(record)}
+
+
+class CampaignSaveRequest(BaseModel):
+    token: str
+    name: str = "Campaign Autosave"
+    snapshot: Dict[str, Any]
+    round_number: int = 1
+
+
+def _owner_or_401(token: str) -> str:
+    return _require_user_id(token)
+
+
+@app.post("/api/v1/campaign/save")
+async def campaign_save(req: CampaignSaveRequest):
+    owner = _owner_or_401(req.token)
+    meta = await storage_backend.upsert_campaign_save(
+        owner, req.name.strip() or "Campaign Autosave", req.snapshot, req.round_number
+    )
+    return {"status": "saved", **meta}
+
+
+@app.get("/api/v1/campaign/saves")
+async def campaign_saves(token: str = Query(...)):
+    owner = _owner_or_401(token)
+    saves = await storage_backend.list_campaign_saves(owner)
+    return {"total": len(saves), "saves": saves}
+
+
+@app.get("/api/v1/campaign/save/{save_id}")
+async def campaign_load(save_id: str, token: str = Query(...)):
+    owner = _owner_or_401(token)
+    record = await storage_backend.get_campaign_save(owner, save_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Save not found")
+    return record
+
+
+@app.delete("/api/v1/campaign/save/{save_id}")
+async def campaign_delete(save_id: str, token: str = Query(...)):
+    owner = _owner_or_401(token)
+    deleted = await storage_backend.delete_campaign_save(owner, save_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Save not found")
+    return {"status": "deleted"}
 
 
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)

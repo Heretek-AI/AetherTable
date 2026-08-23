@@ -11,7 +11,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./database/postgres:/docker-entrypoint-initdb.d:ro
+      - ./database/postgres:/docker-entrypoint-initdb.d:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vtt_admin -d vtt_campaign_db"]
       interval: 5s

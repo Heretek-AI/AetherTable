@@ -38,6 +38,8 @@ import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
+import { CampaignSaveModal } from './components/CampaignSaveModal';
+import type { CampaignSnapshot } from './api/campaign_store';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
@@ -50,6 +52,7 @@ export function App() {
   const [isMapEditorOpen, setIsMapEditorOpen] = useState(false);
   const [isHandoutsOpen, setIsHandoutsOpen] = useState(false);
   const [isQuestJournalOpen, setIsQuestJournalOpen] = useState(false);
+  const [isCampaignSavesOpen, setIsCampaignSavesOpen] = useState(false);
   const [isVideoMeshVisible, setIsVideoMeshVisible] = useState(true);
   const [isStreamerHUDOpen, setIsStreamerHUDOpen] = useState(false);
   const [activeMapLayer, setActiveMapLayer] = useState<MapLayerType>('tokens');
@@ -497,6 +500,25 @@ export function App() {
     );
   };
 
+  const getCampaignSnapshot = (): CampaignSnapshot => ({
+    tokens,
+    customWalls,
+    messages,
+    roundNumber,
+    currentTurnIndex,
+    spotlightWeights,
+  });
+
+  const applyCampaignSnapshot = (snapshot: CampaignSnapshot) => {
+    setTokens(snapshot.tokens as Token[]);
+    setCustomWalls(snapshot.customWalls || []);
+    setMessages(snapshot.messages as ChatMessage[]);
+    setRoundNumber(snapshot.roundNumber ?? 1);
+    setCurrentTurnIndex(snapshot.currentTurnIndex ?? 0);
+    setSpotlightWeights((snapshot.spotlightWeights ?? { Thorin: 0.55, Lyra: 0.45 }) as { Thorin: number; Lyra: number });
+    addSystemMessage('Campaign state restored from database save.');
+  };
+
   const handleSafetyRewind = async (topic: string) => {
     addSystemMessage(`SAFETY CARD TRIGGERED: Topic '${topic}' flagged. Scene state rewound 1 turn.`);
     // Apply the rewind against the authoritative engine ledger when online.
@@ -734,6 +756,7 @@ export function App() {
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         onOpenJukebox={() => setIsJukeboxOpen(true)}
+                onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
         onOpenMapEditor={() => setIsMapEditorOpen(true)}
         onOpenHandouts={() => setIsHandoutsOpen(true)}
@@ -919,6 +942,14 @@ export function App() {
         isOpen={isQuestJournalOpen}
         onClose={() => setIsQuestJournalOpen(false)}
         onShareToChat={(text) => addSystemMessage(text)}
+      />
+
+      {/* Campaign Save / Load Modal (Postgres-backed) */}
+      <CampaignSaveModal
+        isOpen={isCampaignSavesOpen}
+        onClose={() => setIsCampaignSavesOpen(false)}
+        getSnapshot={getCampaignSnapshot}
+        onLoadSnapshot={applyCampaignSnapshot}
       />
 
       {/* Streamer Broadcast HUD Modal */}

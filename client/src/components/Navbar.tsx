@@ -33,6 +33,7 @@ import {
   Wand2,
   Tv,
   Zap,
+  Save,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { User, DEMO_ACCOUNTS } from '../types/auth';
@@ -49,6 +50,7 @@ interface NavbarProps {
   onOpenMapEditor?: () => void;
   onOpenHandouts?: () => void;
   onOpenQuestJournal?: () => void;
+  onOpenCampaignSaves?: () => void;
   onToggleVideoMesh?: () => void;
   onOpenStreamerHUD?: () => void;
   onOpenSubscription?: () => void;
@@ -70,6 +72,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenMapEditor,
   onOpenHandouts,
   onOpenQuestJournal,
+  onOpenCampaignSaves,
   onToggleVideoMesh,
   onOpenStreamerHUD,
   onOpenSubscription,
@@ -428,6 +431,22 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {activeDropdown === 'tools' && (
             <div className="absolute right-0 top-11 w-60 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1 font-mono text-xs">
+              {onOpenCampaignSaves && (
+                <button
+                  onClick={() => {
+                    onOpenCampaignSaves();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Save className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Campaign Saves</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Persist & resume sessions</div>
+                  </div>
+                </button>
+              )}
+
               {onOpenJukebox && (
                 <button
                   onClick={() => {
