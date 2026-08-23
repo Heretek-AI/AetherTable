@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   Swords, 
   BookOpen, 
@@ -29,7 +29,10 @@ import {
   Music,
   Search,
   Command,
-  Video
+  Video,
+  Wand2,
+  Tv,
+  Zap,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { User, DEMO_ACCOUNTS } from '../types/auth';
@@ -75,6 +78,21 @@ export const Navbar: React.FC<NavbarProps> = ({
 }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+  const [activeDropdown, setActiveDropdown] = useState<'compendium' | 'characters' | 'gm_studio' | 'tools' | null>(null);
+
+  const navRef = useRef<HTMLDivElement | null>(null);
+
+  // Close dropdowns on click outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (navRef.current && !navRef.current.contains(e.target as Node)) {
+        setActiveDropdown(null);
+        setIsUserMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const toggleMute = () => {
     const next = !isMuted;
@@ -82,35 +100,27 @@ export const Navbar: React.FC<NavbarProps> = ({
     globalAudio.isMuted = next;
   };
 
-  const navItems: { id: SaaSView; label: string; icon: React.ReactNode; requiresAdmin?: boolean }[] = [
-    { id: 'tabletop', label: 'Tactical Tabletop', icon: <Swords className="w-4 h-4" /> },
-    { id: 'compendium', label: 'Compendium Codex', icon: <BookOpen className="w-4 h-4" /> },
-    { id: 'builder', label: 'Character Studio', icon: <UserCheck className="w-4 h-4" /> },
-    { id: 'encounters', label: 'Encounter Builder', icon: <Flame className="w-4 h-4 text-orange-400" /> },
-    { id: 'marketplace', label: 'Marketplace', icon: <ShoppingBag className="w-4 h-4 text-emerald-400" /> },
-    { id: 'lobby', label: 'Campaign Lobby', icon: <Users className="w-4 h-4" /> },
-    { id: 'dynasty', label: 'Dynasty & Factions', icon: <Crown className="w-4 h-4" /> },
-    { id: 'bundles', label: 'Campaign Bundles', icon: <Package className="w-4 h-4" /> },
-    { id: 'quests', label: 'Quest & Dialogue', icon: <Scroll className="w-4 h-4" /> },
-    { id: 'wfc', label: 'WFC Dungeon Studio', icon: <Layers className="w-4 h-4" /> },
-    { id: 'analytics', label: 'SLA Telemetry', icon: <LineChart className="w-4 h-4" /> },
-    { id: 'admin', label: 'Admin Console', icon: <ShieldAlert className="w-4 h-4 text-rose-400" />, requiresAdmin: true },
-  ];
+  const handleNavClick = (view: SaaSView) => {
+    onSelectView(view);
+    setActiveDropdown(null);
+    globalAudio.playTurnAdvance();
+  };
 
-  const visibleNavItems = navItems.filter(
-    (item) => !item.requiresAdmin || (currentUser && currentUser.role === 'admin')
-  );
+  const toggleDropdown = (name: 'compendium' | 'characters' | 'gm_studio' | 'tools') => {
+    setActiveDropdown((prev) => (prev === name ? null : name));
+    globalAudio.playTurnAdvance();
+  };
 
   return (
-    <header className="h-14 border-b border-slate-800 bg-slate-950/95 backdrop-blur-md px-4 flex items-center justify-between z-30 shrink-0 select-none shadow-md">
-      {/* Brand & Campaign Meta */}
+    <header ref={navRef} className="h-14 border-b border-slate-800 bg-slate-950/95 backdrop-blur-md px-4 flex items-center justify-between z-30 shrink-0 select-none shadow-md">
+      {/* Brand & Global Search */}
       <div className="flex items-center gap-3">
         <button
-          onClick={() => onSelectView('landing')}
-          className="flex items-center gap-2 hover:opacity-90 transition cursor-pointer text-left"
+          onClick={() => handleNavClick('landing')}
+          className="flex items-center gap-2 hover:opacity-90 transition cursor-pointer text-left group"
           title="Return to SaaS Landing Page"
         >
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shadow-lg shadow-amber-950/50">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shadow-lg shadow-amber-950/50 group-hover:scale-105 transition-transform">
             <Sparkles className="w-4 h-4 text-white" />
           </div>
           <div className="flex flex-col">
@@ -119,7 +129,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 AetherTable
               </span>
               <span className="text-[9px] uppercase font-mono px-1.5 py-0.2 rounded bg-amber-950 text-amber-300 border border-amber-600/50 font-bold">
-                AI SaaS
+                SaaS
               </span>
             </div>
             <span className="text-[10px] text-slate-400 font-mono mt-0.5 truncate max-w-[130px]">
@@ -132,11 +142,11 @@ export const Navbar: React.FC<NavbarProps> = ({
         {onOpenCommandPalette && (
           <button
             onClick={onOpenCommandPalette}
-            className="hidden lg:flex items-center space-x-2 px-2.5 py-1 bg-slate-900/90 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 text-slate-400 hover:text-slate-200 rounded-lg text-xs font-mono transition shadow-inner cursor-pointer"
+            className="hidden md:flex items-center space-x-2 px-2.5 py-1 bg-slate-900/90 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 text-slate-400 hover:text-slate-200 rounded-lg text-xs font-mono transition shadow-inner cursor-pointer"
             title="Open Universal Search Palette (Cmd+K)"
           >
             <Search className="w-3.5 h-3.5 text-amber-400" />
-            <span>Search Compendium...</span>
+            <span className="hidden xl:inline">Search...</span>
             <span className="text-[9px] px-1 py-0.2 bg-slate-950 border border-slate-700 text-slate-400 rounded">
               ⌘K
             </span>
@@ -144,88 +154,342 @@ export const Navbar: React.FC<NavbarProps> = ({
         )}
       </div>
 
-      {/* Navigation Switcher */}
-      <nav aria-label="Main Navigation" className="flex items-center bg-slate-900/80 p-1 rounded-xl border border-slate-800/80 shadow-inner overflow-x-auto">
-        {visibleNavItems.map((item) => {
-          const isActive = currentView === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => onSelectView(item.id)}
-              className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-semibold font-mono transition-all duration-150 cursor-pointer whitespace-nowrap ${
-                isActive
-                  ? 'bg-amber-600 text-white shadow-md shadow-amber-950 border border-amber-400/40'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
-              }`}
-            >
-              {item.icon}
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
+      {/* Categorized Navigation Dropdown Hub */}
+      <nav aria-label="Main Navigation" className="flex items-center space-x-1.5 font-mono text-xs">
+        {/* 1. Tactical Tabletop (Direct Link) */}
+        <button
+          onClick={() => handleNavClick('tabletop')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-bold transition-all cursor-pointer ${
+            currentView === 'tabletop'
+              ? 'bg-amber-600 text-white shadow-md shadow-amber-950 border border-amber-400/40'
+              : 'text-slate-300 hover:text-white hover:bg-slate-900'
+          }`}
+        >
+          <Swords className="w-4 h-4 text-amber-400" />
+          <span>Tabletop</span>
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse ml-0.5" />
+        </button>
+
+        {/* 2. Compendium & Lore Dropdown */}
+        <div className="relative">
+          <button
+            onClick={() => toggleDropdown('compendium')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
+              activeDropdown === 'compendium' || ['compendium', 'bundles', 'dynasty'].includes(currentView)
+                ? 'bg-slate-850 text-amber-300 border border-slate-700'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <BookOpen className="w-4 h-4" />
+            <span>Compendium & Lore</span>
+            <ChevronDown className="w-3 h-3 opacity-60" />
+          </button>
+
+          {activeDropdown === 'compendium' && (
+            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+              <button
+                onClick={() => handleNavClick('compendium')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <BookOpen className="w-4 h-4 text-amber-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Compendium Codex</div>
+                  <div className="text-[10px] text-slate-400 font-sans">319 Spells & 318 Monsters</div>
+                </div>
+              </button>
+
+              {onOpenHandouts && (
+                <button
+                  onClick={() => {
+                    onOpenHandouts();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Scroll className="w-4 h-4 text-rose-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Digital Handouts Vault</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Parchment Clues & Letters</div>
+                  </div>
+                </button>
+              )}
+
+              <button
+                onClick={() => handleNavClick('bundles')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Package className="w-4 h-4 text-sky-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Campaign Bundles</div>
+                  <div className="text-[10px] text-slate-400 font-sans">.vttbundle Exporter/Importer</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleNavClick('dynasty')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Crown className="w-4 h-4 text-amber-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Dynasty & Factions</div>
+                  <div className="text-[10px] text-slate-400 font-sans">Noble Houses & Feud Matrix</div>
+                </div>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* 3. Characters & Encounters Dropdown */}
+        <div className="relative">
+          <button
+            onClick={() => toggleDropdown('characters')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
+              activeDropdown === 'characters' || ['builder', 'encounters', 'lobby'].includes(currentView)
+                ? 'bg-slate-850 text-amber-300 border border-slate-700'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <UserCheck className="w-4 h-4" />
+            <span>Characters & Party</span>
+            <ChevronDown className="w-3 h-3 opacity-60" />
+          </button>
+
+          {activeDropdown === 'characters' && (
+            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+              <button
+                onClick={() => handleNavClick('builder')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Sparkles className="w-4 h-4 text-purple-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Character Studio</div>
+                  <div className="text-[10px] text-slate-400 font-sans">5-Step Wizard & Point Buy</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleNavClick('encounters')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Flame className="w-4 h-4 text-orange-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Encounter Builder</div>
+                  <div className="text-[10px] text-slate-400 font-sans">XP Budgets & CR Thresholds</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleNavClick('lobby')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Users className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Campaign Lobby</div>
+                  <div className="text-[10px] text-slate-400 font-sans">Multiplayer Seat Claiming</div>
+                </div>
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* 4. Marketplace (Direct Link) */}
+        <button
+          onClick={() => handleNavClick('marketplace')}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
+            currentView === 'marketplace'
+              ? 'bg-amber-600 text-white shadow border border-amber-400/40'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+          }`}
+        >
+          <ShoppingBag className="w-4 h-4 text-emerald-400" />
+          <span>Marketplace</span>
+        </button>
+
+        {/* 5. GM World Studio Dropdown */}
+        <div className="relative">
+          <button
+            onClick={() => toggleDropdown('gm_studio')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
+              activeDropdown === 'gm_studio' || ['wfc', 'quests', 'analytics', 'admin'].includes(currentView)
+                ? 'bg-slate-850 text-amber-300 border border-slate-700'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <Layers className="w-4 h-4" />
+            <span>GM World Studio</span>
+            <ChevronDown className="w-3 h-3 opacity-60" />
+          </button>
+
+          {activeDropdown === 'gm_studio' && (
+            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+              <button
+                onClick={() => handleNavClick('wfc')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Layers className="w-4 h-4 text-indigo-400 shrink-0" />
+                <div>
+                  <div className="font-bold">WFC Dungeon Studio</div>
+                  <div className="text-[10px] text-slate-400 font-sans">Procedural Dungeon Synthesis</div>
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleNavClick('quests')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <Scroll className="w-4 h-4 text-amber-400 shrink-0" />
+                <div>
+                  <div className="font-bold">Quest & Dialogue Trees</div>
+                  <div className="text-[10px] text-slate-400 font-sans">Branching Concordia NPC Pacts</div>
+                </div>
+              </button>
+
+              {onOpenMapEditor && (
+                <button
+                  onClick={() => {
+                    onOpenMapEditor();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <PenToolIcon className="w-4 h-4 text-teal-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Map & LoS Editor</div>
+                    <div className="text-[10px] text-slate-400 font-sans">4-Layer Drawing & Wall Cells</div>
+                  </div>
+                </button>
+              )}
+
+              <button
+                onClick={() => handleNavClick('analytics')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+              >
+                <LineChart className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div>
+                  <div className="font-bold">SLA Telemetry</div>
+                  <div className="text-[10px] text-slate-400 font-sans">Latency & Reliability Metrics</div>
+                </div>
+              </button>
+
+              {currentUser?.role === 'admin' && (
+                <button
+                  onClick={() => handleNavClick('admin')}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-rose-950/50 transition text-rose-300 cursor-pointer border-t border-slate-800 pt-2"
+                >
+                  <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Admin Console</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Cluster & RBAC Controls</div>
+                  </div>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       </nav>
 
-      {/* Telemetry, User Profile Menu & Actions */}
+      {/* Utilities, Table Tools Hub & User Profile */}
       <div className="flex items-center gap-2">
-        {/* Map & LoS Layer Editor Trigger */}
-        {onOpenMapEditor && (
+        {/* Table Tools & Audio Dropdown */}
+        <div className="relative">
           <button
-            onClick={onOpenMapEditor}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-950/60 hover:bg-amber-900/80 text-amber-300 border border-amber-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="Multi-Layer Tactical Map & LoS Wall Editor"
+            onClick={() => toggleDropdown('tools')}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition cursor-pointer ${
+              activeDropdown === 'tools'
+                ? 'bg-amber-950/80 text-amber-300 border-amber-600/60 shadow'
+                : 'bg-slate-900/90 text-slate-300 border-slate-800 hover:bg-slate-800'
+            }`}
+            title="Tabletop Audio, Soundscapes, Map Layers & Streamer Tools"
           >
-            <Layers className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden xl:inline text-[11px]">Map Layers</span>
+            <Zap className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden xl:inline">Table Tools</span>
+            <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
-        )}
 
-        {/* Digital Handouts Vault Trigger */}
-        {onOpenHandouts && (
-          <button
-            onClick={onOpenHandouts}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="Digital Handouts & Secret Notes Vault"
-          >
-            <Scroll className="w-3.5 h-3.5 text-rose-400" />
-            <span className="hidden xl:inline text-[11px]">Handouts</span>
-          </button>
-        )}
+          {activeDropdown === 'tools' && (
+            <div className="absolute right-0 top-11 w-60 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1 font-mono text-xs">
+              {onOpenJukebox && (
+                <button
+                  onClick={() => {
+                    onOpenJukebox();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Music className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Jukebox & Soundscapes</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Ambient multi-track audio</div>
+                  </div>
+                </button>
+              )}
 
-        {/* Jukebox Ambient Soundscapes Trigger */}
-        {onOpenJukebox && (
-          <button
-            onClick={onOpenJukebox}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-950/60 hover:bg-indigo-900/80 text-indigo-300 border border-indigo-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="Tactical Jukebox & Ambient Soundscapes"
-          >
-            <Music className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden xl:inline text-[11px]">Jukebox</span>
-          </button>
-        )}
+              {onOpenMapEditor && (
+                <button
+                  onClick={() => {
+                    onOpenMapEditor();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Layers className="w-4 h-4 text-amber-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Map & LoS Layers</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Dynamic lighting editor</div>
+                  </div>
+                </button>
+              )}
 
-        {/* Streamer Broadcast Mode Trigger */}
-        {onOpenStreamerHUD && (
-          <button
-            onClick={onOpenStreamerHUD}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-950/60 hover:bg-red-900/80 text-red-300 border border-red-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="Streamer Broadcast Mode & Discord Webhooks"
-          >
-            <Video className="w-3.5 h-3.5 text-red-400" />
-            <span className="hidden xl:inline text-[11px]">Streamer</span>
-          </button>
-        )}
+              {onOpenHandouts && (
+                <button
+                  onClick={() => {
+                    onOpenHandouts();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Scroll className="w-4 h-4 text-rose-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Handouts Vault</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Secret notes & parchment</div>
+                  </div>
+                </button>
+              )}
 
-        {/* Audio Radar & Spatial Mixer Trigger */}
-        {onOpenAudioMixer && (
-          <button
-            onClick={onOpenAudioMixer}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/80 text-purple-300 border border-purple-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="3D Spatial Audio & Voice Radar Mixer"
-          >
-            <Radio className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
-            <span className="hidden xl:inline text-[11px]">3D Audio Radar</span>
-          </button>
-        )}
+              {onOpenStreamerHUD && (
+                <button
+                  onClick={() => {
+                    onOpenStreamerHUD();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Video className="w-4 h-4 text-red-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Streamer Broadcast Mode</div>
+                    <div className="text-[10px] text-slate-400 font-sans">OBS clean & Discord webhooks</div>
+                  </div>
+                </button>
+              )}
+
+              {onOpenAudioMixer && (
+                <button
+                  onClick={() => {
+                    onOpenAudioMixer();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Radio className="w-4 h-4 text-purple-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">3D Audio Radar</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Spatial stereo mixer</div>
+                  </div>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* User Profile & Multi-User Menu */}
         {currentUser ? (
@@ -301,7 +565,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   {currentUser.role === 'admin' && (
                     <button
                       onClick={() => {
-                        onSelectView('admin');
+                        handleNavClick('admin');
                         setIsUserMenuOpen(false);
                       }}
                       className="w-full flex items-center space-x-2 px-2 py-1.5 rounded-lg text-rose-300 hover:bg-rose-950/60 transition cursor-pointer font-bold"
@@ -370,3 +634,26 @@ export const Navbar: React.FC<NavbarProps> = ({
     </header>
   );
 };
+
+// Helper icon component for pen/layer tool
+function PenToolIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      {...props}
+      xmlns="http://www.w3.org/2000/svg"
+      width="24"
+      height="24"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m12 19 7-7 3 3-7 7-3-3z" />
+      <path d="m18 13-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" />
+      <path d="m2 2 7.586 7.586" />
+      <circle cx="11" cy="11" r="2" />
+    </svg>
+  );
+}

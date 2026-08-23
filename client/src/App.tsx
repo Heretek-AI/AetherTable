@@ -35,7 +35,7 @@ import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 
 export function App() {
-  const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
+  const [currentView, setCurrentView] = useState<SaaSView>('landing');
   const [campaignTitle, setCampaignTitle] = useState('The Fall of Baron Vane');
   const [currentUser, setCurrentUser] = useState<User>(DEMO_ACCOUNTS[0].user);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);

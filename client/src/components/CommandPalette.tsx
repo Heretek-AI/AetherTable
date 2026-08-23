@@ -35,9 +35,22 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
 
   useEffect(() => {
     if (isOpen) {
+      setQuery('');
+      setSelectedIndex(0);
       setTimeout(() => inputRef.current?.focus(), 50);
+
+      const handleGlobalEsc = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          onClose();
+        }
+      };
+
+      window.addEventListener('keydown', handleGlobalEsc);
+      return () => window.removeEventListener('keydown', handleGlobalEsc);
     }
-  }, [isOpen]);
+  }, [isOpen, onClose]);
 
   if (!isOpen) return null;
 
@@ -72,9 +85,32 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onClose();
   };
 
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev + 1) % Math.max(1, filteredItems.length));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev - 1 + filteredItems.length) % Math.max(1, filteredItems.length));
+    } else if (e.key === 'Enter' && filteredItems[selectedIndex]) {
+      e.preventDefault();
+      handleSelect(filteredItems[selectedIndex]);
+    }
+  };
+
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-start justify-center pt-24 p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full shadow-2xl overflow-hidden animate-fadeIn flex flex-col font-sans">
+    <div
+      onClick={onClose}
+      className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-start justify-center pt-24 p-4 cursor-pointer"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full shadow-2xl overflow-hidden animate-fadeIn flex flex-col font-sans cursor-default"
+      >
         {/* Search Bar */}
         <div className="p-3.5 border-b border-slate-800 flex items-center space-x-3 bg-slate-950/80">
           <Search className="w-5 h-5 text-amber-400 shrink-0" />
@@ -83,12 +119,21 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
             type="text"
             placeholder="Type a command, spell, monster, or view..."
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setSelectedIndex(0);
+            }}
+            onKeyDown={handleInputKeyDown}
             className="flex-1 bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none font-mono"
           />
-          <span className="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 border border-slate-700 text-slate-400 rounded">
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 rounded transition cursor-pointer"
+            title="Press Escape or click to close"
+          >
             ESC
-          </span>
+          </button>
         </div>
 
         {/* Results List */}
