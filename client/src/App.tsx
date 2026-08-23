@@ -15,6 +15,10 @@ import { BundleManagerView } from './components/BundleManagerView';
 import { QuestDialogueView } from './components/QuestDialogueView';
 import { WfcStudioView } from './components/WfcStudioView';
 import { AnalyticsView } from './components/AnalyticsView';
+import { LandingPageView } from './components/LandingPageView';
+import { MacroQuickbar } from './components/MacroQuickbar';
+import { SpellbookModal } from './components/SpellbookModal';
+import { SubscriptionModal } from './components/SubscriptionModal';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
@@ -25,6 +29,8 @@ export function App() {
   const [campaignTitle, setCampaignTitle] = useState('The Fall of Baron Vane');
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
+  const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
+  const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
 
@@ -520,6 +526,66 @@ export function App() {
     addSystemMessage(`Applied procedural WFC dungeon layout (${width}x${height} tiles) to active session.`);
   };
 
+  const handleMacroRoll = (
+    macroName: string,
+    formula: string,
+    isWhisper: boolean,
+    advDis: 'normal' | 'advantage' | 'disadvantage'
+  ) => {
+    const d20Roll =
+      advDis === 'advantage'
+        ? Math.max(Math.floor(Math.random() * 20) + 1, Math.floor(Math.random() * 20) + 1)
+        : advDis === 'disadvantage'
+        ? Math.min(Math.floor(Math.random() * 20) + 1, Math.floor(Math.random() * 20) + 1)
+        : Math.floor(Math.random() * 20) + 1;
+
+    if (diceBoxRef.current) {
+      diceBoxRef.current.rollDice('d20', d20Roll, 400, 300);
+    }
+    if (particleFXRef.current) {
+      particleFXRef.current.spawnGoldCritBurst(400, 300, 30);
+    }
+
+    const dmMsgId = `dm_${Date.now() + 1}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `macro_${Date.now()}`,
+        sender: selectedToken?.name || 'Thorin',
+        role: 'player',
+        content: `🎲 ${isWhisper ? '[WHISPER TO GM] ' : ''}Triggered Macro: ${macroName} (${formula}) [${advDis.toUpperCase()}] -> Result: ${d20Roll + 4}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+      {
+        id: dmMsgId,
+        sender: 'Encounter DM (AI)',
+        role: 'dm',
+        content: '...',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isStreaming: true,
+      },
+    ]);
+
+    streamNarrativeResponse(
+      `I execute ${macroName} with result ${d20Roll + 4}`,
+      { action_name: macroName, is_hit: true, total_damage: d20Roll + 4 },
+      dmMsgId
+    );
+  };
+
+  const handleCastSpellWithUpcast = (
+    spellName: string,
+    baseLevel: number,
+    castLevel: number,
+    damageFormula: string
+  ) => {
+    handleCastSpell(
+      `spell_${spellName.toLowerCase().replace(/ /g, '_')}`,
+      `${spellName} (Upcast Lvl ${castLevel})`,
+      castLevel
+    );
+  };
+
   return (
     <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 font-sans overflow-hidden">
       {/* Top Universal Navbar */}
@@ -528,14 +594,22 @@ export function App() {
         onSelectView={setCurrentView}
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
+        onOpenSubscription={() => setIsSubscriptionOpen(true)}
         latencyMs={latencyMs}
         campaignName={campaignTitle}
       />
 
       {/* View Content */}
       <div className="flex-1 flex overflow-hidden relative min-h-0">
+        {currentView === 'landing' && (
+          <LandingPageView
+            onEnterApp={(target) => setCurrentView((target as SaaSView) || 'tabletop')}
+            onOpenPricing={() => setIsSubscriptionOpen(true)}
+          />
+        )}
+
         {currentView === 'tabletop' && (
-          <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0">
+          <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0 relative">
             {/* Tabletop Center Workspace */}
             <div className="flex-1 flex overflow-hidden relative min-h-0">
               {/* Left Dock: Initiative Tracker */}
@@ -570,10 +644,14 @@ export function App() {
                 onExecuteAttack={handleExecuteAttack}
                 onCastSpell={handleCastSpell}
                 onRollCheck={handleRollCheck}
+                onOpenGrimoire={() => setIsSpellbookOpen(true)}
                 isCollapsed={isRightDockCollapsed}
                 onToggleCollapse={() => setIsRightDockCollapsed(!isRightDockCollapsed)}
               />
             </div>
+
+            {/* In-Canvas Roll20 Style Macro Quickbar */}
+            <MacroQuickbar onExecuteRoll={handleMacroRoll} />
 
             {/* Bottom Floating Console */}
             <NarrativeChat
@@ -639,6 +717,19 @@ export function App() {
         isOpen={isSafetyOpen}
         onClose={() => setIsSafetyOpen(false)}
         onTriggerRewind={handleSafetyRewind}
+      />
+
+      {/* D&D Beyond Digital Grimoire & Upcasting Modal */}
+      <SpellbookModal
+        isOpen={isSpellbookOpen}
+        onClose={() => setIsSpellbookOpen(false)}
+        onCastSpellWithUpcast={handleCastSpellWithUpcast}
+      />
+
+      {/* SaaS Subscription & Account Profile Modal */}
+      <SubscriptionModal
+        isOpen={isSubscriptionOpen}
+        onClose={() => setIsSubscriptionOpen(false)}
       />
     </div>
   );

@@ -19,7 +19,8 @@ import {
   Sun,
   CheckCircle2,
   XCircle,
-  AlertCircle
+  AlertCircle,
+  BookOpen
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
 
@@ -28,6 +29,7 @@ interface CharacterSheetProps {
   onExecuteAttack: (actionName: string, damageFormula: string, damageType: string) => void;
   onCastSpell: (spellId: string, spellName: string, level: number) => void;
   onRollCheck: (skillName: string, modifier: number, dc: number) => void;
+  onOpenGrimoire?: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
 }
@@ -37,6 +39,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   onExecuteAttack,
   onCastSpell,
   onRollCheck,
+  onOpenGrimoire,
   isCollapsed,
   onToggleCollapse,
 }) => {
@@ -396,6 +399,17 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                 })}
               </div>
             </div>
+
+            {/* Open Digital Grimoire Button */}
+            {onOpenGrimoire && (
+              <button
+                onClick={onOpenGrimoire}
+                className="w-full py-2 bg-purple-950/70 hover:bg-purple-900 border border-purple-600/50 text-purple-200 rounded-lg text-xs font-bold font-mono transition flex items-center justify-center space-x-1.5 shadow-sm cursor-pointer"
+              >
+                <BookOpen className="w-3.5 h-3.5 text-purple-400" />
+                <span>Open Digital Grimoire & Upcaster</span>
+              </button>
+            )}
 
             {/* Spells List */}
             <div className="space-y-2">
