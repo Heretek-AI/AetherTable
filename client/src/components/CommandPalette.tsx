@@ -12,6 +12,9 @@ import {
   Compass,
   Zap,
   Flame,
+  Gem,
+  Feather,
+  ScrollText,
 } from 'lucide-react';
 import { SaaSView } from './Navbar';
 import { globalAudio } from '../render/audio_manager';
@@ -23,6 +26,52 @@ interface CommandPaletteProps {
   onExecuteRoll?: (expression: string) => void;
 }
 
+interface PaletteItem {
+  id: string;
+  category: string;
+  title: string;
+  subtitle: string;
+  icon: JSX.Element;
+  action: () => void;
+}
+
+const COMPENDIUM_SOURCES: Array<{
+  url: string;
+  key: string;
+  category: string;
+  icon: JSX.Element;
+  subtitleOf: (entry: any) => string;
+}> = [
+  {
+    url: '/api/v1/compendium/spells?limit=400',
+    key: 'spells',
+    category: 'Spells (SRD)',
+    icon: <Sparkles className="w-4 h-4 text-indigo-400" />,
+    subtitleOf: (s) => `${s.level === 0 ? 'Cantrip' : `${s.level}${s.level === 1 ? 'st' : s.level === 2 ? 'nd' : s.level === 3 ? 'rd' : 'th'}-level`} ${s.school || ''} · ${s.casting_time || ''}`.trim(),
+  },
+  {
+    url: '/api/v1/compendium/magic-items?limit=300',
+    key: 'magic_items',
+    category: 'Magic Items (SRD)',
+    icon: <Gem className="w-4 h-4 text-purple-400" />,
+    subtitleOf: (i) => `${i.rarity || 'Common'} ${i.category || ''}${i.requires_attunement ? ' · Attunement' : ''}`.trim(),
+  },
+  {
+    url: '/api/v1/compendium/feats?limit=100',
+    key: 'feats',
+    category: 'Feats (SRD)',
+    icon: <Feather className="w-4 h-4 text-emerald-400" />,
+    subtitleOf: (f) => `${f.category} Feat${f.prerequisite ? ` · Requires ${f.prerequisite}` : ''}`,
+  },
+  {
+    url: '/api/v1/compendium/glossary?limit=200',
+    key: 'glossary',
+    category: 'Rules Glossary (SRD)',
+    icon: <ScrollText className="w-4 h-4 text-cyan-400" />,
+    subtitleOf: (t) => `${t.tag ? `[${t.tag}] ` : ''}${(t.definition || '').slice(0, 70)}...`,
+  },
+];
+
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
   isOpen,
   onClose,
@@ -32,10 +81,49 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const [compendiumEntries, setCompendiumEntries] = useState<PaletteItem[]>([]);
+
+  // Live-index the SRD 5.2 compendium so Cmd+K searches real rules data
+  // (spells, magic items, feats, glossary) rather than a hardcoded sample.
+  useEffect(() => {
+    if (!isOpen || compendiumEntries.length > 0) return;
+
+    const loadCompendium = async () => {
+      try {
+        const results = await Promise.all(
+          COMPENDIUM_SOURCES.map((src) =>
+            fetch(src.url)
+              .then((r) => (r.ok ? r.json() : null))
+              .catch(() => null)
+          )
+        );
+        const entries: PaletteItem[] = [];
+        results.forEach((payload, i) => {
+          if (!payload) return;
+          const src = COMPENDIUM_SOURCES[i];
+          const list: any[] = payload[src.key] || [];
+          list.slice(0, 200).forEach((entry: any) => {
+            entries.push({
+              id: `${src.category}-${entry.id}`,
+              category: src.category,
+              title: entry.name || entry.term,
+              subtitle: src.subtitleOf(entry),
+              icon: src.icon,
+              action: () => onNavigate('compendium'),
+            });
+          });
+        });
+        setCompendiumEntries(entries);
+      } catch (e) {
+        console.warn('CommandPalette compendium index unavailable.');
+      }
+    };
+    loadCompendium();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   useEffect(() => {
     if (isOpen) {
-      setQuery('');
       setSelectedIndex(0);
       setTimeout(() => inputRef.current?.focus(), 50);
 
@@ -57,7 +145,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   const allItems = [
     // Navigation
     { id: 'nav_tabletop', category: 'Navigation', title: 'Tactical Tabletop', subtitle: 'Live battlemap canvas & initiative order', icon: <Swords className="w-4 h-4 text-sky-400" />, action: () => onNavigate('tabletop') },
-    { id: 'nav_compendium', category: 'Navigation', title: 'Compendium Codex', subtitle: '319 Spells & 318 Monsters', icon: <BookOpen className="w-4 h-4 text-amber-400" />, action: () => onNavigate('compendium') },
+    { id: 'nav_compendium', category: 'Navigation', title: 'Compendium Codex', subtitle: 'SRD 5.2 · 352 Spells · 330 Statblocks · 260 Magic Items', icon: <BookOpen className="w-4 h-4 text-amber-400" />, action: () => onNavigate('compendium') },
     { id: 'nav_builder', category: 'Navigation', title: 'Character Studio (5-Step Wizard)', subtitle: 'Create hero, 27-pt buy, export PDF', icon: <Sparkles className="w-4 h-4 text-purple-400" />, action: () => onNavigate('builder') },
     { id: 'nav_marketplace', category: 'Navigation', title: 'Campaign Marketplace', subtitle: 'Install .vttbundle modules & homebrew', icon: <Compass className="w-4 h-4 text-emerald-400" />, action: () => onNavigate('marketplace') },
     { id: 'nav_admin', category: 'Navigation', title: 'Platform Admin Console', subtitle: 'Cluster telemetry, users, RBAC roles', icon: <Zap className="w-4 h-4 text-rose-400" />, action: () => onNavigate('admin') },
@@ -70,7 +158,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     // Monsters
     { id: 'mon_dragon', category: 'Monsters (SRD)', title: 'Adult Red Dragon', subtitle: 'CR 17 Huge Dragon · 256 HP · 19 AC', icon: <Skull className="w-4 h-4 text-rose-400" />, action: () => onNavigate('compendium') },
     { id: 'mon_orc', category: 'Monsters (SRD)', title: 'Orc Warlord', subtitle: 'CR 3 Medium Humanoid · 58 HP · 16 AC', icon: <Skull className="w-4 h-4 text-amber-400" />, action: () => onNavigate('tabletop') },
-  ];
+  ].concat(compendiumEntries);
 
   const filteredItems = allItems.filter(
     (item) =>

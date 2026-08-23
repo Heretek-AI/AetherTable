@@ -127,10 +127,39 @@ class SRDMonsterDefinition(BaseModel):
     condition_immunities: List[str] = Field(default_factory=list)
     senses: str
     languages: str
+    category: str = "monster"
+    bonus_actions: List[Dict[str, str]] = Field(default_factory=list)
+    xp: Optional[int] = None
+    proficiency_bonus: Optional[int] = None
     traits: List[Dict[str, str]] = Field(default_factory=list)
     actions: List[SRDMonsterAction] = Field(default_factory=list)
     legendary_actions: List[Dict[str, str]] = Field(default_factory=list)
     reactions: List[Dict[str, str]] = Field(default_factory=list)
+
+
+class SRDMagicItemDefinition(BaseModel):
+    id: str
+    name: str
+    category: str
+    item_type: str = ""
+    rarity: str = ""
+    requires_attunement: bool = False
+    description: str = ""
+
+
+class SRDFeatDefinition(BaseModel):
+    id: str
+    name: str
+    category: str
+    prerequisite: str = ""
+    description: str = ""
+
+
+class SRDGlossaryTerm(BaseModel):
+    id: str
+    term: str
+    tag: str = ""
+    definition: str = ""
 
 
 class SRDClassFeature(BaseModel):

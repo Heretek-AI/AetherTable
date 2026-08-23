@@ -23,6 +23,10 @@ import {
   Award,
   Heart,
   Sword,
+  Gem,
+  Feather,
+  PawPrint,
+  ScrollText,
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
 import { globalAudio } from '../render/audio_manager';
@@ -69,14 +73,20 @@ const FALLBACK_SPELLS = [
   { id: 's14', name: 'Fly', level: 3, school: 'Transmutation', casting_time: '1 action', range: 'Touch', duration: 'Concentration, up to 10 minutes', description: 'You touch a willing creature. The target gains a flying speed of 60 feet for the duration.' },
 ];
 
+export type CompendiumTab = 'monsters' | 'spells' | 'magic-items' | 'feats' | 'animals' | 'glossary';
+
 export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) => {
-  const [activeTab, setActiveTab] = useState<'monsters' | 'spells' | 'rules'>('monsters');
+  const [activeTab, setActiveTab] = useState<CompendiumTab>('monsters');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSchool, setSelectedSchool] = useState<string>('All');
   const [selectedCR, setSelectedCR] = useState<string>('All');
 
   const [monsters, setMonsters] = useState<any[]>(FALLBACK_MONSTERS);
   const [spells, setSpells] = useState<any[]>(FALLBACK_SPELLS);
+  const [magicItems, setMagicItems] = useState<any[]>([]);
+  const [feats, setFeats] = useState<any[]>([]);
+  const [animals, setAnimals] = useState<any[]>([]);
+  const [glossaryTerms, setGlossaryTerms] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedItem, setSelectedItem] = useState<any | null>(null);
   const [spawnSuccess, setSpawnSuccess] = useState<string | null>(null);
@@ -89,16 +99,27 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     const fetchData = async () => {
       setLoading(true);
       try {
-        const [monstersRes, spellsRes] = await Promise.all([
+        const [
+          monstersRes,
+          spellsRes,
+          magicItemsRes,
+          featsRes,
+          animalsRes,
+          glossaryRes,
+        ] = await Promise.all([
           fetch('/api/v1/compendium/monsters?limit=350').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/spells?limit=350').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/v1/compendium/spells?limit=400').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/v1/compendium/magic-items?limit=300').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/v1/compendium/feats?limit=100').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/v1/compendium/animals?limit=150').then((r) => (r.ok ? r.json() : null)),
+          fetch('/api/v1/compendium/glossary?limit=200').then((r) => (r.ok ? r.json() : null)),
         ]);
-        if (monstersRes?.monsters && monstersRes.monsters.length > 0) {
-          setMonsters(monstersRes.monsters);
-        }
-        if (spellsRes?.spells && spellsRes.spells.length > 0) {
-          setSpells(spellsRes.spells);
-        }
+        if (monstersRes?.monsters?.length) setMonsters(monstersRes.monsters);
+        if (spellsRes?.spells?.length) setSpells(spellsRes.spells);
+        if (magicItemsRes?.magic_items?.length) setMagicItems(magicItemsRes.magic_items);
+        if (featsRes?.feats?.length) setFeats(featsRes.feats);
+        if (animalsRes?.animals?.length) setAnimals(animalsRes.animals);
+        if (glossaryRes?.glossary?.length) setGlossaryTerms(glossaryRes.glossary);
       } catch (e) {
         console.warn('Compendium API unavailable, using rich built-in SRD dataset.');
       } finally {
@@ -131,8 +152,34 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     return matchesSearch && matchesSchool;
   });
 
+  const q = searchQuery.toLowerCase();
+  const matchesText = (entry: any) =>
+    !q ||
+    entry.name?.toLowerCase().includes(q) ||
+    entry.term?.toLowerCase().includes(q) ||
+    entry.description?.toLowerCase().includes(q) ||
+    entry.definition?.toLowerCase().includes(q);
+
+  const filteredMagicItems = magicItems.filter(matchesText);
+  const filteredFeats = feats.filter(matchesText);
+  const filteredAnimals = animals.filter(
+    (a) => matchesText(a) && (selectedCR === 'All' || String(a.challenge_rating || '').includes(selectedCR.toLowerCase()))
+  );
+  const filteredGlossary = glossaryTerms.filter(matchesText);
+
   // Active items and pagination calculations
-  const activeItems = activeTab === 'monsters' ? filteredMonsters : filteredSpells;
+  const activeItems =
+    activeTab === 'monsters'
+      ? filteredMonsters
+      : activeTab === 'spells'
+        ? filteredSpells
+        : activeTab === 'magic-items'
+          ? filteredMagicItems
+          : activeTab === 'feats'
+            ? filteredFeats
+            : activeTab === 'animals'
+              ? filteredAnimals
+              : filteredGlossary;
   const totalPages = Math.max(1, Math.ceil(activeItems.length / ITEMS_PER_PAGE));
   const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
   const paginatedItems = activeItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
@@ -191,7 +238,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
                   D&D 5e Compendium Codex
                 </h2>
                 <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-950 text-amber-300 border border-amber-600/50 rounded-full font-mono">
-                  Official SRD 5.1
+                  SRD 5.2
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
@@ -235,6 +282,50 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
               >
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>Spells ({filteredSpells.length})</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('magic-items')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
+                  activeTab === 'magic-items'
+                    ? 'bg-amber-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Gem className="w-3.5 h-3.5" />
+                <span>Magic Items ({filteredMagicItems.length})</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('feats')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
+                  activeTab === 'feats'
+                    ? 'bg-amber-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Feather className="w-3.5 h-3.5" />
+                <span>Feats ({filteredFeats.length})</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('animals')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
+                  activeTab === 'animals'
+                    ? 'bg-amber-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <PawPrint className="w-3.5 h-3.5" />
+                <span>Animals ({filteredAnimals.length})</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('glossary')}
+                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
+                  activeTab === 'glossary'
+                    ? 'bg-amber-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <ScrollText className="w-3.5 h-3.5" />
+                <span>Glossary ({filteredGlossary.length})</span>
               </button>
             </div>
           </div>
@@ -360,6 +451,180 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
                   </div>
                 </div>
               ))}
+
+            {activeTab === 'magic-items' &&
+              paginatedItems.map((item: any, index: number) => (
+                <div
+                  key={item.id || index}
+                  onClick={() => setSelectedItem(item)}
+                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-purple-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center space-x-3">
+                        <div className="p-2 bg-purple-950/50 border border-purple-600/40 rounded-xl text-purple-400 group-hover:scale-105 transition-transform">
+                          <Gem className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-purple-300 transition-colors">
+                            {item.name}
+                          </h3>
+                          <p className="text-[10px] text-slate-400 font-mono capitalize">{item.item_type || item.category}</p>
+                        </div>
+                      </div>
+
+                      <span className={`px-2 py-0.5 border text-[10px] font-mono font-bold rounded ${
+                        item.rarity === 'Legendary' ? 'bg-orange-950 text-orange-300 border-orange-600/40'
+                        : item.rarity === 'Very Rare' ? 'bg-violet-950 text-violet-300 border-violet-600/40'
+                        : item.rarity === 'Rare' ? 'bg-sky-950 text-sky-300 border-sky-600/40'
+                        : item.rarity === 'Uncommon' ? 'bg-emerald-950 text-emerald-300 border-emerald-600/40'
+                        : 'bg-slate-800 text-slate-300 border-slate-600/40'
+                      }`}>
+                        {item.rarity || 'Common'}
+                      </span>
+                    </div>
+
+                    <p className="text-xs text-slate-300 mt-3 line-clamp-2 font-sans leading-relaxed">
+                      {item.description}
+                    </p>
+                  </div>
+
+                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] font-mono text-slate-400">
+                    <span className="capitalize">{item.category}</span>
+                    {item.requires_attunement && (
+                      <span className="px-1.5 py-0.5 bg-amber-950/60 text-amber-300 border border-amber-600/30 rounded">Attunement</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+            {activeTab === 'feats' &&
+              paginatedItems.map((feat: any, index: number) => (
+                <div
+                  key={feat.id || index}
+                  onClick={() => setSelectedItem(feat)}
+                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-emerald-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center space-x-3">
+                        <div className="p-2 bg-emerald-950/50 border border-emerald-600/40 rounded-xl text-emerald-400 group-hover:scale-105 transition-transform">
+                          <Feather className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-emerald-300 transition-colors">
+                            {feat.name}
+                          </h3>
+                          <p className="text-[10px] text-slate-400 font-mono">{feat.category} Feat</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-slate-300 mt-3 line-clamp-3 font-sans leading-relaxed">
+                      {feat.description}
+                    </p>
+                  </div>
+
+                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center text-[10px] font-mono text-slate-400">
+                    <span>{feat.prerequisite ? `Requires: ${feat.prerequisite}` : 'No prerequisite'}</span>
+                  </div>
+                </div>
+              ))}
+
+            {activeTab === 'animals' &&
+              paginatedItems.map((animal: any, index: number) => (
+                <div
+                  key={animal.id || index}
+                  onClick={() => setSelectedItem(animal)}
+                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-lime-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center space-x-3">
+                        <div className="p-2 bg-lime-950/50 border border-lime-600/40 rounded-xl text-lime-400 group-hover:scale-105 transition-transform">
+                          <PawPrint className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-lime-300 transition-colors">
+                            {animal.name}
+                          </h3>
+                          <p className="text-[10px] text-slate-400 font-mono capitalize">
+                            {animal.size || 'Medium'} Beast
+                          </p>
+                        </div>
+                      </div>
+
+                      <span className="px-2 py-0.5 bg-lime-950 text-lime-300 border border-lime-600/40 text-[11px] font-mono font-bold rounded">
+                        CR {animal.challenge_rating || '1/4'}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 mt-3 text-center font-mono text-xs">
+                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
+                        <div className="text-[9px] text-slate-500">AC</div>
+                        <div className="font-bold text-sky-400">{animal.ac || 12}</div>
+                      </div>
+                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
+                        <div className="text-[9px] text-slate-500">HP</div>
+                        <div className="font-bold text-emerald-400">{animal.hp || 20}</div>
+                      </div>
+                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
+                        <div className="text-[9px] text-slate-500">SPEED</div>
+                        <div className="font-bold text-amber-400 truncate">{animal.speed || '30 ft'}</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-end">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSpawnMonster(animal);
+                      }}
+                      className="flex items-center space-x-1 px-2.5 py-1 bg-lime-600/20 hover:bg-lime-600 text-lime-300 hover:text-white border border-lime-600/40 rounded-lg text-xs font-semibold transition cursor-pointer"
+                    >
+                      {spawnSuccess === animal.name ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-300" />
+                          <span>Spawned!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Plus className="w-3 h-3" />
+                          <span>Spawn</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+            {activeTab === 'glossary' &&
+              paginatedItems.map((term: any, index: number) => (
+                <div
+                  key={term.id || index}
+                  onClick={() => setSelectedItem({ ...term, name: term.term, description: term.definition })}
+                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-cyan-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group"
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center space-x-3">
+                      <div className="p-2 bg-cyan-950/50 border border-cyan-600/40 rounded-xl text-cyan-400 group-hover:scale-105 transition-transform">
+                        <ScrollText className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-cyan-300 transition-colors">
+                          {term.term}
+                        </h3>
+                        {term.tag && <p className="text-[10px] text-slate-400 font-mono">[{term.tag}]</p>}
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-slate-300 mt-3 line-clamp-3 font-sans leading-relaxed">
+                    {term.definition}
+                  </p>
+                </div>
+              ))}
           </div>
         )}
       </div>
@@ -371,6 +636,14 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
           <strong className="text-slate-200">{Math.min(startIndex + ITEMS_PER_PAGE, activeItems.length)}</strong> of{' '}
           <strong className="text-amber-400">{activeItems.length}</strong> {activeTab} (Page{' '}
           <strong className="text-slate-200">{currentPage}</strong> of <strong className="text-slate-200">{totalPages}</strong>)
+        </div>
+
+        <div className="hidden lg:block text-[9px] text-slate-600">
+          Rules content from the D&amp;D System Reference Document 5.2 © Wizards of the Coast (
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer" className="underline hover:text-slate-400">
+            CC BY 4.0
+          </a>
+          )
         </div>
 
         {/* Pagination Nav Buttons */}
@@ -451,7 +724,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
             </p>
 
             <div className="flex justify-end space-x-2 pt-2 border-t border-slate-800">
-              {activeTab === 'monsters' && (
+              {(activeTab === 'monsters' || activeTab === 'animals') && (
                 <button
                   onClick={() => {
                     handleSpawnMonster(selectedItem);

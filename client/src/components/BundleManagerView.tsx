@@ -85,7 +85,7 @@ export const BundleManagerView: React.FC<BundleManagerViewProps> = ({
         loot_tables: { chest_loot: ['Sunblade', 'Potion of Healing'] },
       };
 
-      const res = await fetch('/api/v1/orchestrator/campaign/export-bundle', {
+      const res = await fetch('/api/v1/campaign/export-bundle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -114,7 +114,7 @@ export const BundleManagerView: React.FC<BundleManagerViewProps> = ({
   const handleParseMarkdown = async () => {
     globalAudio.playDiceRoll();
     try {
-      const res = await fetch('/api/v1/orchestrator/homebrew/parse-markdown', {
+      const res = await fetch('/api/v1/homebrew/parse-markdown', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ markdown_text: markdownInput }),

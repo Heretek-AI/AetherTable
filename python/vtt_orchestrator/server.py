@@ -55,19 +55,37 @@ pdf_renderer = CharacterSheetPDFRenderer()
 empirical_playtester = EmpiricalPlaytester()
 
 # Load Compendium Data
+# Prefer the richer SRD 5.2 fixtures (full stat blocks, untruncated spells,
+# magic items, feats, origins, animals, glossary); fall back to the legacy
+# 5.1 data files when they are absent.
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-SPELLS_FILE = os.path.join(DATA_DIR, "srd_spells.json")
-MONSTERS_FILE = os.path.join(DATA_DIR, "srd_monsters.json")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+COMPENDIUM_DIR = os.path.join(PROJECT_ROOT, "compendium")
+SPELLS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_spells.json")
+MONSTERS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_monsters.json")
+MAGIC_ITEMS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_magic_items.json")
+FEATS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_feats.json")
+ANIMALS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_animals.json")
+ORIGINS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_origins.json")
+GLOSSARY_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_rules_glossary.json")
 
-all_spells: List[Dict[str, Any]] = []
-if os.path.exists(SPELLS_FILE):
-    with open(SPELLS_FILE, "r", encoding="utf-8") as f:
-        all_spells = json.load(f)
 
-all_monsters: List[Dict[str, Any]] = []
-if os.path.exists(MONSTERS_FILE):
-    with open(MONSTERS_FILE, "r", encoding="utf-8") as f:
-        all_monsters = json.load(f)
+def _load_json(path: str) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+all_spells: List[Dict[str, Any]] = _load_json(SPELLS_FILE) or _load_json(
+    os.path.join(DATA_DIR, "srd_spells.json"))
+all_monsters: List[Dict[str, Any]] = _load_json(MONSTERS_FILE) or _load_json(
+    os.path.join(DATA_DIR, "srd_monsters.json"))
+all_magic_items: List[Dict[str, Any]] = _load_json(MAGIC_ITEMS_FILE)
+all_feats: List[Dict[str, Any]] = _load_json(FEATS_FILE)
+all_animals: List[Dict[str, Any]] = _load_json(ANIMALS_FILE)
+all_origins: List[Dict[str, Any]] = _load_json(ORIGINS_FILE)
+all_glossary_terms: List[Dict[str, Any]] = _load_json(GLOSSARY_FILE)
 
 
 class ClassifyRequest(BaseModel):
@@ -188,6 +206,96 @@ def get_compendium_monsters(
     return {
         "total": len(results),
         "monsters": results[:limit]
+    }
+
+
+@app.get("/api/v1/compendium/animals")
+def get_compendium_animals(
+    q: Optional[str] = Query(None, description="Search query for animal name"),
+    limit: int = Query(50, ge=1, le=400)
+):
+    results = all_animals
+    if q:
+        query = q.lower()
+        results = [a for a in results if query in a.get("name", "").lower()]
+    return {
+        "total": len(results),
+        "animals": results[:limit]
+    }
+
+
+@app.get("/api/v1/compendium/magic-items")
+def get_compendium_magic_items(
+    q: Optional[str] = Query(None, description="Search query for magic item name"),
+    category: Optional[str] = Query(None, description="Filter by item category"),
+    rarity: Optional[str] = Query(None, description="Filter by rarity"),
+    limit: int = Query(50, ge=1, le=400)
+):
+    results = all_magic_items
+    if q:
+        query = q.lower()
+        results = [i for i in results if query in i.get("name", "").lower() or query in i.get("description", "").lower()]
+    if category:
+        results = [i for i in results if i.get("category", "").lower() == category.lower()]
+    if rarity:
+        results = [i for i in results if i.get("rarity", "").lower() == rarity.lower()]
+    return {
+        "total": len(results),
+        "magic_items": results[:limit]
+    }
+
+
+@app.get("/api/v1/compendium/feats")
+def get_compendium_feats(
+    q: Optional[str] = Query(None, description="Search query for feat name"),
+    category: Optional[str] = Query(None, description="Filter by feat category"),
+    limit: int = Query(50, ge=1, le=100)
+):
+    results = all_feats
+    if q:
+        query = q.lower()
+        results = [f for f in results if query in f.get("name", "").lower() or query in f.get("description", "").lower()]
+    if category:
+        results = [f for f in results if f.get("category", "").lower() == category.lower()]
+    return {
+        "total": len(results),
+        "feats": results[:limit]
+    }
+
+
+@app.get("/api/v1/compendium/origins")
+def get_compendium_origins(
+    q: Optional[str] = Query(None, description="Search query for background/species name"),
+    kind: Optional[str] = Query(None, description="Filter by kind (background/species)"),
+    limit: int = Query(50, ge=1, le=100)
+):
+    results = all_origins
+    if q:
+        query = q.lower()
+        results = [o for o in results if query in o.get("name", "").lower() or query in o.get("description", "").lower()]
+    if kind:
+        results = [o for o in results if o.get("kind") == kind.lower()]
+    return {
+        "total": len(results),
+        "origins": results[:limit]
+    }
+
+
+@app.get("/api/v1/compendium/glossary")
+def get_compendium_glossary(
+    q: Optional[str] = Query(None, description="Search query for rules term"),
+    tag: Optional[str] = Query(None, description="Filter by rule family tag"),
+    limit: int = Query(50, ge=1, le=400)
+):
+    results = all_glossary_terms
+    if q:
+        query = q.lower()
+        results = [t for t in results if query in t.get("term", "").lower() or query in t.get("definition", "").lower()]
+    if tag:
+        results = [t for t in results if t.get("tag", "").lower() == tag.lower()]
+    return {
+        "total": len(results),
+        "glossary": results[:limit]
     }
 
 

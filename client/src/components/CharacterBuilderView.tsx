@@ -70,7 +70,7 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
   useEffect(() => {
-    fetch('/api/v1/orchestrator/compendium/spells?limit=50')
+    fetch('/api/v1/compendium/spells?limit=50')
       .then((r) => r.json())
       .then((data) => {
         if (data.spells) setAvailableSpells(data.spells);
@@ -195,7 +195,7 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         spells: selectedSpells.map((s) => ({ name: s, level: 1, school: 'Evocation', casting_time: '1 action', range: '60 ft' })),
       };
 
-      const res = await fetch('/api/v1/orchestrator/character/export-pdf', {
+      const res = await fetch('/api/v1/character/export-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
