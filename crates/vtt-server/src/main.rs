@@ -1,6 +1,8 @@
 use actix_cors::Cors;
 use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
+use actix_ws::Message;
 use dashmap::DashMap;
+use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +13,7 @@ use vtt_core::{
     Ability, ActionResolver, Condition, DamageType, DeathSaveState, DiceEngine, GameSession,
     RulesEvaluator,
 };
-use vtt_crdt_sync::CrdtRelayHub;
+use vtt_crdt_sync::{CrdtRelayHub, CrdtSyncMessage, TokenTransform, VectorClock};
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
 use vtt_spatial::{AStarPathfinder, CoverCalculator, GridCollisionMap, Vector3};
 use vtt_wfc::{DungeonGenerator, RoomDescriptor};
@@ -19,12 +21,66 @@ use vtt_wfc::{DungeonGenerator, RoomDescriptor};
 pub struct AppState {
     pub sessions: DashMap<Uuid, Arc<RwLock<GameSession>>>,
     pub crdt_hub: Arc<CrdtRelayHub>,
+    pub peers: Arc<PeerRegistry>,
     pub wasm_engine: Arc<SandboxedWasmEngine>,
     pub rhai_engine: Arc<RhaiNarrativeEngine>,
     pub total_action_requests: AtomicU64,
     pub valid_action_executions: AtomicU64,
     pub total_audits: AtomicU64,
     pub auditor_rejections: AtomicU64,
+}
+
+/// Live WebSocket peer registry per room. The CrdtRelayHub merges state
+/// (LWW arbitration); this struct handles the fan-out to connected clients.
+pub struct PeerRegistry {
+    rooms: DashMap<String, DashMap<u64, actix_ws::Session>>,
+    next_peer_id: AtomicU64,
+}
+
+impl PeerRegistry {
+    pub fn new() -> Self {
+        Self {
+            rooms: DashMap::new(),
+            next_peer_id: AtomicU64::new(1),
+        }
+    }
+
+    fn join(&self, room_id: &str, session: &actix_ws::Session) -> u64 {
+        let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
+        self.rooms
+            .entry(room_id.to_string())
+            .or_default()
+            .insert(peer_id, session.clone());
+        peer_id
+    }
+
+    fn leave(&self, room_id: &str, peer_id: u64) {
+        if let Some(peers) = self.rooms.get(room_id) {
+            peers.remove(&peer_id);
+        }
+    }
+
+    async fn broadcast(&self, room_id: &str, except_peer: u64, text: &str) {
+        if let Some(peers) = self.rooms.get(room_id) {
+            for entry in peers.iter() {
+                if *entry.key() != except_peer {
+                    let mut peer_session = entry.value().clone();
+                    // actix-ws Session::text is async; dropped futures never flush.
+                    let _ = peer_session.text(text).await;
+                }
+            }
+        }
+    }
+
+    fn count(&self, room_id: &str) -> usize {
+        self.rooms.get(room_id).map(|p| p.len()).unwrap_or(0)
+    }
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -346,6 +402,130 @@ async fn resolve_death_save(
     }))
 }
 
+// --- Live CRDT Sync WebSocket (/ws/sessions/{id}/sync) ---------------------
+
+fn fnv1a_hash(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Normalize the browser's camelCase TokenUpdate payload into the CRDT
+/// model and run it through LWW arbitration; true means "accept & relay".
+fn accept_token_update(hub: &CrdtRelayHub, room_id: &str, value: &serde_json::Value) -> bool {
+    let payload = match value.get("payload") {
+        Some(p) => p,
+        None => return false,
+    };
+    let token_name = match payload.get("tokenId").and_then(|v| v.as_str()) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => return false,
+    };
+
+    let num = |key: &str| -> f32 {
+        payload
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32
+    };
+    let ts_ms = payload
+        .get("timestamp")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+
+    let transform = TokenTransform {
+        token_id: Uuid::from_u64_pair(
+            fnv1a_hash(&token_name),
+            fnv1a_hash(&format!("{}#y", token_name)),
+        ),
+        x: num("x"),
+        y: num("y"),
+        z: num("z"),
+        rotation: num("rotation"),
+        scale: num("scale"),
+        elevation: num("elevation"),
+        vector_clock: VectorClock {
+            client_id: fnv1a_hash(&token_name),
+            sequence: ts_ms,
+        },
+        timestamp: chrono::Utc::now(),
+    };
+
+    matches!(
+        hub.handle_incoming_message(room_id, CrdtSyncMessage::TokenUpdate(transform)),
+        Some(CrdtSyncMessage::TokenUpdate(_))
+    )
+}
+
+async fn ws_sync(
+    data: web::Data<AppState>,
+    path: web::Path<String>,
+    req: actix_web::HttpRequest,
+    body: web::Payload,
+) -> impl Responder {
+    let room_id = path.into_inner();
+
+    let (response, session, mut msg_stream) = match actix_ws::handle(&req, body) {
+        Ok(handshake) => handshake,
+        Err(e) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()}))
+        }
+    };
+
+    let mut session = session;
+    let peer_id = data.peers.join(&room_id, &session);
+    let hub = Arc::clone(&data.crdt_hub);
+    let peers = Arc::clone(&data.peers);
+    let rid = room_id.clone();
+
+    actix_web::rt::spawn(async move {
+        while let Some(Ok(msg)) = msg_stream.next().await {
+            match msg {
+                Message::Text(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(value) => {
+                        match value.get("type").and_then(|t| t.as_str()) {
+                            Some("TokenUpdate") => {
+                                // Relay only updates that win LWW arbitration.
+                                if accept_token_update(&hub, &rid, &value) {
+                                    peers.broadcast(&rid, peer_id, &text).await;
+                                }
+                            }
+                            Some("CursorAwareness") | Some("FogUpdate") => {
+                                peers.broadcast(&rid, peer_id, &text).await;
+                            }
+                            Some("Heartbeat") | Some("SyncStep1") => {
+                                let _ = session.text(text.clone()).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {}
+                },
+                Message::Ping(bytes) => {
+                    let _ = session.pong(&bytes).await;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        peers.leave(&rid, peer_id);
+        let _ = session.close(None);
+    });
+
+    response
+}
+
+async fn room_presence(data: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
+    let room_id = path.into_inner();
+    HttpResponse::Ok().json(serde_json::json!({
+        "room_id": room_id,
+        "connected_peers": data.peers.count(&room_id),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LosReq {
     pub attacker_pos: Vector3,
@@ -502,6 +682,7 @@ async fn main() -> std::io::Result<()> {
     let state = web::Data::new(AppState {
         sessions: DashMap::new(),
         crdt_hub: Arc::new(CrdtRelayHub::new()),
+        peers: Arc::new(PeerRegistry::new()),
         wasm_engine: Arc::new(SandboxedWasmEngine::new().expect("Failed Wasm engine init")),
         rhai_engine: Arc::new(RhaiNarrativeEngine::new()),
         total_action_requests: AtomicU64::new(0),
@@ -521,12 +702,16 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .route("/health", web::get().to(health_check))
             .route("/metrics", web::get().to(get_metrics))
+            // Root-path alias matching the browser client's sync URL contract.
+            .route("/ws/sessions/{id}/sync", web::get().to(ws_sync))
             .service(
                 web::scope("/api/v1")
                     .route("/sessions", web::post().to(create_session))
                     .route("/sessions/{id}", web::get().to(get_session))
                     .route("/sessions/{id}/action/attack", web::post().to(resolve_attack))
                     .route("/sessions/{id}/safety/x-card", web::post().to(trigger_safety_rewind))
+                    .route("/ws/sessions/{id}/sync", web::get().to(ws_sync))
+                    .route("/rooms/{id}/presence", web::get().to(room_presence))
                     .route("/actions/check", web::post().to(resolve_check))
                     .route("/actions/save", web::post().to(resolve_save))
                     .route("/actions/concentration", web::post().to(resolve_concentration))

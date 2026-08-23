@@ -43,28 +43,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setError('Please enter your email and password.');
       return;
     }
-    // Match with demo account or create dynamic user
-    const matched = DEMO_ACCOUNTS.find(
-      (d) => d.user.email.toLowerCase() === email.toLowerCase() || d.user.username.toLowerCase() === email.toLowerCase()
-    );
-    if (matched) {
-      onLoginSuccess(matched.user);
-    } else {
-      const newUser: User = {
-        id: `usr_${Date.now()}`,
-        username: email.split('@')[0],
-        email,
-        displayName: displayName || email.split('@')[0],
-        avatarUrl: 'fighter',
-        role: 'player',
-        subscriptionTier: 'free',
-        assignedTokenIds: ['thorin_1'],
-        diceTheme: 'gold',
-        createdAt: new Date().toISOString(),
-      };
-      onLoginSuccess(newUser);
-    }
-    onClose();
+    // Server-backed login first; fall back to the demo directory when the
+    // orchestrator is unreachable so the tabletop never hard-blocks.
+    fetch('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    })
+      .then(async (resp) => {
+        if (resp.ok) {
+          const data = await resp.json();
+          sessionStorage.setItem('aethertable_token', data.token);
+          onLoginSuccess({ ...data.user, avatarUrl: 'fighter', diceTheme: 'gold', bio: undefined } as User);
+          onClose();
+        } else {
+          setError((await resp.json()).detail || 'Invalid email or password.');
+        }
+      })
+      .catch(() => {
+        const matched = DEMO_ACCOUNTS.find(
+          (d) =>
+            d.user.email.toLowerCase() === email.toLowerCase() ||
+            d.user.username.toLowerCase() === email.toLowerCase()
+        );
+        if (matched) {
+          onLoginSuccess(matched.user);
+          onClose();
+        } else {
+          setError('Auth server unavailable and no matching demo account.');
+        }
+      });
   };
 
   const handleSignUp = (e: React.FormEvent) => {
@@ -73,20 +81,44 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setError('All fields are required for sign up.');
       return;
     }
-    const newUser: User = {
-      id: `usr_${Date.now()}`,
-      username: email.split('@')[0],
-      email,
-      displayName,
-      avatarUrl: role === 'admin' ? 'crown' : role === 'gm' ? 'crown' : role === 'spectator' ? 'scout' : 'fighter',
-      role,
-      subscriptionTier: role === 'admin' ? 'master' : 'hero',
-      assignedTokenIds: role === 'admin' || role === 'gm' ? ['*'] : ['thorin_1'],
-      diceTheme: 'gold',
-      createdAt: new Date().toISOString(),
-    };
-    onLoginSuccess(newUser);
-    onClose();
+    fetch('/api/v1/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email,
+        username: email.split('@')[0],
+        display_name: displayName,
+        password,
+        role,
+      }),
+    })
+      .then(async (resp) => {
+        if (resp.ok) {
+          const data = await resp.json();
+          sessionStorage.setItem('aethertable_token', data.token);
+          onLoginSuccess({ ...data.user, avatarUrl: 'fighter', diceTheme: 'gold', bio: undefined } as User);
+          onClose();
+        } else {
+          setError((await resp.json()).detail || 'Sign up failed.');
+        }
+      })
+      .catch(() => {
+        // Offline fallback: local-only account.
+        const newUser: User = {
+          id: `usr_${Date.now()}`,
+          username: email.split('@')[0],
+          email,
+          displayName,
+          avatarUrl: role === 'admin' ? 'crown' : role === 'gm' ? 'crown' : role === 'spectator' ? 'scout' : 'fighter',
+          role,
+          subscriptionTier: role === 'admin' ? 'master' : 'hero',
+          assignedTokenIds: role === 'admin' || role === 'gm' ? ['*'] : ['thorin_1'],
+          diceTheme: 'gold',
+          createdAt: new Date().toISOString(),
+        };
+        onLoginSuccess(newUser);
+        onClose();
+      });
   };
 
   const handleQuickDemoLogin = (demo: typeof DEMO_ACCOUNTS[0]) => {

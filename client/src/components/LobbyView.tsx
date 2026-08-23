@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { 
   Users, 
   Shield, 
@@ -38,6 +38,28 @@ interface LobbyViewProps {
 export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentUser }) => {
   const [copied, setCopied] = useState(false);
   const [selectedSeat, setSelectedSeat] = useState<string>('seat_gm');
+  // Live presence from the engine relay; null while unreachable (solo session).
+  const [livePeers, setLivePeers] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pollPresence = () => {
+      fetch('/api/v1/engine/rooms/aethertable-live/presence')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!cancelled) setLivePeers(data ? data.connected_peers : null);
+        })
+        .catch(() => {
+          if (!cancelled) setLivePeers(null);
+        });
+    };
+    pollPresence();
+    const timer = setInterval(pollPresence, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   const [campaignMeta, setCampaignMeta] = useState({
     title: 'The Fall of Baron Vane',
@@ -147,6 +169,11 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
             <h2 className="text-sm font-bold font-display uppercase tracking-wider text-purple-400 flex items-center gap-2">
               <UserCheck className="w-4 h-4" />
               <span>Assigned Seats & Presence ({seats.length} / {campaignMeta.maxPlayers})</span>
+              {livePeers !== null && (
+                <span className="ml-2 px-2 py-0.5 text-[9px] font-mono bg-emerald-950/60 text-emerald-300 border border-emerald-600/40 rounded-full">
+                  ● {livePeers} live via relay
+                </span>
+              )}
             </h2>
             <span className="text-xs font-mono text-emerald-400 flex items-center gap-1">
               <Radio className="w-3 h-3 animate-pulse" />

@@ -1,5 +1,10 @@
 import os
 import json
+import base64
+import hashlib
+import hmac
+import secrets
+import time
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -165,6 +170,120 @@ def health_check():
         "version": "1.0.0",
         "mcr_compliance": 1.0,
     }
+
+
+# --- Identity & Sessions (/api/v1/auth/*) -----------------------------------
+# In-memory credential store with salted SHA-256 password hashes and
+# HMAC-signed session tokens (AUTH_SECRET env; swap for the Postgres
+# narrative_state schema when persistence lands in a later wave).
+
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "aethertable-dev-secret")
+TOKEN_TTL_SECONDS = 12 * 3600
+
+user_registry: Dict[str, Dict[str, Any]] = {}  # email.lower() -> user record
+
+
+class AuthSignupRequest(BaseModel):
+    email: str
+    username: str = ""
+    display_name: str = ""
+    password: str
+    role: str = "player"
+
+
+class AuthLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def _hash_password(password: str, salt: bytes) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000).hex()
+
+
+def _sign_token(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hmac.new(AUTH_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(raw).decode() + "." + sig
+
+
+def _verify_token(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        raw_b64, sig = token.split(".", 1)
+        raw = base64.urlsafe_b64decode(raw_b64.encode())
+        expected = hmac.new(AUTH_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(raw)
+        if payload.get("exp", 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _auth_response(record: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    token = _sign_token({"user_id": record["id"], "exp": now + TOKEN_TTL_SECONDS})
+    profile = {k: v for k, v in record.items() if k not in ("salt", "password_hash")}
+    return {"token": token, "expires_in": TOKEN_TTL_SECONDS, "user": profile}
+
+
+@app.post("/api/v1/auth/signup")
+def auth_signup(req: AuthSignupRequest):
+    key = req.email.strip().lower()
+    if not key or "@" not in key or len(req.password) < 4:
+        raise HTTPException(status_code=400, detail="Valid email and password (4+ chars) required")
+    if key in user_registry:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    salt = secrets.token_bytes(16)
+    record = {
+        "id": f"usr_{secrets.token_hex(6)}",
+        "email": key,
+        "username": req.username or key.split("@")[0],
+        "displayName": req.display_name or req.username or key.split("@")[0],
+        "role": req.role if req.role in ("gm", "player", "spectator", "admin") else "player",
+        "salt": salt,
+        "password_hash": _hash_password(req.password, salt),
+        "assignedTokenIds": [],
+        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    user_registry[key] = record
+    return _auth_response(record)
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(req: AuthLoginRequest):
+    key = req.email.strip().lower()
+    record = user_registry.get(key)
+    # Seed default GM account on first use so the demo flow works out of the box.
+    if key == "gm@aethertable.io" and record is None and req.password == "dragonlance":
+        salt = secrets.token_bytes(16)
+        record = {
+            "id": "usr_gm_001",
+            "email": key,
+            "username": "gm",
+            "displayName": "Lead GM",
+            "role": "gm",
+            "salt": salt,
+            "password_hash": _hash_password(req.password, salt),
+            "assignedTokenIds": ["*"],
+            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        user_registry[key] = record
+    if record is None or _hash_password(req.password, record["salt"]) != record["password_hash"]:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return _auth_response(record)
+
+
+@app.get("/api/v1/auth/session")
+def auth_session(token: str = Query(...)):
+    payload = _verify_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    for record in user_registry.values():
+        if record["id"] == payload["user_id"]:
+            return {"valid": True, "user": {k: v for k, v in record.items() if k not in ("salt", "password_hash")}}
+    raise HTTPException(status_code=401, detail="User no longer exists")
 
 
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
@@ -418,6 +537,13 @@ async def engine_generate_map(req: EngineMapGenerateRequest):
         "theme": req.theme,
     }
     return await _engine_call(engine_client.generate_map({"room_desc": room_desc, "seed": req.seed}))
+
+
+@app.get("/api/v1/engine/rooms/{room_id}/presence")
+async def engine_room_presence(room_id: str):
+    return await _engine_call(
+        engine_client.engine_request("GET", f"/api/v1/rooms/{room_id}/presence")
+    )
 
 
 @app.post("/api/v1/character/export-pdf")

@@ -37,6 +37,7 @@ import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier } from './api/rules_engine';
+import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
@@ -83,6 +84,30 @@ export function App() {
 
   const particleFXRef = useRef<ParticleFXManager | null>(null);
   const diceBoxRef = useRef<DiceBox3D | null>(null);
+
+  // Live CRDT sync with the engine relay (tokens sync across peers; solo-safe).
+  const syncClientRef = useRef<VttCrdtSyncClient | null>(null);
+  useEffect(() => {
+    const engineWsUrl =
+      (import.meta as any).env?.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
+    const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
+    client.connect();
+    syncClientRef.current = client;
+
+    const unsubscribe = client.onRemoteTokenUpdate((update: TokenTransformData) => {
+      setTokens((prev) =>
+        prev.map((t) =>
+          t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t
+        )
+      );
+    });
+
+    return () => {
+      unsubscribe();
+      client.disconnect();
+      syncClientRef.current = null;
+    };
+  }, []);
 
   // Authoritative Tokens
   const [tokens, setTokens] = useState<Token[]>([
@@ -188,6 +213,8 @@ export function App() {
       prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
     );
     globalWebRTCMesh.updatePeerPosition(tokenId, newX, newY);
+    // Broadcast the move through the engine's CRDT relay (no-op when offline).
+    syncClientRef.current?.updateTokenPosition(tokenId, newX, newY, 0);
   };
 
   const handleNextTurn = () => {
