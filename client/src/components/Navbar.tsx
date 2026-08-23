@@ -28,7 +28,8 @@ import {
   ShoppingBag,
   Music,
   Search,
-  Command
+  Command,
+  Video
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { User, DEMO_ACCOUNTS } from '../types/auth';
@@ -42,6 +43,9 @@ interface NavbarProps {
   onOpenAudioMixer?: () => void;
   onOpenJukebox?: () => void;
   onOpenCommandPalette?: () => void;
+  onOpenMapEditor?: () => void;
+  onOpenHandouts?: () => void;
+  onOpenStreamerHUD?: () => void;
   onOpenSubscription?: () => void;
   onOpenUserSettings?: () => void;
   onOpenAuth?: () => void;
@@ -58,6 +62,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenAudioMixer,
   onOpenJukebox,
   onOpenCommandPalette,
+  onOpenMapEditor,
+  onOpenHandouts,
+  onOpenStreamerHUD,
   onOpenSubscription,
   onOpenUserSettings,
   onOpenAuth,
@@ -160,6 +167,30 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* Telemetry, User Profile Menu & Actions */}
       <div className="flex items-center gap-2">
+        {/* Map & LoS Layer Editor Trigger */}
+        {onOpenMapEditor && (
+          <button
+            onClick={onOpenMapEditor}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-950/60 hover:bg-amber-900/80 text-amber-300 border border-amber-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
+            title="Multi-Layer Tactical Map & LoS Wall Editor"
+          >
+            <Layers className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden xl:inline text-[11px]">Map Layers</span>
+          </button>
+        )}
+
+        {/* Digital Handouts Vault Trigger */}
+        {onOpenHandouts && (
+          <button
+            onClick={onOpenHandouts}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
+            title="Digital Handouts & Secret Notes Vault"
+          >
+            <Scroll className="w-3.5 h-3.5 text-rose-400" />
+            <span className="hidden xl:inline text-[11px]">Handouts</span>
+          </button>
+        )}
+
         {/* Jukebox Ambient Soundscapes Trigger */}
         {onOpenJukebox && (
           <button
@@ -169,6 +200,18 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <Music className="w-3.5 h-3.5 text-indigo-400" />
             <span className="hidden xl:inline text-[11px]">Jukebox</span>
+          </button>
+        )}
+
+        {/* Streamer Broadcast Mode Trigger */}
+        {onOpenStreamerHUD && (
+          <button
+            onClick={onOpenStreamerHUD}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-950/60 hover:bg-red-900/80 text-red-300 border border-red-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
+            title="Streamer Broadcast Mode & Discord Webhooks"
+          >
+            <Video className="w-3.5 h-3.5 text-red-400" />
+            <span className="hidden xl:inline text-[11px]">Streamer</span>
           </button>
         )}
 

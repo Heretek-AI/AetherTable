@@ -25,6 +25,9 @@ import { AdminDashboardView } from './components/AdminDashboardView';
 import { MarketplaceView } from './components/MarketplaceView';
 import { SoundscapeJukeboxModal } from './components/SoundscapeJukeboxModal';
 import { CommandPalette } from './components/CommandPalette';
+import { MapLayerEditorModal, MapLayerType } from './components/MapLayerEditorModal';
+import { HandoutManagerModal, DigitalHandout } from './components/HandoutManagerModal';
+import { StreamerHUDModal } from './components/StreamerHUDModal';
 import { User, DEMO_ACCOUNTS } from './types/auth';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
@@ -39,6 +42,10 @@ export function App() {
   const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
   const [isJukeboxOpen, setIsJukeboxOpen] = useState(false);
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [isMapEditorOpen, setIsMapEditorOpen] = useState(false);
+  const [isHandoutsOpen, setIsHandoutsOpen] = useState(false);
+  const [isStreamerHUDOpen, setIsStreamerHUDOpen] = useState(false);
+  const [activeMapLayer, setActiveMapLayer] = useState<MapLayerType>('tokens');
   const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
@@ -627,6 +634,9 @@ export function App() {
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         onOpenJukebox={() => setIsJukeboxOpen(true)}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
+        onOpenMapEditor={() => setIsMapEditorOpen(true)}
+        onOpenHandouts={() => setIsHandoutsOpen(true)}
+        onOpenStreamerHUD={() => setIsStreamerHUDOpen(true)}
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
         onOpenUserSettings={() => setIsUserSettingsOpen(true)}
         onOpenAuth={() => setIsAuthOpen(true)}
@@ -766,6 +776,36 @@ export function App() {
         onClose={() => setIsCommandPaletteOpen(false)}
         onNavigate={(view) => setCurrentView(view)}
         onExecuteRoll={(expr) => handleMacroRoll('Quick Roll', expr, false, 'normal')}
+      />
+
+      {/* Map & LoS Layer Editor Modal */}
+      <MapLayerEditorModal
+        isOpen={isMapEditorOpen}
+        onClose={() => setIsMapEditorOpen(false)}
+        walls={customWalls}
+        onUpdateWalls={setCustomWalls}
+        activeLayer={activeMapLayer}
+        onSelectLayer={setActiveMapLayer}
+      />
+
+      {/* Digital Handouts Vault Modal */}
+      <HandoutManagerModal
+        isOpen={isHandoutsOpen}
+        onClose={() => setIsHandoutsOpen(false)}
+        onBroadcastHandout={(handout) => {
+          addSystemMessage(`📜 Handout Shared: "${handout.title}" revealed to ${String(handout.revealedTo).toUpperCase()}`);
+        }}
+      />
+
+      {/* Streamer Broadcast HUD Modal */}
+      <StreamerHUDModal
+        isOpen={isStreamerHUDOpen}
+        onClose={() => setIsStreamerHUDOpen(false)}
+        onToggleCinematicMode={(enabled) => {
+          setIsLeftDockCollapsed(enabled);
+          setIsRightDockCollapsed(enabled);
+          addSystemMessage(enabled ? '🎥 Cinematic Streamer Mode Enabled (Clean OBS capture)' : '🎥 Cinematic Mode Disabled');
+        }}
       />
 
       {/* 3D Spatial Audio & Radar Modal */}
