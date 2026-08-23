@@ -29,9 +29,10 @@ import {
 interface LandingPageViewProps {
   onEnterApp: (targetView?: string) => void;
   onOpenPricing?: () => void;
+  onOpenAuth?: (initialTab?: 'signin' | 'signup') => void;
 }
 
-export const LandingPageView: React.FC<LandingPageViewProps> = ({ onEnterApp, onOpenPricing }) => {
+export const LandingPageView: React.FC<LandingPageViewProps> = ({ onEnterApp, onOpenPricing, onOpenAuth }) => {
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'yearly'>('monthly');
   const [expandedFaq, setExpandedFaq] = useState<number | null>(0);
 
@@ -89,12 +90,28 @@ export const LandingPageView: React.FC<LandingPageViewProps> = ({ onEnterApp, on
         </nav>
 
         <div className="flex items-center space-x-3">
+          {onOpenAuth && (
+            <>
+              <button
+                onClick={() => onOpenAuth('signin')}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-300 hover:text-white transition cursor-pointer"
+              >
+                Sign In
+              </button>
+              <button
+                onClick={() => onOpenAuth('signup')}
+                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 rounded-lg text-xs font-bold transition cursor-pointer"
+              >
+                Create Account
+              </button>
+            </>
+          )}
           <button
             onClick={() => onEnterApp('tabletop')}
             className="flex items-center space-x-2 px-4 py-2 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white text-xs font-bold rounded-lg shadow-lg shadow-amber-950/50 border border-amber-500/40 transition active:scale-95 cursor-pointer"
           >
             <Play className="w-3.5 h-3.5 fill-white" />
-            <span>Launch Virtual Tabletop</span>
+            <span>Launch Tabletop</span>
           </button>
         </div>
       </header>

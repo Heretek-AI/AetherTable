@@ -19,6 +19,10 @@ import { LandingPageView } from './components/LandingPageView';
 import { MacroQuickbar } from './components/MacroQuickbar';
 import { SpellbookModal } from './components/SpellbookModal';
 import { SubscriptionModal } from './components/SubscriptionModal';
+import { AuthModal } from './components/AuthModal';
+import { UserSettingsModal } from './components/UserSettingsModal';
+import { AdminDashboardView } from './components/AdminDashboardView';
+import { User, DEMO_ACCOUNTS } from './types/auth';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
@@ -27,10 +31,13 @@ import { globalWebRTCMesh } from './render/webrtc_mesh';
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('tabletop');
   const [campaignTitle, setCampaignTitle] = useState('The Fall of Baron Vane');
+  const [currentUser, setCurrentUser] = useState<User>(DEMO_ACCOUNTS[0].user);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
   const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+  const [isUserSettingsOpen, setIsUserSettingsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
 
@@ -595,6 +602,10 @@ export function App() {
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
+        onOpenUserSettings={() => setIsUserSettingsOpen(true)}
+        onOpenAuth={() => setIsAuthOpen(true)}
+        onFastSwitchUser={setCurrentUser}
+        currentUser={currentUser}
         latencyMs={latencyMs}
         campaignName={campaignTitle}
       />
@@ -605,6 +616,7 @@ export function App() {
           <LandingPageView
             onEnterApp={(target) => setCurrentView((target as SaaSView) || 'tabletop')}
             onOpenPricing={() => setIsSubscriptionOpen(true)}
+            onOpenAuth={(tab) => setIsAuthOpen(true)}
           />
         )}
 
@@ -632,6 +644,7 @@ export function App() {
                   selectedTokenId={selectedTokenId}
                   onSelectToken={(id) => setSelectedTokenId(id)}
                   onUpdateTokenElevation={handleUpdateTokenElevation}
+                  currentUser={currentUser}
                   walls={customWalls}
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
@@ -702,6 +715,10 @@ export function App() {
         {currentView === 'analytics' && (
           <AnalyticsView />
         )}
+
+        {currentView === 'admin' && (
+          <AdminDashboardView />
+        )}
       </div>
 
       {/* 3D Spatial Audio & Radar Modal */}
@@ -730,6 +747,24 @@ export function App() {
       <SubscriptionModal
         isOpen={isSubscriptionOpen}
         onClose={() => setIsSubscriptionOpen(false)}
+      />
+
+      {/* Multi-User Identity Auth Modal */}
+      <AuthModal
+        isOpen={isAuthOpen}
+        onClose={() => setIsAuthOpen(false)}
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+          addSystemMessage(`👤 Authenticated as ${user.displayName} (${user.role.toUpperCase()})`);
+        }}
+      />
+
+      {/* User Settings & Preferences Modal */}
+      <UserSettingsModal
+        isOpen={isUserSettingsOpen}
+        onClose={() => setIsUserSettingsOpen(false)}
+        currentUser={currentUser}
+        onUpdateUser={setCurrentUser}
       />
     </div>
   );

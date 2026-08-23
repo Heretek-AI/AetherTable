@@ -19,6 +19,7 @@ import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
 import { RaycastLighting, Point } from '../render/raycast_lighting';
 import { globalAudio } from '../render/audio_manager';
+import { User } from '../types/auth';
 
 export interface Token {
   id: string;
@@ -41,6 +42,8 @@ interface TacticalCanvasProps {
   selectedTokenId: string | null;
   onSelectToken: (tokenId: string) => void;
   onUpdateTokenElevation?: (tokenId: string, newElevation: number) => void;
+  currentUser?: User;
+  remoteCursors?: { id: string; name: string; color: string; x: number; y: number }[];
   gridWidth?: number;
   gridHeight?: number;
   walls?: { x: number; y: number }[];
@@ -56,6 +59,11 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   selectedTokenId,
   onSelectToken,
   onUpdateTokenElevation,
+  currentUser,
+  remoteCursors = [
+    { id: 'usr_lyra', name: 'Lyra', color: '#818cf8', x: 6, y: 3 },
+    { id: 'usr_player1', name: 'Thorin', color: '#ef4444', x: 3, y: 5 },
+  ],
   gridWidth = 16,
   gridHeight = 12,
   walls = [
@@ -70,6 +78,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [isPanning, setIsPanning] = useState(false);
   const [startPan, setStartPan] = useState({ x: 0, y: 0 });
   const [draggedTokenId, setDraggedTokenId] = useState<string | null>(null);
+  const [permissionWarning, setPermissionWarning] = useState<string | null>(null);
   
   // Tools
   const [measureMode, setMeasureMode] = useState(false);
@@ -256,6 +265,13 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         setZoom(newZoom);
       }}
     >
+      {/* Permission Warning Banner */}
+      {permissionWarning && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-rose-950/90 border border-rose-500/80 rounded-xl text-xs font-mono font-bold text-rose-200 shadow-2xl backdrop-blur-md animate-bounce">
+          ⚠️ {permissionWarning}
+        </div>
+      )}
+
       {/* Floating Tactical Overlay Controls */}
       <div className="absolute top-4 left-4 z-20 flex items-center gap-2 vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl border border-slate-800">
         {/* Zoom Controls */}
@@ -477,6 +493,21 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 onClick={(e) => {
                   e.stopPropagation();
                   onSelectToken(token.id);
+
+                  // Token Authority Enforcement
+                  const hasAuthority =
+                    !currentUser ||
+                    currentUser.role === 'admin' ||
+                    currentUser.role === 'gm' ||
+                    (currentUser.assignedTokenIds &&
+                      (currentUser.assignedTokenIds.includes('*') || currentUser.assignedTokenIds.includes(token.id)));
+
+                  if (!hasAuthority) {
+                    setPermissionWarning(`Authority Denied: ${token.name} is controlled by another player or the GM.`);
+                    setTimeout(() => setPermissionWarning(null), 3000);
+                    return;
+                  }
+
                   setDraggedTokenId(isDragging ? null : token.id);
                 }}
                 className={`absolute flex flex-col items-center justify-center transition-all duration-200 cursor-pointer ${
@@ -527,6 +558,29 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               </div>
             );
           })}
+
+          {/* Live Multiplayer Remote Player Cursors & Pings */}
+          {remoteCursors.map((cursor) => (
+            <div
+              key={cursor.id}
+              className="absolute pointer-events-none z-35 transition-all duration-300 flex items-center space-x-1.5"
+              style={{
+                left: `${(cursor.x + 0.4) * cellSize}px`,
+                top: `${(cursor.y + 0.4) * cellSize}px`,
+              }}
+            >
+              <div
+                className="w-3.5 h-3.5 rounded-full border-2 border-white shadow-lg animate-pulse"
+                style={{ backgroundColor: cursor.color }}
+              />
+              <span
+                className="px-2 py-0.5 text-[9px] font-mono font-bold text-white rounded-md shadow-2xl backdrop-blur-md border border-white/30 whitespace-nowrap"
+                style={{ backgroundColor: cursor.color }}
+              >
+                🎯 {cursor.name} [{String.fromCharCode(65 + cursor.x)}{cursor.y + 1}]
+              </span>
+            </div>
+          ))}
 
           {/* 2D Raycast Lighting & Line-of-Sight Mask Layer */}
           <canvas
