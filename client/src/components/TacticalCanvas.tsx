@@ -593,6 +593,27 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   height: `${cellSize}px`,
                 }}
               >
+                {/* Dynamic Token Aura Field (10ft Paladin Aura / Spirit Guardians) */}
+                {isSelected && (
+                  <div
+                    className="absolute rounded-full border border-amber-400/40 bg-amber-500/10 pointer-events-none animate-pulse-glow z-0"
+                    style={{
+                      width: `${cellSize * 3}px`,
+                      height: `${cellSize * 3}px`,
+                      left: `${-cellSize}px`,
+                      top: `${-cellSize}px`,
+                    }}
+                  />
+                )}
+
+                {/* Token Condition Aura Ring */}
+                {token.conditions && token.conditions.length > 0 && (
+                  <div
+                    className="absolute -inset-1 rounded-full border-2 border-dashed border-cyan-400 animate-spin pointer-events-none z-20"
+                    title={`Active Conditions: ${token.conditions.join(', ')}`}
+                  />
+                )}
+
                 {isSelected && (
                   <div className="absolute inset-0.5 rounded-full border-2 border-purple-400 animate-pulse-glow" />
                 )}

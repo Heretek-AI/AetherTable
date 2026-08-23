@@ -28,6 +28,9 @@ import { CommandPalette } from './components/CommandPalette';
 import { MapLayerEditorModal, MapLayerType } from './components/MapLayerEditorModal';
 import { HandoutManagerModal, DigitalHandout } from './components/HandoutManagerModal';
 import { StreamerHUDModal } from './components/StreamerHUDModal';
+import { QuestJournalModal } from './components/QuestJournalModal';
+import { VideoMeshTiles } from './components/VideoMeshTiles';
+import { BossHealthBar } from './components/BossHealthBar';
 import { User, DEMO_ACCOUNTS } from './types/auth';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
@@ -44,6 +47,8 @@ export function App() {
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [isMapEditorOpen, setIsMapEditorOpen] = useState(false);
   const [isHandoutsOpen, setIsHandoutsOpen] = useState(false);
+  const [isQuestJournalOpen, setIsQuestJournalOpen] = useState(false);
+  const [isVideoMeshVisible, setIsVideoMeshVisible] = useState(true);
   const [isStreamerHUDOpen, setIsStreamerHUDOpen] = useState(false);
   const [activeMapLayer, setActiveMapLayer] = useState<MapLayerType>('tokens');
   const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
@@ -636,6 +641,8 @@ export function App() {
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
         onOpenMapEditor={() => setIsMapEditorOpen(true)}
         onOpenHandouts={() => setIsHandoutsOpen(true)}
+        onOpenQuestJournal={() => setIsQuestJournalOpen(true)}
+        onToggleVideoMesh={() => setIsVideoMeshVisible(!isVideoMeshVisible)}
         onOpenStreamerHUD={() => setIsStreamerHUDOpen(true)}
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
         onOpenUserSettings={() => setIsUserSettingsOpen(true)}
@@ -658,6 +665,20 @@ export function App() {
 
         {currentView === 'tabletop' && (
           <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0 relative">
+            {/* Top Epic Boss Health Bar */}
+            {tokens.find((t) => !t.isPlayer && t.maxHp >= 50) && (
+              <BossHealthBar
+                bossToken={tokens.find((t) => !t.isPlayer && t.maxHp >= 50) || null}
+                activeTurnName={tokens[currentTurnIndex]?.name || 'Active Turn'}
+              />
+            )}
+
+            {/* Floating WebRTC Video Mesh Tiles */}
+            <VideoMeshTiles
+              isVisible={isVideoMeshVisible}
+              onToggleVisible={() => setIsVideoMeshVisible(false)}
+            />
+
             {/* Tabletop Center Workspace */}
             <div className="flex-1 flex overflow-hidden relative min-h-0">
               {/* Left Dock: Initiative Tracker */}
@@ -795,6 +816,13 @@ export function App() {
         onBroadcastHandout={(handout) => {
           addSystemMessage(`📜 Handout Shared: "${handout.title}" revealed to ${String(handout.revealedTo).toUpperCase()}`);
         }}
+      />
+
+      {/* Campaign Notes & Interactive Quest Journal Modal */}
+      <QuestJournalModal
+        isOpen={isQuestJournalOpen}
+        onClose={() => setIsQuestJournalOpen(false)}
+        onShareToChat={(text) => addSystemMessage(text)}
       />
 
       {/* Streamer Broadcast HUD Modal */}

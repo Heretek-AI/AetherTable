@@ -48,6 +48,8 @@ interface NavbarProps {
   onOpenCommandPalette?: () => void;
   onOpenMapEditor?: () => void;
   onOpenHandouts?: () => void;
+  onOpenQuestJournal?: () => void;
+  onToggleVideoMesh?: () => void;
   onOpenStreamerHUD?: () => void;
   onOpenSubscription?: () => void;
   onOpenUserSettings?: () => void;
@@ -67,6 +69,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenCommandPalette,
   onOpenMapEditor,
   onOpenHandouts,
+  onOpenQuestJournal,
+  onToggleVideoMesh,
   onOpenStreamerHUD,
   onOpenSubscription,
   onOpenUserSettings,
@@ -197,6 +201,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <div className="text-[10px] text-slate-400 font-sans">319 Spells & 318 Monsters</div>
                 </div>
               </button>
+
+              {onOpenQuestJournal && (
+                <button
+                  onClick={() => {
+                    onOpenQuestJournal();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <BookOpen className="w-4 h-4 text-sky-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Quest & Campaign Journal</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Active Objectives & NPC Dossiers</div>
+                  </div>
+                </button>
+              )}
 
               {onOpenHandouts && (
                 <button
@@ -468,6 +488,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <div>
                     <div className="font-bold">Streamer Broadcast Mode</div>
                     <div className="text-[10px] text-slate-400 font-sans">OBS clean & Discord webhooks</div>
+                  </div>
+                </button>
+              )}
+
+              {onToggleVideoMesh && (
+                <button
+                  onClick={() => {
+                    onToggleVideoMesh();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                >
+                  <Users className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">WebRTC Video Mesh</div>
+                    <div className="text-[10px] text-slate-400 font-sans">Player camera & audio tiles</div>
                   </div>
                 </button>
               )}
