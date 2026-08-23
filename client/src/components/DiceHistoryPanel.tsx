@@ -62,7 +62,8 @@ export const DiceHistoryPanel: React.FC<DiceHistoryPanelProps> = ({ entries, onC
 
   return (
     <div
-      className="absolute bottom-24 left-4 z-30 w-64 pointer-events-auto"
+      className="absolute bottom-24 left-4 w-64 pointer-events-auto"
+      style={{ zIndex: 'var(--z-chrome)' }}
       data-testid="dice-history-panel"
     >
       {/* Header / toggle */}

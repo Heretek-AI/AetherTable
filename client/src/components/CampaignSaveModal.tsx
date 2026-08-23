@@ -3,11 +3,11 @@ import {
   Save,
   FolderOpen,
   Trash2,
-  X,
   CloudUpload,
   Clock,
   Swords,
 } from 'lucide-react';
+import { ModalShell } from './ui/ModalShell';
 import {
   CampaignSnapshot,
   CampaignSaveMeta,
@@ -41,8 +41,6 @@ export const CampaignSaveModal: React.FC<CampaignSaveModalProps> = ({
       listSaves().then(setSaves);
     }
   }, [isOpen]);
-
-  if (!isOpen) return null;
 
   const handleSave = async () => {
     setLoading(true);
@@ -78,25 +76,15 @@ export const CampaignSaveModal: React.FC<CampaignSaveModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full max-h-[85vh] overflow-y-auto p-6 shadow-2xl space-y-4 animate-fadeIn">
-        <div className="flex items-start justify-between border-b border-slate-800 pb-3">
-          <div>
-            <h3 className="text-xl font-bold font-serif text-slate-100">Campaign Saves</h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Snapshots persist in the campaign database and survive restarts.
-            </p>
-          </div>
-          <button
-            onClick={onClose}
-            aria-label="Close modal"
-            autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
-          >
-              <X className="w-5 h-5" aria-hidden="true" />
-          </button>
-        </div>
-
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Campaign Saves"
+      subtitle="Snapshots persist in the campaign database and survive restarts."
+      icon={<Save className="w-5 h-5" />}
+      size="md"
+    >
+      <div className="space-y-4">
         {/* Save current state */}
         <div className="flex gap-2">
           <input
@@ -169,6 +157,6 @@ export const CampaignSaveModal: React.FC<CampaignSaveModalProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 };

@@ -198,7 +198,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   return (
     <div
       onClick={onClose}
-      className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-start justify-center pt-24 p-4 cursor-pointer"
+      className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-start justify-center pt-24 p-4 cursor-pointer"
+      style={{ zIndex: 'var(--z-command)' }}
     >
       <div
         onClick={(e) => e.stopPropagation()}

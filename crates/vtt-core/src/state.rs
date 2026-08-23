@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Tracks an entity's active concentration (SRD: one spell at a time).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConcentrationState {
+    pub spell_id: String,
+    pub started_round: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntityState {
     pub id: Uuid,
@@ -26,6 +33,10 @@ pub struct EntityState {
     pub is_conscious: bool,
     pub is_dead: bool,
     pub is_visible: bool,
+    /// Active concentration spell, if any. Serde default keeps pre-existing
+    /// persisted session / event-log JSON (without this field) deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concentration: Option<ConcentrationState>,
 }
 
 impl EntityState {
@@ -65,6 +76,7 @@ impl EntityState {
             is_conscious: true,
             is_dead: false,
             is_visible: true,
+            concentration: None,
         }
     }
 }

@@ -1,11 +1,63 @@
 @import "tailwindcss";
+/* Rustic identity fonts (Cinzel + EB Garamond, SIL OFL 1.1 — see
+   compendium/ATTRIBUTION.md) load via <link> in index.html, not @import,
+   so the fetch starts in parallel with the bundle. */
+
+/* ── Rustic Tavern & Parchment design tokens ────────────────────────────────
+   Three-layer architecture (primitive → semantic → component) per the
+   design-system skill. Components must reference semantic/component tokens —
+   never raw hex — so a future light "parchment day mode" is a token swap. */
+:root {
+  /* Primitives: raw palette values */
+  --rp-parchment-100: #f5ede0;
+  --rp-parchment-200: #e8dcc4;
+  --rp-parchment-300: #d9c9a8;
+  --rp-iron-900: #2c241d;
+  --rp-iron-800: #3d312a;
+  --rp-leather-700: #634832;
+  --rp-leather-600: #7a5c42;
+  --rp-amber-500: #d97706;
+  --rp-amber-600: #b45309;
+  --rp-crimson-600: #9f1239;
+  --rp-forest-600: #166534;
+  --rp-ink-900: #1c150e;
+
+  /* Semantic: purpose aliases */
+  --tavern-bg: var(--rp-iron-900);            /* app chrome: dark tavern wood/iron */
+  --tavern-surface: var(--rp-iron-800);       /* raised panels */
+  --tavern-border: var(--rp-leather-700);     /* beveled frame edges */
+  --tavern-accent: var(--rp-amber-500);       /* gold leaf highlights */
+  --tavern-accent-deep: var(--rp-amber-600);
+  --parchment-paper: var(--rp-parchment-100); /* in-world documents */
+  --parchment-paper-aged: var(--rp-parchment-200);
+  --parchment-ink: var(--rp-ink-900);         /* writing on parchment */
+  --state-danger: var(--rp-crimson-600);
+  --state-success: var(--rp-forest-600);
+
+  /* Typography */
+  --font-display: 'Cinzel', 'Plus Jakarta Sans', serif;
+  --font-serif-prose: 'EB Garamond', Georgia, serif;
+  --font-body: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* ── Z-index ladder ────────────────────────────────────────────────────────
+     Single source of stacking truth. Before this ladder every modal sat at
+     z-50 alongside the canvas error banner, and navbar dropdowns collided
+     with modal backdrops. Rule of thumb when adding layers: pick the lowest
+     rung that satisfies the ordering you need, never a raw z-* utility.
+       tokens(10) < fx(20) < chrome(30) < popover(40) < toast(50)
+         < modal(60) < modal-nested(70) < command(80) */
+  --z-tokens: 10;        /* selected-token rings inside the canvas stack */
+  --z-fx: 20;            /* canvas particle/FX overlay */
+  --z-chrome: 30;        /* persistent app chrome: navbar, tool rail, quickbar */
+  --z-popover: 40;       /* dropdown menus anchored to chrome */
+  --z-toast: 50;         /* transient banners/alerts above everything interactive */
+  --z-modal: 60;         /* modal sheets */
+  --z-modal-nested: 70;  /* a modal opened from within another modal */
+  --z-command: 80;       /* command palette — always on top */
+}
 
 @layer base {
-  :root {
-    --font-display: 'Plus Jakarta Sans', -apple-system, sans-serif;
-    --font-body: 'Inter', -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
-  }
 
   html, body, #root {
     margin: 0;
@@ -52,48 +104,90 @@
   user-select: text;
 }
 
-/* Glassmorphism & SaaS Panels */
+/* Glassmorphism & SaaS Panels — restyled from cold slate to warm tavern wood:
+   translucent iron surface with a leather frame and candle-warm shadow. */
 .vtt-glass-panel {
-  background: rgba(15, 23, 42, 0.85);
+  background: color-mix(in srgb, var(--tavern-surface) 88%, transparent);
   backdrop-filter: blur(16px);
-  border: 1px solid rgba(51, 65, 85, 0.6);
+  border: 1px solid var(--tavern-border);
   box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
 }
 
-.vtt-card-elevated {
-  background: rgba(30, 41, 59, 0.6);
-  border: 1px solid rgba(51, 65, 85, 0.7);
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-}
-.vtt-card-elevated:hover {
-  background: rgba(51, 65, 85, 0.6);
-  border-color: rgba(167, 139, 250, 0.4);
-  box-shadow: 0 8px 24px rgba(124, 58, 237, 0.18);
+/* Flat raised surface for dense panels (trackers, quickbars) — cheaper than
+   the glass panel (no backdrop blur) where many instances render per frame. */
+.vtt-surface {
+  background: var(--tavern-surface);
+  border: 1px solid var(--tavern-border);
 }
 
-.vtt-glow-border {
-  border-color: #7c3aed;
-  box-shadow: 0 0 18px rgba(124, 58, 237, 0.4);
+/* ── Component layer: rustic surfaces ────────────────────────────────────── */
+
+/* Engraved display header — Cinzel with a subtle gold-leaf gradient. Apply to
+   view titles, modal headers and the navbar brand. */
+.vtt-engraved {
+  font-family: var(--font-display);
+  letter-spacing: 0.04em;
+  background: linear-gradient(180deg, #f7e8c8 0%, var(--rp-amber-500) 55%, var(--rp-amber-600) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
 }
 
+/* Parchment document card — for in-world paper: handouts, letters, quest text.
+   Aged paper base, iron frame, double bevel (light top-left, dark bottom-right)
+   and a faint edge burn to suggest candlelight. Text uses parchment-ink. */
+.vtt-parchment {
+  background:
+    radial-gradient(ellipse at top left, rgba(255, 252, 240, 0.9), transparent 55%),
+    radial-gradient(ellipse at bottom right, rgba(138, 106, 62, 0.22), transparent 60%),
+    var(--parchment-paper);
+  color: var(--parchment-ink);
+  border: 1px solid var(--rp-leather-700);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 250, 235, 0.65),   /* inner light bevel */
+    inset 0 0 24px rgba(120, 90, 50, 0.18),      /* aged edge burn */
+    0 6px 18px rgba(0, 0, 0, 0.55);              /* lift off the dark table */
+  font-family: var(--font-serif-prose);
+}
+
+/* Vintage bronze scrollbar — the app-wide vtt-scrollbar restyled to aged metal. */
 .vtt-scrollbar::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 .vtt-scrollbar::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
+  background: var(--rp-iron-900);
+  border-left: 1px solid rgba(99, 72, 50, 0.4);
 }
 .vtt-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(71, 85, 105, 0.8);
+  background: linear-gradient(180deg, var(--rp-leather-600), var(--rp-leather-700));
+  border: 1px solid rgba(217, 119, 6, 0.25);
   border-radius: 4px;
 }
 .vtt-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(124, 58, 237, 0.9);
+  background: linear-gradient(180deg, var(--rp-amber-500), var(--rp-amber-600));
+}
+
+.vtt-card-elevated {
+  background: color-mix(in srgb, var(--tavern-surface) 60%, transparent);
+  border: 1px solid var(--tavern-border);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.vtt-card-elevated:hover {
+  background: color-mix(in srgb, var(--tavern-surface) 85%, transparent);
+  border-color: var(--tavern-accent);
+  box-shadow: 0 8px 24px rgba(217, 119, 6, 0.18);
+}
+
+.vtt-glow-border {
+  border-color: var(--tavern-accent);
+  box-shadow: 0 0 18px rgba(217, 119, 6, 0.35);
 }
 
 @keyframes pulseGlow {
-  0%, 100% { opacity: 0.95; transform: scale(1.03); filter: drop-shadow(0 0 8px rgba(124, 58, 237, 0.6)); }
-  50% { opacity: 0.5; transform: scale(0.98); filter: drop-shadow(0 0 2px rgba(124, 58, 237, 0.2)); }
+  0%, 100% { opacity: 0.95; transform: scale(1.03); filter: drop-shadow(0 0 8px rgba(217, 119, 6, 0.55)); }
+  50% { opacity: 0.5; transform: scale(0.98); filter: drop-shadow(0 0 2px rgba(217, 119, 6, 0.15)); }
 }
 
 .animate-pulse-glow {

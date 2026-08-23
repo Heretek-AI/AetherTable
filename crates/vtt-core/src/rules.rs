@@ -1,4 +1,6 @@
+use crate::actions::ActionResolver;
 use crate::dice::DiceEngine;
+use crate::state::EntityState;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -99,9 +101,109 @@ pub struct SavingThrowResult {
     pub target_is_dead: bool,
 }
 
+/// Outcome of a concentration saving throw triggered by damage.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ConcentrationBreakResult {
+    pub dc: i32,
+    pub total: i32,
+    pub maintained: bool,
+}
+
 pub struct RulesEvaluator;
 
 impl RulesEvaluator {
+    /// Derives (advantage, disadvantage) for an attack from entity conditions and elevation.
+    ///
+    /// Reuses the existing condition helper flags on `Condition` (see types.rs):
+    /// - Attacker-side conditions that impose disadvantage on attacks (blinded,
+    ///   frightened, poisoned, prone, restrained, exhaustion level 3+).
+    /// - Target conditions that grant advantage to the attacker (paralyzed, restrained,
+    ///   unconscious; prone only within 5 ft).
+    /// - Target conditions that impose disadvantage on the attacker (invisible;
+    ///   prone beyond 5 ft).
+    /// - High ground grants advantage when the existing high-ground attack bonus is > 0.
+    ///
+    /// NOTE: when both flags are true the pair CANCELS per SRD 5.1 and resolves as a
+    /// single straight d20 — that cancellation already happens in
+    /// `RulesEvaluator::resolve_attack` (rules.rs), so callers may pass both flags
+    /// through without pre-resolving them here.
+    pub fn edge_from_conditions(
+        attacker: &EntityState,
+        target: &EntityState,
+        distance_feet: f32,
+        attacker_z: f32,
+        target_z: f32,
+    ) -> (bool, bool) {
+        let mut advantage = target
+            .conditions
+            .iter()
+            .any(|c| c.grants_advantage_to_attacker(distance_feet));
+        let disadvantage = attacker
+            .conditions
+            .iter()
+            .any(|c| c.inflicts_disadvantage_on_attacks())
+            || target
+                .conditions
+                .iter()
+                .any(|c| c.inflicts_disadvantage_on_attacker(distance_feet));
+
+        // High ground: only treat as advantage when the bonus is actually applied.
+        if Self::calculate_high_ground_attack_bonus(attacker_z, target_z) > 0 {
+            advantage = true;
+        }
+
+        (advantage, disadvantage)
+    }
+
+    /// Starts concentration on a spell, overwriting any prior concentration
+    /// (SRD replacement rule: casting a new concentration spell ends the old one).
+    pub fn begin_concentration(entity: &mut EntityState, spell_id: &str) {
+        // Overwrite any prior concentration — only one spell can be concentrated on at a time.
+        entity.concentration = Some(crate::state::ConcentrationState {
+            spell_id: spell_id.to_string(),
+            started_round: 0,
+        });
+    }
+
+    /// Ends concentration. Returns true if there was an active spell to end.
+    pub fn end_concentration(entity: &mut EntityState, _reason: &str) -> bool {
+        entity.concentration.take().is_some()
+    }
+
+    /// Applies damage-triggered concentration save (SRD: CON save vs DC = max(10, damage / 2)).
+    ///
+    /// Delegates DC math to `ActionResolver::resolve_concentration_check` so there is a
+    /// single source of truth. Zero damage never triggers a check. On a failed save the
+    /// entity's concentration is cleared.
+    pub fn apply_damage_to_concentration(
+        entity: &mut EntityState,
+        damage_taken: i32,
+        con_roll: i32,
+        con_mod: i32,
+    ) -> ConcentrationBreakResult {
+        // No damage taken => no save is triggered; concentration is maintained.
+        if damage_taken <= 0 {
+            return ConcentrationBreakResult {
+                dc: 0,
+                total: con_roll + con_mod,
+                maintained: true,
+            };
+        }
+
+        let (passed, total, dc) =
+            ActionResolver::resolve_concentration_check(con_roll, con_mod, damage_taken);
+
+        if !passed && entity.concentration.is_some() {
+            Self::end_concentration(entity, "FAILED_CONCENTRATION_SAVE");
+        }
+
+        ConcentrationBreakResult {
+            dc,
+            total,
+            maintained: passed,
+        }
+    }
+
     pub fn resolve_attack(
         dice: &mut DiceEngine,
         attacker_id: Uuid,

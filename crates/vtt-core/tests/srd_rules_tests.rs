@@ -1,9 +1,26 @@
 use vtt_core::actions::{ActionResolver, AttackOutcome};
+use vtt_core::dice::DiceEngine;
 use vtt_core::modifier_graph::{
     calculate_ability_modifier, calculate_armor_class, calculate_passive_perception,
     calculate_proficiency_bonus,
 };
+use vtt_core::rules::{ConcentrationBreakResult, RulesEvaluator};
+use vtt_core::state::{ConcentrationState, EntityState};
 use vtt_core::types::*;
+
+fn dummy_entity(name: &str) -> EntityState {
+    EntityState::new(
+        uuid::Uuid::new_v4(),
+        format!("compendium_{}", name),
+        name.to_string(),
+        false,
+        20,
+        14,
+        30.0,
+        AbilityScores::default(),
+    )
+}
+
 
 #[test]
 fn test_srd_ability_modifier_floored_formula() {
@@ -191,3 +208,202 @@ fn test_srd_3d_elevation_and_fall_damage() {
     assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(20.0, 0.0), 2);
     assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(5.0, 0.0), 0);
 }
+
+#[test]
+fn test_srd_concentration_state_machine() {
+    let mut caster = dummy_entity("wizard");
+    assert!(caster.concentration.is_none());
+
+    // Begin concentration
+    RulesEvaluator::begin_concentration(&mut caster, "spell_haste");
+    let conc = caster.concentration.as_ref().expect("concentration active");
+    // started_round defaults to 0 (rounds are not tracked at this layer)
+    assert_eq!(conc.started_round, 0);
+
+    // Replacement rule: casting a second concentration spell overwrites the first
+    RulesEvaluator::begin_concentration(&mut caster, "spell_fly");
+    let conc = caster.concentration.as_ref().expect("still concentrating");
+    assert_eq!(conc.spell_id, "spell_fly");
+
+    // Zero damage => no check is triggered (maintained, DC reported as 0)
+    let noop = RulesEvaluator::apply_damage_to_concentration(&mut caster, 0, 5, -1);
+    assert_eq!(
+        noop,
+        ConcentrationBreakResult { dc: 0, total: 4, maintained: true }
+    );
+    assert_eq!(
+        caster.concentration.as_ref().expect("kept").spell_id,
+        "spell_fly"
+    );
+
+    // DC floor: 12 damage would scale to DC 6 but the floor is DC 10 -> failed save breaks it
+    let broken = RulesEvaluator::apply_damage_to_concentration(&mut caster, 12, 8, 1);
+    assert_eq!(broken.dc, 10);
+    assert_eq!(broken.total, 9);
+    assert!(!broken.maintained);
+    assert!(caster.concentration.is_none());
+
+    // Re-concentrate; damage-scaled DC above floor: 50 damage -> DC 25 -> passed save keeps it
+    RulesEvaluator::begin_concentration(&mut caster, "spell_web");
+    let held = RulesEvaluator::apply_damage_to_concentration(&mut caster, 50, 20, 5);
+    assert_eq!(held.dc, 25);
+    assert_eq!(held.total, 25);
+    assert!(held.maintained);
+    assert_eq!(
+        caster.concentration.as_ref().expect("kept").spell_id,
+        "spell_web"
+    );
+
+    // Voluntary end reports whether a spell was actually dropped
+    assert!(RulesEvaluator::end_concentration(&mut caster, "SPELL_ENDED"));
+    assert!(caster.concentration.is_none());
+    assert!(!RulesEvaluator::end_concentration(&mut caster, "SPELL_ENDED"));
+}
+
+#[test]
+fn test_srd_edge_from_conditions_cancellation() {
+    // Blinded attacker vs restrained target: attacker's own blindness imposes
+    // disadvantage while the target grants advantage — both flags set, and per SRD
+    // they cancel to a straight d20 inside resolve_attack.
+    let mut attacker = dummy_entity("blinded_archer");
+    attacker.conditions.push(Condition::Blinded);
+    let mut restrained_target = dummy_entity("restrained_ogre");
+    restrained_target.conditions.push(Condition::Restrained);
+
+    let (adv, dis) =
+        RulesEvaluator::edge_from_conditions(&attacker, &restrained_target, 30.0, 0.0, 0.0);
+    assert!(adv && dis, "expected both flags true for cancelling pair");
+
+    // Blinded attacker vs prone target BEYOND 5 ft: prone grants no advantage at range,
+    // so this is pure disadvantage (no cancellation).
+    let mut prone_target = dummy_entity("prone_goblin");
+    prone_target.conditions.push(Condition::Prone);
+    let (adv_far, dis_far) =
+        RulesEvaluator::edge_from_conditions(&attacker, &prone_target, 30.0, 0.0, 0.0);
+    assert!(!adv_far && dis_far);
+
+    // Prone target within 5 ft: melee attackers get pure advantage, no disadvantage.
+    let clean_attacker = dummy_entity("barbarian");
+    let (adv_close, dis_close) =
+        RulesEvaluator::edge_from_conditions(&clean_attacker, &prone_target, 5.0, 0.0, 0.0);
+    assert!(adv_close && !dis_close);
+
+    // Exhaustion level 3+ on the attacker imposes disadvantage on its own attacks.
+    let mut exhausted = dummy_entity("exhausted_ranger");
+    exhausted.conditions.push(Condition::Exhaustion(3));
+    let fresh_target = dummy_entity("orc");
+    let (adv_ex, dis_ex) = RulesEvaluator::edge_from_conditions(&exhausted, &fresh_target, 30.0, 0.0, 0.0);
+    assert!(!adv_ex && dis_ex);
+
+    // High ground only counts when the existing bonus is > 0 (+2 requires >= 10 ft).
+    let (adv_high, dis_high) =
+        RulesEvaluator::edge_from_conditions(&clean_attacker, &fresh_target, 60.0, 15.0, 0.0);
+    assert!(adv_high && !dis_high);
+    let (adv_low, dis_low) =
+        RulesEvaluator::edge_from_conditions(&clean_attacker, &fresh_target, 60.0, 5.0, 0.0);
+    assert!(!adv_low && !dis_low);
+
+    // Cancellation semantics in resolve_attack: adv + dis resolves as a single straight d20,
+    // identical to a plain roll from an identically-seeded engine.
+    const SEED: u64 = 90210;
+    let mut straight = DiceEngine::with_seed(SEED);
+    let expected = straight.roll_d20();
+
+    let mut cancelled = DiceEngine::with_seed(SEED);
+    let result = RulesEvaluator::resolve_attack(
+        &mut cancelled,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        5,
+        13,
+        "1d8+3",
+        DamageType::Piercing,
+        20,
+        20,
+        0,
+        &[],
+        &[],
+        &[],
+        true,  // advantage
+        true,  // disadvantage — cancels to straight roll
+    )
+    .expect("attack resolves");
+    assert_eq!(result.natural_roll, expected);
+
+    // Sanity check that a real edge is applied: advantage-only takes max of two d20s
+    // from an identically-seeded engine.
+    let mut pair = DiceEngine::with_seed(SEED);
+    let r1 = pair.roll_d20();
+    let r2 = pair.roll_d20();
+    let mut adv_engine = DiceEngine::with_seed(SEED);
+    let adv_result = RulesEvaluator::resolve_attack(
+        &mut adv_engine,
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        5,
+        13,
+        "1d8+3",
+        DamageType::Piercing,
+        20,
+        20,
+        0,
+        &[],
+        &[],
+        &[],
+        true,
+        false,
+    )
+    .expect("attack resolves");
+    assert_eq!(adv_result.natural_roll, r1.max(r2));
+}
+
+#[test]
+fn test_srd_concentration_state_serialization_roundtrip() {
+    // New field is skipped when None and deserializes back from legacy JSON without it.
+    let json = r#"{
+        "id": "00000000-0000-0000-0000-000000000001",
+        "compendium_id": "goblin",
+        "name": "Goblin",
+        "is_player": false,
+        "current_hp": 7,
+        "max_hp": 7,
+        "temp_hp": 0,
+        "ac": 15,
+        "speed_feet": 30.0,
+        "position": [0.0, 0.0, 0.0],
+        "zone_id": "Zone_Default",
+        "abilities": {
+            "strength": 8, "dexterity": 14, "constitution": 10,
+            "intelligence": 10, "wisdom": 8, "charisma": 8
+        },
+        "conditions": [],
+        "action_budget": {
+            "action": true, "bonus_action": true, "reaction": true,
+            "movement_remaining_feet": 30.0, "free_object_interaction": true
+        },
+        "spell_slots_remaining": {},
+        "inventory": { "items": {} },
+        "is_conscious": true,
+        "is_dead": false,
+        "is_visible": true
+    }"#;
+    let legacy: EntityState = serde_json::from_str(json).expect("legacy JSON deserializes");
+    assert!(legacy.concentration.is_none());
+    assert!(serde_json::to_string(&legacy)
+        .expect("serializes")
+        .contains("\"concentration\"") == false);
+
+    let mut concentrated = legacy.clone();
+    concentrated.concentration = Some(ConcentrationState {
+        spell_id: "spell_hunters_mark".to_string(),
+        started_round: 3,
+    });
+    let serialized = serde_json::to_string(&concentrated).expect("serializes");
+    assert!(serialized.contains("\"concentration\""));
+    let roundtrip: EntityState =
+        serde_json::from_str(&serialized).expect("concentration roundtrips");
+    let conc = roundtrip.concentration.expect("present");
+    assert_eq!(conc.spell_id, "spell_hunters_mark");
+    assert_eq!(conc.started_round, 3);
+}
+

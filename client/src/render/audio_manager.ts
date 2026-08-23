@@ -2,6 +2,26 @@ export class AudioManager {
   private ctx: AudioContext | null = null;
   public isMuted: boolean = false;
 
+  // ── SFX debounce ──────────────────────────────────────────────────────────
+  // Rapid-fire events (area attacks, multi-token moves, macro bursts) used to
+  // stack identical cues into a harsh click wall. Each cue name is throttled
+  // to one sound per SFX_DEBOUNCE_MS window; extra triggers within the window
+  // are dropped, not queued — the ear reads one solid hit, not a machine gun.
+  private static readonly SFX_DEBOUNCE_MS = 60;
+  private lastPlayedAt: Record<string, number> = {};
+
+  // INVARIANT: every one-shot SFX method in this class MUST gate on
+  // shouldPlay('<method-name>') before touching the AudioContext. A new cue
+  // added without the gate reintroduces the click-wall under burst load.
+
+  private shouldPlay(cue: string): boolean {
+    const now = performance.now();
+    const last = this.lastPlayedAt[cue] ?? -Infinity;
+    if (now - last < AudioManager.SFX_DEBOUNCE_MS) return false;
+    this.lastPlayedAt[cue] = now;
+    return true;
+  }
+
   private init() {
     if (!this.ctx && typeof window !== 'undefined') {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -16,6 +36,7 @@ export class AudioManager {
 
   public playDiceRoll() {
     if (this.isMuted) return;
+    if (!this.shouldPlay('playDiceRoll')) return;  // debounce rapid duplicate triggers
     this.init();
     if (!this.ctx) return;
 
@@ -42,6 +63,7 @@ export class AudioManager {
 
   public playWeaponImpact() {
     if (this.isMuted) return;
+    if (!this.shouldPlay('playWeaponImpact')) return;  // debounce rapid duplicate triggers
     this.init();
     if (!this.ctx) return;
 
@@ -65,6 +87,7 @@ export class AudioManager {
 
   public playSpellCast() {
     if (this.isMuted) return;
+    if (!this.shouldPlay('playSpellCast')) return;  // debounce rapid duplicate triggers
     this.init();
     if (!this.ctx) return;
 
@@ -96,6 +119,7 @@ export class AudioManager {
 
   public playTurnAdvance() {
     if (this.isMuted) return;
+    if (!this.shouldPlay('playTurnAdvance')) return;  // debounce rapid duplicate triggers
     this.init();
     if (!this.ctx) return;
 

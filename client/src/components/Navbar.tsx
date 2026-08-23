@@ -119,7 +119,11 @@ export const Navbar: React.FC<NavbarProps> = ({
   };
 
   return (
-    <header ref={navRef} className="h-14 border-b border-slate-800 bg-slate-950/95 backdrop-blur-md px-4 flex items-center justify-between z-30 shrink-0 select-none shadow-md">
+    <header
+      ref={navRef}
+      className="h-14 bg-[color-mix(in_srgb,var(--tavern-bg)_95%,transparent)] backdrop-blur-md px-4 flex items-center justify-between shrink-0 select-none shadow-md"
+      style={{ zIndex: 'var(--z-chrome)', borderBottom: '1px solid var(--tavern-border)' }}
+    >
       {/* Brand & Global Search */}
       <div className="flex items-center gap-3">
         <button
@@ -132,14 +136,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
           <div className="flex flex-col">
             <div className="flex items-center gap-1.5 leading-none">
-              <span className="font-extrabold text-sm tracking-tight text-slate-100 font-serif">
+              <span className="vtt-engraved font-extrabold text-sm tracking-tight">
                 AetherTable
               </span>
               <span className="text-[9px] uppercase font-mono px-1.5 py-0.2 rounded bg-amber-950 text-amber-300 border border-amber-600/50 font-bold">
                 SaaS
               </span>
             </div>
-            <span className="text-[10px] text-slate-400 font-mono mt-0.5 truncate max-w-[130px]">
+            <span className="text-[10px] text-[var(--rp-parchment-300)] font-mono mt-0.5 truncate max-w-[130px]">
               {campaignName}
             </span>
           </div>
@@ -149,12 +153,12 @@ export const Navbar: React.FC<NavbarProps> = ({
         {onOpenCommandPalette && (
           <button
             onClick={onOpenCommandPalette}
-            className="hidden md:flex items-center space-x-2 px-2.5 py-1 bg-slate-900/90 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 text-slate-400 hover:text-slate-200 rounded-lg text-xs font-mono transition shadow-inner cursor-pointer"
+            className="hidden md:flex items-center space-x-2 px-2.5 py-1 bg-[var(--tavern-surface)] hover:bg-[var(--rp-leather-700)] border border-[var(--tavern-border)] hover:border-[var(--tavern-accent)]/50 text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] rounded-lg text-xs font-mono transition shadow-inner cursor-pointer"
             title="Open Universal Search Palette (Cmd+K)"
           >
             <Search className="w-3.5 h-3.5 text-amber-400" />
             <span className="hidden xl:inline">Search...</span>
-            <span className="text-[9px] px-1 py-0.2 bg-slate-950 border border-slate-700 text-slate-400 rounded">
+            <span className="text-[9px] px-1 py-0.2 bg-black/40 border border-[var(--tavern-border)] text-[var(--rp-parchment-300)] rounded">
               ⌘K
             </span>
           </button>
@@ -169,7 +173,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-bold transition-all cursor-pointer ${
             currentView === 'tabletop'
               ? 'bg-amber-600 text-white shadow-md shadow-amber-950 border border-amber-400/40'
-              : 'text-slate-300 hover:text-white hover:bg-slate-900'
+              : 'text-[var(--rp-parchment-200)] hover:text-white hover:bg-[var(--tavern-surface)]'
           }`}
         >
           <Swords className="w-4 h-4 text-amber-400" />
@@ -183,8 +187,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             onClick={() => toggleDropdown('compendium')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
               activeDropdown === 'compendium' || ['compendium', 'bundles', 'dynasty'].includes(currentView)
-                ? 'bg-slate-850 text-amber-300 border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                ? 'bg-[var(--tavern-surface)] text-[var(--tavern-accent)] border border-[var(--tavern-border)]'
+                : 'text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] hover:bg-[var(--tavern-surface)]'
             }`}
           >
             <BookOpen className="w-4 h-4" />
@@ -193,15 +197,15 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
 
           {activeDropdown === 'compendium' && (
-            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+            <div className="absolute left-0 top-11 w-56 vtt-glass-panel rounded-xl shadow-2xl p-1.5 animate-fadeIn space-y-1" style={{ zIndex: 'var(--z-popover)' }}>
               <button
                 onClick={() => handleNavClick('compendium')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <BookOpen className="w-4 h-4 text-amber-400 shrink-0" />
                 <div>
                   <div className="font-bold">Compendium Codex</div>
-                  <div className="text-[10px] text-slate-400 font-sans">319 Spells & 318 Monsters</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">319 Spells & 318 Monsters</div>
                 </div>
               </button>
 
@@ -211,12 +215,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenQuestJournal();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <BookOpen className="w-4 h-4 text-sky-400 shrink-0" />
                   <div>
                     <div className="font-bold">Quest & Campaign Journal</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Active Objectives & NPC Dossiers</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Active Objectives & NPC Dossiers</div>
                   </div>
                 </button>
               )}
@@ -227,35 +231,35 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenHandouts();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Scroll className="w-4 h-4 text-rose-400 shrink-0" />
                   <div>
                     <div className="font-bold">Digital Handouts Vault</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Parchment Clues & Letters</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Parchment Clues & Letters</div>
                   </div>
                 </button>
               )}
 
               <button
                 onClick={() => handleNavClick('bundles')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Package className="w-4 h-4 text-sky-400 shrink-0" />
                 <div>
                   <div className="font-bold">Campaign Bundles</div>
-                  <div className="text-[10px] text-slate-400 font-sans">.vttbundle Exporter/Importer</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">.vttbundle Exporter/Importer</div>
                 </div>
               </button>
 
               <button
                 onClick={() => handleNavClick('dynasty')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Crown className="w-4 h-4 text-amber-400 shrink-0" />
                 <div>
                   <div className="font-bold">Dynasty & Factions</div>
-                  <div className="text-[10px] text-slate-400 font-sans">Noble Houses & Feud Matrix</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Noble Houses & Feud Matrix</div>
                 </div>
               </button>
             </div>
@@ -268,8 +272,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             onClick={() => toggleDropdown('characters')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
               activeDropdown === 'characters' || ['builder', 'encounters', 'lobby'].includes(currentView)
-                ? 'bg-slate-850 text-amber-300 border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                ? 'bg-[var(--tavern-surface)] text-[var(--tavern-accent)] border border-[var(--tavern-border)]'
+                : 'text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] hover:bg-[var(--tavern-surface)]'
             }`}
           >
             <UserCheck className="w-4 h-4" />
@@ -278,37 +282,37 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
 
           {activeDropdown === 'characters' && (
-            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+            <div className="absolute left-0 top-11 w-56 vtt-glass-panel rounded-xl shadow-2xl p-1.5 animate-fadeIn space-y-1" style={{ zIndex: 'var(--z-popover)' }}>
               <button
                 onClick={() => handleNavClick('builder')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
-                <Sparkles className="w-4 h-4 text-purple-400 shrink-0" />
+                <Sparkles className="w-4 h-4 text-[var(--tavern-accent)] shrink-0" />
                 <div>
                   <div className="font-bold">Character Studio</div>
-                  <div className="text-[10px] text-slate-400 font-sans">5-Step Wizard & Point Buy</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">5-Step Wizard & Point Buy</div>
                 </div>
               </button>
 
               <button
                 onClick={() => handleNavClick('encounters')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Flame className="w-4 h-4 text-orange-400 shrink-0" />
                 <div>
                   <div className="font-bold">Encounter Builder</div>
-                  <div className="text-[10px] text-slate-400 font-sans">XP Budgets & CR Thresholds</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">XP Budgets & CR Thresholds</div>
                 </div>
               </button>
 
               <button
                 onClick={() => handleNavClick('lobby')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Users className="w-4 h-4 text-emerald-400 shrink-0" />
                 <div>
                   <div className="font-bold">Campaign Lobby</div>
-                  <div className="text-[10px] text-slate-400 font-sans">Multiplayer Seat Claiming</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Multiplayer Seat Claiming</div>
                 </div>
               </button>
             </div>
@@ -321,7 +325,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
             currentView === 'marketplace'
               ? 'bg-amber-600 text-white shadow border border-amber-400/40'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+              : 'text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] hover:bg-[var(--tavern-surface)]'
           }`}
         >
           <ShoppingBag className="w-4 h-4 text-emerald-400" />
@@ -334,8 +338,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             onClick={() => toggleDropdown('gm_studio')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
               activeDropdown === 'gm_studio' || ['wfc', 'quests', 'analytics', 'admin'].includes(currentView)
-                ? 'bg-slate-850 text-amber-300 border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                ? 'bg-[var(--tavern-surface)] text-[var(--tavern-accent)] border border-[var(--tavern-border)]'
+                : 'text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] hover:bg-[var(--tavern-surface)]'
             }`}
           >
             <Layers className="w-4 h-4" />
@@ -344,26 +348,26 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
 
           {activeDropdown === 'gm_studio' && (
-            <div className="absolute left-0 top-11 w-56 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1">
+            <div className="absolute left-0 top-11 w-56 vtt-glass-panel rounded-xl shadow-2xl p-1.5 animate-fadeIn space-y-1" style={{ zIndex: 'var(--z-popover)' }}>
               <button
                 onClick={() => handleNavClick('wfc')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Layers className="w-4 h-4 text-indigo-400 shrink-0" />
                 <div>
                   <div className="font-bold">WFC Dungeon Studio</div>
-                  <div className="text-[10px] text-slate-400 font-sans">Procedural Dungeon Synthesis</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Procedural Dungeon Synthesis</div>
                 </div>
               </button>
 
               <button
                 onClick={() => handleNavClick('quests')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <Scroll className="w-4 h-4 text-amber-400 shrink-0" />
                 <div>
                   <div className="font-bold">Quest & Dialogue Trees</div>
-                  <div className="text-[10px] text-slate-400 font-sans">Branching Concordia NPC Pacts</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Branching Concordia NPC Pacts</div>
                 </div>
               </button>
 
@@ -373,36 +377,36 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenMapEditor();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <PenToolIcon className="w-4 h-4 text-teal-400 shrink-0" />
                   <div>
                     <div className="font-bold">Map & LoS Editor</div>
-                    <div className="text-[10px] text-slate-400 font-sans">4-Layer Drawing & Wall Cells</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">4-Layer Drawing & Wall Cells</div>
                   </div>
                 </button>
               )}
 
               <button
                 onClick={() => handleNavClick('analytics')}
-                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
                 <LineChart className="w-4 h-4 text-emerald-400 shrink-0" />
                 <div>
                   <div className="font-bold">SLA Telemetry</div>
-                  <div className="text-[10px] text-slate-400 font-sans">Latency & Reliability Metrics</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Latency & Reliability Metrics</div>
                 </div>
               </button>
 
               {currentUser?.role === 'admin' && (
                 <button
                   onClick={() => handleNavClick('admin')}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-rose-950/50 transition text-rose-300 cursor-pointer border-t border-slate-800 pt-2"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-rose-950/50 transition text-rose-300 cursor-pointer border-t border-[var(--tavern-border)] pt-2"
                 >
                   <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
                   <div>
                     <div className="font-bold">Admin Console</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Cluster & RBAC Controls</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Cluster & RBAC Controls</div>
                   </div>
                 </button>
               )}
@@ -420,7 +424,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono transition cursor-pointer ${
               activeDropdown === 'tools'
                 ? 'bg-amber-950/80 text-amber-300 border-amber-600/60 shadow'
-                : 'bg-slate-900/90 text-slate-300 border-slate-800 hover:bg-slate-800'
+                : 'bg-[var(--tavern-surface)] text-[var(--rp-parchment-200)] border-[var(--tavern-border)] hover:bg-[var(--rp-leather-700)]'
             }`}
             title="Tabletop Audio, Soundscapes, Map Layers & Streamer Tools"
           >
@@ -430,19 +434,19 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
 
           {activeDropdown === 'tools' && (
-            <div className="absolute right-0 top-11 w-60 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-1.5 z-50 animate-fadeIn space-y-1 font-mono text-xs">
+            <div className="absolute right-0 top-11 w-60 vtt-glass-panel rounded-xl shadow-2xl p-1.5 animate-fadeIn space-y-1 font-mono text-xs" style={{ zIndex: 'var(--z-popover)' }}>
               {onOpenCampaignSaves && (
                 <button
                   onClick={() => {
                     onOpenCampaignSaves();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Save className="w-4 h-4 text-emerald-400 shrink-0" />
                   <div>
                     <div className="font-bold">Campaign Saves</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Persist & resume sessions</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Persist & resume sessions</div>
                   </div>
                 </button>
               )}
@@ -453,12 +457,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenJukebox();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Music className="w-4 h-4 text-indigo-400 shrink-0" />
                   <div>
                     <div className="font-bold">Jukebox & Soundscapes</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Ambient multi-track audio</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Ambient multi-track audio</div>
                   </div>
                 </button>
               )}
@@ -469,12 +473,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenMapEditor();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Layers className="w-4 h-4 text-amber-400 shrink-0" />
                   <div>
                     <div className="font-bold">Map & LoS Layers</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Dynamic lighting editor</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Dynamic lighting editor</div>
                   </div>
                 </button>
               )}
@@ -485,12 +489,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenHandouts();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Scroll className="w-4 h-4 text-rose-400 shrink-0" />
                   <div>
                     <div className="font-bold">Handouts Vault</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Secret notes & parchment</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Secret notes & parchment</div>
                   </div>
                 </button>
               )}
@@ -501,12 +505,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenStreamerHUD();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Video className="w-4 h-4 text-red-400 shrink-0" />
                   <div>
                     <div className="font-bold">Streamer Broadcast Mode</div>
-                    <div className="text-[10px] text-slate-400 font-sans">OBS clean & Discord webhooks</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">OBS clean & Discord webhooks</div>
                   </div>
                 </button>
               )}
@@ -517,12 +521,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onToggleVideoMesh();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
                   <Users className="w-4 h-4 text-emerald-400 shrink-0" />
                   <div>
                     <div className="font-bold">WebRTC Video Mesh</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Player camera & audio tiles</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Player camera & audio tiles</div>
                   </div>
                 </button>
               )}
@@ -533,12 +537,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                     onOpenAudioMixer();
                     setActiveDropdown(null);
                   }}
-                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-slate-800 transition text-slate-200 cursor-pointer"
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
-                  <Radio className="w-4 h-4 text-purple-400 shrink-0" />
+                  <Radio className="w-4 h-4 text-[var(--tavern-accent)] shrink-0" />
                   <div>
                     <div className="font-bold">3D Audio Radar</div>
-                    <div className="text-[10px] text-slate-400 font-sans">Spatial stereo mixer</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Spatial stereo mixer</div>
                   </div>
                 </button>
               )}
@@ -551,40 +555,41 @@ export const Navbar: React.FC<NavbarProps> = ({
           <div className="relative">
             <button
               onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}
-              className="flex items-center space-x-2 p-1.5 bg-slate-900 hover:bg-slate-850 border border-slate-700 hover:border-amber-500/60 rounded-xl transition cursor-pointer"
+              className="flex items-center space-x-2 p-1.5 bg-[var(--tavern-surface)] hover:bg-[var(--rp-leather-700)] border border-[var(--tavern-border)] hover:border-[var(--tavern-accent)]/60 rounded-xl transition cursor-pointer"
             >
-              <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center text-slate-950 font-bold text-xs shadow">
+              <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center text-[var(--rp-ink-900)] font-bold text-xs shadow">
                 {currentUser.displayName.charAt(0)}
               </div>
               <div className="hidden lg:flex flex-col text-left">
-                <span className="text-[11px] font-bold text-slate-200 leading-none">
+                <span className="text-[11px] font-bold text-[var(--rp-parchment-100)] leading-none">
                   {currentUser.displayName.split(' ')[0]}
                 </span>
                 <span className="text-[9px] font-mono text-amber-400 uppercase font-semibold">
                   {currentUser.role}
                 </span>
               </div>
-              <ChevronDown className="w-3 h-3 text-slate-400" />
+              <ChevronDown className="w-3 h-3 text-[var(--rp-parchment-300)]" />
             </button>
 
             {/* Dropdown Menu */}
             {isUserMenuOpen && (
-              <div className="absolute right-0 top-12 w-64 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-2 z-50 animate-fadeIn space-y-1 font-mono text-xs">
-                <div className="p-2 border-b border-slate-800 text-left">
-                  <div className="font-bold text-slate-100">{currentUser.displayName}</div>
-                  <div className="text-[10px] text-slate-400 truncate">{currentUser.email}</div>
+              <div className="absolute right-0 top-12 w-64 vtt-glass-panel rounded-2xl shadow-2xl p-2 animate-fadeIn space-y-1 font-mono text-xs" style={{ zIndex: 'var(--z-popover)' }}>
+                <div className="p-2 border-b border-[var(--tavern-border)] text-left">
+                  <div className="font-bold text-[var(--rp-parchment-100)]">{currentUser.displayName}</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] truncate">{currentUser.email}</div>
                   <div className="flex items-center space-x-1.5 mt-1">
                     <span className="px-1.5 py-0.2 bg-amber-950 text-amber-300 border border-amber-600/50 rounded text-[9px] font-bold uppercase">
                       {currentUser.role}
                     </span>
-                    <span className="px-1.5 py-0.2 bg-purple-950 text-purple-300 border border-purple-600/50 rounded text-[9px] font-bold uppercase">
+                    {/* Subscription badge: aged-leather chip instead of the old violet. */}
+                    <span className="px-1.5 py-0.2 bg-[var(--rp-leather-700)] text-[var(--rp-parchment-200)] border border-[var(--rp-amber-600)]/40 rounded text-[9px] font-bold uppercase">
                       {currentUser.subscriptionTier} Tier
                     </span>
                   </div>
                 </div>
 
                 {/* Switch Perspective (Multiplayer Simulator) */}
-                <div className="p-1 text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                <div className="p-1 text-[10px] text-[var(--rp-parchment-300)] font-bold uppercase tracking-wider">
                   Switch Client Perspective
                 </div>
                 {DEMO_ACCOUNTS.map((demo) => (
@@ -595,7 +600,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                       setIsUserMenuOpen(false);
                     }}
                     className={`w-full flex items-center justify-between px-2 py-1.5 rounded-lg text-left transition cursor-pointer ${
-                      currentUser.id === demo.user.id ? 'bg-amber-950/60 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                      currentUser.id === demo.user.id ? 'bg-amber-950/60 text-amber-300 font-bold' : 'hover:bg-[var(--rp-leather-700)] text-[var(--rp-parchment-200)]'
                     }`}
                   >
                     <span>{demo.user.displayName.split(' ')[0]}</span>
@@ -603,14 +608,14 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </button>
                 ))}
 
-                <div className="border-t border-slate-800 pt-1">
+                <div className="border-t border-[var(--tavern-border)] pt-1">
                   {onOpenUserSettings && (
                     <button
                       onClick={() => {
                         onOpenUserSettings();
                         setIsUserMenuOpen(false);
                       }}
-                      className="w-full flex items-center space-x-2 px-2 py-1.5 rounded-lg text-slate-300 hover:bg-slate-800 hover:text-white transition cursor-pointer"
+                      className="w-full flex items-center space-x-2 px-2 py-1.5 rounded-lg text-[var(--rp-parchment-200)] hover:bg-[var(--rp-leather-700)] hover:text-white transition cursor-pointer"
                     >
                       <Settings className="w-3.5 h-3.5" />
                       <span>User Settings</span>
@@ -636,7 +641,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                         onOpenAuth();
                         setIsUserMenuOpen(false);
                       }}
-                      className="w-full flex items-center space-x-2 px-2 py-1.5 rounded-lg text-slate-400 hover:bg-slate-800 hover:text-rose-400 transition cursor-pointer"
+                      className="w-full flex items-center space-x-2 px-2 py-1.5 rounded-lg text-[var(--rp-parchment-300)] hover:bg-[var(--rp-leather-700)] hover:text-rose-400 transition cursor-pointer"
                     >
                       <LogOut className="w-3.5 h-3.5" />
                       <span>Switch Account / Sign Out</span>
@@ -662,8 +667,8 @@ export const Navbar: React.FC<NavbarProps> = ({
           onClick={toggleMute}
           className={`p-1.5 rounded-lg border transition cursor-pointer ${
             isMuted
-              ? 'bg-slate-900 text-rose-400 border-slate-800'
-              : 'bg-slate-900 text-amber-400 border-slate-800 hover:text-white'
+              ? 'bg-[var(--tavern-surface)] text-rose-400 border-[var(--tavern-border)]'
+              : 'bg-[var(--tavern-surface)] text-amber-400 border-[var(--tavern-border)] hover:text-white'
           }`}
           title={isMuted ? 'Unmute Audio Cues' : 'Mute Audio Cues'}
         >
@@ -671,7 +676,7 @@ export const Navbar: React.FC<NavbarProps> = ({
         </button>
 
         {/* Live Latency Status */}
-        <div className="hidden 2xl:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-[11px] font-mono text-slate-300 shadow-inner">
+        <div className="hidden 2xl:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-black/30 border border-[var(--tavern-border)] text-[11px] font-mono text-[var(--rp-parchment-200)] shadow-inner">
           <Wifi className="w-3 h-3 text-emerald-400 animate-pulse" />
           <span>Sync: <strong className="text-emerald-400">{latencyMs}ms</strong></span>
         </div>

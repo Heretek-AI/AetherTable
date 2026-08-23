@@ -1,20 +1,14 @@
 import React, { useState } from 'react';
 import {
   Sparkles,
-  Shield,
-  Crown,
-  UserCheck,
   Eye,
   EyeOff,
-  X,
-  ArrowRight,
   Lock,
   Mail,
-  User as UserIcon,
-  CheckCircle2,
   Zap,
 } from 'lucide-react';
 import { User, DEMO_ACCOUNTS, UserRole } from '../types/auth';
+import { ModalShell } from './ui/ModalShell';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -34,8 +28,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [role, setRole] = useState<UserRole>('player');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  if (!isOpen) return null;
 
   const handleSignIn = (e: React.FormEvent) => {
     e.preventDefault();
@@ -127,34 +119,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-amber-500/40 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-5 animate-fadeIn">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-gradient-to-br from-amber-500 to-red-600 rounded-xl text-white shadow-lg shadow-amber-950/50">
-              <Sparkles className="w-6 h-6" />
-            </div>
-            <div>
-              <h2 className="text-xl font-bold font-serif tracking-wide text-slate-100">
-                AetherTable Identity Portal
-              </h2>
-              <p className="text-xs text-slate-400">
-                Sign in to join active campaigns or create a new adventurer account.
-              </p>
-            </div>
-          </div>
-
-          <button
-            onClick={onClose}
-            aria-label="Close modal"
-            autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
-          >
-              <X className="w-5 h-5" aria-hidden="true" />
-          </button>
-        </div>
-
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="AetherTable Identity Portal"
+      subtitle="Sign in to join active campaigns or create a new adventurer account."
+      icon={<Sparkles className="w-5 h-5" />}
+      size="md"
+    >
+      <div className="space-y-5">
         {/* Tab Switcher */}
         <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 font-mono text-xs">
           <button
@@ -327,6 +300,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 };

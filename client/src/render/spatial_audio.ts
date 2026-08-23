@@ -61,8 +61,11 @@ export class SpatialAudioEngine {
       return { pan: 0, gain: 1.0, distance };
     }
 
-    // Stereo Panning: -1.0 (far left) to +1.0 (far right)
-    const pan = Math.max(-1.0, Math.min(1.0, dx / 8.0));
+    // Stereo Panning: -1.0 (far left) to +1.0 (far right). tanh(dx/6) instead
+    // of a hard-clamped dx/8: smooth S-curve saturation that asymptotically
+    // approaches the extremes, so panning never "snaps" to full L/R at a fixed
+    // distance and tokens far off-axis still shift subtly further out.
+    const pan = Math.tanh(dx / 6.0);
 
     // Inverse Distance Rolloff: 1 / (1 + 0.15 * d)
     const gain = Math.max(0.08, Math.min(1.0, 1.0 / (1.0 + distance * 0.15)));
@@ -82,7 +85,11 @@ export class SpatialAudioEngine {
     const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
     const soundGain = this.ctx.createGain();
 
-    soundGain.gain.setValueAtTime(gain * 0.6, now);
+    // 8 ms linear attack before the decay: starting at full amplitude causes
+    // an audible click (hard waveform onset); ramping up from near-silence
+    // removes it without perceptibly softening the transient.
+    soundGain.gain.setValueAtTime(0.0001, now);
+    soundGain.gain.linearRampToValueAtTime(gain * 0.6, now + 0.008);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
 
     if (panner) {
@@ -115,7 +122,9 @@ export class SpatialAudioEngine {
     const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
     const soundGain = this.ctx.createGain();
 
-    soundGain.gain.setValueAtTime(gain * 0.5, now);
+    // Attack ramp as in playSpatialImpact — kills onset click.
+    soundGain.gain.setValueAtTime(0.0001, now);
+    soundGain.gain.linearRampToValueAtTime(gain * 0.5, now + 0.01);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
 
     if (panner) {
@@ -150,7 +159,9 @@ export class SpatialAudioEngine {
     const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
     const soundGain = this.ctx.createGain();
 
-    soundGain.gain.setValueAtTime(gain * 0.5, now);
+    // Attack ramp as in playSpatialImpact — kills onset click.
+    soundGain.gain.setValueAtTime(0.0001, now);
+    soundGain.gain.linearRampToValueAtTime(gain * 0.5, now + 0.008);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
 
     if (panner) {
@@ -183,7 +194,9 @@ export class SpatialAudioEngine {
     const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
     const soundGain = this.ctx.createGain();
 
-    soundGain.gain.setValueAtTime(gain * 0.35, now);
+    // Shortest cue → shortest attack (4 ms) so the dice rattle stays crisp.
+    soundGain.gain.setValueAtTime(0.0001, now);
+    soundGain.gain.linearRampToValueAtTime(gain * 0.35, now + 0.004);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
 
     if (panner) {

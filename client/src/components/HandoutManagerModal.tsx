@@ -1,19 +1,7 @@
 import React, { useState } from 'react';
-import {
-  Scroll,
-  FileText,
-  Eye,
-  Lock,
-  Share2,
-  X,
-  Sparkles,
-  Search,
-  Check,
-  Key,
-  Shield,
-  Send,
-} from 'lucide-react';
+import { Scroll, Share2, Sparkles, Shield } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { ModalShell } from './ui/ModalShell';
 
 export interface DigitalHandout {
   id: string;
@@ -89,8 +77,6 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
   const [broadcastAlert, setBroadcastAlert] = useState<string | null>(null);
   const [handouts, setHandouts] = useState<DigitalHandout[]>(INITIAL_HANDOUTS);
 
-  if (!isOpen) return null;
-
   const activeHandout = handouts.find((h) => h.id === selectedHandoutId) || handouts[0];
 
   const handleShare = (handout: DigitalHandout, target: 'all' | 'party') => {
@@ -106,36 +92,17 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-3xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col font-sans animate-fadeIn">
-        {/* Header */}
-        <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-gradient-to-br from-amber-600 to-rose-700 rounded-xl text-white shadow-lg">
-              <Scroll className="w-6 h-6" />
-            </div>
-            <div>
-              <h2 className="text-xl font-bold font-serif text-slate-100">
-                Digital Handouts & Secret Notes Vault
-              </h2>
-              <p className="text-xs text-slate-400">
-                Inspect stylized parchment letters, clue ciphers, and broadcast secrets to the table.
-              </p>
-            </div>
-          </div>
-
-          <button
-            onClick={onClose}
-            aria-label="Close modal"
-            autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
-          >
-              <X className="w-5 h-5" aria-hidden="true" />
-          </button>
-        </div>
-
-        {/* Content Layout: 2 Columns */}
-        <div className="flex-1 flex overflow-hidden min-h-0">
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Digital Handouts & Secret Notes Vault"
+      subtitle="Inspect stylized parchment letters, clue ciphers, and broadcast secrets to the table."
+      icon={<Scroll className="w-5 h-5" />}
+      size="lg"
+      tone="parchment"
+    >
+      {/* Content Layout: 2 Columns */}
+      <div className="flex min-h-0">
           {/* Left Column: Handouts List */}
           <div className="w-1/3 border-r border-slate-800 p-4 space-y-2 overflow-y-auto bg-slate-950/50 font-mono text-xs">
             <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2">
@@ -188,11 +155,13 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
               </div>
             )}
 
-            {/* Parchment Document Frame */}
-            <div className="bg-amber-50/95 text-slate-900 p-6 rounded-2xl border-4 border-amber-900/30 shadow-2xl relative font-serif space-y-4">
+            {/* Parchment Document Frame — tokenized rustic surface
+                (.vtt-parchment: aged paper gradient, iron frame, candlelight
+                edge burn; see index.css component layer) */}
+            <div className="vtt-parchment p-6 rounded-2xl relative space-y-4">
               <div className="flex items-start justify-between border-b-2 border-amber-900/20 pb-3">
                 <div>
-                  <h3 className="text-xl font-extrabold text-amber-950 tracking-wide">
+                  <h3 className="text-xl font-extrabold tracking-wide" style={{ color: "var(--parchment-ink)" }}>
                     {activeHandout.title}
                   </h3>
                   <div className="text-[11px] font-mono text-amber-800/80 mt-0.5">
@@ -237,7 +206,6 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
             </div>
           </div>
         </div>
-      </div>
-    </div>
+      </ModalShell>
   );
 };

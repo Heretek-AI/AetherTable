@@ -1,20 +1,12 @@
 import React, { useState } from 'react';
 import {
   BookOpen,
-  CheckCircle2,
-  Clock,
-  AlertCircle,
-  Users,
-  Coins,
   Share2,
-  X,
-  Plus,
   Sparkles,
-  Shield,
-  Search,
   Check,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { ModalShell } from './ui/ModalShell';
 
 export interface QuestItem {
   id: string;
@@ -151,8 +143,6 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
     ],
   });
 
-  if (!isOpen) return null;
-
   const activeQuest = quests.find((q) => q.id === selectedQuestId) || quests[0];
 
   const handleToggleStep = (stepIdx: number) => {
@@ -176,35 +166,25 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-4xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col font-sans animate-fadeIn">
-        {/* Header */}
-        <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-gradient-to-br from-amber-500 to-indigo-600 rounded-xl text-white shadow-lg">
-              <BookOpen className="w-6 h-6" />
-            </div>
-            <div>
-              <h2 className="text-xl font-bold font-serif text-slate-100">
-                Campaign Notes & Interactive Quest Journal
-              </h2>
-              <p className="text-xs text-slate-400">
-                Active quest objectives, NPC dossiers, session chronicles, and party treasury ledger.
-              </p>
-            </div>
-          </div>
-
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="Campaign Notes & Interactive Quest Journal"
+      subtitle="Active quest objectives, NPC dossiers, session chronicles, and party treasury ledger."
+      icon={<BookOpen className="w-5 h-5" />}
+      size="xl"
+      footer={
+        <div className="flex justify-end">
           <button
             onClick={onClose}
-            aria-label="Close modal"
-            autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
           >
-              <X className="w-5 h-5" aria-hidden="true" />
+            Close Journal
           </button>
         </div>
-
-        {/* Tab Navigation */}
+      }
+    >
+      {/* Tab Navigation */}
         <div className="flex border-b border-slate-800 bg-slate-950 px-6 pt-2 font-mono text-xs space-x-2">
           <button
             onClick={() => setActiveTab('quests')}
@@ -446,17 +426,6 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
             </div>
           )}
         </div>
-
-        {/* Footer */}
-        <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex justify-end">
-          <button
-            onClick={onClose}
-            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
-          >
-            Close Journal
-          </button>
-        </div>
-      </div>
-    </div>
+    </ModalShell>
   );
 };

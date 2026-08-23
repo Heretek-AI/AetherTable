@@ -291,16 +291,22 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     >
       {/* Permission Warning Banner */}
       {permissionWarning && (
-        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-rose-950/90 border border-rose-500/80 rounded-xl text-xs font-mono font-bold text-rose-200 shadow-2xl backdrop-blur-md animate-bounce">
-          ⚠️ {permissionWarning}
-        </div>
+        <>
+          {/* Toast layer: was z-50 — the same plane as every modal backdrop, so it
+              fought with sheets opened over the canvas. Toast rung sits above all
+              interactive chrome but below modals. */}
+          <div className="absolute top-16 left-1/2 -translate-x-1/2 px-4 py-2 bg-rose-950/90 border border-rose-500/80 rounded-xl text-xs font-mono font-bold text-rose-200 shadow-2xl backdrop-blur-md animate-bounce" style={{ zIndex: 'var(--z-toast)' }}>
+            ⚠️ {permissionWarning}
+          </div>
+        </>
       )}
 
       {/* Floating Tactical Overlay Controls */}
       {/* Canvas tool rail. flex-wrap + max-width keep tools inside the canvas
           area: without them the rail ran under the right character-sheet dock
           on ≤1440px screens, silently clipping the elevation stepper. */}
-      <div className="absolute top-4 left-4 z-20 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)] vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl border border-slate-800">
+      {/* Tool rail sits at chrome layer: above canvas FX but below any popover/modal. */}
+      <div className="absolute top-4 left-4 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)] vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl" style={{ zIndex: 'var(--z-chrome)' }}>
         {/* Zoom Controls */}
         <div className="flex items-center gap-1 bg-slate-900/90 p-0.5 rounded-lg border border-slate-800">
           <button
@@ -705,15 +711,18 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             ref={lightingCanvasRef}
             width={gridWidth * cellSize}
             height={gridHeight * cellSize}
-            className="absolute inset-0 pointer-events-none z-20"
+            className="absolute inset-0 pointer-events-none"
+            style={{ zIndex: 'var(--z-tokens)' }}
           />
 
-          {/* 3D Dice & WebGL Particle FX Overlay Canvas */}
+          {/* 3D Dice & WebGL Particle FX Overlay Canvas — fx rung. Was z-40,
+              which collided with popover dropdowns anchored over the canvas. */}
           <canvas
             ref={fxCanvasRef}
             width={gridWidth * cellSize}
             height={gridHeight * cellSize}
-            className="absolute inset-0 pointer-events-none z-40"
+            className="absolute inset-0 pointer-events-none"
+            style={{ zIndex: 'var(--z-fx)' }}
           />
         </div>
       </div>

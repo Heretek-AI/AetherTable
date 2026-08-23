@@ -11,15 +11,9 @@ import {
   Dices,
   Volume2,
   Sliders,
-  HardDrive,
   Check,
-  X,
-  Shield,
-  Crown,
-  Sparkles,
-  Radio,
-  Eye,
 } from 'lucide-react';
+import { ModalShell } from './ui/ModalShell';
 
 interface UserSettingsModalProps {
   isOpen: boolean;
@@ -41,8 +35,6 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const [spatialAudioEnabled, setSpatialAudioEnabled] = useState(true);
   const [voiceMode, setVoiceMode] = useState<'ptt' | 'vad'>('vad');
   const [savedSuccess, setSavedSuccess] = useState(false);
-
-  if (!isOpen) return null;
 
   const handleSave = () => {
     onUpdateUser({
@@ -67,40 +59,34 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   ];
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col animate-fadeIn">
-        {/* Header */}
-        <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-slate-800 rounded-xl text-slate-300">
-              <Settings className="w-6 h-6" />
-            </div>
-            <div>
-              <h2 className="text-xl font-bold font-serif tracking-wide text-slate-100">
-                User Preferences & Profile
-              </h2>
-              <div className="flex items-center space-x-2 text-xs font-mono mt-0.5">
-                <span className="text-amber-400 font-bold">{currentUser.displayName}</span>
-                <span className="text-slate-600">•</span>
-                <span className="px-1.5 py-0.2 bg-slate-800 text-slate-300 rounded uppercase text-[10px]">
-                  {currentUser.role}
-                </span>
-              </div>
-            </div>
-          </div>
-
+    <ModalShell
+      isOpen={isOpen}
+      onClose={onClose}
+      title="User Preferences & Profile"
+      subtitle={`Signed in as ${currentUser.displayName} · ${String(currentUser.role).toUpperCase()}`}
+      icon={<Settings className="w-5 h-5" />}
+      size="lg"
+      footer={
+        /* Footer Actions */
+        <div className="flex justify-end space-x-3">
           <button
             onClick={onClose}
-            aria-label="Close modal"
-            autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer"
           >
-              <X className="w-5 h-5" aria-hidden="true" />
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            className="flex items-center space-x-1.5 px-5 py-2 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white text-xs font-bold rounded-lg shadow-lg shadow-amber-950/60 transition cursor-pointer"
+          >
+            {savedSuccess ? <Check className="w-4 h-4 text-emerald-300" /> : null}
+            <span>{savedSuccess ? 'Saved Preferences!' : 'Save Changes'}</span>
           </button>
         </div>
-
-        {/* Content Body with Left Nav Tabs */}
-        <div className="grid grid-cols-1 md:grid-cols-12 flex-1 overflow-hidden">
+      }
+    >
+      {/* Content Body with Left Nav Tabs */}
+      <div className="grid grid-cols-1 md:grid-cols-12">
           {/* Left Navigation */}
           <div className="md:col-span-4 border-r border-slate-800 p-3 space-y-1 bg-slate-950/40">
             <button
@@ -288,24 +274,6 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
             )}
           </div>
         </div>
-
-        {/* Footer Actions */}
-        <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex justify-end space-x-3">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSave}
-            className="flex items-center space-x-1.5 px-5 py-2 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white text-xs font-bold rounded-lg shadow-lg shadow-amber-950/60 transition cursor-pointer"
-          >
-            {savedSuccess ? <Check className="w-4 h-4 text-emerald-300" /> : null}
-            <span>{savedSuccess ? 'Saved Preferences!' : 'Save Changes'}</span>
-          </button>
-        </div>
-      </div>
-    </div>
+      </ModalShell>
   );
 };

@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
+import { useFocusTrap } from './ui/useFocusTrap';
 import {
   Video,
   Radio,
@@ -49,8 +50,14 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
     setTimeout(() => setTestSent(false), 2500);
   };
 
+  // Shared dialog behavior (ESC dismiss + focus trap) without restructuring
+  // this bespoke overlay onto ModalShell — same pattern, ladder z-index.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap({ active: true, containerRef, onEscape: onClose });
+
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center p-4" style={{ zIndex: 'var(--z-modal)' }}>
+      <div ref={containerRef} tabIndex={-1} role="dialog" aria-modal="true">
       <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col font-sans animate-fadeIn">
         {/* Header */}
         <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
@@ -173,6 +180,7 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
             Save & Close Streamer HUD
           </button>
         </div>
+      </div>
       </div>
     </div>
   );

@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useFocusTrap } from './ui/useFocusTrap';
 import { 
   BookOpen, 
   Search, 
@@ -700,53 +701,97 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
         </div>
       </div>
 
-      {/* Rich Statblock Detail Modal */}
+      {/* Rich Statblock Detail Modal — nested sheet: ESC/trap via the shared
+          hook, modal-nested rung so it layers above the compendium itself. */}
       {selectedItem && (
-        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full max-h-[85vh] overflow-y-auto p-6 shadow-2xl space-y-4 animate-fadeIn">
-            <div className="flex items-start justify-between border-b border-slate-800 pb-3">
-              <div>
-                <h3 className="text-xl font-bold font-serif text-slate-100">{selectedItem.name}</h3>
-                <p className="text-xs text-slate-400 font-mono mt-0.5">
-                  {selectedItem.size || (selectedItem.level === 0 ? 'Cantrip' : `Level ${selectedItem.level}`)}{' '}
-                  {selectedItem.type || selectedItem.school}
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedItem(null)}
-                className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <p className="text-xs text-slate-300 leading-relaxed font-sans bg-slate-950/60 p-4 rounded-xl border border-slate-800">
-              {selectedItem.description}
-            </p>
-
-            <div className="flex justify-end space-x-2 pt-2 border-t border-slate-800">
-              {(activeTab === 'monsters' || activeTab === 'animals') && (
-                <button
-                  onClick={() => {
-                    handleSpawnMonster(selectedItem);
-                    setSelectedItem(null);
-                  }}
-                  className="flex items-center space-x-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>Spawn to Canvas</span>
-                </button>
-              )}
-              <button
-                onClick={() => setSelectedItem(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono rounded-xl transition cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+        <StatblockOverlay
+          item={selectedItem}
+          onClose={() => setSelectedItem(null)}
+          canSpawn={activeTab === 'monsters' || activeTab === 'animals'}
+          onSpawn={() => {
+            handleSpawnMonster(selectedItem);
+            setSelectedItem(null);
+          }}
+        />
       )}
     </div>
   );
 };
+
+/**
+ * Nested statblock detail sheet, extracted from CompendiumView so the shared
+ * focus-trap hook can be called unconditionally (hooks are illegal inside a
+ * conditional render in the parent view). Sits on the modal-nested rung.
+ */
+function StatblockOverlay({
+  item,
+  onClose,
+  canSpawn,
+  onSpawn,
+}: {
+  // Matches the parent's selectedItem state (loosely typed compendium entries).
+  item: any;
+  onClose: () => void;
+  canSpawn: boolean;
+  onSpawn: () => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap({ active: true, containerRef, onEscape: onClose });
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
+      style={{ zIndex: 'var(--z-modal-nested)' }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={containerRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        className="vtt-glass-panel rounded-2xl max-w-xl w-full max-h-[85vh] overflow-y-auto vtt-scrollbar p-6 shadow-2xl space-y-4 animate-fadeIn"
+      >
+        <div className="flex items-start justify-between border-b border-[var(--tavern-border)] pb-3">
+          <div>
+            <h3 className="vtt-engraved text-xl font-bold">{item.name}</h3>
+            <p className="text-xs text-[var(--rp-parchment-300)] font-mono mt-0.5">
+              {item.size || (item.level === 0 ? 'Cantrip' : `Level ${item.level}`)}{' '}
+              {item.type || item.school}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close statblock"
+            className="p-1.5 text-[var(--rp-parchment-300)] hover:text-white rounded-lg hover:bg-[var(--rp-leather-700)] transition cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <p className="selectable-text text-xs text-[var(--rp-parchment-200)] leading-relaxed font-sans bg-black/30 p-4 rounded-xl border border-[var(--tavern-border)]">
+          {item.description}
+        </p>
+
+        <div className="flex justify-end space-x-2 pt-2 border-t border-[var(--tavern-border)]">
+          {canSpawn && (
+            <button
+              onClick={onSpawn}
+              className="flex items-center space-x-1.5 px-4 py-2 bg-[var(--rp-amber-600)] hover:bg-[var(--rp-amber-500)] text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Spawn to Canvas</span>
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-black/30 hover:bg-[var(--rp-leather-700)] text-[var(--rp-parchment-100)] text-xs font-mono rounded-xl transition cursor-pointer"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
