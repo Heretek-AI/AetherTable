@@ -44,6 +44,7 @@ interface TacticalCanvasProps {
   onUpdateTokenElevation?: (tokenId: string, newElevation: number) => void;
   currentUser?: User;
   remoteCursors?: { id: string; name: string; color: string; x: number; y: number }[];
+  activePing?: { x: number; y: number } | null;
   gridWidth?: number;
   gridHeight?: number;
   walls?: { x: number; y: number }[];
@@ -52,6 +53,7 @@ interface TacticalCanvasProps {
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
+export type TokenLightMode = 'torch' | 'lantern' | 'darkvision' | 'none';
 
 export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   tokens,
@@ -64,6 +66,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     { id: 'usr_lyra', name: 'Lyra', color: '#818cf8', x: 6, y: 3 },
     { id: 'usr_player1', name: 'Thorin', color: '#ef4444', x: 3, y: 5 },
   ],
+  activePing = null,
   gridWidth = 16,
   gridHeight = 12,
   walls = [
@@ -79,6 +82,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [startPan, setStartPan] = useState({ x: 0, y: 0 });
   const [draggedTokenId, setDraggedTokenId] = useState<string | null>(null);
   const [permissionWarning, setPermissionWarning] = useState<string | null>(null);
+  const [tokenLightMode, setTokenLightMode] = useState<TokenLightMode>('torch');
   
   // Tools
   const [measureMode, setMeasureMode] = useState(false);
@@ -134,8 +138,17 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         }
       });
 
-      // 2. Render 2D Raycast Lighting & Shadows based on Perspective Mode
+      // 2. Render 2D Raycast Lighting & Shadows based on Perspective Mode & Token Light Mode
       lightCtx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
+
+      const lightRadius =
+        tokenLightMode === 'torch'
+          ? 260
+          : tokenLightMode === 'lantern'
+          ? 360
+          : tokenLightMode === 'darkvision'
+          ? 420
+          : 130;
 
       if (visionPerspective === 'party') {
         const playerSources: Point[] = tokens
@@ -151,7 +164,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             playerSources,
             gridWidth * cellSize,
             gridHeight * cellSize,
-            420
+            lightRadius
           );
         }
       } else if (visionPerspective === 'selected') {
@@ -166,7 +179,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             source,
             gridWidth * cellSize,
             gridHeight * cellSize,
-            420
+            lightRadius
           );
         }
       }
@@ -177,7 +190,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
     renderLoop();
     return () => cancelAnimationFrame(animId);
-  }, [tokens, selectedTokenId, visionPerspective, gridWidth, gridHeight]);
+  }, [tokens, selectedTokenId, visionPerspective, tokenLightMode, gridWidth, gridHeight]);
 
   const isWall = (x: number, y: number) => {
     return walls.some((w) => w.x === x && w.y === y);
@@ -387,6 +400,29 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
         </div>
 
+        {/* Dynamic Light Source Preset (Roll20 Style) */}
+        <button
+          onClick={() => {
+            const modes: TokenLightMode[] = ['torch', 'lantern', 'darkvision', 'none'];
+            const nextIdx = (modes.indexOf(tokenLightMode) + 1) % modes.length;
+            setTokenLightMode(modes[nextIdx]);
+            globalAudio.playTurnAdvance();
+          }}
+          className="flex items-center gap-1.5 bg-slate-900/90 px-2.5 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-orange-400 font-bold hover:bg-slate-800 transition cursor-pointer"
+          title="Toggle Dynamic Lighting Source Preset"
+        >
+          <Flame className="w-3.5 h-3.5 text-orange-400" />
+          <span>
+            {tokenLightMode === 'torch'
+              ? 'Torch (20/40ft)'
+              : tokenLightMode === 'lantern'
+              ? 'Lantern (30/60ft)'
+              : tokenLightMode === 'darkvision'
+              ? 'Darkvision (60ft)'
+              : 'No Light'}
+          </span>
+        </button>
+
         {/* Token Elevation Stepper (Roll20 Style) */}
         {selectedTokenId && onUpdateTokenElevation && (
           <div className="flex items-center gap-1.5 bg-slate-900/90 px-2 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-amber-300">
@@ -559,7 +595,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             );
           })}
 
-          {/* Live Multiplayer Remote Player Cursors & Pings */}
+          {/* Live Multiplayer Remote Player Cursors */}
           {remoteCursors.map((cursor) => (
             <div
               key={cursor.id}
@@ -581,6 +617,22 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               </span>
             </div>
           ))}
+
+          {/* Active Tactical Beacon Map Ping */}
+          {activePing && (
+            <div
+              className="absolute pointer-events-none z-35 flex items-center justify-center -translate-x-1/2 -translate-y-1/2"
+              style={{
+                left: `${(activePing.x + 0.5) * cellSize}px`,
+                top: `${(activePing.y + 0.5) * cellSize}px`,
+                width: `${cellSize * 2}px`,
+                height: `${cellSize * 2}px`,
+              }}
+            >
+              <div className="w-full h-full rounded-full border-4 border-amber-400 bg-amber-400/20 animate-ping" />
+              <div className="absolute w-4 h-4 rounded-full bg-amber-300 border-2 border-white shadow-lg" />
+            </div>
+          )}
 
           {/* 2D Raycast Lighting & Line-of-Sight Mask Layer */}
           <canvas

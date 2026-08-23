@@ -40,6 +40,14 @@ export function App() {
   const [isUserSettingsOpen, setIsUserSettingsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
+  const [activePing, setActivePing] = useState<{ x: number; y: number } | null>(null);
+  const [activePeerTyping, setActivePeerTyping] = useState<string | null>(null);
+
+  const handleBroadcastPing = () => {
+    setActivePing({ x: 5, y: 3 });
+    addSystemMessage(`📍 Tactical Beacon: Map ping broadcasted at [F4] by ${currentUser.displayName}`);
+    setTimeout(() => setActivePing(null), 4000);
+  };
 
   const [isLeftDockCollapsed, setIsLeftDockCollapsed] = useState(false);
   const [isRightDockCollapsed, setIsRightDockCollapsed] = useState(false);
@@ -645,6 +653,7 @@ export function App() {
                   onSelectToken={(id) => setSelectedTokenId(id)}
                   onUpdateTokenElevation={handleUpdateTokenElevation}
                   currentUser={currentUser}
+                  activePing={activePing}
                   walls={customWalls}
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
@@ -672,6 +681,8 @@ export function App() {
               onSendMessage={handleSendMessage}
               spotlightWeights={spotlightWeights}
               isStreamingResponse={isStreamingResponse}
+              activePeerTyping={activePeerTyping}
+              onBroadcastPing={handleBroadcastPing}
             />
           </div>
         )}
@@ -689,7 +700,7 @@ export function App() {
         )}
 
         {currentView === 'lobby' && (
-          <LobbyView onLaunchCampaign={handleLaunchFromLobby} />
+          <LobbyView onLaunchCampaign={handleLaunchFromLobby} currentUser={currentUser} />
         )}
 
         {currentView === 'dynasty' && (

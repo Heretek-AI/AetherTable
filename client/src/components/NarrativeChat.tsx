@@ -10,10 +10,18 @@ import {
   Volume2, 
   Flame, 
   Skull,
-  Radio
+  Radio,
+  Lock,
+  MessageSquare,
+  Users,
+  Dices,
+  Eye,
+  MapPin
 } from 'lucide-react';
 import { globalVoiceCapture } from '../render/voice_capture';
 import { globalAudio } from '../render/audio_manager';
+
+export type ChatChannel = 'all' | 'party' | 'gm' | 'combat';
 
 export interface ChatMessage {
   id: string;
@@ -21,6 +29,8 @@ export interface ChatMessage {
   role: 'dm' | 'player' | 'system';
   content: string;
   timestamp: string;
+  channel?: ChatChannel;
+  recipient?: string;
   isStreaming?: boolean;
   diceRollDetails?: {
     total: number;
@@ -31,9 +41,11 @@ export interface ChatMessage {
 
 interface NarrativeChatProps {
   messages: ChatMessage[];
-  onSendMessage: (text: string) => void;
+  onSendMessage: (text: string, channel?: ChatChannel, recipient?: string) => void;
   spotlightWeights: { Thorin: number; Lyra: number; [key: string]: number };
   isStreamingResponse?: boolean;
+  activePeerTyping?: string | null;
+  onBroadcastPing?: () => void;
 }
 
 export const NarrativeChat: React.FC<NarrativeChatProps> = ({
@@ -41,7 +53,10 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   onSendMessage,
   spotlightWeights,
   isStreamingResponse = false,
+  activePeerTyping = null,
+  onBroadcastPing,
 }) => {
+  const [activeChannel, setActiveChannel] = useState<ChatChannel>('all');
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(0);
@@ -49,12 +64,12 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreamingResponse]);
+  }, [messages, isStreamingResponse, activePeerTyping]);
 
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim()) return;
-    onSendMessage(inputText.trim());
+    onSendMessage(inputText.trim(), activeChannel);
     setInputText('');
   };
 
@@ -78,129 +93,198 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         "I examine the ancient runes carved into the sarcophagus lid.",
       ];
       const randomUtterance = voiceUtterances[Math.floor(Math.random() * voiceUtterances.length)];
-      onSendMessage(randomUtterance);
+      onSendMessage(randomUtterance, activeChannel);
     }
   };
 
+  // Filter messages based on active channel
+  const filteredMessages = messages.filter((msg) => {
+    if (activeChannel === 'all') return true;
+    if (activeChannel === 'party') return msg.role === 'player' || msg.channel === 'party';
+    if (activeChannel === 'gm') return msg.channel === 'gm' || msg.sender.includes('DM') || msg.sender.includes('Auditor');
+    if (activeChannel === 'combat') return !!msg.diceRollDetails || msg.content.includes('Damage') || msg.content.includes('Hit') || msg.content.includes('rolled');
+    return true;
+  });
+
   return (
-    <div className="h-56 border-t border-slate-800 bg-slate-950/95 flex flex-col text-slate-100 font-sans shadow-2xl shrink-0">
-      {/* Top Telemetry Strip */}
-      <div className="h-7 px-4 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between text-[11px] font-mono text-slate-400 shrink-0">
-        <div className="flex items-center gap-3">
-          <span className="flex items-center gap-1.5 text-purple-400 font-semibold">
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>AI Narrative Director</span>
-          </span>
-          <span className="text-slate-600">|</span>
-          <span className="text-slate-400">
-            Voice Spotlight: Thorin ({Math.round(spotlightWeights.Thorin * 100)}%) · Lyra ({Math.round(spotlightWeights.Lyra * 100)}%)
-          </span>
+    <div className="h-60 border-t border-slate-800 bg-slate-950/95 flex flex-col text-slate-100 font-sans shadow-2xl shrink-0 select-none">
+      {/* Top Telemetry Strip & Channel Tabs */}
+      <div className="h-8 px-3 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between text-[11px] font-mono text-slate-400 shrink-0">
+        <div className="flex items-center gap-1.5 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+          <button
+            onClick={() => setActiveChannel('all')}
+            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
+              activeChannel === 'all' ? 'bg-amber-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <MessageSquare className="w-3 h-3" />
+            <span>All Table</span>
+          </button>
+
+          <button
+            onClick={() => setActiveChannel('party')}
+            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
+              activeChannel === 'party' ? 'bg-emerald-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Users className="w-3 h-3" />
+            <span>Party</span>
+          </button>
+
+          <button
+            onClick={() => setActiveChannel('gm')}
+            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
+              activeChannel === 'gm' ? 'bg-purple-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Lock className="w-3 h-3" />
+            <span>GM Whispers</span>
+          </button>
+
+          <button
+            onClick={() => setActiveChannel('combat')}
+            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
+              activeChannel === 'combat' ? 'bg-rose-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Dices className="w-3 h-3" />
+            <span>Combat Log</span>
+          </button>
         </div>
 
         <div className="flex items-center gap-2">
-          {isStreamingResponse && (
-            <span className="flex items-center gap-1 text-emerald-400 font-bold animate-pulse">
-              <Radio className="w-3 h-3 text-emerald-400" />
-              <span>Streaming SSE Narrative...</span>
-            </span>
+          {onBroadcastPing && (
+            <button
+              onClick={() => {
+                onBroadcastPing();
+                globalAudio.playTurnAdvance();
+              }}
+              className="flex items-center space-x-1 px-2 py-0.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-amber-300 rounded text-[10px] font-bold transition cursor-pointer"
+              title="Broadcast tactical beacon ping to party"
+            >
+              <MapPin className="w-3 h-3 text-amber-400 animate-bounce" />
+              <span className="hidden sm:inline">Map Ping</span>
+            </button>
           )}
+
+          <div className="flex items-center gap-1.5 text-slate-500 font-mono text-[10px]">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-slate-400">Thorin (50%) · Lyra (50%)</span>
+          </div>
         </div>
       </div>
 
-      {/* Messages Scroll Area */}
-      <div className="flex-1 p-3 overflow-y-auto space-y-2.5 vtt-scrollbar font-sans text-xs min-h-0">
-        {messages.map((msg) => {
+      {/* Narrative Messages Stream */}
+      <div className="flex-1 p-3 overflow-y-auto space-y-2 text-xs font-mono">
+        {filteredMessages.map((msg) => {
           const isDm = msg.role === 'dm';
           const isSystem = msg.role === 'system';
+          const isWhisper = msg.channel === 'gm';
 
           return (
             <div
               key={msg.id}
-              className={`p-2.5 rounded-xl border transition-all ${
-                isDm
-                  ? 'bg-purple-950/30 border-purple-800/50 shadow-md shadow-purple-950/20'
+              className={`p-2 rounded-xl border transition-all ${
+                isWhisper
+                  ? 'bg-purple-950/40 border-purple-500/50 shadow-md'
+                  : isDm
+                  ? 'bg-slate-900/90 border-slate-800 text-slate-200'
                   : isSystem
-                  ? 'bg-slate-900/90 border-slate-700/60 text-slate-300'
-                  : 'bg-slate-900/60 border-slate-800'
+                  ? 'bg-amber-950/20 border-amber-500/30 text-amber-200'
+                  : 'bg-slate-950 border-slate-850 text-slate-300'
               }`}
             >
-              <div className="flex items-center justify-between mb-1">
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`w-4 h-4 rounded flex items-center justify-center text-[9px] font-bold ${
-                      isDm
-                        ? 'bg-purple-600 text-white'
+              <div className="flex items-center justify-between mb-1 text-[10px]">
+                <div className="flex items-center space-x-1.5">
+                  <span
+                    className={`font-bold ${
+                      isWhisper
+                        ? 'text-purple-300'
+                        : isDm
+                        ? 'text-amber-400'
                         : isSystem
-                        ? 'bg-slate-700 text-slate-300'
-                        : 'bg-sky-600 text-white'
+                        ? 'text-sky-400'
+                        : 'text-emerald-400'
                     }`}
                   >
-                    {isDm ? <Sparkles className="w-2.5 h-2.5" /> : isSystem ? <ShieldAlert className="w-2.5 h-2.5" /> : <User className="w-2.5 h-2.5" />}
-                  </div>
-                  <span className={`font-bold font-display text-[11px] ${isDm ? 'text-purple-300' : 'text-slate-200'}`}>
                     {msg.sender}
                   </span>
+                  {isWhisper && (
+                    <span className="px-1.5 py-0.2 bg-purple-900 border border-purple-500/50 text-purple-200 rounded text-[9px] font-bold">
+                      SECRET WHISPER
+                    </span>
+                  )}
+                  {msg.channel && msg.channel !== 'all' && !isWhisper && (
+                    <span className="px-1.5 py-0.2 bg-slate-800 rounded text-[9px] uppercase text-slate-400">
+                      {msg.channel}
+                    </span>
+                  )}
                 </div>
-                <span className="text-[9px] font-mono text-slate-500">{msg.timestamp}</span>
+                <span className="text-slate-600">{msg.timestamp}</span>
               </div>
 
-              <p className="text-slate-200 leading-relaxed font-sans text-[11px] select-text">
-                {msg.content}
-                {msg.isStreaming && (
-                  <span className="inline-block w-1.5 h-3 ml-1 bg-purple-400 animate-pulse align-middle" />
-                )}
-              </p>
+              <div className="leading-relaxed font-sans text-xs">{msg.content}</div>
+
+              {msg.diceRollDetails && (
+                <div className="mt-1.5 p-1.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center space-x-2 text-[10px] font-mono">
+                  <Dices className="w-3.5 h-3.5 text-amber-400" />
+                  <span className="text-slate-400">Expression: {msg.diceRollDetails.expression}</span>
+                  <span className="text-slate-600">•</span>
+                  <span className="text-amber-300 font-bold">Total: {msg.diceRollDetails.total}</span>
+                  <span className="text-slate-600">•</span>
+                  <span className="text-slate-500">[{msg.diceRollDetails.rolls.join(', ')}]</span>
+                </div>
+              )}
             </div>
           );
         })}
+
+        {/* Live Peer Typing Indicator */}
+        {(activePeerTyping || isStreamingResponse) && (
+          <div className="p-2 bg-slate-900/60 border border-slate-800 rounded-xl flex items-center space-x-2 text-xs font-mono text-purple-300 animate-pulse">
+            <Sparkles className="w-3.5 h-3.5 text-purple-400 animate-spin" />
+            <span>
+              {activePeerTyping ? `${activePeerTyping} is typing...` : 'AI Narrative Director is forging story...'}
+            </span>
+          </div>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input & Microphone Bar */}
-      <form onSubmit={handleSend} className="p-2.5 bg-slate-900/80 border-t border-slate-800 flex items-center gap-2 shrink-0">
-        {/* Animated Microphone Push-to-Talk Button */}
+      {/* Message Input & Action Bar */}
+      <form onSubmit={handleSend} className="p-2 border-t border-slate-800/80 bg-slate-900/80 flex items-center gap-2">
         <button
           type="button"
           onClick={toggleRecording}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition shadow ${
+          className={`p-2 rounded-xl border transition cursor-pointer ${
             isRecording
-              ? 'bg-rose-600 text-white shadow-rose-900/50 animate-pulse'
-              : 'bg-slate-800 hover:bg-slate-700 text-purple-300 border border-slate-700'
+              ? 'bg-red-600 text-white border-red-500 animate-pulse'
+              : 'bg-slate-800 text-slate-300 border-slate-700 hover:text-white'
           }`}
-          title={isRecording ? 'Click to Stop & Send Speech Declaration' : 'Push-to-Talk (Microphone Ingestion)'}
+          title={isRecording ? 'Stop Recording' : 'Push-to-Talk (Microphone Ingestion)'}
         >
-          {isRecording ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-          <span>{isRecording ? 'Listening...' : 'Mic'}</span>
+          {isRecording ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
         </button>
-
-        {/* Live Audio Waveform Bars (when recording) */}
-        {isRecording && (
-          <div className="flex items-center gap-1 px-2 h-7 bg-slate-950 rounded-lg border border-slate-800">
-            {Array.from({ length: 6 }).map((_, i) => {
-              const h = Math.max(4, Math.min(18, (voiceVolume / 100) * 18 * (0.5 + Math.sin(i * 1.2) * 0.5)));
-              return (
-                <div
-                  key={i}
-                  className="w-1 bg-purple-400 rounded-full transition-all duration-75"
-                  style={{ height: `${h}px` }}
-                />
-              );
-            })}
-          </div>
-        )}
 
         <input
           type="text"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
-          placeholder="Speak or type player action (e.g. 'I cast Fireball at the warlord', 'I roll Athletics to jump')..."
-          className="flex-1 px-3.5 py-1.5 bg-slate-950 border border-slate-700/80 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-purple-500 font-sans"
+          placeholder={
+            activeChannel === 'gm'
+              ? 'Whisper secretly to Dungeon Master...'
+              : activeChannel === 'party'
+              ? 'Speak to party members...'
+              : "Declare action (e.g. 'I cast Fireball at the warlord', 'I roll Athletics to leap')..."
+          }
+          className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
         />
 
         <button
           type="submit"
           disabled={!inputText.trim()}
-          className="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow shadow-purple-950"
+          className="px-4 py-1.5 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 disabled:opacity-30 text-white text-xs font-bold font-mono rounded-xl shadow transition cursor-pointer flex items-center space-x-1"
         >
           <Send className="w-3.5 h-3.5" />
           <span>Send</span>
@@ -209,3 +293,5 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
     </div>
   );
 };
+
+export default NarrativeChat;

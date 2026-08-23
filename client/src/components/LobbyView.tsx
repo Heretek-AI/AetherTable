@@ -17,6 +17,7 @@ import {
   Radio
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { User } from '../types/auth';
 
 export interface PlayerSeat {
   id: string;
@@ -31,9 +32,10 @@ export interface PlayerSeat {
 
 interface LobbyViewProps {
   onLaunchCampaign: (selectedSeatId: string) => void;
+  currentUser?: User;
 }
 
-export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign }) => {
+export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentUser }) => {
   const [copied, setCopied] = useState(false);
   const [selectedSeat, setSelectedSeat] = useState<string>('seat_gm');
 
