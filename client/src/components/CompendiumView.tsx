@@ -187,7 +187,8 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
   const handlePageChange = (newPage: number) => {
     if (newPage >= 1 && newPage <= totalPages) {
       setCurrentPage(newPage);
-      globalAudio.playTurnAdvance();
+      // No chime here: pagination is silent UI navigation — reserving audio
+      // cues for gameplay events keeps them meaningful (UX: alarm fatigue).
     }
   };
 

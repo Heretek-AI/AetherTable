@@ -1,45 +1,77 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
+// Eager: only what first paint needs — landing page (default route), navbar,
+// and the Cmd+K palette. Everything else is code-split below.
 import { Navbar, SaaSView } from './components/Navbar';
-import { TacticalCanvas, Token } from './components/TacticalCanvas';
-import { InitiativeTracker } from './components/InitiativeTracker';
-import { CharacterSheet } from './components/CharacterSheet';
-import { NarrativeChat, ChatMessage } from './components/NarrativeChat';
-import { SafetyModal } from './components/SafetyModal';
-import { AudioMixerModal } from './components/AudioMixerModal';
-import { CompendiumView } from './components/CompendiumView';
-import { CharacterBuilderView } from './components/CharacterBuilderView';
-import { EncounterBuilderView } from './components/EncounterBuilderView';
-import { LobbyView } from './components/LobbyView';
-import { DynastyView } from './components/DynastyView';
-import { BundleManagerView } from './components/BundleManagerView';
-import { QuestDialogueView } from './components/QuestDialogueView';
-import { WfcStudioView } from './components/WfcStudioView';
-import { AnalyticsView } from './components/AnalyticsView';
 import { LandingPageView } from './components/LandingPageView';
-import { MacroQuickbar } from './components/MacroQuickbar';
-import { SpellbookModal } from './components/SpellbookModal';
-import { SubscriptionModal } from './components/SubscriptionModal';
-import { AuthModal } from './components/AuthModal';
-import { UserSettingsModal } from './components/UserSettingsModal';
-import { AdminDashboardView } from './components/AdminDashboardView';
-import { MarketplaceView } from './components/MarketplaceView';
-import { SoundscapeJukeboxModal } from './components/SoundscapeJukeboxModal';
 import { CommandPalette } from './components/CommandPalette';
-import { MapLayerEditorModal, MapLayerType } from './components/MapLayerEditorModal';
-import { HandoutManagerModal, DigitalHandout } from './components/HandoutManagerModal';
-import { StreamerHUDModal } from './components/StreamerHUDModal';
-import { QuestJournalModal } from './components/QuestJournalModal';
-import { VideoMeshTiles } from './components/VideoMeshTiles';
-import { BossHealthBar } from './components/BossHealthBar';
+
+// Type-only imports: their modules are lazy-loaded below.
+import type { Token } from './components/TacticalCanvas';
+import type { ChatMessage } from './components/NarrativeChat';
+import type { MapLayerType } from './components/MapLayerEditorModal';
+import type { DigitalHandout } from './components/HandoutManagerModal';
+import type { ParticleFXManager } from './render/particle_effects';
+import type { DiceBox3D } from './render/dice_box_3d';
+
+/**
+ * Code splitting (perf): the app previously shipped every view + modal inside a
+ * single ~1.9 MB chunk. Each component below is now split into its own chunk
+ * that Vite fetches on demand — views when navigated to, modals when first
+ * opened. Named exports need the `.then()` remap because React.lazy expects
+ * `{ default }`.
+ */
+const TacticalCanvas = lazy(() => import('./components/TacticalCanvas').then((m) => ({ default: m.TacticalCanvas })));
+const InitiativeTracker = lazy(() => import('./components/InitiativeTracker').then((m) => ({ default: m.InitiativeTracker })));
+const CharacterSheet = lazy(() => import('./components/CharacterSheet').then((m) => ({ default: m.CharacterSheet })));
+const NarrativeChat = lazy(() => import('./components/NarrativeChat').then((m) => ({ default: m.NarrativeChat })));
+const SafetyModal = lazy(() => import('./components/SafetyModal').then((m) => ({ default: m.SafetyModal })));
+const AudioMixerModal = lazy(() => import('./components/AudioMixerModal').then((m) => ({ default: m.AudioMixerModal })));
+const CompendiumView = lazy(() => import('./components/CompendiumView').then((m) => ({ default: m.CompendiumView })));
+const CharacterBuilderView = lazy(() => import('./components/CharacterBuilderView').then((m) => ({ default: m.CharacterBuilderView })));
+const EncounterBuilderView = lazy(() => import('./components/EncounterBuilderView').then((m) => ({ default: m.EncounterBuilderView })));
+const LobbyView = lazy(() => import('./components/LobbyView').then((m) => ({ default: m.LobbyView })));
+const DynastyView = lazy(() => import('./components/DynastyView').then((m) => ({ default: m.DynastyView })));
+const BundleManagerView = lazy(() => import('./components/BundleManagerView').then((m) => ({ default: m.BundleManagerView })));
+const QuestDialogueView = lazy(() => import('./components/QuestDialogueView').then((m) => ({ default: m.QuestDialogueView })));
+const WfcStudioView = lazy(() => import('./components/WfcStudioView').then((m) => ({ default: m.WfcStudioView })));
+const AnalyticsView = lazy(() => import('./components/AnalyticsView').then((m) => ({ default: m.AnalyticsView })));
+const MacroQuickbar = lazy(() => import('./components/MacroQuickbar').then((m) => ({ default: m.MacroQuickbar })));
+const SpellbookModal = lazy(() => import('./components/SpellbookModal').then((m) => ({ default: m.SpellbookModal })));
+const SubscriptionModal = lazy(() => import('./components/SubscriptionModal').then((m) => ({ default: m.SubscriptionModal })));
+const AuthModal = lazy(() => import('./components/AuthModal').then((m) => ({ default: m.AuthModal })));
+const UserSettingsModal = lazy(() => import('./components/UserSettingsModal').then((m) => ({ default: m.UserSettingsModal })));
+const AdminDashboardView = lazy(() => import('./components/AdminDashboardView').then((m) => ({ default: m.AdminDashboardView })));
+const MarketplaceView = lazy(() => import('./components/MarketplaceView').then((m) => ({ default: m.MarketplaceView })));
+const SoundscapeJukeboxModal = lazy(() => import('./components/SoundscapeJukeboxModal').then((m) => ({ default: m.SoundscapeJukeboxModal })));
+const MapLayerEditorModal = lazy(() => import('./components/MapLayerEditorModal').then((m) => ({ default: m.MapLayerEditorModal })));
+const HandoutManagerModal = lazy(() => import('./components/HandoutManagerModal').then((m) => ({ default: m.HandoutManagerModal })));
+const StreamerHUDModal = lazy(() => import('./components/StreamerHUDModal').then((m) => ({ default: m.StreamerHUDModal })));
+const QuestJournalModal = lazy(() => import('./components/QuestJournalModal').then((m) => ({ default: m.QuestJournalModal })));
+const VideoMeshTiles = lazy(() => import('./components/VideoMeshTiles').then((m) => ({ default: m.VideoMeshTiles })));
+const BossHealthBar = lazy(() => import('./components/BossHealthBar').then((m) => ({ default: m.BossHealthBar })));
+const CampaignSaveModal = lazy(() => import('./components/CampaignSaveModal').then((m) => ({ default: m.CampaignSaveModal })));
+const ShortcutsModal = lazy(() => import('./components/ShortcutsModal').then((m) => ({ default: m.ShortcutsModal })));
+
+/** Themed loading placeholder shown while a lazily-split view/modal chunk loads. */
+const ChunkFallback = ({ label }: { label: string }) => (
+  <div className="flex-1 flex items-center justify-center bg-slate-950" role="status" aria-live="polite">
+    <div className="flex flex-col items-center gap-3 text-slate-400">
+      <div className="w-8 h-8 border-2 border-amber-500/30 border-t-amber-500 rounded-full animate-spin" />
+      <span className="text-sm tracking-wide">{label}</span>
+    </div>
+  </div>
+);
 import { User, DEMO_ACCOUNTS } from './types/auth';
-import { ParticleFXManager } from './render/particle_effects';
-import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
-import { CampaignSaveModal } from './components/CampaignSaveModal';
 import type { CampaignSnapshot } from './api/campaign_store';
+import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
+
+// --- Roll history persistence ---------------------------------------------
+const ROLL_HISTORY_KEY = 'vtt_roll_history_v1';
+const ROLL_HISTORY_CAP = 50;
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
@@ -60,6 +92,7 @@ export function App() {
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isUserSettingsOpen, setIsUserSettingsOpen] = useState(false);
+  const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
   const [activePing, setActivePing] = useState<{ x: number; y: number } | null>(null);
@@ -70,11 +103,72 @@ export function App() {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
         setIsCommandPaletteOpen((prev) => !prev);
+        return;
+      }
+
+      // Never hijack keys while the user is typing in chat, search, forms, etc.
+      const target = e.target as HTMLElement | null;
+      const isTyping =
+        !!target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+      if (isTyping) return;
+
+      // `?` (Shift+/) — discoverable shortcut cheat-sheet.
+      if (e.key === '?') {
+        e.preventDefault();
+        setIsShortcutsOpen((prev) => !prev);
+        return;
+      }
+
+      // Escape closes the top-most open modal (first match wins = "top-most"
+      // in the fixed stacking priority below).
+      if (e.key === 'Escape') {
+        const closeFns: Array<[boolean, () => void]> = [
+          [isShortcutsOpen, () => setIsShortcutsOpen(false)],
+          [isCommandPaletteOpen, () => setIsCommandPaletteOpen(false)],
+          [isAuthOpen, () => setIsAuthOpen(false)],
+          [isSafetyOpen, () => setIsSafetyOpen(false)],
+          [isSpellbookOpen, () => setIsSpellbookOpen(false)],
+          [isMapEditorOpen, () => setIsMapEditorOpen(false)],
+          [isHandoutsOpen, () => setIsHandoutsOpen(false)],
+          [isQuestJournalOpen, () => setIsQuestJournalOpen(false)],
+          [isCampaignSavesOpen, () => setIsCampaignSavesOpen(false)],
+          [isStreamerHUDOpen, () => setIsStreamerHUDOpen(false)],
+          [isAudioMixerOpen, () => setIsAudioMixerOpen(false)],
+          [isJukeboxOpen, () => setIsJukeboxOpen(false)],
+          [isSubscriptionOpen, () => setIsSubscriptionOpen(false)],
+          [isUserSettingsOpen, () => setIsUserSettingsOpen(false)],
+        ];
+        for (const [isOpen, close] of closeFns) {
+          if (isOpen) {
+            close();
+            e.preventDefault();
+            break;
+          }
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [
+    isShortcutsOpen,
+    isCommandPaletteOpen,
+    isAuthOpen,
+    isSafetyOpen,
+    isSpellbookOpen,
+    isMapEditorOpen,
+    isHandoutsOpen,
+    isQuestJournalOpen,
+    isCampaignSavesOpen,
+    isStreamerHUDOpen,
+    isAudioMixerOpen,
+    isJukeboxOpen,
+    isSubscriptionOpen,
+    isUserSettingsOpen,
+  ]);
 
   const handleBroadcastPing = () => {
     setActivePing({ x: 5, y: 3 });
@@ -177,6 +271,40 @@ export function App() {
   const [isStreamingResponse, setIsStreamingResponse] = useState(false);
 
   // Chat & Narrative Messages
+  // Dice roll history: a session-wide audit log of every resolved roll.
+  // Restored from localStorage so a page refresh doesn't wipe the table's
+  // history; capped at ROLL_HISTORY_CAP entries to bound memory.
+  const [rollHistory, setRollHistory] = useState<RollLogEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem(ROLL_HISTORY_KEY);
+      return saved ? (JSON.parse(saved) as RollLogEntry[]) : [];
+    } catch {
+      return []; // storage unavailable / corrupted — start fresh
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ROLL_HISTORY_KEY, JSON.stringify(rollHistory.slice(0, ROLL_HISTORY_CAP)));
+    } catch {
+      /* private-mode browsers may reject writes; history simply won't persist */
+    }
+  }, [rollHistory]);
+
+  /** Prepend a resolved roll to the history (newest first). */
+  const addRollEntry = useCallback((entry: Omit<RollLogEntry, 'id' | 'timestamp'>) => {
+    setRollHistory((prev) =>
+      [
+        {
+          ...entry,
+          id: `roll_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+        ...prev,
+      ].slice(0, ROLL_HISTORY_CAP)
+    );
+  }, []);
+
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'msg_init_1',
@@ -317,6 +445,16 @@ export function App() {
     const naturalRoll = result?.natural_roll ?? localD20();
     const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 12) + 4 : 0;
 
+    // Audit trail: every engine-resolved attack lands in the roll history panel.
+    addRollEntry({
+      kind: 'attack',
+      label: `${selectedToken?.name || 'Hero'} → ${actionName}`,
+      expression: `1d20+7 / ${damageFormula} ${damageType}`,
+      natural: naturalRoll,
+      total: dmg,
+      outcome: isCritical ? 'crit' : isHit ? 'hit' : 'miss',
+    });
+
     if (isHit && dmg > 0) {
       setTokens((prev) =>
         prev.map((t) =>
@@ -382,6 +520,16 @@ export function App() {
     const naturalRoll = result?.natural_roll ?? localD20();
     const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 24) + 12 : 0;
 
+    // Audit trail: spell attacks are logged with their upcast level for context.
+    addRollEntry({
+      kind: 'spell',
+      label: `${spellName} (Lvl ${level})`,
+      expression: `1d20+8 / ${spellDamageExpression}`,
+      natural: naturalRoll,
+      total: dmg,
+      outcome: isHit ? 'hit' : 'miss',
+    });
+
     if (isHit && dmg > 0) {
       setTokens((prev) =>
         prev.map((t) =>
@@ -437,6 +585,16 @@ export function App() {
     const roll = result?.roll ?? localD20();
     const total = result?.total ?? roll + modifier;
     const passed = result ? ['SUCCESS', 'CRITICAL_SUCCESS', 'SUCCESS_AT_A_COST'].includes(result.outcome) : total >= dc;
+
+    // Audit trail: ability checks log natural d20 so crits/fumbles stand out.
+    addRollEntry({
+      kind: 'check',
+      label: `${skillName} (DC ${dc})`,
+      expression: `1d20 + ${modifier}`,
+      natural: roll,
+      total,
+      outcome: roll === 20 ? 'crit' : roll === 1 ? 'fumble' : passed ? 'success' : 'failure',
+    });
 
     if (selectedToken) {
       globalSpatialAudio.playSpatialDice(selectedToken.x, selectedToken.y);
@@ -700,6 +858,16 @@ export function App() {
     const d20Roll = result?.roll ?? localD20();
     const macroTotal = result?.total ?? d20Roll + formulaModifier(formula);
 
+    // Audit trail: quickbar macros resolve through the engine like any other roll.
+    addRollEntry({
+      kind: 'macro',
+      label: macroName,
+      expression: formula,
+      natural: d20Roll,
+      total: macroTotal,
+      outcome: d20Roll === 20 ? 'crit' : d20Roll === 1 ? 'fumble' : undefined,
+    });
+
     if (diceBoxRef.current) {
       diceBoxRef.current.rollDice('d20', d20Roll, 400, 300);
     }
@@ -772,7 +940,9 @@ export function App() {
         campaignName={campaignTitle}
       />
 
-      {/* View Content */}
+      {/* View Content — Suspense boundary so lazily-split views show a themed
+          loader instead of blanking the navbar while their chunk arrives. */}
+      <Suspense fallback={<ChunkFallback label="Preparing your table…" />}>
       <div className="flex-1 flex overflow-hidden relative min-h-0">
         {currentView === 'landing' && (
           <LandingPageView
@@ -825,6 +995,12 @@ export function App() {
                   walls={customWalls}
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
+                />
+
+                {/* Session dice audit log — floats over the map's free corner */}
+                <DiceHistoryPanel
+                  entries={rollHistory}
+                  onClear={() => setRollHistory([])}
                 />
               </main>
 
@@ -903,7 +1079,12 @@ export function App() {
           <AdminDashboardView />
         )}
       </div>
+      </Suspense>
 
+      {/* On-demand modals — each lives in its own lazily-fetched chunk and only
+          mounts (and downloads) when first opened. fallback={null} keeps the
+          page stable while a modal chunk loads. */}
+      <Suspense fallback={null}>
       {/* Tactical Jukebox & Ambient Soundscapes Modal */}
       <SoundscapeJukeboxModal
         isOpen={isJukeboxOpen}
@@ -916,6 +1097,7 @@ export function App() {
         onClose={() => setIsCommandPaletteOpen(false)}
         onNavigate={(view) => setCurrentView(view)}
         onExecuteRoll={(expr) => handleMacroRoll('Quick Roll', expr, false, 'normal')}
+        onOpenShortcuts={() => setIsShortcutsOpen(true)}
       />
 
       {/* Map & LoS Layer Editor Modal */}
@@ -1008,6 +1190,13 @@ export function App() {
         currentUser={currentUser}
         onUpdateUser={setCurrentUser}
       />
+
+      {/* Keyboard Shortcut Cheat-Sheet (`?` or via command palette) */}
+      <ShortcutsModal
+        isOpen={isShortcutsOpen}
+        onClose={() => setIsShortcutsOpen(false)}
+      />
+      </Suspense>
     </div>
   );
 }

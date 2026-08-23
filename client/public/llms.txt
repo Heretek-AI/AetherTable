@@ -1,0 +1,27 @@
+# AI-Native Virtual Tabletop (VTT)
+
+> An enterprise-grade virtual tabletop that decouples probabilistic LLM narrative
+> generation from an authoritative deterministic Rust rules engine.
+
+Every dice roll resolves through the deterministic engine, narration is audited
+against mechanical state before it reaches players, and multiplayer state syncs
+via CRDTs over WebSockets.
+
+## Platform
+
+- [Rules engine architecture](https://github.com/Heretek-AI/TTRPG#readme): pure Rust
+  core — SRD 5.2 dice resolution, floored modifiers, death saves.
+- [Multi-agent orchestrator](https://github.com/Heretek-AI/TTRPG#readme): FastAPI
+  intent router, pre-commit invariant auditor, lore-graph grounding.
+- [Realtime client](https://github.com/Heretek-AI/TTRPG#readme): React 18 + TypeScript,
+  code-split per view, WebRTC voice mesh with 3D positional audio.
+
+## Licensing & content
+
+- [SRD attribution](https://github.com/Heretek-AI/TTRPG#readme): rules text derives
+  from D&D 5e SRD under CC-BY-4.0 / Open Gaming License.
+
+## Crawling policy
+
+- [robots.txt](https://example.com/robots.txt): landing page is public; the
+  tabletop app requires a session and API/WS endpoints are off-limits.

@@ -103,7 +103,8 @@ export const VideoMeshTiles: React.FC<VideoMeshTilesProps> = ({
     setPeers((prev) =>
       prev.map((p) => (p.id === id ? { ...p, isMuted: !p.isMuted } : p))
     );
-    globalAudio.playTurnAdvance();
+    // Silent: mute toggles are frequent quiet actions; a combat chime here
+    // trains users to ignore the chime that actually matters (turn advance).
   };
 
   const togglePeerVideo = (id: string) => {

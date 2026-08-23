@@ -33,8 +33,13 @@ export const SafetyModal: React.FC<SafetyModalProps> = ({
             <AlertOctagon className="w-5 h-5 text-rose-500" />
             <span>Safety Gateway (X-Card Active)</span>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition">
-            <X className="w-5 h-5" />
+          <button
+            onClick={onClose}
+            aria-label="Close modal"
+            autoFocus  // move keyboard focus into the dialog on open
+            className="text-slate-400 hover:text-white transition"
+          >
+            <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 

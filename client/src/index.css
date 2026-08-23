@@ -18,6 +18,38 @@
     font-family: var(--font-body);
     user-select: none;
   }
+
+  /* ── Accessibility: visible keyboard focus ────────────────────────────────
+     The app is heavily mouse/touch driven; without an explicit rule most
+     custom controls show no focus indicator at all, making keyboard
+     navigation invisible. Amber matches the brand accent and passes
+     contrast on the obsidian background. */
+  :focus-visible {
+    outline: 2px solid #f59e0b;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* ── Accessibility: respect reduced-motion preferences ────────────────────
+     Kills decorative animation (spinners aside) for users with vestibular
+     sensitivity; gameplay still works, nothing distracts or nauseates. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* Opt-in text selection: the global `user-select: none` protects canvas /
+   UI chrome from accidental drags, but narrative prose, handouts and chat
+   transcripts should behave like documents players can copy. */
+.selectable-text {
+  user-select: text;
 }
 
 /* Glassmorphism & SaaS Panels */

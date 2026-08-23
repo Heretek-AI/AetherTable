@@ -223,7 +223,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
                 <span className="text-slate-600">{msg.timestamp}</span>
               </div>
 
-              <div className="leading-relaxed font-sans text-xs">{msg.content}</div>
+              <div className="leading-relaxed font-sans text-xs selectable-text">{msg.content}</div>
 
               {msg.diceRollDetails && (
                 <div className="mt-1.5 p-1.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center space-x-2 text-[10px] font-mono">
@@ -269,6 +269,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
 
         <input
           type="text"
+          id="narrative-chat-input"
+          name="chat-message"
+          aria-label="Chat message"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
           placeholder={

@@ -297,18 +297,23 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       )}
 
       {/* Floating Tactical Overlay Controls */}
-      <div className="absolute top-4 left-4 z-20 flex items-center gap-2 vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl border border-slate-800">
+      {/* Canvas tool rail. flex-wrap + max-width keep tools inside the canvas
+          area: without them the rail ran under the right character-sheet dock
+          on ≤1440px screens, silently clipping the elevation stepper. */}
+      <div className="absolute top-4 left-4 z-20 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)] vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl border border-slate-800">
         {/* Zoom Controls */}
         <div className="flex items-center gap-1 bg-slate-900/90 p-0.5 rounded-lg border border-slate-800">
           <button
             onClick={() => setZoom((z) => Math.min(2.2, z + 0.15))}
+            aria-label="Zoom in"
             className="w-6 h-6 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
           >
             +
           </button>
-          <span className="text-slate-400 px-1">{Math.round(zoom * 100)}%</span>
+          <span className="text-slate-400 px-1" aria-live="polite">{Math.round(zoom * 100)}%</span>
           <button
             onClick={() => setZoom((z) => Math.max(0.5, z - 0.15))}
+            aria-label="Zoom out"
             className="w-6 h-6 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
           >
             -
@@ -339,6 +344,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             onClick={() => setAoeShape(aoeShape === 'sphere' ? 'none' : 'sphere')}
             className={`p-1.5 rounded ${aoeShape === 'sphere' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
             title="20ft Sphere AoE (Fireball)"
+            aria-label="Toggle 20ft sphere area-of-effect template"
           >
             <Circle className="w-3.5 h-3.5" />
           </button>
@@ -346,6 +352,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             onClick={() => setAoeShape(aoeShape === 'cone' ? 'none' : 'cone')}
             className={`p-1.5 rounded ${aoeShape === 'cone' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
             title="15ft Cone AoE (Burning Hands)"
+            aria-label="Toggle 15ft cone area-of-effect template"
           >
             <Triangle className="w-3.5 h-3.5" />
           </button>
@@ -353,6 +360,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             onClick={() => setAoeShape(aoeShape === 'cube' ? 'none' : 'cube')}
             className={`p-1.5 rounded ${aoeShape === 'cube' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
             title="20ft Cube AoE"
+            aria-label="Toggle 20ft cube area-of-effect template"
           >
             <Square className="w-3.5 h-3.5" />
           </button>

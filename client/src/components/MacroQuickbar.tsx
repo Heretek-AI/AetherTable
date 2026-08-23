@@ -24,7 +24,10 @@ export const MacroQuickbar: React.FC<MacroQuickbarProps> = ({ onExecuteRoll }) =
   const [advDis, setAdvDis] = useState<'normal' | 'advantage' | 'disadvantage'>('normal');
   const [isWhisper, setIsWhisper] = useState<boolean>(false);
   const [customFormula, setCustomFormula] = useState<string>('');
-  const [isExpanded, setIsExpanded] = useState<boolean>(true);
+  // Collapsed by default: expanded, this panel covers ~80% of the chat
+  // console it floats over (the chat is a fixed h-60). Players still see the
+  // labelled header and can pop it open with one click; the chat stays legible.
+  const [isExpanded, setIsExpanded] = useState<boolean>(false);
 
   const quickMacros = [
     { name: 'Initiative', formula: '1d20 + 2', icon: <Zap className="w-3 h-3 text-amber-400" /> },
@@ -130,6 +133,9 @@ export const MacroQuickbar: React.FC<MacroQuickbarProps> = ({ onExecuteRoll }) =
             <form onSubmit={handleCustomSubmit} className="flex items-center space-x-1 ml-1">
               <input
                 type="text"
+                id="macro-custom-formula"
+                name="custom-formula"
+                aria-label="Custom dice formula"
                 placeholder="/roll 2d6 + 4"
                 value={customFormula}
                 onChange={(e) => setCustomFormula(e.target.value)}

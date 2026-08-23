@@ -130,7 +130,8 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
 
   const handleSeatClick = (id: string) => {
     setSelectedSeat(id);
-    globalAudio.playTurnAdvance();
+    // Silent selection — audio feedback is reserved for commit actions
+    // (launch campaign) rather than every seat pick.
   };
 
   const handleLaunch = () => {

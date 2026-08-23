@@ -188,7 +188,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             }`}
           >
             <BookOpen className="w-4 h-4" />
-            <span>Compendium & Lore</span>
+            <span className="hidden xl:inline">Compendium & Lore</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
 
@@ -273,7 +273,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             }`}
           >
             <UserCheck className="w-4 h-4" />
-            <span>Characters & Party</span>
+            <span className="hidden xl:inline">Characters & Party</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
 
@@ -325,7 +325,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           }`}
         >
           <ShoppingBag className="w-4 h-4 text-emerald-400" />
-          <span>Marketplace</span>
+          <span className="hidden xl:inline">Marketplace</span>
         </button>
 
         {/* 5. GM World Studio Dropdown */}
@@ -339,7 +339,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             }`}
           >
             <Layers className="w-4 h-4" />
-            <span>GM World Studio</span>
+            <span className="hidden xl:inline">GM World Studio</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
 
@@ -425,7 +425,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             title="Tabletop Audio, Soundscapes, Map Layers & Streamer Tools"
           >
             <Zap className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden xl:inline">Table Tools</span>
+            <span className="hidden 2xl:inline">Table Tools</span>
             <ChevronDown className="w-3 h-3 opacity-60" />
           </button>
 
@@ -671,7 +671,7 @@ export const Navbar: React.FC<NavbarProps> = ({
         </button>
 
         {/* Live Latency Status */}
-        <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-[11px] font-mono text-slate-300 shadow-inner">
+        <div className="hidden 2xl:flex items-center gap-1.5 px-2 py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-[11px] font-mono text-slate-300 shadow-inner">
           <Wifi className="w-3 h-3 text-emerald-400 animate-pulse" />
           <span>Sync: <strong className="text-emerald-400">{latencyMs}ms</strong></span>
         </div>

@@ -1,0 +1,8 @@
+# Allow all crawlers; the marketing landing page is public, the app itself
+# is a client-rendered SPA behind auth, so keep bots on the entry page.
+User-agent: *
+Allow: /
+Disallow: /api
+Disallow: /ws
+
+Sitemap: https://example.com/sitemap.xml

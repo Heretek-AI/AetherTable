@@ -37,7 +37,9 @@ export const SoundscapeJukeboxModal: React.FC<SoundscapeJukeboxModalProps> = ({
   isOpen,
   onClose,
 }) => {
-  const [isPlaying, setIsPlaying] = useState(true);
+  // Backed by the real WebAudio ambience engine (audio_manager.startAmbience).
+  // Starts paused: opening the modal must not blast audio uninvited.
+  const [isPlaying, setIsPlaying] = useState(false);
   const [activeTrackId, setActiveTrackId] = useState<string>('tavern');
   const [masterVolume, setMasterVolume] = useState(80);
   const [ambientVolume, setAmbientVolume] = useState(70);
@@ -92,9 +94,24 @@ export const SoundscapeJukeboxModal: React.FC<SoundscapeJukeboxModalProps> = ({
     { name: 'Victory Fanfare', action: () => globalAudio.playTurnAdvance(), icon: '🎺' },
   ];
 
+  /** Start/stop the synthesised ambience loop for the active preset. */
+  const handleTogglePlay = () => {
+    if (isPlaying) {
+      globalAudio.stopAmbience();
+      setIsPlaying(false);
+    } else {
+      globalAudio.startAmbience(activeTrackId, masterVolume / 100);
+      setIsPlaying(true);
+    }
+  };
+
   const handleSelectTrack = (id: string) => {
     setActiveTrackId(id);
-    setIsPlaying(true);
+    // Switching presets while playing crossfades the engine to the new recipe;
+    // while paused it just updates the selection.
+    if (isPlaying) {
+      globalAudio.startAmbience(id, masterVolume / 100);
+    }
     globalAudio.playTurnAdvance();
   };
 
@@ -119,9 +136,11 @@ export const SoundscapeJukeboxModal: React.FC<SoundscapeJukeboxModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+            aria-label="Close modal"
+            autoFocus  // move keyboard focus into the dialog on open
+                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
           >
-            <X className="w-5 h-5" />
+              <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 
@@ -131,7 +150,7 @@ export const SoundscapeJukeboxModal: React.FC<SoundscapeJukeboxModalProps> = ({
           <div className="p-4 bg-slate-950 rounded-2xl border border-slate-800 flex items-center justify-between shadow-inner">
             <div className="flex items-center space-x-4">
               <button
-                onClick={() => setIsPlaying(!isPlaying)}
+                onClick={handleTogglePlay}
                 className={`w-12 h-12 rounded-xl flex items-center justify-center text-white shadow-lg transition transform active:scale-95 cursor-pointer ${
                   isPlaying ? 'bg-amber-600 shadow-amber-950/50' : 'bg-slate-800 text-slate-400'
                 }`}
@@ -161,7 +180,12 @@ export const SoundscapeJukeboxModal: React.FC<SoundscapeJukeboxModalProps> = ({
                 min="0"
                 max="100"
                 value={masterVolume}
-                onChange={(e) => setMasterVolume(Number(e.target.value))}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setMasterVolume(v);
+                  // Live update — no need to pause/resume to change loudness.
+                  globalAudio.setAmbienceVolume(v / 100);
+                }}
                 className="w-28 accent-amber-500 cursor-pointer"
               />
               <span className="text-xs font-mono text-slate-400 w-8 text-right">{masterVolume}%</span>

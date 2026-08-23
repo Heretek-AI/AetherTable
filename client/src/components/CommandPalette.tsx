@@ -15,6 +15,7 @@ import {
   Gem,
   Feather,
   ScrollText,
+  Keyboard,
 } from 'lucide-react';
 import { SaaSView } from './Navbar';
 import { globalAudio } from '../render/audio_manager';
@@ -24,6 +25,7 @@ interface CommandPaletteProps {
   onClose: () => void;
   onNavigate: (view: SaaSView) => void;
   onExecuteRoll?: (expression: string) => void;
+  onOpenShortcuts?: () => void;
 }
 
 interface PaletteItem {
@@ -77,6 +79,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onClose,
   onNavigate,
   onExecuteRoll,
+  onOpenShortcuts,
 }) => {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -149,6 +152,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     { id: 'nav_builder', category: 'Navigation', title: 'Character Studio (5-Step Wizard)', subtitle: 'Create hero, 27-pt buy, export PDF', icon: <Sparkles className="w-4 h-4 text-purple-400" />, action: () => onNavigate('builder') },
     { id: 'nav_marketplace', category: 'Navigation', title: 'Campaign Marketplace', subtitle: 'Install .vttbundle modules & homebrew', icon: <Compass className="w-4 h-4 text-emerald-400" />, action: () => onNavigate('marketplace') },
     { id: 'nav_admin', category: 'Navigation', title: 'Platform Admin Console', subtitle: 'Cluster telemetry, users, RBAC roles', icon: <Zap className="w-4 h-4 text-rose-400" />, action: () => onNavigate('admin') },
+    // Help & discoverability
+    { id: 'help_shortcuts', category: 'Help', title: 'Keyboard Shortcuts', subtitle: 'Cheat-sheet for every shortcut (also press ? anywhere)', icon: <Keyboard className="w-4 h-4 text-slate-300" />, action: () => { onClose(); onOpenShortcuts?.(); } },
     
     // Spells
     { id: 'spell_fireball', category: 'Spells (SRD)', title: 'Fireball', subtitle: '3rd-level Evocation · 8d6 Fire 20ft Sphere', icon: <Flame className="w-4 h-4 text-orange-400" />, action: () => { if (onExecuteRoll) onExecuteRoll('8d6'); } },

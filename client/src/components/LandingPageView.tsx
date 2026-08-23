@@ -60,7 +60,7 @@ export const LandingPageView: React.FC<LandingPageViewProps> = ({
   ];
 
   return (
-    <div className="w-full h-full overflow-y-auto bg-slate-950 text-slate-100 font-sans selection:bg-amber-500 selection:text-black">
+    <main className="w-full h-full overflow-y-auto bg-slate-950 text-slate-100 font-sans selection:bg-amber-500 selection:text-black">
       {/* Hero Section */}
       <section className="relative overflow-hidden pt-12 pb-20 px-6 max-w-7xl mx-auto text-center flex flex-col items-center">
         {/* Ambient Glow */}
@@ -368,6 +368,6 @@ export const LandingPageView: React.FC<LandingPageViewProps> = ({
           </div>
         </div>
       </footer>
-    </div>
+    </main>
   );
 };

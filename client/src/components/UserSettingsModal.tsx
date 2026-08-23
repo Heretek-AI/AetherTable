@@ -91,9 +91,11 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+            aria-label="Close modal"
+            autoFocus  // move keyboard focus into the dialog on open
+                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
           >
-            <X className="w-5 h-5" />
+              <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 

@@ -194,9 +194,11 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
 
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition"
+            aria-label="Close modal"
+            autoFocus  // move keyboard focus into the dialog on open
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800 transition"
           >
-            <X className="w-5 h-5" />
+              <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 

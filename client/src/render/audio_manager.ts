@@ -116,6 +116,132 @@ export class AudioManager {
     osc.start(now);
     osc.stop(now + 0.28);
   }
+
+  // ── Ambient soundscape engine ─────────────────────────────────────────────
+  // Synthesised looping ambience so the Soundscape Jukebox's play state is
+  // real, not decorative. Each preset shapes a shared noise buffer through a
+  // per-track filter (+ optional drone), keeping CPU cost negligible.
+
+  private ambientNoiseBuffer: AudioBuffer | null = null;
+  private ambientNodes: Array<AudioBufferSourceNode | OscillatorNode> = [];
+  private ambientGain: GainNode | null = null;
+  private ambientTrackId: string | null = null;
+  private ambientVolume: number = 0.5;
+
+  /** Per-preset synthesis recipe: filter shape + optional drone oscillator. */
+  private static readonly AMBIENCE_RECIPES: Record<
+    string,
+    { filterType: BiquadFilterType; freq: number; q: number; gain: number; droneHz?: number }
+  > = {
+    // Hearthfire crackle: warm low-passed noise
+    tavern: { filterType: 'lowpass', freq: 700, q: 0.8, gain: 0.55 },
+    // Rain on pines: bright band-passed hiss
+    storm: { filterType: 'bandpass', freq: 2400, q: 0.5, gain: 0.4 },
+    // Crypt: faint high reverb-y whisper noise + deep drone
+    crypt: { filterType: 'highpass', freq: 3000, q: 0.7, gain: 0.18, droneHz: 52 },
+    // Boss clash: ominous low drone + rumble
+    boss: { filterType: 'lowpass', freq: 300, q: 1.0, gain: 0.5, droneHz: 65 },
+  };
+
+  /** Build one shared 2-second stereo noise buffer (cheap, looped). */
+  private getNoiseBuffer(): AudioBuffer | null {
+    if (!this.ctx) return null;
+    if (this.ambientNoiseBuffer) return this.ambientNoiseBuffer;
+    const len = this.ctx.sampleRate * 2;
+    const buf = this.ctx.createBuffer(2, len, this.ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buf.getChannelData(ch);
+      // Pink-ish noise: average successive white samples to tame harshness.
+      let last = 0;
+      for (let i = 0; i < len; i++) {
+        const white = Math.random() * 2 - 1;
+        last = (last + 0.04 * white) / 1.04;
+        data[i] = last * 3.5;
+      }
+    }
+    this.ambientNoiseBuffer = buf;
+    return buf;
+  }
+
+  /**
+   * Start (or switch) the looping ambience for a jukebox preset.
+   * Safe to call repeatedly: switching tracks crossfades by stopping the old
+   * nodes immediately and starting the new recipe at the current volume.
+   */
+  public startAmbience(trackId: string, volume?: number) {
+    if (this.isMuted) return;
+    this.init();
+    if (!this.ctx) return;
+    const recipe = AudioManager.AMBIENCE_RECIPES[trackId] ?? AudioManager.AMBIENCE_RECIPES.tavern;
+    if (volume !== undefined) this.ambientVolume = volume;
+
+    this.stopAmbience();
+    this.ambientTrackId = trackId;
+    this.ambientGain = this.ctx.createGain();
+    this.ambientGain.gain.setValueAtTime(this.ambientVolume * recipe.gain, this.ctx.currentTime);
+    this.ambientGain.connect(this.ctx.destination);
+
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this.getNoiseBuffer();
+    noise.loop = true;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = recipe.filterType;
+    filter.frequency.setValueAtTime(recipe.freq, this.ctx.currentTime);
+    filter.Q.setValueAtTime(recipe.q, this.ctx.currentTime);
+    noise.connect(filter);
+    filter.connect(this.ambientGain);
+    noise.start();
+    this.ambientNodes.push(noise);
+
+    if (recipe.droneHz) {
+      const drone = this.ctx.createOscillator();
+      drone.type = 'sine';
+      drone.frequency.setValueAtTime(recipe.droneHz, this.ctx.currentTime);
+      const droneGain = this.ctx.createGain();
+      droneGain.gain.setValueAtTime(0.12, this.ctx.currentTime);
+      drone.connect(droneGain);
+      droneGain.connect(this.ambientGain);
+      drone.start();
+      this.ambientNodes.push(drone);
+    }
+  }
+
+  /** True when a jukebox ambience loop is currently sounding. */
+  public isAmbiencePlaying(): boolean {
+    return this.ambientNodes.length > 0;
+  }
+
+  /** Track id passed to the last successful startAmbience call, if any. */
+  public currentAmbienceTrack(): string | null {
+    return this.ambientTrackId;
+  }
+
+  /** Live volume update from the jukebox master slider (0..1). */
+  public setAmbienceVolume(volume: number) {
+    this.ambientVolume = volume;
+    if (this.ambientGain && this.ctx) {
+      const trackId = this.ambientTrackId ?? 'tavern';
+      const recipe = AudioManager.AMBIENCE_RECIPES[trackId] ?? AudioManager.AMBIENCE_RECIPES.tavern;
+      this.ambientGain.gain.setTargetAtTime(
+        volume * recipe.gain,
+        this.ctx.currentTime,
+        0.05 // short ramp avoids zipper noise on slider drags
+      );
+    }
+  }
+
+  public stopAmbience() {
+    for (const node of this.ambientNodes) {
+      try {
+        node.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    this.ambientNodes = [];
+    this.ambientGain?.disconnect();
+    this.ambientGain = null;
+  }
 }
 
 export const globalAudio = new AudioManager();
