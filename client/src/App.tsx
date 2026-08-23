@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Navbar, SaaSView } from './components/Navbar';
 import { TacticalCanvas, Token } from './components/TacticalCanvas';
 import { InitiativeTracker } from './components/InitiativeTracker';
@@ -22,6 +22,9 @@ import { SubscriptionModal } from './components/SubscriptionModal';
 import { AuthModal } from './components/AuthModal';
 import { UserSettingsModal } from './components/UserSettingsModal';
 import { AdminDashboardView } from './components/AdminDashboardView';
+import { MarketplaceView } from './components/MarketplaceView';
+import { SoundscapeJukeboxModal } from './components/SoundscapeJukeboxModal';
+import { CommandPalette } from './components/CommandPalette';
 import { User, DEMO_ACCOUNTS } from './types/auth';
 import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
@@ -34,6 +37,8 @@ export function App() {
   const [currentUser, setCurrentUser] = useState<User>(DEMO_ACCOUNTS[0].user);
   const [isSafetyOpen, setIsSafetyOpen] = useState(false);
   const [isAudioMixerOpen, setIsAudioMixerOpen] = useState(false);
+  const [isJukeboxOpen, setIsJukeboxOpen] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
@@ -42,6 +47,17 @@ export function App() {
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
   const [activePing, setActivePing] = useState<{ x: number; y: number } | null>(null);
   const [activePeerTyping, setActivePeerTyping] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsCommandPaletteOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   const handleBroadcastPing = () => {
     setActivePing({ x: 5, y: 3 });
@@ -609,6 +625,8 @@ export function App() {
         onSelectView={setCurrentView}
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
+        onOpenJukebox={() => setIsJukeboxOpen(true)}
+        onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
         onOpenUserSettings={() => setIsUserSettingsOpen(true)}
         onOpenAuth={() => setIsAuthOpen(true)}
@@ -699,6 +717,10 @@ export function App() {
           <EncounterBuilderView onLaunchEncounter={handleLaunchEncounter} />
         )}
 
+        {currentView === 'marketplace' && (
+          <MarketplaceView onInstallBundle={(id) => addSystemMessage(`📦 Installed campaign bundle ${id}`)} />
+        )}
+
         {currentView === 'lobby' && (
           <LobbyView onLaunchCampaign={handleLaunchFromLobby} currentUser={currentUser} />
         )}
@@ -731,6 +753,20 @@ export function App() {
           <AdminDashboardView />
         )}
       </div>
+
+      {/* Tactical Jukebox & Ambient Soundscapes Modal */}
+      <SoundscapeJukeboxModal
+        isOpen={isJukeboxOpen}
+        onClose={() => setIsJukeboxOpen(false)}
+      />
+
+      {/* Universal Command Palette (Cmd+K) */}
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        onNavigate={(view) => setCurrentView(view)}
+        onExecuteRoll={(expr) => handleMacroRoll('Quick Roll', expr, false, 'normal')}
+      />
 
       {/* 3D Spatial Audio & Radar Modal */}
       <AudioMixerModal

@@ -24,18 +24,24 @@ import {
   ShieldAlert,
   LogOut,
   User as UserIcon,
-  ChevronDown
+  ChevronDown,
+  ShoppingBag,
+  Music,
+  Search,
+  Command
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { User, DEMO_ACCOUNTS } from '../types/auth';
 
-export type SaaSView = 'landing' | 'tabletop' | 'compendium' | 'builder' | 'encounters' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics' | 'admin';
+export type SaaSView = 'landing' | 'tabletop' | 'compendium' | 'builder' | 'encounters' | 'marketplace' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics' | 'admin';
 
 interface NavbarProps {
   currentView: SaaSView;
   onSelectView: (view: SaaSView) => void;
   onOpenSafety: () => void;
   onOpenAudioMixer?: () => void;
+  onOpenJukebox?: () => void;
+  onOpenCommandPalette?: () => void;
   onOpenSubscription?: () => void;
   onOpenUserSettings?: () => void;
   onOpenAuth?: () => void;
@@ -50,6 +56,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   onSelectView,
   onOpenSafety,
   onOpenAudioMixer,
+  onOpenJukebox,
+  onOpenCommandPalette,
   onOpenSubscription,
   onOpenUserSettings,
   onOpenAuth,
@@ -72,6 +80,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'compendium', label: 'Compendium Codex', icon: <BookOpen className="w-4 h-4" /> },
     { id: 'builder', label: 'Character Studio', icon: <UserCheck className="w-4 h-4" /> },
     { id: 'encounters', label: 'Encounter Builder', icon: <Flame className="w-4 h-4 text-orange-400" /> },
+    { id: 'marketplace', label: 'Marketplace', icon: <ShoppingBag className="w-4 h-4 text-emerald-400" /> },
     { id: 'lobby', label: 'Campaign Lobby', icon: <Users className="w-4 h-4" /> },
     { id: 'dynasty', label: 'Dynasty & Factions', icon: <Crown className="w-4 h-4" /> },
     { id: 'bundles', label: 'Campaign Bundles', icon: <Package className="w-4 h-4" /> },
@@ -111,6 +120,21 @@ export const Navbar: React.FC<NavbarProps> = ({
             </span>
           </div>
         </button>
+
+        {/* Global Fast Search Command Palette Button */}
+        {onOpenCommandPalette && (
+          <button
+            onClick={onOpenCommandPalette}
+            className="hidden lg:flex items-center space-x-2 px-2.5 py-1 bg-slate-900/90 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 text-slate-400 hover:text-slate-200 rounded-lg text-xs font-mono transition shadow-inner cursor-pointer"
+            title="Open Universal Search Palette (Cmd+K)"
+          >
+            <Search className="w-3.5 h-3.5 text-amber-400" />
+            <span>Search Compendium...</span>
+            <span className="text-[9px] px-1 py-0.2 bg-slate-950 border border-slate-700 text-slate-400 rounded">
+              ⌘K
+            </span>
+          </button>
+        )}
       </div>
 
       {/* Navigation Switcher */}
@@ -136,12 +160,29 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* Telemetry, User Profile Menu & Actions */}
       <div className="flex items-center gap-2">
-        {/* Live Multiplayer Room Presence Badges */}
-        <div className="hidden 2xl:flex items-center space-x-1 bg-slate-900/90 px-2 py-1 rounded-lg border border-slate-800 text-[10px] font-mono">
-          <span className="text-slate-500 mr-1">In Room:</span>
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="text-slate-300 font-bold">4 Players</span>
-        </div>
+        {/* Jukebox Ambient Soundscapes Trigger */}
+        {onOpenJukebox && (
+          <button
+            onClick={onOpenJukebox}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-950/60 hover:bg-indigo-900/80 text-indigo-300 border border-indigo-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
+            title="Tactical Jukebox & Ambient Soundscapes"
+          >
+            <Music className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="hidden xl:inline text-[11px]">Jukebox</span>
+          </button>
+        )}
+
+        {/* Audio Radar & Spatial Mixer Trigger */}
+        {onOpenAudioMixer && (
+          <button
+            onClick={onOpenAudioMixer}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/80 text-purple-300 border border-purple-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
+            title="3D Spatial Audio & Voice Radar Mixer"
+          >
+            <Radio className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+            <span className="hidden xl:inline text-[11px]">3D Audio Radar</span>
+          </button>
+        )}
 
         {/* User Profile & Multi-User Menu */}
         {currentUser ? (
@@ -252,18 +293,6 @@ export const Navbar: React.FC<NavbarProps> = ({
               Sign In
             </button>
           )
-        )}
-
-        {/* Audio Radar & Spatial Mixer Trigger */}
-        {onOpenAudioMixer && (
-          <button
-            onClick={onOpenAudioMixer}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-purple-950/60 hover:bg-purple-900/80 text-purple-300 border border-purple-800/80 text-xs font-mono transition shadow-sm cursor-pointer"
-            title="3D Spatial Audio & Voice Radar Mixer"
-          >
-            <Radio className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
-            <span className="hidden xl:inline text-[11px]">3D Audio Radar</span>
-          </button>
         )}
 
         {/* Audio Mute Toggle */}

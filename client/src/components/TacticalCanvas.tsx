@@ -13,11 +13,13 @@ import {
   Square,
   Triangle,
   Eye,
-  Users
+  Users,
+  CloudRain
 } from 'lucide-react';
 import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
 import { RaycastLighting, Point } from '../render/raycast_lighting';
+import { WeatherEffectsManager, WeatherType } from '../render/weather_effects';
 import { globalAudio } from '../render/audio_manager';
 import { User } from '../types/auth';
 
@@ -83,6 +85,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const [draggedTokenId, setDraggedTokenId] = useState<string | null>(null);
   const [permissionWarning, setPermissionWarning] = useState<string | null>(null);
   const [tokenLightMode, setTokenLightMode] = useState<TokenLightMode>('torch');
+  const [currentWeather, setCurrentWeather] = useState<WeatherType>('rain');
   
   // Tools
   const [measureMode, setMeasureMode] = useState(false);
@@ -99,6 +102,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const internalParticleFX = useRef<ParticleFXManager>(new ParticleFXManager());
   const internalDiceBox = useRef<DiceBox3D>(new DiceBox3D());
   const raycastLighting = useRef<RaycastLighting>(new RaycastLighting());
+  const weatherEffects = useRef<WeatherEffectsManager>(new WeatherEffectsManager());
 
   if (particleFXRef) particleFXRef.current = internalParticleFX.current;
   if (diceBoxRef) diceBoxRef.current = internalDiceBox.current;
@@ -109,6 +113,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   useEffect(() => {
     raycastLighting.current.updateWalls(walls, cellSize, gridWidth, gridHeight);
   }, [walls, gridWidth, gridHeight]);
+
+  useEffect(() => {
+    weatherEffects.current.setWeather(currentWeather);
+  }, [currentWeather]);
 
   // Main Render Animation Loop for 3D Dice, Particle FX, and Dynamic 2D Raycast Vision
   useEffect(() => {
@@ -124,6 +132,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     const renderLoop = () => {
       // 1. Clear FX Canvas
       fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+
+      // Render Dynamic Weather Shaders
+      weatherEffects.current.updateAndRender(fxCtx, fxCanvas.width, fxCanvas.height);
 
       // Render Particles
       internalParticleFX.current.updateAndRender(fxCtx);
@@ -420,6 +431,32 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               : tokenLightMode === 'darkvision'
               ? 'Darkvision (60ft)'
               : 'No Light'}
+          </span>
+        </button>
+
+        {/* Dynamic Tabletop Weather Selector (Roll20 Style) */}
+        <button
+          onClick={() => {
+            const weathers: WeatherType[] = ['rain', 'snow', 'embers', 'fog', 'none'];
+            const nextIdx = (weathers.indexOf(currentWeather) + 1) % weathers.length;
+            const nextWeather = weathers[nextIdx];
+            setCurrentWeather(nextWeather);
+            globalAudio.playTurnAdvance();
+          }}
+          className="flex items-center gap-1.5 bg-slate-900/90 px-2.5 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-sky-400 font-bold hover:bg-slate-800 transition cursor-pointer"
+          title="Toggle Dynamic Tabletop Weather FX"
+        >
+          <CloudRain className="w-3.5 h-3.5 text-sky-400" />
+          <span>
+            {currentWeather === 'rain'
+              ? 'Rain & Thunder'
+              : currentWeather === 'snow'
+              ? 'Snow Blizzard'
+              : currentWeather === 'embers'
+              ? 'Volcanic Embers'
+              : currentWeather === 'fog'
+              ? 'Rolling Fog'
+              : 'Clear Weather'}
           </span>
         </button>
 
