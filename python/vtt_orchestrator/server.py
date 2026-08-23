@@ -111,6 +111,47 @@ class NarrativeGenerateRequest(BaseModel):
     egress_count: int = 0
 
 
+def extract_srd_context(text: str, limit: int = 2) -> List[Dict[str, Any]]:
+    """Find SRD monster/spell references in free text and return stat facts.
+
+    Used to ground LLM narration in authoritative compendium data so the DM
+    agent cannot contradict the stat blocks (mechanical hallucination guard).
+    """
+    lowered = (text or "").lower()
+    facts: List[Dict[str, Any]] = []
+
+    for monster in all_monsters:
+        name = monster.get("name", "")
+        if len(name) >= 4 and name.lower() in lowered:
+            facts.append({
+                "type": "monster",
+                "name": name,
+                "ac": monster.get("ac"),
+                "hp": monster.get("hp"),
+                "challenge_rating": monster.get("challenge_rating"),
+                "action_names": [a.get("name", "") for a in monster.get("actions", [])][:3],
+            })
+            if len(facts) >= limit:
+                return facts
+
+    for spell in all_spells:
+        name = spell.get("name", "")
+        if len(name) >= 4 and name.lower() in lowered:
+            level = spell.get("level", 0)
+            description = spell.get("description", "")
+            facts.append({
+                "type": "spell",
+                "name": name,
+                "level_name": "Cantrip" if level == 0 else f"Level {level}",
+                "school": spell.get("school", ""),
+                "snippet": description[:140] + ("..." if len(description) > 140 else ""),
+            })
+            if len(facts) >= limit:
+                break
+
+    return facts
+
+
 class UtteranceRecordRequest(BaseModel):
     speaker_id: str
     duration_sec: float
@@ -120,6 +161,7 @@ class XCardRequest(BaseModel):
     player_id: str
     topic: str
     current_sequence_id: int
+    engine_session_id: Optional[str] = None
 
 
 class CharacterExportPDFRequest(BaseModel):
@@ -628,14 +670,25 @@ def execute_orchestrator_turn(req: NarrativeGenerateRequest):
 @app.post("/api/v1/narrative/stream")
 @app.post("/api/v1/orchestrator/narrative/stream")
 async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
+    # Ground the narration in SRD 5.2 stat blocks whenever the player's
+    # action names a known monster or spell.
+    srd_facts = extract_srd_context(req.user_intent)
     generator = streaming_gateway.stream_narrative(
         user_intent=req.user_intent,
         engine_payload=req.engine_execution_payload,
+        context={"srd": srd_facts},
     )
     return StreamingResponse(
         generator,
         media_type="text/event-stream",
     )
+
+
+@app.get("/api/v1/compendium/lore-lookup")
+def compendium_lore_lookup(
+    q: str = Query(..., description="Text to scan for SRD monster/spell references"),
+):
+    return {"query": q, "facts": extract_srd_context(q)}
 
 
 @app.post("/api/v1/lore/assert")
@@ -662,12 +715,29 @@ def get_spotlight_agency():
 
 
 @app.post("/api/v1/safety/x-card")
-def trigger_x_card(req: XCardRequest):
-    return safety_gateway.trigger_x_card(
+async def trigger_x_card(req: XCardRequest):
+    result = safety_gateway.trigger_x_card(
         player_id=req.player_id,
         topic=req.topic,
         current_sequence_id=req.current_sequence_id,
     )
+    # Apply the rewind against the authoritative engine ledger when a live
+    # session is bound; the intervention still records orchestrator-side.
+    if req.engine_session_id:
+        try:
+            engine_result = await engine_client.engine_request(
+                "POST",
+                f"/api/v1/sessions/{req.engine_session_id}/safety/x-card",
+                {
+                    "player_id": req.player_id,
+                    "topic": req.topic,
+                    "target_sequence_id": result["target_sequence_id"],
+                },
+            )
+            result["engine_rewind"] = engine_result
+        except EngineUnavailableError as exc:
+            result["engine_rewind"] = {"status": "ENGINE_UNAVAILABLE", "detail": str(exc)}
+    return result
 
 
 @app.post("/api/v1/simulation/tick")

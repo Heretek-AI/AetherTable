@@ -36,7 +36,7 @@ import { ParticleFXManager } from './render/particle_effects';
 import { DiceBox3D } from './render/dice_box_3d';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
-import { engineAttack, engineCheck, localD20, formulaModifier } from './api/rules_engine';
+import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 
 export function App() {
@@ -497,8 +497,30 @@ export function App() {
     );
   };
 
-  const handleSafetyRewind = (topic: string) => {
+  const handleSafetyRewind = async (topic: string) => {
     addSystemMessage(`SAFETY CARD TRIGGERED: Topic '${topic}' flagged. Scene state rewound 1 turn.`);
+    // Apply the rewind against the authoritative engine ledger when online.
+    const sessionId = await ensureEngineSession();
+    fetch('/api/v1/safety/x-card', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        player_id: currentUser.id,
+        topic,
+        current_sequence_id: roundNumber * 10,
+        engine_session_id: sessionId,
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        const engineStatus = data?.engine_rewind?.status;
+        addSystemMessage(
+          engineStatus === 'SAFETY_REWIND_SUCCESS'
+            ? `Engine ledger rewound (${data.engine_rewind.reverted_event_count ?? 0} events reverted).`
+            : 'Intervention recorded; engine ledger offline.'
+        );
+      })
+      .catch(() => addSystemMessage('Intervention recorded locally.'));
     setMessages((prev) => [
       ...prev,
       {

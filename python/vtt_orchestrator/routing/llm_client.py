@@ -106,6 +106,23 @@ class LLMStreamingGateway:
                 print(f"[LLM Gateway] Upstream inference error: {e}. Falling back to deterministic generator.")
 
         # High-Speed Deterministic Generator Fallback
+        # Weave SRD compendium facts into the narration so even the offline
+        # generator stays mechanically faithful to the stat blocks.
+        srd_tail: list = []
+        for fact in (context or {}).get("srd", [])[:2]:
+            if fact.get("type") == "monster":
+                actions = ", ".join(fact.get("action_names", [])[:2]) or "melee attacks"
+                srd_tail.extend([
+                    f"The {fact['name']} ", f"looms ", "over ", "the ",
+                    f"battlefield ", f"(AC {fact.get('ac')}, HP {fact.get('hp')}) ",
+                    f"trading ", f"{actions}! ",
+                ])
+            elif fact.get("type") == "spell":
+                srd_tail.extend([
+                    f"{fact['name']} ", f"is ", f"a {fact.get('level_name')} ",
+                    f"{fact.get('school')} ", f"spell ", f"— ", f"{fact.get('snippet', '')} ",
+                ])
+
         if is_hit:
             tokens = [
                 "With ", "unwavering ", "conviction, ", "the ", "strike ", f"of {action_name} ",
@@ -119,6 +136,9 @@ class LLMStreamingGateway:
                 "harmlessly ", "across ", "the ", "iron-banded ", "shield ", "with ", "a ",
                 "shower ", "of ", "defiant ", "sparks!"
             ]
+
+        if srd_tail:
+            tokens = tokens + ["\n\n"] + srd_tail
 
         for tok in tokens:
             await asyncio.sleep(0.02)  # Simulate 50 tokens/sec streaming

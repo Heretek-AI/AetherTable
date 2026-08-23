@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Video,
   VideoOff,
@@ -12,6 +12,7 @@ import {
   Radio,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { globalWebRTCMesh } from '../render/webrtc_mesh';
 
 interface PeerVideoUser {
   id: string;
@@ -40,7 +41,7 @@ export const VideoMeshTiles: React.FC<VideoMeshTilesProps> = ({
       role: 'GM',
       color: 'from-amber-600 to-red-700',
       avatarIcon: '🧙‍♂️',
-      isSpeaking: true,
+      isSpeaking: false,
       isMuted: false,
       isVideoOn: true,
     },
@@ -75,6 +76,26 @@ export const VideoMeshTiles: React.FC<VideoMeshTilesProps> = ({
       isVideoOn: false,
     },
   ]);
+
+  // Real microphone drives the local player's speaking ring; remote peers
+  // stay silent until genuine P2P audio tracks land.
+  useEffect(() => {
+    let unsubscribe: (() => void) | null = null;
+    globalWebRTCMesh.enableLocalVoiceDetection('peer_thorin').then(() => {
+      unsubscribe = globalWebRTCMesh.onPeersUpdated((updated) => {
+        setPeers((prev) =>
+          prev.map((tile) => {
+            const meshPeer = updated.find((p) => p.peerId === `peer_${tile.id}`);
+            return meshPeer ? { ...tile, isSpeaking: meshPeer.isSpeaking } : tile;
+          })
+        );
+      });
+    });
+    return () => {
+      unsubscribe?.();
+      globalWebRTCMesh.disableLocalVoiceDetection();
+    };
+  }, []);
 
   if (!isVisible) return null;
 
