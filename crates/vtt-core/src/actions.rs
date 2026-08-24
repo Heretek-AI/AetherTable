@@ -11,6 +11,158 @@ pub enum AttackOutcome {
     CriticalMiss,
 }
 
+// --- Contested checks: Grapple & Shove ---------------------------------------
+//
+// SRD 5e melee attack alternatives. Both replace ONE attack with a contested
+// ability check: both sides roll a d20, add their skill modifier, and the
+// HIGHER total wins — on an exact tie the attacker LOSES (SRD contested-check
+// tie rule), so ties resolve to [`ContestedSide::Defender`].
+
+/// Which side of a contested check won.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContestedSide {
+    Attacker,
+    Defender,
+}
+
+/// Effect chosen by the caller for a successful shove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShoveEffect {
+    /// Target is knocked `Condition::Prone`.
+    Prone,
+    /// Target is pushed 5 ft directly away from the shover (caller performs
+    /// the positional translation; this engine call only rules on the check).
+    Push5Feet,
+}
+
+/// Outcome of a contested ability check.
+///
+/// `margin` is the winner's total minus the loser's total (0 on a tie, which
+/// always resolves to [`ContestedSide::Defender`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContestedResolution {
+    pub winner_side: ContestedSide,
+    pub margin: i32,
+}
+
+/// Outcome of a grapple attempt. Success applies `Condition::Grappled`.
+///
+/// NOTE ON STATE MODELLING: the SRD distinguishes *Grappled* (speed 0) from
+/// *Restrained* (speed 0 + attack/save disadv/adv). The `Condition` enum
+/// carries BOTH variants, and a grapple applies the lighter
+/// `Condition::Grappled` — NOT Restrained. Escape mechanics (documented
+/// approximation): the grappled target escapes with an Athletics or Acrobatics
+/// check against DC = 8 + grappler's Strength modifier
+/// ([`ActionResolver::grapple_escape_dc`]; the stat-block model carries no
+/// per-entity proficiency bonus, so it is omitted here).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GrappleResolution {
+    pub contest: ContestedResolution,
+    pub success: bool,
+    /// `Some(Condition::Grappled)` exactly when `success` is true.
+    pub applied_condition: Option<Condition>,
+}
+
+/// Outcome of a shove attempt. Success applies the caller-chosen effect:
+/// `Condition::Prone`, or a 5 ft push (no condition; position is the caller's
+/// concern).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShoveResolution {
+    pub contest: ContestedResolution,
+    pub success: bool,
+    pub effect: ShoveEffect,
+    /// `Some(Condition::Prone)` when the shove succeeded AND chose `ShoveEffect::Prone`.
+    pub applied_condition: Option<Condition>,
+}
+
+impl ActionResolver {
+    /// Pure contested-check math: totals are compared and the higher wins,
+    /// with ties awarded to the defender per SRD. Rolls are supplied by the
+    /// caller (the server draws them from its seeded dice engine).
+    pub fn resolve_contested_check(
+        attacker_roll: i32,
+        attacker_mod: i32,
+        defender_roll: i32,
+        defender_mod: i32,
+    ) -> (ContestedSide, i32) {
+        let attacker_total = attacker_roll + attacker_mod;
+        let defender_total = defender_roll + defender_mod;
+
+        // Tie -> attacker loses (defender wins).
+        if attacker_total > defender_total {
+            (ContestedSide::Attacker, attacker_total - defender_total)
+        } else {
+            (ContestedSide::Defender, defender_total - attacker_total)
+        }
+    }
+
+    /// SRD Grapple: attacker's Athletics vs the DEFENDER'S CHOICE of Athletics
+    /// or Acrobatics (pass their chosen skill modifier in as `defender_skill_mod`;
+    /// the server maps "athletics" -> Str mod, "acrobatics" -> Dex mod).
+    /// Success -> target gains `Condition::Grappled` (see the struct docs for
+    /// the Grappled-vs-Restrained modelling note).
+    pub fn resolve_grapple(
+        attacker_roll: i32,
+        attacker_athletics_mod: i32,
+        defender_roll: i32,
+        defender_skill_mod: i32,
+    ) -> GrappleResolution {
+        let (winner_side, margin) = ActionResolver::resolve_contested_check(
+            attacker_roll,
+            attacker_athletics_mod,
+            defender_roll,
+            defender_skill_mod,
+        );
+        let success = winner_side == ContestedSide::Attacker;
+        GrappleResolution {
+            contest: ContestedResolution { winner_side, margin },
+            success,
+            applied_condition: if success {
+                Some(Condition::Grappled)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Escape DC for a creature trying to break out of an existing grapple:
+    /// 8 + grappler's Strength modifier (+ prof bonus, which the stat-block
+    /// model does not track — see module notes).
+    pub fn grapple_escape_dc(attacker_strength_mod: i32) -> i32 {
+        8 + attacker_strength_mod
+    }
+
+    /// SRD Shove: same contest as grapple (attacker Athletics vs defender's
+    /// Athletics/Acrobatics choice); success inflicts the caller-chosen effect.
+    pub fn resolve_shove(
+        attacker_roll: i32,
+        attacker_athletics_mod: i32,
+        defender_roll: i32,
+        defender_skill_mod: i32,
+        effect: ShoveEffect,
+    ) -> ShoveResolution {
+        let (winner_side, margin) = ActionResolver::resolve_contested_check(
+            attacker_roll,
+            attacker_athletics_mod,
+            defender_roll,
+            defender_skill_mod,
+        );
+        let success = winner_side == ContestedSide::Attacker;
+        let applied_condition = match (success, effect) {
+            (true, ShoveEffect::Prone) => Some(Condition::Prone),
+            _ => None,
+        };
+        ShoveResolution {
+            contest: ContestedResolution { winner_side, margin },
+            success,
+            effect,
+            applied_condition,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttackResolution {
     pub natural_roll: i32,

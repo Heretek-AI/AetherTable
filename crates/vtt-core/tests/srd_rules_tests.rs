@@ -407,3 +407,116 @@ fn test_srd_concentration_state_serialization_roundtrip() {
     assert_eq!(conc.started_round, 3);
 }
 
+
+// --- Contested checks: Grapple & Shove (SRD 5e melee attack alternatives) -----
+//
+// Grapple and Shove are contested ability checks that replace one attack:
+//   - Grapple: Athletics(A) vs Athletics/Acrobatics(D, defender's choice)
+//     success -> target becomes Grappled.
+//   - Shove: same contest; success -> target knocked Prone OR pushed 5 ft.
+
+use vtt_core::actions::{ContestedSide, ShoveEffect};
+
+#[test]
+fn test_contested_check_attacker_wins_by_margin() {
+    // 15+3 = 18 vs 11+2 = 13 -> attacker wins by 5.
+    let (winner, margin) = ActionResolver::resolve_contested_check(15, 3, 11, 2);
+    assert_eq!(winner, ContestedSide::Attacker);
+    assert_eq!(margin, 5);
+}
+
+#[test]
+fn test_contested_check_defender_wins_by_margin() {
+    // 6+0 = 6 vs 17+4 = 21 -> defender wins by 15.
+    let (winner, margin) = ActionResolver::resolve_contested_check(6, 0, 17, 4);
+    assert_eq!(winner, ContestedSide::Defender);
+    assert_eq!(margin, 15);
+}
+
+#[test]
+fn test_contested_check_tie_goes_to_defender() {
+    // SRD: on equal contested totals the attacker LOSES the tie.
+    let (winner, margin) = ActionResolver::resolve_contested_check(10, 3, 13, 0);
+    assert_eq!(winner, ContestedSide::Defender);
+    assert_eq!(margin, 0);
+}
+
+#[test]
+fn test_grapple_success_applies_grappled_condition() {
+    // 16+3 = 19 vs 8+1 = 9 -> grappler wins, target is Grappled.
+    let res = ActionResolver::resolve_grapple(16, 3, 8, 1);
+    assert!(res.success);
+    assert_eq!(res.contest.winner_side, ContestedSide::Attacker);
+    assert_eq!(res.applied_condition, Some(Condition::Grappled));
+}
+
+#[test]
+fn test_grapple_tie_or_loss_applies_nothing() {
+    let tie = ActionResolver::resolve_grapple(10, 3, 13, 0);
+    assert!(!tie.success);
+    assert_eq!(tie.applied_condition, None);
+
+    let lost = ActionResolver::resolve_grapple(5, 0, 14, 2);
+    assert!(!lost.success);
+    assert_eq!(lost.applied_condition, None);
+}
+
+#[test]
+fn test_shove_prone_applies_prone_condition() {
+    let res = ActionResolver::resolve_shove(14, 3, 10, 1, ShoveEffect::Prone);
+    assert!(res.success);
+    assert_eq!(res.effect, ShoveEffect::Prone);
+    assert_eq!(res.applied_condition, Some(Condition::Prone));
+}
+
+#[test]
+fn test_shove_push_5ft_applies_no_condition() {
+    let res = ActionResolver::resolve_shove(14, 3, 10, 1, ShoveEffect::Push5Feet);
+    assert!(res.success);
+    assert_eq!(res.effect, ShoveEffect::Push5Feet);
+    assert_eq!(res.applied_condition, None);
+}
+
+#[test]
+fn test_shove_failure_has_no_effect() {
+    let res = ActionResolver::resolve_shove(7, 0, 15, 3, ShoveEffect::Prone);
+    assert!(!res.success);
+    assert_eq!(res.applied_condition, None);
+}
+
+/// SRD escape DC = 8 + grappler's Strength (Athletics) + proficiency. The
+/// stat-block model carries no proficiency bonus per entity, so the engine
+/// uses the documented approximation 8 + Str mod.
+#[test]
+fn test_grapple_escape_dc_is_eight_plus_strength_mod() {
+    assert_eq!(ActionResolver::grapple_escape_dc(3), 11);
+    assert_eq!(ActionResolver::grapple_escape_dc(-1), 7);
+}
+
+// --- EntityState condition mutation helpers -----------------------------------
+
+#[test]
+fn test_add_and_remove_condition_helpers_are_idempotent() {
+    use vtt_core::types::Condition;
+    let mut e = dummy_entity("brawler");
+
+    e.add_condition(Condition::Grappled);
+    e.add_condition(Condition::Grappled); // duplicate is a no-op
+    assert_eq!(
+        e.conditions
+            .iter()
+            .filter(|c| **c == Condition::Grappled)
+            .count(),
+        1
+    );
+    assert!(e.has_condition(&Condition::Grappled));
+
+    assert!(e.remove_condition(&Condition::Grappled));
+    assert!(!e.has_condition(&Condition::Grappled));
+    assert!(!e.remove_condition(&Condition::Grappled)); // nothing left to remove
+
+    // Exhaustion(u8) matches by variant discriminant, not payload value.
+    e.add_condition(Condition::Exhaustion(2));
+    assert!(e.has_condition(&Condition::Exhaustion(5)));
+    assert!(e.remove_condition(&Condition::Exhaustion(4)));
+}

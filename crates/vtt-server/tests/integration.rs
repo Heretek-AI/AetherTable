@@ -2941,3 +2941,501 @@ async fn spectator_cannot_begin_or_end_combat() {
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), StatusCode::UNAUTHORIZED);
 }
+
+// --- Grapple & Shove (contested melee alternatives) ---------------------------
+//
+// Both endpoints mirror the attack contract: ids-only payloads (client math is
+// structurally impossible), server-side stats, seeded session dice, Action
+// budget spend, ledger events and attack-identical RBAC.
+
+use vtt_core::dice::DiceEngine;
+
+/// Patches an `entity_json` body's Strength/Dexterity.
+fn entity_with_abilities(mut entity: serde_json::Value, strength: i32, dexterity: i32) -> serde_json::Value {
+    entity["abilities"]["strength"] = serde_json::json!(strength);
+    entity["abilities"]["dexterity"] = serde_json::json!(dexterity);
+    entity
+}
+
+/// Patches an `entity_json` body's position [x, y, z].
+fn entity_at(mut entity: serde_json::Value, x: f64, y: f64) -> serde_json::Value {
+    entity["position"] = serde_json::json!([x, y, 0.0]);
+    entity
+}
+
+/// Claims an entity for a gateway user.
+fn entity_owned_by(mut entity: serde_json::Value, owner: &str) -> serde_json::Value {
+    entity["owner_player_id"] = serde_json::json!(owner);
+    entity
+}
+
+/// Deterministically finds a seed whose first two d20 draws decide the
+/// contested check the requested way (both sides use these modifiers).
+fn contest_seed(attacker_mod: i32, defender_mod: i32, attacker_wins: bool) -> u64 {
+    for s in 1..=100_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        let attacker_roll = dice.roll_d20();
+        let defender_roll = dice.roll_d20();
+        let attacker_total = attacker_roll + attacker_mod;
+        let defender_total = defender_roll + defender_mod;
+        // Tie goes to the defender per SRD.
+        if (attacker_total > defender_total) == attacker_wins && attacker_total != defender_total {
+            return s;
+        }
+    }
+    panic!("no seed decides the contest that way");
+}
+
+async fn spawn(app: &impl Service<
+    actix_http::Request,
+    Response = ServiceResponse<EitherBody<BoxBody>>,
+    Error = actix_web::Error,
+>, token: &str, session_id: Uuid, body: serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(token))
+        .set_json(body)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "spawn failed");
+}
+
+async fn post_contest(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    action: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/{}", session_id, action))
+        .insert_header(bearer(token))
+        .set_json(body)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+async fn setup_brawler_duel(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+) -> (String, Uuid, Uuid, Uuid) {
+    let token = sign_token("gm-brawler", TEST_SECRET);
+    let session_id = create_session_as(app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    // Hero: Str 20 (+5). Orc: Str 8 (-1), Dex 8 (-1).
+    spawn(app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 2.5, 2.6)).await;
+    (token, session_id, hero_id, orc_id)
+}
+
+#[actix_web::test]
+async fn grapple_success_applies_grappled_condition_and_spends_action() {
+    let app = test_app().await;
+    let (token, session_id, hero_id, orc_id) = setup_brawler_duel(&app).await;
+
+    // Athletics(+5) vs Acrobatics(-1): any seed where the d20s are close wins.
+    let seed = contest_seed(5, -1, true);
+
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "defender_skill": "acrobatics",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["applied_condition"], serde_json::json!("grappled"));
+    assert_eq!(body["contest"]["winner_side"], serde_json::json!("attacker"));
+    assert_eq!(body["defender_skill"], serde_json::json!("acrobatics"));
+    // Escape DC approximation: 8 + grappler Str mod (+5).
+    assert_eq!(body["escape_dc"], serde_json::json!(13));
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+
+    // The grappled state is authoritative session state, not just a response.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let conditions = &snap["entities"][orc_id.to_string()]["conditions"];
+    assert_eq!(conditions.as_array().unwrap().len(), 1, "conditions: {}", conditions);
+    assert_eq!(conditions[0], serde_json::json!("grappled"));
+
+    // The grapple consumed the Action: a second attempt this turn is refused.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "defender_skill": "athletics",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+
+    // Ledger records the attempt with its outcome.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    let attempted: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("GRAPPLE_ATTEMPTED"))
+        .collect();
+    assert_eq!(attempted.len(), 1, "one GRAPPLE_ATTEMPTED event expected");
+    assert_eq!(attempted[0]["payload"]["success"], serde_json::json!(true));
+    assert_eq!(attempted[0]["payload"]["applied_condition"], serde_json::json!("grappled"));
+}
+
+#[actix_web::test]
+async fn grapple_is_seeded_deterministic_across_sessions() {
+    let app = test_app().await;
+
+    async fn run_once(
+        app: &impl Service<
+            actix_http::Request,
+            Response = ServiceResponse<EitherBody<BoxBody>>,
+            Error = actix_web::Error,
+        >,
+    ) -> serde_json::Value {
+        let (token, session_id, hero_id, orc_id) = setup_brawler_duel(app).await;
+        let (_, body) = post_contest(
+            app,
+            &token,
+            session_id,
+            "grapple",
+            serde_json::json!({
+                "attacker_id": hero_id,
+                "defender_id": orc_id,
+                "defender_skill": "athletics",
+                "seed": 777
+            }),
+        )
+        .await;
+        body
+    }
+
+    let first = run_once(&app).await;
+    let second = run_once(&app).await;
+    for field in [
+        "attacker_natural_roll",
+        "attacker_total",
+        "defender_natural_roll",
+        "defender_total",
+        "success",
+    ] {
+        assert_eq!(
+            first[field], second[field],
+            "field {} must replay identically under the same seed",
+            field
+        );
+    }
+}
+
+#[actix_web::test]
+async fn shove_prone_knocks_target_down_and_push_5ft_moves_it() {
+    let app = test_app().await;
+    let token = sign_token("gm-shove", TEST_SECRET);
+
+    // --- Prone branch ---------------------------------------------------------
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "prone",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["effect"], serde_json::json!("prone"));
+    assert_eq!(body["applied_condition"], serde_json::json!("prone"));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let orc = &snap["entities"][orc_id.to_string()];
+    assert_eq!(orc["conditions"][0], serde_json::json!("prone"));
+
+    // --- Push branch ----------------------------------------------------------
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 3.5, 2.5)).await;
+
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["effect"], serde_json::json!("push_5ft"));
+    assert_eq!(body["applied_condition"], serde_json::json!(null));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let orc = &snap["entities"][orc_id.to_string()];
+    assert_eq!(orc["conditions"].as_array().unwrap().len(), 0, "push applies no condition");
+    let dx = orc["position"][0].as_f64().unwrap() - 3.5;
+    let dy = orc["position"][1].as_f64().unwrap() - 2.5;
+    let pushed = (dx * dx + dy * dy).sqrt();
+    assert!(
+        (pushed - 5.0).abs() < 1e-3,
+        "pushed exactly 5 ft away, got {}",
+        pushed
+    );
+
+    // Shove attempts land in the ledger too.
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("SHOVE_ATTEMPTED")),
+        "SHOVE_ATTEMPTED event expected"
+    );
+}
+
+#[actix_web::test]
+async fn lost_contest_spends_the_action_but_changes_nothing() {
+    let app = test_app().await;
+    let (token, session_id, hero_id, orc_id) = setup_brawler_duel(&app).await;
+
+    let seed = contest_seed(5, -1, false);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "defender_skill": "acrobatics",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a LOST contest is still a resolved action");
+    assert_eq!(body["success"], serde_json::json!(false));
+    assert_eq!(body["applied_condition"], serde_json::json!(null));
+    assert_eq!(body["contest"]["winner_side"], serde_json::json!("defender"));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let orc = &snap["entities"][orc_id.to_string()];
+    assert_eq!(orc["conditions"].as_array().unwrap().len(), 0, "no condition on a lost grapple");
+
+    // The attempt still burned the Action.
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "prone",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "failed grapple still spends the Action");
+}
+
+#[actix_web::test]
+async fn contests_enforce_reach_rbac_and_payload_shape() {
+    let app = test_app().await;
+
+    // --- Out of reach (> 5 ft) -> 409, no state change. -----------------------
+    let token = sign_token("gm-reach", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let far_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    // Defender well past melee reach.
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(far_id, "Orc Far", 20, 11, 0, "1d4"), 8, 8), 12.5, 12.5)).await;
+
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": far_id,
+            "defender_skill": "athletics"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("OUT_OF_REACH"));
+    // The rejected attempt must NOT consume the Action.
+    let (status2, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": far_id,
+            "shove_effect": "prone"
+        }),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CONFLICT, "still out of reach");
+    // And a legal target right next to the hero still works -> action was kept.
+    let near_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(near_id, "Near", 20, 11, 0, "1d4"), 8, 8), 2.6, 2.5)).await;
+    let (status3, body3) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": near_id,
+            "defender_skill": "athletics",
+            "seed": contest_seed(5, -1, true)
+        }),
+    )
+    .await;
+    assert_eq!(status3, StatusCode::OK, "reach rejection must not burn the Action: {}", body3);
+
+    // --- Spectators cannot grapple or shove. ----------------------------------
+    let spectator = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &spectator,
+        session_id,
+        "grapple",
+        serde_json::json!({"attacker_id": hero_id, "defender_id": near_id, "defender_skill": "athletics"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    let (status, _) = post_contest(
+        &app,
+        &spectator,
+        session_id,
+        "shove",
+        serde_json::json!({"attacker_id": hero_id, "defender_id": near_id, "shove_effect": "prone"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // --- Players cannot grapple AS someone else's entity. ---------------------
+    let (p_session, owned_hero, other_orc) = {
+        let gm = sign_token_with_role("gm-owned", "gm", TEST_SECRET);
+        let sid = create_session_as(&app, &gm).await;
+        let hero_id = Uuid::new_v4();
+        let orc_id = Uuid::new_v4();
+        spawn(&app, &gm, sid, entity_owned_by(entity_json(hero_id, "Claimed Hero", 30, 14, 0, "1d4"), "player-nine")).await;
+        spawn(&app, &gm, sid, entity_json(orc_id, "Orc", 20, 11, 0, "1d4")).await;
+        (sid, hero_id, orc_id)
+    };
+    let player = sign_token("player-one", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": owned_hero,
+            "defender_id": other_orc,
+            "defender_skill": "athletics"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // --- Payload shape: unknown fields AND bad enum values are 422. -----------
+    let (status, _) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": owned_hero,
+            "defender_id": other_orc,
+            "defender_skill": "athletics",
+            "attacker_athletics_bonus": 99
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "smuggled client math must be structurally rejected, got {}",
+        status
+    );
+
+    let (status, _) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "grapple",
+        serde_json::json!({
+            "attacker_id": owned_hero,
+            "defender_id": other_orc,
+            "defender_skill": "persuasion"
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "invalid skill choice must be rejected, got {}",
+        status
+    );
+
+    let (status, _) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "shove",
+        serde_json::json!({
+            "attacker_id": owned_hero,
+            "defender_id": other_orc,
+            "shove_effect": "yeet_10ft"
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "invalid shove effect must be rejected, got {}",
+        status
+    );
+}

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use vtt_core::{
     Ability, ActionResolver, CheckOutcomeTier, Condition, CostSuggestion, DiceEngine,
-    GameSession, RulesEvaluator, SessionMap,
+    EntityState, GameSession, RulesEvaluator, SessionMap,
 };
 use vtt_crdt_sync::{
     CrdtRelayHub, CrdtSyncMessage, FogOfWarMask, SnapshotToken, SyncSnapshot, TokenTransform,
@@ -1120,8 +1120,390 @@ async fn resolve_attack(
     }
 }
 
-// --- Damage-triggered concentration automation (backlog 4.11) -----------------
+// --- Grapple & Shove (contested melee alternatives) ---------------------------
+//
+// SRD 5e melee attack alternatives that replace one attack with a contested
+// ability check. Both reuse the attack contract wholesale: ids-only payloads
+// (`deny_unknown_fields` makes smuggled client math structurally impossible),
+// server-side stats only, session dice seeded like every other combat action,
+// Action-budget spend, ledger events, and attack-identical RBAC
+// (`may_mutate_session` + `may_control_entity`).
 
+/// The defender's choice of contested skill for a grapple (SRD: Athletics or
+/// Acrobatics). Mapped server-side to Str / Dex ability modifiers — stat
+/// blocks carry no per-skill proficiency bonuses in this engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DefenderSkill {
+    #[serde(rename = "athletics")]
+    Athletics,
+    #[serde(rename = "acrobatics")]
+    Acrobatics,
+}
+
+impl DefenderSkill {
+    fn ability(self) -> Ability {
+        match self {
+            DefenderSkill::Athletics => Ability::Strength,
+            DefenderSkill::Acrobatics => Ability::Dexterity,
+        }
+    }
+}
+
+/// The caller-chosen effect of a successful shove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShoveEffectChoice {
+    #[serde(rename = "prone")]
+    Prone,
+    #[serde(rename = "push_5ft")]
+    Push5Feet,
+}
+
+impl From<ShoveEffectChoice> for vtt_core::actions::ShoveEffect {
+    fn from(choice: ShoveEffectChoice) -> Self {
+        match choice {
+            ShoveEffectChoice::Prone => vtt_core::actions::ShoveEffect::Prone,
+            ShoveEffectChoice::Push5Feet => vtt_core::actions::ShoveEffect::Push5Feet,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrappleActionReq {
+    pub attacker_id: Uuid,
+    pub defender_id: Uuid,
+    /// Defender's choice of contested skill ("athletics" | "acrobatics").
+    pub defender_skill: DefenderSkill,
+    /// Optional deterministic seed pinning the rolls (engine decides meaning).
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShoveActionReq {
+    pub attacker_id: Uuid,
+    pub defender_id: Uuid,
+    /// Chosen effect on success ("prone" | "push_5ft").
+    pub shove_effect: ShoveEffectChoice,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+/// Melee reach for grapple/shove contests (SRD 5 ft; no reach weapons modelled).
+const CONTEST_REACH_FEET: f32 = 5.0;
+
+/// Small rejection record so the shared validator's `Err` variant stays tiny
+/// (clippy result_large_err) — callers render it through `reject`.
+struct ContestRejection {
+    status: u16,
+    code: &'static str,
+    detail: &'static str,
+}
+
+impl ContestRejection {
+    fn render(self, data: &AppState) -> HttpResponse {
+        reject(data, self.status, self.code, self.detail)
+    }
+}
+
+/// Shared validation + roll plumbing for both contest endpoints.
+///
+/// Returns `(attacker_snapshot, defender_snapshot, attacker_athletics_mod)`
+/// once every gate passes; the caller then spends the Action and rolls.
+fn validate_contest(
+    session: &GameSession,
+    role: Role,
+    user_id: &str,
+    attacker_id: Uuid,
+    defender_id: Uuid,
+) -> Result<(EntityState, EntityState, i32), ContestRejection> {
+    let attacker = match session.entities.get(&attacker_id) {
+        Some(a) => a.clone(),
+        None => {
+            return Err(ContestRejection {
+                status: 404,
+                code: "ATTACKER_NOT_FOUND",
+                detail: "attacker_id does not exist in this session",
+            })
+        }
+    };
+    if !may_control_entity(attacker.owner_player_id.as_ref(), role, user_id) {
+        return Err(ContestRejection {
+            status: 403,
+            code: "ENTITY_NOT_OWNED",
+            detail: "you do not control the attacking entity",
+        });
+    }
+    let defender = match session.entities.get(&defender_id) {
+        Some(t) => t.clone(),
+        None => {
+            return Err(ContestRejection {
+                status: 404,
+                code: "DEFENDER_NOT_FOUND",
+                detail: "defender_id does not exist in this session",
+            })
+        }
+    };
+
+    if !attacker.can_act() {
+        return Err(ContestRejection {
+            status: 409,
+            code: "ENTITY_CANNOT_ACT",
+            detail: "attacker is unconscious, dead, or incapacitated",
+        });
+    }
+    if defender.is_dead {
+        return Err(ContestRejection {
+            status: 409,
+            code: "TARGET_ALREADY_DEAD",
+            detail: "defender has expired",
+        });
+    }
+    if attacker.id == defender.id {
+        return Err(ContestRejection {
+            status: 422,
+            code: "SELF_TARGET_INVALID",
+            detail: "attacker and defender coincide",
+        });
+    }
+    // Checked now, spent only after every other gate passes — an illegal
+    // contest must not consume the turn.
+    if !attacker.action_budget.action {
+        return Err(ContestRejection {
+            status: 409,
+            code: "ACTION_ECONOMY_EXHAUSTED",
+            detail: "the attacker has already used their Action this turn",
+        });
+    }
+    let distance = attacker.distance_to_feet(&defender);
+    if distance > CONTEST_REACH_FEET {
+        return Err(ContestRejection {
+            status: 409,
+            code: "OUT_OF_REACH",
+            detail: "grapple and shove require the target within 5 ft",
+        });
+    }
+
+    // Athletics is keyed off Strength; the defender's skill choice maps to
+    // Str or Dex at the call site (stat blocks carry no per-skill proficiencies).
+    let attacker_mod = attacker.abilities.modifier(Ability::Strength);
+    Ok((attacker, defender, attacker_mod))
+}
+
+
+async fn resolve_grapple_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<GrappleActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let (attacker, defender, attacker_mod) =
+            match validate_contest(
+                &session,
+                role,
+                &identity.user_id,
+                req.attacker_id,
+                req.defender_id,
+            ) {
+                Ok(v) => v,
+                Err(rejection) => return rejection.render(&data),
+            };
+        let defender_mod = defender.abilities.modifier(req.defender_skill.ability());
+
+        // All validations passed — spend the Action now.
+        if let Err(e) = session
+            .entities
+            .get_mut(&req.attacker_id)
+            .expect("checked above")
+            .spend_action()
+        {
+            return reject(&data, 409, &e, "action budget exhausted or entity incapable");
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+        let attacker_roll = dice.roll_d20();
+        let defender_roll = dice.roll_d20();
+
+        let resolution =
+            ActionResolver::resolve_grapple(attacker_roll, attacker_mod, defender_roll, defender_mod);
+
+        let campaign_id = session.campaign_id;
+        if let Some(condition) = resolution.applied_condition {
+            if let Some(t) = session.entities.get_mut(&req.defender_id) {
+                t.add_condition(condition);
+            }
+        }
+
+        let escape_dc = ActionResolver::grapple_escape_dc(attacker_mod);
+        let payload = serde_json::json!({
+            "attacker_id": req.attacker_id.to_string(),
+            "defender_id": req.defender_id.to_string(),
+            "attacker_natural_roll": attacker_roll,
+            "attacker_total": attacker_roll + attacker_mod,
+            "defender_natural_roll": defender_roll,
+            "defender_total": defender_roll + defender_mod,
+            "defender_skill": req.defender_skill,
+            "success": resolution.success,
+            "applied_condition": resolution.applied_condition,
+            "escape_dc": escape_dc,
+        });
+        let event = session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.attacker_id,
+            "GRAPPLE_ATTEMPTED",
+            payload.clone(),
+        );
+
+        data.count_valid();
+        let mut body = payload;
+        body["contest"] = serde_json::to_value(resolution.contest).unwrap_or_default();
+        body["winner_side"] = serde_json::json!(resolution.contest.winner_side);
+        body["margin"] = serde_json::json!(resolution.contest.margin);
+        body["distance_feet"] = serde_json::json!(attacker.distance_to_feet(&defender));
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+async fn resolve_shove_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<ShoveActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let (attacker, defender, attacker_mod) =
+            match validate_contest(
+                &session,
+                role,
+                &identity.user_id,
+                req.attacker_id,
+                req.defender_id,
+            ) {
+                Ok(v) => v,
+                Err(rejection) => return rejection.render(&data),
+            };
+        // The shover contests the defender's choice of Athletics/Acrobatics too
+        // — same skill mapping as grapple.
+        let defender_skill = if defender.abilities.modifier(Ability::Strength)
+            >= defender.abilities.modifier(Ability::Dexterity)
+        {
+            DefenderSkill::Athletics
+        } else {
+            DefenderSkill::Acrobatics
+        };
+        let defender_mod = defender.abilities.modifier(defender_skill.ability());
+
+        if let Err(e) = session
+            .entities
+            .get_mut(&req.attacker_id)
+            .expect("checked above")
+            .spend_action()
+        {
+            return reject(&data, 409, &e, "action budget exhausted or entity incapable");
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+        let attacker_roll = dice.roll_d20();
+        let defender_roll = dice.roll_d20();
+
+        let effect: vtt_core::actions::ShoveEffect = req.shove_effect.into();
+        let resolution = ActionResolver::resolve_shove(
+            attacker_roll,
+            attacker_mod,
+            defender_roll,
+            defender_mod,
+            effect,
+        );
+
+        let campaign_id = session.campaign_id;
+        if let Some(condition) = resolution.applied_condition {
+            if let Some(t) = session.entities.get_mut(&req.defender_id) {
+                t.add_condition(condition);
+            }
+        } else if resolution.success && effect == vtt_core::actions::ShoveEffect::Push5Feet {
+            // Push 5 ft directly away from the shover along their connecting
+            // line (degenerate same-point case pushes along +x).
+            if let Some(t) = session.entities.get_mut(&req.defender_id) {
+                let dx = t.position.0 - attacker.position.0;
+                let dy = t.position.1 - attacker.position.1;
+                let len = (dx * dx + dy * dy).sqrt();
+                let (ux, uy) = if len > f32::EPSILON { (dx / len, dy / len) } else { (1.0, 0.0) };
+                t.position = (
+                    t.position.0 + ux * 5.0,
+                    t.position.1 + uy * 5.0,
+                    t.position.2,
+                );
+            }
+        }
+
+        let payload = serde_json::json!({
+            "attacker_id": req.attacker_id.to_string(),
+            "defender_id": req.defender_id.to_string(),
+            "attacker_natural_roll": attacker_roll,
+            "attacker_total": attacker_roll + attacker_mod,
+            "defender_natural_roll": defender_roll,
+            "defender_total": defender_roll + defender_mod,
+            "defender_skill": defender_skill,
+            "shove_effect": req.shove_effect,
+            "success": resolution.success,
+            "applied_condition": resolution.applied_condition,
+        });
+        let event = session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.attacker_id,
+            "SHOVE_ATTEMPTED",
+            payload.clone(),
+        );
+
+        data.count_valid();
+        let mut body = payload;
+        body["contest"] = serde_json::to_value(resolution.contest).unwrap_or_default();
+        body["winner_side"] = serde_json::json!(resolution.contest.winner_side);
+        body["margin"] = serde_json::json!(resolution.contest.margin);
+        body["effect"] = serde_json::json!(req.shove_effect);
+        body["distance_feet"] = serde_json::json!(attacker.distance_to_feet(&defender));
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+
+// --- Damage-triggered concentration automation (backlog 4.11) -----------------
 /// One server-side damage-triggered concentration save, serialized additively
 /// into action responses as `concentration_check` when a check was triggered.
 ///
@@ -2830,6 +3212,8 @@ pub fn configure_app_with(
                         .route("/entities/{eid}", web::delete().to(remove_entity))
                         .route("/map", web::put().to(set_session_map))
                         .route("/action/attack", web::post().to(resolve_attack))
+                        .route("/action/grapple", web::post().to(resolve_grapple_action))
+                        .route("/action/shove", web::post().to(resolve_shove_action))
                         .route("/action/cast-spell", web::post().to(resolve_cast_spell))
                         .route("/move", web::post().to(move_entity))
                         .route("/reactions/arm", web::post().to(arm_reaction))

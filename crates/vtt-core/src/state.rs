@@ -233,6 +233,34 @@ impl EntityState {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Adds a condition if not already present. Matching is by variant
+    /// discriminant, so payload-carrying variants (e.g. `Exhaustion(u8)`) are
+    /// treated as singletons regardless of their level. Idempotent — safe to
+    /// call on every successful grapple/shove.
+    pub fn add_condition(&mut self, condition: Condition) {
+        let disc = std::mem::discriminant(&condition);
+        if self.conditions.iter().any(|c| std::mem::discriminant(c) == disc) {
+            return;
+        }
+        self.conditions.push(condition);
+    }
+
+    /// True when this entity carries the given condition (matched by variant
+    /// discriminant — see [`EntityState::add_condition`]).
+    pub fn has_condition(&self, condition: &Condition) -> bool {
+        let disc = std::mem::discriminant(condition);
+        self.conditions.iter().any(|c| std::mem::discriminant(c) == disc)
+    }
+
+    /// Removes every instance of the given condition (by variant
+    /// discriminant). Returns true when something was actually removed.
+    pub fn remove_condition(&mut self, condition: &Condition) -> bool {
+        let disc = std::mem::discriminant(condition);
+        let before = self.conditions.len();
+        self.conditions.retain(|c| std::mem::discriminant(c) != disc);
+        before != self.conditions.len()
+    }
 }
 
 // ------------------------------------------------------------- exhaustion
