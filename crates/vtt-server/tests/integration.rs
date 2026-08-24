@@ -1204,7 +1204,11 @@ async fn rewind_past_heal_restores_prior_hp() {
 #[actix_web::test]
 async fn x_card_response_includes_post_rewind_snapshot() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    // The full-snapshot contract is the GM/admin view; non-GM callers receive
+    // the projected board-token snapshot (see
+    // x_card_snapshot_projected_for_players_full_for_gm). A role-less token
+    // counts as a player, so claim the role explicitly.
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&gm);
     let session_id = create_session_as(&app, &gm).await;
 
@@ -2560,6 +2564,209 @@ async fn move_without_adjacent_armed_enemies_omits_opportunity_attack() {
     assert_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = test::read_body_json(res).await;
     assert!(body.get("opportunity_attack").is_none(), "{}", body);
+}
+
+// --- Audit follow-ups ---------------------------------------------------------
+
+/// MED audit finding: the X-card response embeds the FULL post-rewind
+/// GameSession snapshot and is reachable by ANY non-spectator — leaking hidden
+/// NPCs' AC/HP/abilities/attacks to players. Non-GM callers must receive the
+/// same public-board-token projection the gateway applies to engine state
+/// ({id,name,is_visible,position,is_player,is_dead} per entity, hidden
+/// entities dropped, own sheet in full); GMs keep the authoritative snapshot.
+#[actix_web::test]
+async fn x_card_snapshot_projected_for_players_full_for_gm() {
+    let app = test_app().await;
+    // Explicit role claims: binding another player's ownership is a GM
+    // privilege, so the GM token must actually carry the "gm" role here.
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-2", "player", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // A hero owned by player-2 plus two DM-controlled NPCs: one visible on the
+    // board, one hidden (is_visible=false) whose stat block must never reach
+    // a non-GM caller.
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let lurker_id = Uuid::new_v4();
+
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["owner_player_id"] = serde_json::json!("player-2");
+    let mut orc = entity_json(orc_id, "Board Orc", 20, 11, 3, "1d6+2");
+    orc["is_player"] = serde_json::json!(false);
+    let mut lurker = entity_json(lurker_id, "Hidden Lurker", 40, 17, 6, "2d8+4");
+    lurker["is_player"] = serde_json::json!(false);
+    lurker["is_visible"] = serde_json::json!(false);
+
+    for payload in [hero, orc, lurker] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Rewind target = the current ledger tail, so the spawns survive the
+    // rewind and the snapshot still carries all three entities.
+    let target_seq: u64 = {
+        let snap = snapshot_as(&app, &gm, session_id).await;
+        snap["ledger"]["current_sequence"].as_u64().unwrap()
+    };
+
+    let card = serde_json::json!({
+        "player_id": "player-2",
+        "topic": "spider imagery",
+        "target_sequence_id": target_seq
+    });
+
+    // --- Player view: projected board tokens only ---
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&player))
+        .set_json(card.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
+
+    let entities = &body["snapshot"]["entities"];
+
+    // The hidden NPC's stat block is gone entirely: no key, hence no ac/HP/
+    // abilities/attacks anywhere in the payload.
+    assert!(
+        entities.get(lurker_id.to_string()).is_none(),
+        "hidden NPC must be dropped from a player's x-card snapshot: {}",
+        body["snapshot"]
+    );
+    assert!(
+        entities[&lurker_id.to_string()]["ac"].is_null()
+            && entities[&lurker_id.to_string()]["attacks"].is_null(),
+        "hidden entity must lack ac/attacks fields"
+    );
+
+    // The visible unowned NPC is reduced to the public board-token projection.
+    let projected_orc = &entities[&orc_id.to_string()];
+    let mut fields: Vec<&str> = projected_orc
+        .as_object()
+        .expect("projected entity must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec!["id", "is_dead", "is_player", "is_visible", "name", "position"],
+        "visible NPC must carry exactly the public board-token fields"
+    );
+    assert!(projected_orc["ac"].is_null());
+    assert!(projected_orc["current_hp"].is_null());
+    assert!(projected_orc["abilities"].is_null());
+    assert_eq!(projected_orc["name"], "Board Orc");
+
+    // The caller's OWN entity keeps its full sheet (gateway matrix parity).
+    let own_hero = &entities[&hero_id.to_string()];
+    assert_eq!(own_hero["ac"], 14, "own sheet stays unredacted");
+    assert!(own_hero["attacks"].is_array());
+
+    // --- GM view: the authoritative post-rewind snapshot, hidden NPC included ---
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(card)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let gm_entities = &body["snapshot"]["entities"];
+    let lurker = &gm_entities[&lurker_id.to_string()];
+    assert_eq!(lurker["ac"], 17, "GM sees the hidden NPC's stat block");
+    assert_eq!(lurker["current_hp"], 40);
+    assert_eq!(
+        lurker["attacks"].as_array().map(|a| a.len()),
+        Some(1),
+        "GM sees the hidden NPC's attacks"
+    );
+}
+
+/// MINOR audit finding: when a move provokes MORE THAN ONE adjacent armed
+/// enemy, the response must surface every provoked attacker in
+/// `opportunity_attacks_detail`, not just `.first()` — while keeping the
+/// singular `opportunity_attack` field for back-compat.
+#[actix_web::test]
+async fn move_provoke_reports_all_attackers_in_opportunity_attacks_detail() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    // Hero flanked by two adjacent enemies, each 5 ft away.
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let goblin_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, goblin_id, "Goblin", false, [5.0, 10.0, 0.0]).await;
+
+    // Arm BOTH enemies' opportunity reactions.
+    for enemy in [orc_id, goblin_id] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+            .insert_header((auth.0.clone(), auth.1.clone()))
+            .set_json(serde_json::json!({
+                "entity_id": enemy,
+                "reaction_type": "opportunity_attack"
+            }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Move diagonally away from both (~21 ft, within the 30 ft budget).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 20.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(st, StatusCode::OK, "move failed: {:?}", String::from_utf8_lossy(&raw));
+    let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+    // Engine detection saw both provocations.
+    let triggers = body["outcome"]["opportunity_attacks"].as_array().unwrap();
+    assert_eq!(triggers.len(), 2, "both adjacent armed enemies provoke");
+
+    // THE FIX: the detail array lists EVERY provoked attacker.
+    let detail = body["opportunity_attacks_detail"]
+        .as_array()
+        .expect("opportunity_attacks_detail array must be present");
+    assert_eq!(detail.len(), 2, "every provoked attacker must be surfaced: {}", body);
+    let mut provoked: Vec<String> = detail
+        .iter()
+        .map(|d| d["provoked_by"].as_str().unwrap().to_string())
+        .collect();
+    provoked.sort();
+    let mut expected = vec![orc_id.to_string(), goblin_id.to_string()];
+    expected.sort();
+    assert_eq!(provoked, expected, "detail array must name both attackers");
+    for entry in detail {
+        assert_eq!(entry["reaction_type"], "opportunity_attack");
+        assert_eq!(entry["available"], true);
+    }
+
+    // Back-compat: the singular field survives and agrees with the first
+    // detail entry (HashMap iteration order is nondeterministic).
+    let singular = &body["opportunity_attack"];
+    assert_eq!(
+        singular["provoked_by"].as_str().unwrap(),
+        detail[0]["provoked_by"].as_str().unwrap(),
+        "singular field must mirror the first trigger for old clients"
+    );
+    assert_eq!(singular["reaction_type"], "opportunity_attack");
+    assert_eq!(singular["available"], true);
 }
 
 // --- Initiative combat lifecycle (/combat/begin, /combat/end) ----------------

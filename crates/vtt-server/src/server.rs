@@ -781,7 +781,18 @@ async fn move_entity(
                 // spent) — matching `GameSession::move_entity` semantics,
                 // which consumes the readied reaction at detection time.
                 let mut body = serde_json::json!({ "status": "MOVED", "outcome": outcome });
-                if let Some(trigger) = outcome.opportunity_attacks.first() {
+                if !outcome.opportunity_attacks.is_empty() {
+                    // Full report: EVERY provoked attacker, not just the first.
+                    body["opportunity_attacks_detail"] = serde_json::json!(
+                        outcome.opportunity_attacks.iter().map(|trigger| serde_json::json!({
+                            "provoked_by": trigger.attacker_id,
+                            "reaction_type": "opportunity_attack",
+                            "available": true,
+                        })).collect::<Vec<_>>()
+                    );
+                    // Back-compat: old clients read the singular field, which
+                    // mirrors the first detail entry.
+                    let trigger = &outcome.opportunity_attacks[0];
                     body["opportunity_attack"] = serde_json::json!({
                         "provoked_by": trigger.attacker_id,
                         "reaction_type": "opportunity_attack",
@@ -1992,6 +2003,83 @@ async fn execute_rhai_script(
 
 // --- Safety X-card ------------------------------------------------------------
 
+/// Board-token facts every participant may see about any entity: identity,
+/// placement, shown/hidden, PC-or-NPC, and whether it still stands. Deliberately
+/// EXCLUDES current_hp/max_hp/temp_hp/ac/speed/abilities/attacks/conditions/
+/// spell slots/resistances/owner markers — anything a player could use to
+/// optimize against the sheet rather than watch the board.
+const PUBLIC_ENTITY_FIELDS: [&str; 5] = [
+    "name", "is_visible", "position", "is_player", "is_dead",
+];
+
+/// An absent flag means visible: the engine defaults entities to shown, so a
+/// missing field must not silently blank the whole board (gateway parity).
+fn entity_is_visible(entity: &serde_json::Value) -> bool {
+    entity
+        .get("is_visible")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// The board-token view of one entity: who it is and where it stands. No HP,
+/// AC, abilities, attacks, conditions, or ownership markers.
+fn public_board_token(entity_id: &str, entity: &serde_json::Value) -> serde_json::Value {
+    let mut projected = serde_json::Map::new();
+    projected.insert("id".to_string(), serde_json::json!(entity_id));
+    for field in PUBLIC_ENTITY_FIELDS {
+        if let Some(value) = entity.get(field) {
+            projected.insert(field.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(projected)
+}
+
+/// Projects a serialized GameSession snapshot for the calling role, mirroring
+/// the gateway's `_project_session_state` matrix in
+/// python/vtt_orchestrator/server.py:
+///
+/// ================  ========================================================
+/// Caller role       Entities received
+/// ================  ========================================================
+/// gm / admin        Full authoritative stat blocks, including hidden entities.
+/// player            Entities they OWN (`owner_player_id` == user_id) in full;
+///                   every OTHER visible entity reduced to the public
+///                   board-token projection; hidden entities dropped.
+/// spectator         All visible entities as board tokens; hidden dropped.
+///                   (Unreachable on the x-card route — spectators 403 — but
+///                   kept for fails-closed symmetry.)
+/// ================  ========================================================
+///
+/// Ledger events need no redaction here: only gm/player roles reach this route,
+/// and both are trusted with exact ledger numbers under the gateway policy.
+fn project_snapshot_for_role(
+    mut snapshot: serde_json::Value,
+    role: Role,
+    user_id: &str,
+) -> serde_json::Value {
+    if role.is_gm() {
+        return snapshot;
+    }
+    if let Some(entities) = snapshot.get_mut("entities").and_then(|e| e.as_object_mut()) {
+        let projected: serde_json::Map<String, serde_json::Value> = entities
+            .iter()
+            .filter_map(|(id, entity)| {
+                if !entity_is_visible(entity) {
+                    return None; // hidden from everyone but GM/admin
+                }
+                if entity.get("owner_player_id").and_then(|o| o.as_str()) == Some(user_id) {
+                    Some((id.clone(), entity.clone())) // your own sheet, unredacted
+                } else {
+                    Some((id.clone(), public_board_token(id, entity)))
+                }
+            })
+            .collect();
+        *entities = projected;
+    }
+    snapshot
+}
+
+
 #[derive(Debug, Deserialize)]
 pub struct SafetyXCardReq {
     pub player_id: String,
@@ -2065,8 +2153,14 @@ async fn trigger_safety_rewind(
         // token and therefore cannot call GET /sessions/{id} itself.
         // Payload size is fine here: in-memory sessions are small (entities +
         // ledger), and this is an explicit safety intervention, not a hot path.
-        let snapshot = serde_json::to_value(&*session)
-            .unwrap_or_else(|_| serde_json::Value::Null);
+        // AUDIT (MED): any non-spectator may raise an X-card, so the snapshot
+        // is projected by caller role before it leaves the engine — non-GMs
+        // get public board tokens only and never see hidden NPCs' stat blocks.
+        let snapshot = project_snapshot_for_role(
+            serde_json::to_value(&*session).unwrap_or_else(|_| serde_json::Value::Null),
+            role,
+            &identity.user_id,
+        );
 
         HttpResponse::Ok().json(serde_json::json!({
             "status": "SAFETY_REWIND_SUCCESS",
