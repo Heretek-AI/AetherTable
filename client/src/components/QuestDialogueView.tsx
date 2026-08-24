@@ -16,6 +16,7 @@ import {
   Flame,
   Check,
 } from 'lucide-react';
+import { authHeaders } from '../api/auth_headers';
 
 interface QuestChoice {
   choice_id: string;
@@ -73,7 +74,9 @@ export const QuestDialogueView: React.FC<QuestDialogueViewProps> = ({ onInjectQu
 
   const fetchQuest = async () => {
     try {
-      const res = await fetch('/api/v1/quest/active');
+      // GET /api/v1/quest/active requires any valid token (header-first
+      // dependency) — identity rides Authorization, never ?token=.
+      const res = await fetch('/api/v1/quest/active', { headers: authHeaders() });
       if (res.ok) {
         const data = await res.json();
         setQuest(data);
@@ -95,7 +98,8 @@ export const QuestDialogueView: React.FC<QuestDialogueViewProps> = ({ onInjectQu
     try {
       const res = await fetch('/api/v1/quest/concordia-negotiate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // POST /api/v1/quest/concordia-negotiate also requires a valid token.
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           house_a: 'House Vane',
           house_b: 'House Silverpeak',

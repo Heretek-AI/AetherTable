@@ -26,8 +26,9 @@ interface QuestJournalModalProps {
   /**
    * Live session role from the App shell (same convention as StreamerHUDModal:
    * passed IN rather than mirrored). Defaults to the App shell's own default
-   * seat. Quest generation and GM notes are gated on this; the gateway route
-   * itself is not role-enforced, so this is an entry-point gate only.
+   * seat. Quest generation and GM notes are gated on this in the UI; the
+   * gateway also enforces GM on POST /api/v1/quest/generate via its auth
+   * dependency, so this is a UX gate layered on real server enforcement.
    */
   userRole?: 'gm' | 'player' | 'spectator';
 }
@@ -170,9 +171,9 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
                   </div>
                   <span
                     className="text-[10px] text-[var(--rp-parchment-300)] font-mono"
-                    title="The /api/v1/quest/generate route does not enforce roles server-side yet."
+                    title="POST /api/v1/quest/generate requires a GM token (Authorization header) — enforced by the gateway."
                   >
-                    client-side gate only — server route unauthenticated
+                    GM-only · server-enforced
                   </span>
                 </div>
 

@@ -2,16 +2,18 @@
  * Quest generation API client — real gateway surface backed by iteration 79's
  * parametrized quest engine (python/vtt_orchestrator/simulation/quest_engine.py).
  *
- * Routes (python/vtt_orchestrator/server.py):
- *   POST /api/v1/quest/generate  { campaign_theme, primary_house, rival_house } → QuestGraph
- *   GET  /api/v1/quest/active    → the gateway's most recently generated graph
+ * Routes (python/vtt_orchestrator/server.py), all server-side auth'd since
+ * iteration 94 via header-first dependencies (`Depends(_require_auth)`):
+ *   POST /api/v1/quest/generate  → GM token required
+ *   GET  /api/v1/quest/active    → any valid token
+ *   POST /api/v1/quest/concordia-negotiate → any valid token
  *
- * Mirrors handout_store conventions: helpers resolve null on network failure so
- * the UI can surface an honest error instead of padding with invented content.
+ * Identity rides the Authorization header (never a query-string `?token=`,
+ * which these routes no longer consult). Mirrors handout_store conventions:
+ * helpers resolve null on network failure so the UI can surface an honest
+ * error instead of padding with invented content.
  *
  * Honesty notes carried into the UI:
- *  - The gateway route is NOT role-enforced today; GM gating here is client-side
- *    only (the modal discloses this next to the control).
  *  - Generated graphs are held only in the gateway process (`global_quest_generator`
  *    module state). Nothing here persists them client-side either.
  */
