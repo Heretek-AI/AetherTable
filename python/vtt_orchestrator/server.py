@@ -45,7 +45,14 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Strict origin allowlist (mirrors the engine's strict_cors): wildcard
+    # origins combined with credentials is both invalid per the fetch spec
+    # and an open credential-forwarding hole.
+    allow_origins=[
+        o.strip()
+        for o in os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+        if o.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -273,6 +280,16 @@ def _require_user_id(token: str) -> str:
     if payload is None:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
     return payload["user_id"]
+
+
+def _caller_actor(token: str) -> Dict[str, str]:
+    """Verified caller identity forwarded to the engine so its RBAC layer
+    authorizes the real actor (entity ownership, spectator limits) instead
+    of the gateway's service principal."""
+    payload = _verify_token(token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+    return {"user_id": payload["user_id"], "role": payload.get("role", "player")}
 
 
 def _auth_response(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -603,7 +620,7 @@ async def engine_create_session(req: EngineSessionRequest):
 
 
 @app.post("/api/v1/engine/attack")
-async def engine_resolve_attack(req: EngineAttackRequest):
+async def engine_resolve_attack(req: EngineAttackRequest, token: Optional[str] = Query(None)):
     # Reference-only payload: ids + optional action index. No math crosses
     # this boundary in either direction — the engine owns every modifier.
     action = {
@@ -611,7 +628,10 @@ async def engine_resolve_attack(req: EngineAttackRequest):
         "target_id": engine_client._coerce_uuid(req.target_id),
         "action_index": req.action_index,
     }
-    return await _engine_call(engine_client.resolve_attack(req.session_id, action))
+    actor = _caller_actor(token) if token else None
+    return await _engine_call(
+        engine_client.resolve_attack(req.session_id, action, actor=actor)
+    )
 
 
 @app.post("/api/v1/engine/check")
@@ -634,8 +654,11 @@ async def engine_resolve_concentration(req: EngineConcentrationRequest):
 
 
 @app.post("/api/v1/engine/death-save")
-async def engine_resolve_death_save(req: EngineDeathSaveRequest):
-    return await _engine_call(engine_client.resolve_death_save(req.session_id, req.entity_id))
+async def engine_resolve_death_save(req: EngineDeathSaveRequest, token: Optional[str] = Query(None)):
+    actor = _caller_actor(token) if token else None
+    return await _engine_call(
+        engine_client.resolve_death_save(req.session_id, req.entity_id, actor=actor)
+    )
 
 
 @app.post("/api/v1/engine/map/generate")
@@ -971,17 +994,23 @@ class EngineArmReactionRequest(BaseModel):
 
 
 @app.post("/api/v1/engine/spawn")
-async def engine_spawn(req: EngineSpawnRequest):
+async def engine_spawn(req: EngineSpawnRequest, token: str = Query(...)):
     payload = dict(req.entity)
     if req.ingress is not None:
         payload["ingress"] = req.ingress
     return await _engine_call(
-        engine_client.engine_request("POST", f"/api/v1/sessions/{req.session_id}/entities", payload)
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/entities",
+            payload,
+            actor=_caller_actor(token),
+        )
     )
 
 
 @app.post("/api/v1/engine/cast-spell")
-async def engine_cast_spell(req: EngineCastSpellRequest):
+async def engine_cast_spell(req: EngineCastSpellRequest, token: str = Query(...)):
+    actor = _caller_actor(token)
     payload: Dict[str, Any] = {
         "caster_id": engine_client._coerce_uuid(req.caster_id),
         "spell": req.spell,
@@ -991,13 +1020,13 @@ async def engine_cast_spell(req: EngineCastSpellRequest):
         payload["target_id"] = engine_client._coerce_uuid(req.target_id)
     return await _engine_call(
         engine_client.engine_request(
-            "POST", f"/api/v1/sessions/{req.session_id}/action/cast-spell", payload
+            "POST", f"/api/v1/sessions/{req.session_id}/action/cast-spell", payload, actor=actor
         )
     )
 
 
 @app.post("/api/v1/engine/move")
-async def engine_move(req: EngineMoveRequest):
+async def engine_move(req: EngineMoveRequest, token: str = Query(...)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1006,19 +1035,25 @@ async def engine_move(req: EngineMoveRequest):
                 "entity_id": engine_client._coerce_uuid(req.entity_id),
                 "x": req.x, "y": req.y, "z": req.z,
             },
+            actor=_caller_actor(token),
         )
     )
 
 
 @app.post("/api/v1/engine/turn-next")
-async def engine_turn_next(req: EngineSessionActionRequest):
+async def engine_turn_next(req: EngineSessionActionRequest, token: str = Query(...)):
     return await _engine_call(
-        engine_client.engine_request("POST", f"/api/v1/sessions/{req.session_id}/turn/next", {})
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/turn/next",
+            {},
+            actor=_caller_actor(token),
+        )
     )
 
 
 @app.post("/api/v1/engine/damage")
-async def engine_damage(req: EngineDamageRequest):
+async def engine_damage(req: EngineDamageRequest, token: str = Query(...)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1027,12 +1062,13 @@ async def engine_damage(req: EngineDamageRequest):
                 "target_id": engine_client._coerce_uuid(req.target_id),
                 "source_event_sequence": req.source_event_sequence,
             },
+            actor=_caller_actor(token),
         )
     )
 
 
 @app.post("/api/v1/engine/reactions/arm")
-async def engine_arm_reaction(req: EngineArmReactionRequest):
+async def engine_arm_reaction(req: EngineArmReactionRequest, token: str = Query(...)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1041,6 +1077,7 @@ async def engine_arm_reaction(req: EngineArmReactionRequest):
                 "entity_id": engine_client._coerce_uuid(req.entity_id),
                 "reaction_type": req.reaction_type,
             },
+            actor=_caller_actor(token),
         )
     )
 

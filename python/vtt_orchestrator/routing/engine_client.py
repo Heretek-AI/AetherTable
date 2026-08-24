@@ -40,6 +40,22 @@ def _service_token() -> str:
     )
 
 
+def _actor_token(actor: Optional[Dict[str, str]]) -> str:
+    """Token carrying the ORIGINAL caller's identity so the engine's RBAC
+    layer authorizes the real actor (entity ownership, spectator limits)
+    rather than the gateway itself. Falls back to the service principal for
+    server-mediated calls (lobby launch, character deploy)."""
+    if not actor:
+        return _service_token()
+    return _sign_token(
+        {
+            "user_id": actor["user_id"],
+            "role": actor.get("role", "player"),
+            "exp": time.time() + _SERVICE_TOKEN_TTL_SECONDS,
+        }
+    )
+
+
 class EngineUnavailableError(Exception):
     """Raised when the authoritative engine cannot be reached."""
 
@@ -52,10 +68,20 @@ class EngineRejectedError(Exception):
         super().__init__(f"Engine rejected request ({status_code}): {detail}")
 
 
-async def engine_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Perform one authenticated request against the engine."""
+async def engine_request(
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    actor: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Perform one authenticated request against the engine.
+
+    Pass ``actor`` ({"user_id", "role"}) when the request acts on behalf of a
+    browser caller so the engine's RBAC sees the real player identity.
+    """
     url = f"{ENGINE_API_URL}{path}"
-    headers = {"Authorization": f"Bearer {_service_token()}"}
+    headers = {"Authorization": f"Bearer {_actor_token(actor)}"}
     try:
         async with httpx.AsyncClient(timeout=ENGINE_TIMEOUT_SECONDS) as client:
             response = await client.request(method, url, json=payload, headers=headers)
@@ -66,10 +92,16 @@ async def engine_request(method: str, path: str, payload: Optional[Dict[str, Any
         raise EngineUnavailableError(f"Engine unreachable at {url}: {exc}") from exc
 
 
-def engine_request_sync(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def engine_request_sync(
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    actor: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Synchronous twin of engine_request for test/tooling call sites."""
     url = f"{ENGINE_API_URL}{path}"
-    headers = {"Authorization": f"Bearer {_service_token()}"}
+    headers = {"Authorization": f"Bearer {_actor_token(actor)}"}
     try:
         with httpx.Client(timeout=ENGINE_TIMEOUT_SECONDS) as client:
             response = client.request(method, url, json=payload, headers=headers)
@@ -96,8 +128,15 @@ async def create_session(campaign_id: str, session_name: str) -> Dict[str, Any]:
     )
 
 
-async def resolve_attack(session_id: str, action: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", f"/api/v1/sessions/{session_id}/action/attack", action)
+async def resolve_attack(
+    session_id: str,
+    action: Dict[str, Any],
+    *,
+    actor: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    return await engine_request(
+        "POST", f"/api/v1/sessions/{session_id}/action/attack", action, actor=actor
+    )
 
 
 async def resolve_check(action: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,13 +151,19 @@ async def resolve_concentration(action: Dict[str, Any]) -> Dict[str, Any]:
     return await engine_request("POST", "/api/v1/actions/concentration", action)
 
 
-async def resolve_death_save(session_id: str, entity_id: str) -> Dict[str, Any]:
+async def resolve_death_save(
+    session_id: str,
+    entity_id: str,
+    *,
+    actor: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Death saves resolve against the SERVER-side entity state — the client
     may only name the entity, never supply counters."""
     return await engine_request(
         "POST",
         f"/api/v1/sessions/{session_id}/action/death-save",
         {"entity_id": _coerce_uuid(entity_id)},
+        actor=actor,
     )
 
 

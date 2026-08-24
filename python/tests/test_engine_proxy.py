@@ -191,3 +191,113 @@ class TestEngineProxy:
         # Perimeter must be sealed.
         assert all(cell == 1 for cell in tiles[0])
         assert any(1 in row for row in tiles)
+
+
+class TestProxyIdentity:
+    """Regression tests for caller-identity forwarding through the proxies:
+
+    The engine's RBAC authorizes the REAL actor (entity ownership, spectator
+    limits), so the gateway must mint forwarded-identity tokens instead of
+    always speaking as 'orchestrator-service' (which 403s on owned entities).
+    """
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token(
+            {"user_id": user_id, "role": role, "exp": _time.time() + 600}
+        )
+
+    def test_move_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/move",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": "s", "entity_id": "e", "x": 0, "y": 0, "z": 0},
+        )
+        assert resp.status_code == 401
+
+    def test_turn_next_requires_a_token(self):
+        resp = client.post(
+            "/api/v1/engine/turn-next", json={"session_id": "s"}
+        )
+        assert resp.status_code == 422, "missing required token query param"
+
+    def test_valid_player_token_forwards_real_identity(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["actor"] = actor
+            return {"status": "MOVED"}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("player-7", "player")
+        resp = client.post(
+            "/api/v1/engine/move",
+            params={"token": token},
+            json={"session_id": "s", "entity_id": "e", "x": 1, "y": 2, "z": 0},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+
+    def test_gm_token_forwards_gm_role(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["actor"] = actor
+            return {"status": "OK"}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/cast-spell",
+            params={"token": token},
+            json={"session_id": "s", "caster_id": "c", "spell": {"name": "Magic Missile"}, "cast_level": 1},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_attack_without_token_stays_service_mediated(self, monkeypatch):
+        """Legacy callers that omit the token keep working via the service
+        principal instead of breaking."""
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["actor"] = actor
+            return {"natural_roll": 15, "is_hit": True}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        resp = client.post(
+            "/api/v1/engine/attack",
+            json={"session_id": "s", "attacker_id": "a", "target_id": "b"},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] is None
+
+    def test_actor_token_carries_role_claim_for_engine_rbac(self):
+        """The forwarded token must be verifiable by the engine and carry the
+        role claim its Role::from_identity mapping expects."""
+        from vtt_orchestrator.routing.engine_client import _actor_token
+
+        raw, sig = _actor_token({"user_id": "player-7", "role": "player"}).split(".", 1)
+        import base64 as _b64
+        import hashlib as _hashlib
+        import hmac as _hmac
+        import json as _json
+        import os as _os
+
+        secret = _os.environ.get("VTT_ENGINE_SECRET", _os.environ.get("AUTH_SECRET", ""))
+        if not secret:
+            pytest.skip("no shared secret configured")
+        expected = _hmac.new(
+            secret.encode(), _b64.urlsafe_b64decode(raw.encode()), _hashlib.sha256
+        ).hexdigest()
+        assert sig == expected
+        payload = _json.loads(_b64.urlsafe_b64decode(raw.encode()))
+        assert payload["user_id"] == "player-7"
+        assert payload["role"] == "player"

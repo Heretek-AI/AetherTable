@@ -157,7 +157,20 @@ def test_character_persistence_and_deploy(host, guest):
 # --- Workstream C: proxy routes --------------------------------------------------
 
 def test_engine_proxy_routes_contract():
-    """Spawn → turn-next → move against the live engine via gateway routes."""
+    """Spawn → turn-next → move against the live engine via gateway routes.
+
+    Proxy routes now require a caller token (forwarded to engine RBAC), so
+    these act as a GM — full mutation authority.
+    """
+    import time as _time
+
+    from vtt_orchestrator.server import _sign_token
+
+    gm_token = _sign_token(
+        {"user_id": "contract-gm", "role": "gm", "exp": _time.time() + 600}
+    )
+    auth = {"params": {"token": gm_token}}
+
     session_resp = client.post("/api/v1/engine/session", json={})
     if session_resp.status_code == 502:
         pytest.skip("engine not running")
@@ -166,8 +179,10 @@ def test_engine_proxy_routes_contract():
     from vtt_orchestrator.playtest.synthetic_playtest import _statblock
     hero_id = engine_client._coerce_uuid("proxy-hero")
     entity = _statblock(hero_id, "Proxy Hero", 25, 15, 5)
+    entity["owner_player_id"] = "contract-gm"
     spawned = client.post(
         "/api/v1/engine/spawn",
+        params=auth["params"],
         json={"session_id": session_id, "entity": entity},
     )
     assert spawned.status_code == 200, spawned.text
@@ -175,13 +190,14 @@ def test_engine_proxy_routes_contract():
 
     moved = client.post(
         "/api/v1/engine/move",
+        params=auth["params"],
         json={"session_id": session_id, "entity_id": hero_id, "x": 12.0, "y": 7.5},
     )
     assert moved.status_code == 200
     assert moved.json()["outcome"]["to"]["x"] if isinstance(moved.json()["outcome"]["to"], dict) else True
 
     advanced = client.post(
-        "/api/v1/engine/turn-next", json={"session_id": session_id}
+        "/api/v1/engine/turn-next", params=auth["params"], json={"session_id": session_id}
     )
     assert advanced.status_code == 200
     assert advanced.json()["status"] == "TURN_ADVANCED"
@@ -189,6 +205,7 @@ def test_engine_proxy_routes_contract():
     # Unknown entity move is rejected by the engine (409 MOVE_REJECTED).
     bad_move = client.post(
         "/api/v1/engine/move",
+        params=auth["params"],
         json={"session_id": session_id, "entity_id": engine_client._coerce_uuid("ghost"),
               "x": 1.0, "y": 1.0},
     )
