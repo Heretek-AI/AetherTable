@@ -54,29 +54,37 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({ isOpen, onClose 
       <div className="space-y-5">
         {SHORTCUT_GROUPS.map(({ group, rows }) => (
           <section key={group}>
-            <h3 className="text-[11px] font-mono uppercase tracking-widest text-slate-500 mb-2">
-              {group}
+            <h3 className="vtt-section-header text-xs font-bold mb-2">
+              <span>{group}</span>
             </h3>
-            <ul className="space-y-1.5">
-              {rows.map(({ keys, description }) => (
-                <li
-                  key={description}
-                  className="flex items-center justify-between gap-4 py-1.5 px-2 rounded-lg hover:bg-white/5"
-                >
-                  <span className="text-xs text-slate-300">{description}</span>
-                  <span className="flex items-center gap-1 shrink-0">
-                    {keys.map((k) => (
-                      <kbd
-                        key={k}
-                        className="min-w-[1.75rem] text-center px-1.5 py-0.5 rounded-md bg-slate-800 border border-slate-700 border-b-2 text-[10px] font-mono font-semibold text-slate-200 shadow-sm"
-                      >
-                        {k}
-                      </kbd>
-                    ))}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            {/* Two-column printed-book rules table on dark tavern chrome. */}
+            <table className="vtt-table vtt-table--dark text-xs">
+              <thead>
+                <tr>
+                  <th scope="col">Action</th>
+                  <th scope="col">Keys</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(({ keys, description }) => (
+                  <tr key={description}>
+                    <td className="py-1.5">{description}</td>
+                    <td className="py-1.5">
+                      <span className="flex items-center gap-1">
+                        {keys.map((k) => (
+                          <kbd
+                            key={k}
+                            className="inline-block min-w-[1.75rem] text-center px-1.5 py-0.5 rounded-md bg-tavern-bg border border-tavern-border border-b-2 border-b-[var(--rp-leather-600)] text-[10px] font-mono font-semibold text-[var(--rp-parchment-200)] shadow-sm"
+                          >
+                            {k}
+                          </kbd>
+                        ))}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </section>
         ))}
       </div>

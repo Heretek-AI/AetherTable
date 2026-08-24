@@ -3,6 +3,25 @@
    compendium/ATTRIBUTION.md) load via <link> in index.html, not @import,
    so the fetch starts in parallel with the bundle. */
 
+/* ── Tailwind theme mapping ──────────────────────────────────────────────────
+   Exposes the semantic tokens as real utilities (bg-tavern-surface,
+   text-parchment-ink, border-tavern-border, font-prose…) so views stop
+   hand-writing bg-[var(--…)]. `inline` is required because our values are
+   var() references: plain @theme would emit a second layer of indirection
+   that breaks some opacity-modifier color-mix paths. */
+@theme inline {
+  --color-tavern-bg: var(--tavern-bg);
+  --color-tavern-surface: var(--tavern-surface);
+  --color-tavern-border: var(--tavern-border);
+  --color-tavern-accent: var(--tavern-accent);
+  --color-parchment-paper: var(--parchment-paper);
+  --color-parchment-aged: var(--parchment-paper-aged);
+  --color-parchment-ink: var(--parchment-ink);
+  --color-rule-red: var(--rp-crimson-650);
+  --font-display: 'Cinzel', serif;
+  --font-prose: 'EB Garamond', Georgia, serif;
+}
+
 /* ── Rustic Tavern & Parchment design tokens ────────────────────────────────
    Three-layer architecture (primitive → semantic → component) per the
    design-system skill. Components must reference semantic/component tokens —
@@ -18,7 +37,11 @@
   --rp-leather-600: #7a5c42;
   --rp-amber-500: #d97706;
   --rp-amber-600: #b45309;
-  --rp-crimson-600: #9f1239;
+  --rp-crimson-400: #e11d48;  /* accents on DARK chrome only — too light for parchment text */
+  --rp-crimson-500: #be123c;
+  --rp-crimson-600: #9f1239;  /* the ONLY crimson allowed as body-size text on parchment (6.9:1) */
+  --rp-crimson-650: #b32d2e;  /* rule lines / large display type only (AA large on paper, not body) */
+  --rp-crimson-700: #881337;  /* dense small text on aged parchment */
   --rp-forest-600: #166534;
   --rp-ink-900: #1c150e;
 
@@ -33,6 +56,14 @@
   --parchment-ink: var(--rp-ink-900);         /* writing on parchment */
   --state-danger: var(--rp-crimson-600);
   --state-success: var(--rp-forest-600);
+
+  /* Statblock (official-5e-book) semantics */
+  --statblock-header: var(--rp-crimson-600);
+  --statblock-rule: color-mix(in srgb, var(--rp-crimson-650) 55%, transparent);
+
+  /* Parchment fiber texture — inline SVG feTurbulence, no binary assets.
+     Laid under the paper gradients at low opacity to suggest rag grain. */
+  --parchment-fiber: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.45 0 0 0 0 0.36 0 0 0 0 0.24 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
 
   /* Typography */
   --font-display: 'Cinzel', 'Plus Jakarta Sans', serif;
@@ -139,6 +170,7 @@
    and a faint edge burn to suggest candlelight. Text uses parchment-ink. */
 .vtt-parchment {
   background:
+    var(--parchment-fiber),
     radial-gradient(ellipse at top left, rgba(255, 252, 240, 0.9), transparent 55%),
     radial-gradient(ellipse at bottom right, rgba(138, 106, 62, 0.22), transparent 60%),
     var(--parchment-paper);
@@ -149,6 +181,302 @@
     inset 0 0 24px rgba(120, 90, 50, 0.18),      /* aged edge burn */
     0 6px 18px rgba(0, 0, 0, 0.55);              /* lift off the dark table */
   font-family: var(--font-serif-prose);
+}
+
+/* ── Component layer: official-5e-book styling ─────────────────────────────
+   The printed-book language: crimson small-caps headers over double rule
+   lines, rag-grain parchment stat blocks, ornamental dividers, drop caps.
+   Contrast contract (WCAG AA): crimson TEXT is #9f1239 only; #b32d2e is for
+   rule lines / ≥18px display; amber never appears as text on parchment. */
+
+/* Statblock page — a Monster-Manual entry rendered on rag paper. */
+.vtt-statblock {
+  background:
+    var(--parchment-fiber),
+    var(--parchment-paper);
+  color: var(--parchment-ink);
+  border: 1px solid var(--rp-leather-700);
+  box-shadow:
+    inset 0 0 30px rgb(99 72 50 / 0.18),
+    0 6px 18px rgba(0, 0, 0, 0.5);
+  font-family: var(--font-serif-prose);
+}
+
+/* Creature/spell name plate — Cinzel small caps in book red, double underline. */
+.vtt-statblock-nameplate {
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.04em;
+  color: var(--statblock-header);
+  border-bottom: 2px solid var(--statblock-rule);
+  padding-bottom: 0.15rem;
+}
+
+/* Italic type line under the nameplate ("Medium humanoid, CR 3"). */
+.vtt-statblock-tagline {
+  font-style: italic;
+  color: color-mix(in srgb, var(--parchment-ink) 78%, transparent);
+}
+
+/* Red-tinted attribute strip (AC · HP · SPEED) between hairline rules. */
+.vtt-statblock-attr {
+  background: color-mix(in srgb, var(--rp-crimson-650) 10%, var(--parchment-paper));
+  border-top: 1px solid var(--statblock-rule);
+  border-bottom: 1px solid var(--statblock-rule);
+}
+.vtt-statblock-attr > dt,
+.vtt-statblock-attr .vtt-attr-label {
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.06em;
+  color: var(--statblock-header);
+}
+.vtt-statblock-attr > dd,
+.vtt-statblock-attr .vtt-attr-value {
+  font-weight: 600;
+}
+
+/* Section header — crimson small caps sitting on a double rule line. */
+.vtt-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  color: var(--statblock-header);
+}
+.vtt-section-header::after {
+  content: '';
+  flex: 1;
+  height: 5px;
+  border-top: 1px solid var(--statblock-rule);
+  border-bottom: 1px solid var(--statblock-rule);
+}
+
+/* Ornamental divider — hairlines flanking a rotated leather diamond. */
+.vtt-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  height: 1rem;
+}
+.vtt-divider::before,
+.vtt-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--rp-leather-600));
+}
+.vtt-divider::after {
+  background: linear-gradient(90deg, var(--rp-leather-600), transparent);
+}
+.vtt-divider > * {
+  width: 8px;
+  height: 8px;
+  rotate: 45deg;
+  background: var(--rp-leather-600);
+  box-shadow: 0 0 0 1px var(--rp-leather-700);
+}
+
+/* Printed-book drop cap for opening paragraphs of in-world prose. */
+.vtt-dropcap::first-letter {
+  float: left;
+  font-family: var(--font-display);
+  font-size: 3.2em;
+  line-height: 0.85;
+  padding-right: 0.08em;
+  color: var(--statblock-header);
+}
+
+/* Two-tone 5e rules table — crimson-washed header row, zebra body. */
+.vtt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-serif-prose);
+  font-size: 13px;
+  color: var(--parchment-ink);
+}
+.vtt-table th {
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  text-align: left;
+  color: var(--statblock-header);
+  background: color-mix(in srgb, var(--rp-crimson-650) 12%, var(--parchment-paper));
+  border-bottom: 1px solid var(--rp-leather-700);
+  padding: 0.4rem 0.6rem;
+}
+.vtt-table td {
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--rp-leather-700) 45%, transparent);
+}
+.vtt-table tbody tr:nth-child(odd) {
+  background: color-mix(in srgb, var(--rp-crimson-650) 4%, var(--parchment-paper));
+}
+/* Out-of-world (admin) variant on dark tavern chrome. */
+.vtt-table--dark {
+  color: var(--rp-parchment-200);
+}
+.vtt-table--dark th {
+  color: var(--tavern-accent);
+  background: color-mix(in srgb, var(--tavern-bg) 70%, black);
+  border-bottom-color: var(--tavern-border);
+}
+.vtt-table--dark td {
+  border-bottom-color: color-mix(in srgb, var(--tavern-border) 55%, transparent);
+}
+.vtt-table--dark tbody tr:nth-child(odd) {
+  background: color-mix(in srgb, white 3%, transparent);
+}
+
+/* Muted state badges — pill, Cinzel small caps, tint derived from state token. */
+.vtt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.05rem 0.5rem;
+  border-radius: 9999px;
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--rp-leather-600) 60%, transparent);
+  color: color-mix(in srgb, var(--parchment-ink) 80%, transparent);
+  background: color-mix(in srgb, var(--rp-leather-600) 14%, transparent);
+}
+.vtt-badge-danger {
+  border-color: color-mix(in srgb, var(--state-danger) 55%, transparent);
+  color: var(--state-danger);
+  background: color-mix(in srgb, var(--state-danger) 10%, transparent);
+}
+.vtt-badge-success {
+  border-color: color-mix(in srgb, var(--state-success) 55%, transparent);
+  color: var(--state-success);
+  background: color-mix(in srgb, var(--state-success) 10%, transparent);
+}
+/* Dark-chrome modifier: the base colors are tuned for parchment contrast
+   (#9f1239 red / #166534 green) and sink into iron backgrounds — brighten
+   the text toward the light end when the badge sits on tavern chrome. */
+.vtt-badge-on-dark.vtt-badge-danger {
+  color: var(--rp-crimson-400);
+}
+.vtt-badge-on-dark.vtt-badge-success {
+  color: color-mix(in srgb, var(--state-success) 45%, white);
+}
+
+/* Form controls on dark chrome. */
+.vtt-input,
+.vtt-select {
+  background: color-mix(in srgb, var(--tavern-bg) 70%, black);
+  border: 1px solid var(--tavern-border);
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.7rem;
+  color: var(--rp-parchment-200);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.vtt-input::placeholder {
+  color: color-mix(in srgb, var(--rp-parchment-300) 55%, transparent);
+}
+.vtt-input:focus-visible,
+.vtt-select:focus-visible {
+  outline: 2px solid var(--tavern-accent);
+  outline-offset: 1px;
+  border-color: var(--tavern-accent);
+}
+
+/* Buttons — primary = gold leaf, secondary = leather outline, danger = red. */
+.vtt-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.9rem;
+  border-radius: 0.5rem;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.vtt-btn:focus-visible {
+  outline: 2px solid var(--tavern-accent);
+  outline-offset: 2px;
+}
+.vtt-btn-primary {
+  background: linear-gradient(180deg, var(--rp-amber-500), var(--rp-amber-600));
+  color: var(--rp-ink-900);
+  border: 1px solid color-mix(in srgb, var(--rp-amber-500) 70%, black);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+.vtt-btn-primary:hover {
+  filter: brightness(1.08);
+}
+.vtt-btn-secondary {
+  background: transparent;
+  color: var(--rp-parchment-200);
+  border: 1px solid var(--tavern-border);
+}
+.vtt-btn-secondary:hover {
+  background: color-mix(in srgb, var(--rp-leather-700) 45%, transparent);
+  border-color: var(--rp-leather-600);
+}
+.vtt-btn-danger {
+  background: var(--state-danger);
+  color: #fff;
+  border: 1px solid color-mix(in srgb, var(--state-danger) 70%, black);
+}
+.vtt-btn-danger:hover {
+  filter: brightness(1.1);
+}
+
+/* Tab bar — active tab carries the crimson book underline. */
+.vtt-tabbar {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border-radius: 0.6rem;
+  background: color-mix(in srgb, var(--tavern-bg) 75%, black);
+  border: 1px solid var(--tavern-border);
+}
+.vtt-tab {
+  padding: 0.3rem 0.8rem;
+  border-radius: 0.4rem;
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  font-size: 13px;
+  color: var(--rp-parchment-300);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.vtt-tab:hover {
+  color: var(--rp-parchment-100);
+}
+.vtt-tab[data-active='true'] {
+  color: var(--rp-parchment-100);
+  border-bottom-color: var(--rp-crimson-650);
+  background: color-mix(in srgb, var(--rp-leather-700) 35%, transparent);
+}
+
+/* Inline trait lead-in ("Amphibious.") — small-caps red like the book, but
+   flows inside a paragraph rather than owning a rule line. */
+.vtt-inline-trait {
+  font-family: var(--font-display);
+  font-variant: small-caps;
+  letter-spacing: 0.05em;
+  color: var(--statblock-header);
+  font-weight: 600;
+}
+
+/* Focus inside parchment surfaces: amber vanishes on paper, so book-red
+   carries keyboard focus there instead. */
+:where(.vtt-parchment, .vtt-statblock) :focus-visible {
+  outline: 2px solid var(--rp-crimson-600);
+  outline-offset: 2px;
 }
 
 /* Vintage bronze scrollbar — the app-wide vtt-scrollbar restyled to aged metal. */

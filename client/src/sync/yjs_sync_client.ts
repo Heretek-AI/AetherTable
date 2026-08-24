@@ -38,7 +38,14 @@ export class VttCrdtSyncClient {
   public connect(): void {
     this.closedByUser = false;
     try {
-      this.ws = new WebSocket(`${this.serverUrl}/ws/sessions/${this.roomId}/sync`);
+      // The engine's zero-trust middleware requires a gateway-signed token.
+      // Browsers can't set headers on WebSocket handshakes, so it travels as
+      // a query param; percent-encoding keeps the base64url payload intact.
+      const token = sessionStorage.getItem('aethertable_token') ?? '';
+      const authSuffix = token ? `?token=${encodeURIComponent(token)}` : '';
+      this.ws = new WebSocket(
+        `${this.serverUrl}/ws/sessions/${this.roomId}/sync${authSuffix}`
+      );
     } catch {
       console.warn('[CRDT Sync] WebSocket unavailable; running solo.');
       return;

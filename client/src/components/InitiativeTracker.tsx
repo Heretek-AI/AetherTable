@@ -46,7 +46,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
         return <Crosshair className="w-3.5 h-3.5 text-amber-200" />;
       case 'fighter':
       default:
-        return <Shield className="w-3.5 h-3.5 text-sky-200" />;
+        return <Shield className="w-3.5 h-3.5 text-[var(--rp-parchment-200)]" />;
     }
   };
 
@@ -152,7 +152,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                   </div>
 
                   <div className="flex items-center gap-1 text-xs font-mono text-[var(--rp-parchment-200)]">
-                    <Shield className="w-3.5 h-3.5 text-sky-400" />
+                    <Shield className="w-3.5 h-3.5 text-tavern-accent" />
                     <span>{token.ac} AC</span>
                   </div>
                 </div>

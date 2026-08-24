@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Sparkles, Search, BookOpen } from 'lucide-react';
 import { ModalShell } from './ui/ModalShell';
+import { Statblock } from '../ui/Statblock';
 
 interface SpellbookModalProps {
   isOpen: boolean;
@@ -48,13 +49,13 @@ export const SpellbookModal: React.FC<SpellbookModalProps> = ({
         <div className="flex justify-end space-x-3">
           <button
             onClick={onClose}
-            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer"
+            className="vtt-btn vtt-btn-secondary text-xs"
           >
             Cancel
           </button>
           <button
             onClick={handleCast}
-            className="flex items-center space-x-2 px-5 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-bold rounded-lg shadow-lg shadow-purple-950/60 transition active:scale-95 cursor-pointer"
+            className="vtt-btn vtt-btn-primary font-display tracking-wide active:scale-95"
           >
             <Sparkles className="w-4 h-4" />
             <span>Cast at Level {castLevel}</span>
@@ -62,18 +63,18 @@ export const SpellbookModal: React.FC<SpellbookModalProps> = ({
         </div>
       }
     >
-      {/* Content Body: Left Spell List (5 cols) + Right Spell Details & Upcaster (7 cols) */}
+      {/* Content Body: Left Spell List (5 cols) + Right Spell Statblock & Upcaster (7 cols) */}
       <div className="grid grid-cols-1 md:grid-cols-12">
         {/* Left Column: Prepared Spell Selector */}
-        <div className="md:col-span-5 border-r border-slate-800 pr-4 space-y-3">
+        <div className="md:col-span-5 border-r border-tavern-border pr-4 space-y-3">
           <div className="relative">
-            <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-500" />
+            <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-[var(--rp-parchment-300)] pointer-events-none" />
             <input
               type="text"
               placeholder="Search grimoire..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-purple-500"
+              className="vtt-input w-full pl-8 text-xs"
             />
           </div>
 
@@ -89,50 +90,55 @@ export const SpellbookModal: React.FC<SpellbookModalProps> = ({
                   }}
                   className={`p-3 rounded-lg border transition-all cursor-pointer flex items-center justify-between ${
                     isSelected
-                      ? 'bg-purple-950/60 border-purple-500 text-purple-200'
-                      : 'bg-slate-950/40 border-slate-800 hover:bg-slate-800 text-slate-300'
+                      ? 'bg-tavern-surface border-tavern-accent shadow-[0_0_14px_rgba(217,119,6,0.25)]'
+                      : 'vtt-surface rounded-lg hover:border-[var(--rp-leather-600)]'
                   }`}
                 >
                   <div>
-                    <div className="text-xs font-bold">{spell.name}</div>
-                    <div className="text-[10px] text-slate-400">
+                    <div className={`text-xs font-bold ${isSelected ? 'text-tavern-accent' : 'text-[var(--rp-parchment-100)]'}`}>{spell.name}</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)]">
                       Level {spell.level} · {spell.school}
                     </div>
                   </div>
-                  <span className="text-[10px] font-mono px-2 py-0.5 bg-slate-900 border border-slate-700 rounded text-slate-300">
-                    Lvl {spell.level}
-                  </span>
+                  {/* School badge — printed-book chip */}
+                  <span className="vtt-badge font-mono">Lvl {spell.level}</span>
                 </div>
               );
             })}
           </div>
         </div>
 
-        {/* Right Column: Statblock & Upcasting Engine */}
+        {/* Right Column: Printed Spell Statblock & Upcasting Engine */}
         <div className="md:col-span-7 pl-4 space-y-4">
           <div className="space-y-3">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-              <h3 className="text-lg font-bold font-serif text-slate-100">{selectedSpell.name}</h3>
-              <span className="px-2 py-0.5 bg-purple-950 border border-purple-600/50 text-purple-300 text-xs font-mono font-bold rounded">
+            <div className="flex items-center justify-between border-b border-tavern-border pb-2">
+              <h3 className="text-lg font-bold font-display text-[var(--rp-parchment-100)]">{selectedSpell.name}</h3>
+              <span className="vtt-badge font-mono font-bold">
                 Level {selectedSpell.level} {selectedSpell.school}
               </span>
             </div>
 
-            <div className="grid grid-cols-3 gap-2 text-[11px] font-mono text-slate-300 bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-              <div><strong>Casting:</strong> {selectedSpell.time}</div>
-              <div><strong>Range:</strong> {selectedSpell.range}</div>
-              <div><strong>Duration:</strong> {selectedSpell.duration}</div>
+            {/* Detail pane — the spell prints as an official book stat block
+                on aged parchment (shared Statblock renderer). Local record
+                fields are mapped onto the compendium spell shape; state and
+                handlers are untouched. */}
+            <div className="vtt-parchment rounded-xl p-4">
+              <Statblock
+                item={{
+                  ...selectedSpell,
+                  casting_time: selectedSpell.time,
+                  description: selectedSpell.desc,
+                  upcast: selectedSpell.upcastDamage === 'No scaling' ? undefined : selectedSpell.upcastDamage,
+                }}
+                kind="spell"
+              />
             </div>
 
-            <p className="text-xs text-slate-300 leading-relaxed font-sans italic bg-slate-950/60 p-3 rounded-lg border border-slate-800/80">
-              "{selectedSpell.desc}"
-            </p>
-
             {/* Upcasting Slot Selector */}
-            <div className="p-3 bg-purple-950/30 border border-purple-700/40 rounded-xl space-y-2">
-              <div className="flex items-center justify-between text-xs font-bold text-purple-300 font-mono">
+            <div className="p-3 vtt-surface rounded-xl space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-[var(--rp-parchment-200)] font-mono">
                 <span>Upcast Spell Level:</span>
-                <span className="text-sm text-amber-400">Level {castLevel} Slot</span>
+                <span className="text-sm text-tavern-accent">Level {castLevel} Slot</span>
               </div>
 
               <div className="flex items-center space-x-2">
@@ -142,8 +148,8 @@ export const SpellbookModal: React.FC<SpellbookModalProps> = ({
                     onClick={() => setCastLevel(lvl)}
                     className={`flex-1 py-1.5 rounded-lg font-mono text-xs font-bold transition cursor-pointer ${
                       castLevel === lvl
-                        ? 'bg-purple-600 text-white shadow-lg shadow-purple-900/50 border border-purple-400'
-                        : 'bg-slate-900 border border-slate-700 text-slate-400 hover:text-white'
+                        ? 'bg-gradient-to-b from-[var(--rp-amber-500)] to-[var(--rp-amber-600)] text-[var(--rp-ink-900)] border border-[color-mix(in_srgb,var(--rp-amber-500)_70%,black)]'
+                        : 'bg-tavern-bg border border-tavern-border text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)]'
                     }`}
                   >
                     Lvl {lvl}
@@ -151,8 +157,8 @@ export const SpellbookModal: React.FC<SpellbookModalProps> = ({
                 ))}
               </div>
 
-              <div className="text-[11px] text-slate-400 font-mono pt-1">
-                <strong className="text-purple-300">Upcast Benefit:</strong> {selectedSpell.upcastDamage}
+              <div className="text-[11px] text-[var(--rp-parchment-300)] font-mono pt-1">
+                <strong className="text-tavern-accent">Upcast Benefit:</strong> {selectedSpell.upcastDamage}
               </div>
             </div>
           </div>

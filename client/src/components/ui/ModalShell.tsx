@@ -28,9 +28,12 @@ export interface ModalShellProps {
   size?: keyof typeof SIZES;
   /**
    * Surface treatment: 'tavern' = dark wood/iron chrome panel,
-   * 'parchment' = in-world paper document (uses .vtt-parchment).
+   * 'parchment' = in-world paper document (uses .vtt-parchment),
+   * 'statblock' = printed-book stat-block page (uses .vtt-statblock; the
+   * header switches from gold-leaf engraving to book-red small caps, which
+   * stays readable on light paper). Exactly these three tones — no ad-hoc.
    */
-  tone?: 'tavern' | 'parchment';
+  tone?: 'tavern' | 'parchment' | 'statblock';
   footer?: ReactNode;
   /** Set false for sheets that must not close on stray backdrop clicks. */
   closeOnBackdrop?: boolean;
@@ -73,9 +76,12 @@ export function ModalShell({
 
   if (!isOpen) return null;
 
+  const onPaper = tone === 'parchment' || tone === 'statblock';
   const surface =
     tone === 'parchment'
-      ? 'vtt-parchment'
+      ? 'vtt-parchment rounded-xl'
+      : tone === 'statblock'
+      ? 'vtt-statblock rounded-xl'
       : 'vtt-glass-panel border rounded-xl';
 
   return (
@@ -96,15 +102,20 @@ export function ModalShell({
         className={`${surface} w-full ${SIZES[size]} max-h-[85vh] flex flex-col shadow-2xl`}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        {/* Engraved header — Cinzel display face with gold-leaf gradient */}
-        <div className="flex items-start gap-3 px-5 py-4 border-b border-[var(--tavern-border)] shrink-0">
+        {/* Engraved header — Cinzel display face with gold-leaf gradient
+            (dark chrome) or book-red small caps (paper surfaces) */}
+        <div className={`flex items-start gap-3 px-5 py-4 shrink-0 ${onPaper ? 'border-b border-[var(--rp-leather-700)]' : 'border-b border-[var(--tavern-border)]'}`}>
           {icon && (
-            <span className="mt-0.5 text-[var(--tavern-accent)]" aria-hidden="true">
+            <span className={`mt-0.5 ${onPaper ? 'text-[var(--rp-crimson-600)]' : 'text-[var(--tavern-accent)]'}`} aria-hidden="true">
               {icon}
             </span>
           )}
           <div className="min-w-0 flex-1">
-            <h2 id={titleId} className="vtt-engraved text-lg font-semibold truncate">
+            <h2
+              id={titleId}
+              className={`${onPaper ? 'text-[var(--statblock-header)] tracking-wide' : 'vtt-engraved'} font-display text-lg font-semibold truncate`}
+              style={onPaper ? { fontFamily: 'var(--font-display)', fontVariant: 'small-caps' } : undefined}
+            >
               {title}
             </h2>
             {subtitle && (
@@ -126,7 +137,7 @@ export function ModalShell({
         </div>
 
         {footer && (
-          <div className="px-5 py-3 border-t border-[var(--tavern-border)] shrink-0 bg-black/20">
+          <div className={`px-5 py-3 border-t shrink-0 ${onPaper ? 'border-[var(--rp-leather-700)] bg-black/5' : 'border-[var(--tavern-border)] bg-black/20'}`}>
             {footer}
           </div>
         )}

@@ -2,9 +2,17 @@
 Authoritative Rules Engine HTTP Client
 Thin httpx wrapper around the Rust vtt-server engine (crates/vtt-server).
 The browser talks only to this orchestrator; all dice math stays in vtt-core.
+
+Every request carries an HMAC session token signed with the shared
+AUTH_SECRET so vtt-server's zero-trust middleware accepts gateway traffic.
 """
 
+import base64
+import hashlib
+import hmac as hmac_mod
+import json
 import os
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -13,18 +21,60 @@ import httpx
 ENGINE_API_URL = os.environ.get("ENGINE_API_URL", "http://localhost:8088")
 ENGINE_TIMEOUT_SECONDS = 5.0
 
+_AUTH_SECRET = os.environ.get(
+    "VTT_ENGINE_SECRET", os.environ.get("AUTH_SECRET", "aethertable-dev-secret")
+)
+_SERVICE_TOKEN_TTL_SECONDS = 600
+
+
+def _sign_token(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hmac_mod.new(_AUTH_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(raw).decode() + "." + sig
+
+
+def _service_token() -> str:
+    """Gateway service identity token for server-to-server engine calls."""
+    return _sign_token(
+        {"user_id": "orchestrator-service", "exp": time.time() + _SERVICE_TOKEN_TTL_SECONDS}
+    )
+
 
 class EngineUnavailableError(Exception):
     """Raised when the authoritative engine cannot be reached."""
 
+class EngineRejectedError(Exception):
+    """Raised when the authoritative engine rejects a proposed action (4xx)."""
+
+    def __init__(self, status_code: int, detail: Any) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Engine rejected request ({status_code}): {detail}")
+
 
 async def engine_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Perform one request against the engine; raise EngineUnavailableError on failure."""
+    """Perform one authenticated request against the engine."""
     url = f"{ENGINE_API_URL}{path}"
+    headers = {"Authorization": f"Bearer {_service_token()}"}
     try:
         async with httpx.AsyncClient(timeout=ENGINE_TIMEOUT_SECONDS) as client:
-            response = await client.request(method, url, json=payload)
-            response.raise_for_status()
+            response = await client.request(method, url, json=payload, headers=headers)
+            if response.status_code >= 400:
+                raise EngineRejectedError(response.status_code, response.text)
+            return response.json()
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        raise EngineUnavailableError(f"Engine unreachable at {url}: {exc}") from exc
+
+
+def engine_request_sync(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Synchronous twin of engine_request for test/tooling call sites."""
+    url = f"{ENGINE_API_URL}{path}"
+    headers = {"Authorization": f"Bearer {_service_token()}"}
+    try:
+        with httpx.Client(timeout=ENGINE_TIMEOUT_SECONDS) as client:
+            response = client.request(method, url, json=payload, headers=headers)
+            if response.status_code >= 400:
+                raise EngineRejectedError(response.status_code, response.text)
             return response.json()
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise EngineUnavailableError(f"Engine unreachable at {url}: {exc}") from exc
@@ -62,8 +112,14 @@ async def resolve_concentration(action: Dict[str, Any]) -> Dict[str, Any]:
     return await engine_request("POST", "/api/v1/actions/concentration", action)
 
 
-async def resolve_death_save(action: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", "/api/v1/actions/death-save", action)
+async def resolve_death_save(session_id: str, entity_id: str) -> Dict[str, Any]:
+    """Death saves resolve against the SERVER-side entity state — the client
+    may only name the entity, never supply counters."""
+    return await engine_request(
+        "POST",
+        f"/api/v1/sessions/{session_id}/action/death-save",
+        {"entity_id": _coerce_uuid(entity_id)},
+    )
 
 
 async def generate_map(request: Dict[str, Any]) -> Dict[str, Any]:

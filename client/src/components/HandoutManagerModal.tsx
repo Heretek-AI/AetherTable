@@ -103,9 +103,12 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
     >
       {/* Content Layout: 2 Columns */}
       <div className="flex min-h-0">
-          {/* Left Column: Handouts List */}
-          <div className="w-1/3 border-r border-slate-800 p-4 space-y-2 overflow-y-auto bg-slate-950/50 font-mono text-xs">
-            <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2">
+          {/* Left Column: Handouts List (aged-paper ledger rail) */}
+          <div className="w-1/3 border-r border-[var(--rp-leather-700)] p-4 space-y-2 overflow-y-auto vtt-scrollbar font-mono text-xs">
+            <div
+              className="text-[10px] font-bold uppercase tracking-wider mb-2 font-display"
+              style={{ color: 'var(--statblock-header)' }}
+            >
               Campaign Clues ({handouts.length})
             </div>
 
@@ -120,23 +123,24 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
                   }}
                   className={`p-3 rounded-xl border transition cursor-pointer flex flex-col space-y-1 ${
                     isSelected
-                      ? 'bg-amber-950/50 border-amber-500 shadow-md text-amber-200'
-                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700 text-slate-300'
+                      ? 'bg-[var(--parchment-paper-aged)] border-tavern-accent shadow-md'
+                      : 'border-[color-mix(in_srgb,var(--rp-leather-700)_50%,transparent)] hover:border-[var(--rp-leather-600)]'
                   }`}
+                  style={{ color: 'var(--parchment-ink)' }}
                 >
                   <div className="flex items-center space-x-2">
                     <span>{h.icon}</span>
                     <span className="font-bold truncate">{h.title}</span>
                   </div>
 
-                  <div className="flex items-center justify-between text-[10px] opacity-70">
+                  <div className="flex items-center justify-between text-[10px] opacity-80">
                     <span className="uppercase">{h.category}</span>
                     <span
-                      className={`px-1.5 py-0.2 rounded ${
+                      className={
                         h.revealedTo === 'gm_only'
-                          ? 'bg-rose-950 text-rose-300 border border-rose-800'
-                          : 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                      }`}
+                          ? 'vtt-badge vtt-badge-danger'
+                          : 'vtt-badge vtt-badge-success'
+                      }
                     >
                       {h.revealedTo === 'gm_only' ? 'GM Only' : 'Revealed'}
                     </span>
@@ -147,57 +151,63 @@ export const HandoutManagerModal: React.FC<HandoutManagerModalProps> = ({
           </div>
 
           {/* Right Column: Stylized Parchment Viewer */}
-          <div className="w-2/3 p-6 overflow-y-auto flex flex-col justify-between bg-slate-900">
+          <div className="w-2/3 p-6 overflow-y-auto flex flex-col justify-between">
             {broadcastAlert && (
-              <div className="p-2.5 mb-3 bg-emerald-950/80 border border-emerald-600/50 rounded-xl text-xs font-mono text-emerald-300 flex items-center space-x-2 animate-fadeIn">
-                <Sparkles className="w-4 h-4 text-emerald-400" />
-                <span>{broadcastAlert}</span>
+              <div className="mb-3 border-l-4 border-[var(--state-success)] bg-[color-mix(in_srgb,var(--state-success)_12%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2 animate-fadeIn">
+                <Sparkles className="w-4 h-4 shrink-0" style={{ color: 'var(--state-success)' }} />
+                <span style={{ color: 'var(--parchment-ink)' }}>{broadcastAlert}</span>
               </div>
             )}
 
             {/* Parchment Document Frame — tokenized rustic surface
                 (.vtt-parchment: aged paper gradient, iron frame, candlelight
-                edge burn; see index.css component layer) */}
+                edge burn; see index.css component layer). Aged variant so the
+                document reads distinct from the parchment shell around it. */}
             <div className="vtt-parchment p-6 rounded-2xl relative space-y-4">
-              <div className="flex items-start justify-between border-b-2 border-amber-900/20 pb-3">
+              <div className="flex items-start justify-between border-b-2 pb-3" style={{ borderColor: 'var(--statblock-rule)' }}>
                 <div>
-                  <h3 className="text-xl font-extrabold tracking-wide" style={{ color: "var(--parchment-ink)" }}>
+                  <h3 className="text-xl font-extrabold tracking-wide font-display" style={{ color: 'var(--parchment-ink)' }}>
                     {activeHandout.title}
                   </h3>
-                  <div className="text-[11px] font-mono text-amber-800/80 mt-0.5">
+                  <div className="text-[11px] font-mono mt-0.5 opacity-70" style={{ color: 'var(--parchment-ink)' }}>
                     {activeHandout.dateFound}
                   </div>
                 </div>
                 <span className="text-2xl">{activeHandout.icon}</span>
               </div>
 
-              <div className="text-sm leading-relaxed whitespace-pre-line text-amber-950/90 font-serif italic">
+              <div className="text-sm leading-relaxed whitespace-pre-line font-serif italic" style={{ color: 'var(--parchment-ink)' }}>
                 "{activeHandout.fullText}"
               </div>
 
-              <div className="pt-3 border-t border-amber-900/20 flex items-center justify-between text-[11px] font-mono text-amber-900/70">
+              <div className="pt-3 border-t flex items-center justify-between text-[11px] font-mono opacity-70" style={{ borderColor: 'var(--rp-leather-700)', color: 'var(--parchment-ink)' }}>
                 <span>Authentic Campaign Relic</span>
                 <span>Seal Verified: OK</span>
               </div>
             </div>
 
             {/* Action Bar */}
-            <div className="pt-4 flex items-center justify-between border-t border-slate-800 mt-4">
-              <div className="flex items-center space-x-2 text-xs font-mono text-slate-400">
-                <Shield className="w-4 h-4 text-amber-400" />
-                <span>Current Access: <strong className="text-slate-200">{String(activeHandout.revealedTo)}</strong></span>
+            <div className="pt-4 flex items-center justify-between border-t border-[var(--rp-leather-700)] mt-4">
+              <div className="flex items-center space-x-2 text-xs font-mono" style={{ color: 'var(--parchment-ink)', opacity: 0.8 }}>
+                <Shield className="w-4 h-4" style={{ color: 'var(--tavern-accent-deep)' }} />
+                <span>Current Access: <strong style={{ color: 'var(--parchment-ink)' }}>{String(activeHandout.revealedTo)}</strong></span>
               </div>
 
               <div className="flex items-center space-x-2 font-mono text-xs">
+                {/* Whisper to Party → secondary leather-outline control.
+                    Note: this sheet holds no upload/delete flows; its only
+                    destructive-capable action (reveal) is intentionally not
+                    danger-toned since it is non-destructive. */}
                 <button
                   onClick={() => handleShare(activeHandout, 'party')}
-                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition cursor-pointer"
+                  className="vtt-btn vtt-btn-secondary"
+                  style={{ color: 'var(--parchment-ink)' }}
                 >
                   Whisper to Party
                 </button>
                 <button
                   onClick={() => handleShare(activeHandout, 'all')}
-                  className="flex items-center space-x-1.5 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg shadow transition cursor-pointer"
+                  className="vtt-btn vtt-btn-primary font-display tracking-wide"
                 >
                   <Share2 className="w-3.5 h-3.5" />
                   <span>Reveal to All Table</span>

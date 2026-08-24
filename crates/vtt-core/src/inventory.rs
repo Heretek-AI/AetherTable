@@ -41,12 +41,30 @@ impl InventoryManager {
     }
 
     pub fn get_item_effective_weight(&self, item_id: &Uuid) -> f32 {
+        self.get_item_effective_weight_guarded(item_id, &mut std::collections::HashSet::new())
+    }
+
+    /// Recursive container weight walk with a visited-node cycle guard:
+    /// a crafted `parent_container_id` cycle must terminate, not overflow.
+    fn get_item_effective_weight_guarded(
+        &self,
+        item_id: &Uuid,
+        visited: &mut std::collections::HashSet<Uuid>,
+    ) -> f32 {
+        if !visited.insert(*item_id) {
+            // Cycle detected — count this item once and stop descending.
+            return self
+                .items
+                .get(item_id)
+                .map(|i| i.base_weight_lbs * i.quantity as f32)
+                .unwrap_or(0.0);
+        }
         if let Some(item) = self.items.get(item_id) {
             let mut total = item.base_weight_lbs * item.quantity as f32;
             if item.is_container {
                 for other in self.items.values() {
                     if other.parent_container_id == Some(*item_id) {
-                        total += self.get_item_effective_weight(&other.id);
+                        total += self.get_item_effective_weight_guarded(&other.id, visited);
                     }
                 }
             }

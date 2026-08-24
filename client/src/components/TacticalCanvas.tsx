@@ -20,6 +20,8 @@ import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
 import { RaycastLighting, Point } from '../render/raycast_lighting';
 import { WeatherEffectsManager, WeatherType } from '../render/weather_effects';
+import { PixiBoard } from '../render/pixi_board';
+import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
 import { User } from '../types/auth';
 
@@ -98,16 +100,76 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   // FX Canvas Refs
   const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lightingCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pixiHostRef = useRef<HTMLDivElement | null>(null);
+  const pixiBoard = useRef<PixiBoard | null>(null);
+  const physicsDice = useRef<ServerDiceBox | null>(null);
 
   const internalParticleFX = useRef<ParticleFXManager>(new ParticleFXManager());
   const internalDiceBox = useRef<DiceBox3D>(new DiceBox3D());
   const raycastLighting = useRef<RaycastLighting>(new RaycastLighting());
   const weatherEffects = useRef<WeatherEffectsManager>(new WeatherEffectsManager());
 
+  // Physics dice (three.js + ammo.wasm) landing on SERVER-determined faces,
+  // falling back to the 2D canvas tumble when WASM assets are unavailable.
+  if (!physicsDice.current) physicsDice.current = new ServerDiceBox('dice-box-mount');
+  type DieType = 'd20' | 'd12' | 'd8' | 'd6' | 'd4';
+  const rollDiceAuthoritative = (
+    type: DieType,
+    value: number,
+    x?: number,
+    y?: number
+  ) => {
+    void (async () => {
+      const ok = await physicsDice.current?.rollPredetermined(type, value);
+      if (!ok && x !== undefined && y !== undefined) {
+        internalDiceBox.current.rollDice(type, value, x, y);
+      }
+    })();
+  };
+
   if (particleFXRef) particleFXRef.current = internalParticleFX.current;
-  if (diceBoxRef) diceBoxRef.current = internalDiceBox.current;
+  if (diceBoxRef) {
+    diceBoxRef.current = {
+      rollDice: rollDiceAuthoritative,
+    } as unknown as DiceBox3D;
+  }
 
   const cellSize = 60;
+
+  // GPU-batched board layer (WebGL/WebGPU via PixiJS v8). When init fails
+  // (no context, SSR, etc.) the DOM grid fallback below stays in charge.
+  useEffect(() => {
+    let cancelled = false;
+    const host = pixiBoard.current;
+    void host;
+    const el = pixiHostRef.current;
+    if (el && !pixiBoard.current) {
+      const board = new PixiBoard(cellSize);
+      board
+        .init(el, gridWidth, gridHeight, new Set(walls.map((w) => `${w.x}:${w.y}`)))
+        .then((ok) => {
+          if (!cancelled && !ok) {
+            board.destroy();
+            return;
+          }
+          if (!cancelled) pixiBoard.current = board;
+        });
+    }
+    return () => {
+      cancelled = true;
+      pixiBoard.current?.destroy();
+      pixiBoard.current = null;
+    };
+    // Rebuild only when the board geometry changes.
+  }, [gridWidth, gridHeight]);
+
+  // Wall edits redraw the batched board layer.
+  useEffect(() => {
+    const board = pixiBoard.current;
+    if (board?.isReady) {
+      void board.redraw(gridWidth, gridHeight, new Set(walls.map((w) => `${w.x}:${w.y}`)));
+    }
+  }, [walls, gridWidth, gridHeight]);
 
   // Initialize and update raycast walls
   useEffect(() => {
@@ -267,20 +329,20 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     switch (iconType) {
       case 'mage':
       case 'caster':
-        return <Sparkles className="w-5 h-5 text-purple-200" />;
+        return <Sparkles className="w-5 h-5 text-parchment-aged" />;
       case 'boss':
         return <Skull className="w-5 h-5 text-rose-200" />;
       case 'scout':
         return <Crosshair className="w-5 h-5 text-amber-200" />;
       case 'fighter':
       default:
-        return <Shield className="w-5 h-5 text-sky-200" />;
+        return <Shield className="w-5 h-5 text-tavern-accent" />;
     }
   };
 
   return (
     <div
-      className="relative w-full h-full bg-slate-950 overflow-hidden cursor-crosshair select-none"
+      className="relative w-full h-full bg-tavern-bg overflow-hidden cursor-crosshair select-none"
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
@@ -308,25 +370,25 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       {/* Tool rail sits at chrome layer: above canvas FX but below any popover/modal. */}
       <div className="absolute top-4 left-4 flex flex-wrap items-center gap-2 max-w-[calc(100%-2rem)] vtt-glass-panel p-2 rounded-xl text-xs font-mono shadow-2xl" style={{ zIndex: 'var(--z-chrome)' }}>
         {/* Zoom Controls */}
-        <div className="flex items-center gap-1 bg-slate-900/90 p-0.5 rounded-lg border border-slate-800">
+        <div className="flex items-center gap-1 vtt-surface p-0.5 rounded-lg">
           <button
             onClick={() => setZoom((z) => Math.min(2.2, z + 0.15))}
             aria-label="Zoom in"
-            className="w-6 h-6 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
+            className="w-6 h-6 flex items-center justify-center bg-black/30 hover:bg-black/20 rounded text-parchment-aged"
           >
             +
           </button>
-          <span className="text-slate-400 px-1" aria-live="polite">{Math.round(zoom * 100)}%</span>
+          <span className="text-parchment-aged/80 px-1" aria-live="polite">{Math.round(zoom * 100)}%</span>
           <button
             onClick={() => setZoom((z) => Math.max(0.5, z - 0.15))}
             aria-label="Zoom out"
-            className="w-6 h-6 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
+            className="w-6 h-6 flex items-center justify-center bg-black/30 hover:bg-black/20 rounded text-parchment-aged"
           >
             -
           </button>
         </div>
 
-        <div className="h-4 w-px bg-slate-800" />
+        <div className="h-4 w-px bg-tavern-border" />
 
         {/* Ruler Tool */}
         <button
@@ -337,7 +399,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             setAoeShape('none');
           }}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all ${
-            measureMode ? 'bg-purple-600 text-white font-bold' : 'bg-slate-900/90 hover:bg-slate-800 text-slate-300 border border-slate-800'
+            measureMode ? 'bg-rule-red text-parchment-aged font-bold' : 'vtt-surface hover:bg-black/20 text-parchment-aged/80'
           }`}
         >
           <Compass className="w-3.5 h-3.5" />
@@ -345,10 +407,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         </button>
 
         {/* AoE Templates */}
-        <div className="flex items-center gap-1 bg-slate-900/90 p-0.5 rounded-lg border border-slate-800">
+        <div className="flex items-center gap-1 vtt-surface p-0.5 rounded-lg">
           <button
             onClick={() => setAoeShape(aoeShape === 'sphere' ? 'none' : 'sphere')}
-            className={`p-1.5 rounded ${aoeShape === 'sphere' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+            className={`p-1.5 rounded ${aoeShape === 'sphere' ? 'bg-orange-600 text-white' : 'text-parchment-aged/70 hover:text-parchment-aged'}`}
             title="20ft Sphere AoE (Fireball)"
             aria-label="Toggle 20ft sphere area-of-effect template"
           >
@@ -356,7 +418,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
           <button
             onClick={() => setAoeShape(aoeShape === 'cone' ? 'none' : 'cone')}
-            className={`p-1.5 rounded ${aoeShape === 'cone' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+            className={`p-1.5 rounded ${aoeShape === 'cone' ? 'bg-orange-600 text-white' : 'text-parchment-aged/70 hover:text-parchment-aged'}`}
             title="15ft Cone AoE (Burning Hands)"
             aria-label="Toggle 15ft cone area-of-effect template"
           >
@@ -364,7 +426,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
           <button
             onClick={() => setAoeShape(aoeShape === 'cube' ? 'none' : 'cube')}
-            className={`p-1.5 rounded ${aoeShape === 'cube' ? 'bg-orange-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+            className={`p-1.5 rounded ${aoeShape === 'cube' ? 'bg-orange-600 text-white' : 'text-parchment-aged/70 hover:text-parchment-aged'}`}
             title="20ft Cube AoE"
             aria-label="Toggle 20ft cube area-of-effect template"
           >
@@ -372,10 +434,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           </button>
         </div>
 
-        <div className="h-4 w-px bg-slate-800" />
+        <div className="h-4 w-px bg-tavern-border" />
 
         {/* Multi-Player POV & Vision Perspective Selector */}
-        <div className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-lg border border-slate-800 text-[11px] font-mono">
+        <div className="flex items-center gap-1 vtt-surface p-1 rounded-lg text-[11px] font-mono">
           <button
             onClick={() => {
               setVisionPerspective('party');
@@ -383,8 +445,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             }}
             className={`flex items-center gap-1 px-2 py-1 rounded transition ${
               visionPerspective === 'party'
-                ? 'bg-purple-600 text-white font-bold'
-                : 'text-slate-400 hover:text-slate-200'
+                ? 'bg-rule-red text-parchment-aged font-bold'
+                : 'text-parchment-aged/70 hover:text-parchment-aged'
             }`}
             title="Party Shared Optical Vision"
           >
@@ -399,8 +461,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             }}
             className={`flex items-center gap-1 px-2 py-1 rounded transition ${
               visionPerspective === 'selected'
-                ? 'bg-purple-600 text-white font-bold'
-                : 'text-slate-400 hover:text-slate-200'
+                ? 'bg-rule-red text-parchment-aged font-bold'
+                : 'text-parchment-aged/70 hover:text-parchment-aged'
             }`}
             title="Individual Token Optical POV"
           >
@@ -415,8 +477,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             }}
             className={`flex items-center gap-1 px-2 py-1 rounded transition ${
               visionPerspective === 'gm_omniscient'
-                ? 'bg-purple-600 text-white font-bold'
-                : 'text-slate-400 hover:text-slate-200'
+                ? 'bg-rule-red text-parchment-aged font-bold'
+                : 'text-parchment-aged/70 hover:text-parchment-aged'
             }`}
             title="GM Master Sight (Unmasked Omniscient View)"
           >
@@ -433,7 +495,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             setTokenLightMode(modes[nextIdx]);
             globalAudio.playTurnAdvance();
           }}
-          className="flex items-center gap-1.5 bg-slate-900/90 px-2.5 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-orange-400 font-bold hover:bg-slate-800 transition cursor-pointer"
+          className="flex items-center gap-1.5 vtt-surface px-2.5 py-1 rounded-lg text-[11px] font-mono text-orange-400 font-bold hover:bg-black/20 transition cursor-pointer"
           title="Toggle Dynamic Lighting Source Preset"
         >
           <Flame className="w-3.5 h-3.5 text-orange-400" />
@@ -457,10 +519,10 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             setCurrentWeather(nextWeather);
             globalAudio.playTurnAdvance();
           }}
-          className="flex items-center gap-1.5 bg-slate-900/90 px-2.5 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-sky-400 font-bold hover:bg-slate-800 transition cursor-pointer"
+          className="flex items-center gap-1.5 vtt-surface px-2.5 py-1 rounded-lg text-[11px] font-mono text-[color:var(--rp-parchment-300)] font-bold hover:bg-black/20 transition cursor-pointer"
           title="Toggle Dynamic Tabletop Weather FX"
         >
-          <CloudRain className="w-3.5 h-3.5 text-sky-400" />
+          <CloudRain className="w-3.5 h-3.5 text-[color:var(--rp-parchment-300)]" />
           <span>
             {currentWeather === 'rain'
               ? 'Rain & Thunder'
@@ -476,14 +538,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
         {/* Token Elevation Stepper (Roll20 Style) */}
         {selectedTokenId && onUpdateTokenElevation && (
-          <div className="flex items-center gap-1.5 bg-slate-900/90 px-2 py-1 rounded-lg border border-slate-800 text-[11px] font-mono text-amber-300">
+          <div className="flex items-center gap-1.5 vtt-surface px-2 py-1 rounded-lg text-[11px] font-mono text-amber-300">
             <span>Elevation: {tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0}ft</span>
             <button
               onClick={() => {
                 const currentEl = tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0;
                 onUpdateTokenElevation(selectedTokenId, currentEl + 5);
               }}
-              className="w-5 h-5 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-bold cursor-pointer"
+              className="w-5 h-5 flex items-center justify-center bg-black/30 hover:bg-black/20 rounded text-parchment-aged font-bold cursor-pointer"
               title="Raise elevation +5ft"
             >
               +
@@ -493,7 +555,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 const currentEl = tokens.find((t) => t.id === selectedTokenId)?.elevationFeet || 0;
                 onUpdateTokenElevation(selectedTokenId, Math.max(0, currentEl - 5));
               }}
-              className="w-5 h-5 flex items-center justify-center bg-slate-800 hover:bg-slate-700 rounded text-slate-200 font-bold cursor-pointer"
+              className="w-5 h-5 flex items-center justify-center bg-black/30 hover:bg-black/20 rounded text-parchment-aged font-bold cursor-pointer"
               title="Lower elevation -5ft"
             >
               -
@@ -504,7 +566,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         {/* Center Button */}
         <button
           onClick={() => setPan({ x: 30, y: 30 })}
-          className="p-1.5 bg-slate-900/90 hover:bg-slate-800 text-slate-300 rounded-lg border border-slate-800 transition"
+          className="p-1.5 vtt-surface hover:bg-black/20 text-parchment-aged/80 rounded-lg transition"
           title="Recenter Map Viewport"
         >
           <Navigation className="w-3.5 h-3.5" />
@@ -521,53 +583,45 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
         }}
       >
         <div
-          className="grid relative rounded-xl border-2 border-slate-800 shadow-2xl bg-slate-950 overflow-hidden"
-          style={{
-            gridTemplateColumns: `repeat(${gridWidth}, ${cellSize}px)`,
-            gridTemplateRows: `repeat(${gridHeight}, ${cellSize}px)`,
-          }}
+          className="relative rounded-xl border-2 border-tavern-border shadow-2xl bg-tavern-bg overflow-hidden"
+          style={{ width: gridWidth * cellSize, height: gridHeight * cellSize }}
         >
-          {/* Grid Cells */}
+          {/* GPU-batched floor/wall layer (PixiJS v8 WebGL/WebGPU). */}
+          <div ref={pixiHostRef} className="absolute inset-0" />
+          {/* Physics dice overlay: full-stage WASM canvas, click-transparent. */}
+          <div id="dice-box-mount" className="absolute inset-0 pointer-events-none z-30" />
+
+          {/* Interaction + highlight overlay: only the cells that matter
+              (AoE footprint) are individual DOM nodes; plain floor cells are
+              handled by one click-mapping surface below. */}
           {Array.from({ length: gridHeight }).map((_, y) =>
             Array.from({ length: gridWidth }).map((_, x) => {
-              const wall = isWall(x, y);
-              
-              let isInsideAoe = false;
-              if (aoeOrigin && aoeShape === 'sphere') {
-                const dist = Math.sqrt((x - aoeOrigin.x) ** 2 + (y - aoeOrigin.y) ** 2);
-                isInsideAoe = dist <= 4.0;
-              }
-
-              return (
+              if (!aoeOrigin || aoeShape !== 'sphere') return null;
+              const dist = Math.sqrt((x - aoeOrigin.x) ** 2 + (y - aoeOrigin.y) ** 2);
+              return dist <= 4.0 ? (
                 <div
-                  key={`cell-${x}-${y}`}
-                  onClick={() => handleCellClick(x, y)}
-                  className={`relative border border-slate-900/80 transition-all ${
-                    wall
-                      ? 'bg-slate-850 border-slate-700/80 shadow-inner'
-                      : (x + y) % 2 === 0
-                      ? 'bg-slate-900/90 hover:bg-slate-850'
-                      : 'bg-slate-900/60 hover:bg-slate-850/60'
-                  }`}
-                  style={{ width: cellSize, height: cellSize }}
-                >
-                  <span className="absolute bottom-1 right-1 text-[8px] font-mono text-slate-700 select-none pointer-events-none">
-                    {String.fromCharCode(65 + x)}{y + 1}
-                  </span>
-
-                  {wall && (
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none text-slate-600/70">
-                      <Shield className="w-5 h-5 opacity-40" />
-                    </div>
-                  )}
-
-                  {isInsideAoe && (
-                    <div className="absolute inset-0 bg-orange-500/30 border border-orange-400/60 pointer-events-none animate-pulse-glow" />
-                  )}
-                </div>
-              );
+                  key={`aoe-${x}-${y}`}
+                  className="absolute inset-0 bg-orange-500/30 border border-orange-400/60 pointer-events-none animate-pulse-glow"
+                  style={{
+                    width: cellSize,
+                    height: cellSize,
+                    left: x * cellSize,
+                    top: y * cellSize,
+                  }}
+                />
+              ) : null;
             })
           )}
+          <div
+            className="absolute inset-0"
+            onClick={(event) => {
+              const rect = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
+              const cx = Math.floor((event.clientX - rect.left) / cellSize);
+              const cy = Math.floor((event.clientY - rect.top) / cellSize);
+              handleCellClick(cx, cy);
+            }}
+          />
+
 
           {/* Tokens Layer */}
           {tokens.map((token) => {
@@ -623,13 +677,13 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 {/* Token Condition Aura Ring */}
                 {token.conditions && token.conditions.length > 0 && (
                   <div
-                    className="absolute -inset-1 rounded-full border-2 border-dashed border-cyan-400 animate-spin pointer-events-none z-20"
+                    className="absolute -inset-1 rounded-full border-2 border-dashed border-rule-red animate-spin pointer-events-none z-20"
                     title={`Active Conditions: ${token.conditions.join(', ')}`}
                   />
                 )}
 
                 {isSelected && (
-                  <div className="absolute inset-0.5 rounded-full border-2 border-purple-400 animate-pulse-glow" />
+                  <div className="absolute inset-0.5 rounded-full border-2 border-tavern-accent animate-pulse-glow" />
                 )}
 
                 {token.elevationFeet && token.elevationFeet > 0 ? (
@@ -640,14 +694,14 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
                 <div
                   className={`w-11 h-11 rounded-full flex items-center justify-center shadow-xl border-2 transition-transform ${
-                    isSelected ? 'border-purple-400 scale-110 shadow-purple-500/50' : 'border-slate-300/80 shadow-black/80'
+                    isSelected ? 'border-tavern-accent scale-110 shadow-amber-600/50' : 'border-parchment-aged/80 shadow-black/80'
                   }`}
                   style={{ backgroundColor: token.color }}
                 >
                   {renderTokenIcon(token)}
                 </div>
 
-                <div className="w-10 h-1.5 bg-slate-950 rounded-full mt-1 overflow-hidden border border-slate-700 shadow-sm">
+                <div className="w-10 h-1.5 bg-black/60 rounded-full mt-1 overflow-hidden border border-tavern-border shadow-sm">
                   <div
                     className={`h-full transition-all duration-300 ${
                       token.hp / token.maxHp > 0.5
@@ -660,7 +714,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   />
                 </div>
 
-                <span className="text-[10px] font-mono font-semibold text-slate-200 px-1.5 py-0.5 bg-slate-950/90 border border-slate-800 rounded mt-0.5 backdrop-blur-md whitespace-nowrap shadow">
+                <span className="text-[10px] font-mono font-semibold text-parchment-aged px-1.5 py-0.5 bg-black/70 border border-tavern-border rounded mt-0.5 backdrop-blur-md whitespace-nowrap shadow">
                   {token.name}
                 </span>
               </div>

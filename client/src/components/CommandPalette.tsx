@@ -48,14 +48,14 @@ const COMPENDIUM_SOURCES: Array<{
     url: '/api/v1/compendium/spells?limit=400',
     key: 'spells',
     category: 'Spells (SRD)',
-    icon: <Sparkles className="w-4 h-4 text-indigo-400" />,
+    icon: <Sparkles className="w-4 h-4 text-[var(--rp-crimson-400)]" />,
     subtitleOf: (s) => `${s.level === 0 ? 'Cantrip' : `${s.level}${s.level === 1 ? 'st' : s.level === 2 ? 'nd' : s.level === 3 ? 'rd' : 'th'}-level`} ${s.school || ''} · ${s.casting_time || ''}`.trim(),
   },
   {
     url: '/api/v1/compendium/magic-items?limit=300',
     key: 'magic_items',
     category: 'Magic Items (SRD)',
-    icon: <Gem className="w-4 h-4 text-purple-400" />,
+    icon: <Gem className="w-4 h-4 text-tavern-accent" />,
     subtitleOf: (i) => `${i.rarity || 'Common'} ${i.category || ''}${i.requires_attunement ? ' · Attunement' : ''}`.trim(),
   },
   {
@@ -69,7 +69,7 @@ const COMPENDIUM_SOURCES: Array<{
     url: '/api/v1/compendium/glossary?limit=200',
     key: 'glossary',
     category: 'Rules Glossary (SRD)',
-    icon: <ScrollText className="w-4 h-4 text-cyan-400" />,
+    icon: <ScrollText className="w-4 h-4 text-[var(--rp-parchment-300)]" />,
     subtitleOf: (t) => `${t.tag ? `[${t.tag}] ` : ''}${(t.definition || '').slice(0, 70)}...`,
   },
 ];
@@ -147,22 +147,22 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
 
   const allItems = [
     // Navigation
-    { id: 'nav_tabletop', category: 'Navigation', title: 'Tactical Tabletop', subtitle: 'Live battlemap canvas & initiative order', icon: <Swords className="w-4 h-4 text-sky-400" />, action: () => onNavigate('tabletop') },
-    { id: 'nav_compendium', category: 'Navigation', title: 'Compendium Codex', subtitle: 'SRD 5.2 · 352 Spells · 330 Statblocks · 260 Magic Items', icon: <BookOpen className="w-4 h-4 text-amber-400" />, action: () => onNavigate('compendium') },
-    { id: 'nav_builder', category: 'Navigation', title: 'Character Studio (5-Step Wizard)', subtitle: 'Create hero, 27-pt buy, export PDF', icon: <Sparkles className="w-4 h-4 text-purple-400" />, action: () => onNavigate('builder') },
+    { id: 'nav_tabletop', category: 'Navigation', title: 'Tactical Tabletop', subtitle: 'Live battlemap canvas & initiative order', icon: <Swords className="w-4 h-4 text-[var(--rp-crimson-400)]" />, action: () => onNavigate('tabletop') },
+    { id: 'nav_compendium', category: 'Navigation', title: 'Compendium Codex', subtitle: 'SRD 5.2 · 352 Spells · 330 Statblocks · 260 Magic Items', icon: <BookOpen className="w-4 h-4 text-tavern-accent" />, action: () => onNavigate('compendium') },
+    { id: 'nav_builder', category: 'Navigation', title: 'Character Studio (5-Step Wizard)', subtitle: 'Create hero, 27-pt buy, export PDF', icon: <Sparkles className="w-4 h-4 text-[var(--rp-parchment-300)]" />, action: () => onNavigate('builder') },
     { id: 'nav_marketplace', category: 'Navigation', title: 'Campaign Marketplace', subtitle: 'Install .vttbundle modules & homebrew', icon: <Compass className="w-4 h-4 text-emerald-400" />, action: () => onNavigate('marketplace') },
     { id: 'nav_admin', category: 'Navigation', title: 'Platform Admin Console', subtitle: 'Cluster telemetry, users, RBAC roles', icon: <Zap className="w-4 h-4 text-rose-400" />, action: () => onNavigate('admin') },
     // Help & discoverability
-    { id: 'help_shortcuts', category: 'Help', title: 'Keyboard Shortcuts', subtitle: 'Cheat-sheet for every shortcut (also press ? anywhere)', icon: <Keyboard className="w-4 h-4 text-slate-300" />, action: () => { onClose(); onOpenShortcuts?.(); } },
-    
+    { id: 'help_shortcuts', category: 'Help', title: 'Keyboard Shortcuts', subtitle: 'Cheat-sheet for every shortcut (also press ? anywhere)', icon: <Keyboard className="w-4 h-4 text-[var(--rp-parchment-200)]" />, action: () => { onClose(); onOpenShortcuts?.(); } },
+
     // Spells
     { id: 'spell_fireball', category: 'Spells (SRD)', title: 'Fireball', subtitle: '3rd-level Evocation · 8d6 Fire 20ft Sphere', icon: <Flame className="w-4 h-4 text-orange-400" />, action: () => { if (onExecuteRoll) onExecuteRoll('8d6'); } },
-    { id: 'spell_shield', category: 'Spells (SRD)', title: 'Shield', subtitle: '1st-level Abjuration · +5 AC Reaction', icon: <Sparkles className="w-4 h-4 text-sky-400" />, action: () => { if (onExecuteRoll) onExecuteRoll('1d20+5'); } },
+    { id: 'spell_shield', category: 'Spells (SRD)', title: 'Shield', subtitle: '1st-level Abjuration · +5 AC Reaction', icon: <Sparkles className="w-4 h-4 text-[var(--rp-crimson-400)]" />, action: () => { if (onExecuteRoll) onExecuteRoll('1d20+5'); } },
     { id: 'spell_cure_wounds', category: 'Spells (SRD)', title: 'Cure Wounds', subtitle: '1st-level Evocation · 1d8 + MOD Healing', icon: <Sparkles className="w-4 h-4 text-emerald-400" />, action: () => { if (onExecuteRoll) onExecuteRoll('1d8+3'); } },
 
     // Monsters
     { id: 'mon_dragon', category: 'Monsters (SRD)', title: 'Adult Red Dragon', subtitle: 'CR 17 Huge Dragon · 256 HP · 19 AC', icon: <Skull className="w-4 h-4 text-rose-400" />, action: () => onNavigate('compendium') },
-    { id: 'mon_orc', category: 'Monsters (SRD)', title: 'Orc Warlord', subtitle: 'CR 3 Medium Humanoid · 58 HP · 16 AC', icon: <Skull className="w-4 h-4 text-amber-400" />, action: () => onNavigate('tabletop') },
+    { id: 'mon_orc', category: 'Monsters (SRD)', title: 'Orc Warlord', subtitle: 'CR 3 Medium Humanoid · 58 HP · 16 AC', icon: <Skull className="w-4 h-4 text-tavern-accent" />, action: () => onNavigate('tabletop') },
   ].concat(compendiumEntries);
 
   const filteredItems = allItems.filter(
@@ -203,11 +203,11 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full shadow-2xl overflow-hidden animate-fadeIn flex flex-col font-sans cursor-default"
+        className="vtt-glass-panel rounded-2xl max-w-xl w-full overflow-hidden animate-fadeIn flex flex-col cursor-default"
       >
         {/* Search Bar */}
-        <div className="p-3.5 border-b border-slate-800 flex items-center space-x-3 bg-slate-950/80">
-          <Search className="w-5 h-5 text-amber-400 shrink-0" />
+        <div className="p-3.5 border-b border-tavern-border flex items-center space-x-3 bg-tavern-bg/60">
+          <Search className="w-5 h-5 text-tavern-accent shrink-0" />
           <input
             ref={inputRef}
             type="text"
@@ -218,12 +218,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
               setSelectedIndex(0);
             }}
             onKeyDown={handleInputKeyDown}
-            className="flex-1 bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none font-mono"
+            className="vtt-input flex-1 text-sm"
           />
           <button
             type="button"
             onClick={onClose}
-            className="text-[10px] font-mono px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 rounded transition cursor-pointer"
+            className="vtt-btn vtt-btn-secondary px-1.5 py-0.5 text-[10px] font-mono"
             title="Press Escape or click to close"
           >
             ESC
@@ -231,9 +231,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         </div>
 
         {/* Results List */}
-        <div className="max-h-80 overflow-y-auto p-2 space-y-1">
+        <div className="max-h-80 overflow-y-auto p-2 space-y-1 vtt-scrollbar">
           {filteredItems.length === 0 ? (
-            <div className="p-6 text-center text-xs text-slate-500 font-mono">
+            <div className="p-6 text-center text-xs text-[var(--rp-parchment-300)] font-mono">
               No matching commands or compendium entries found.
             </div>
           ) : (
@@ -241,37 +241,37 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
               <div
                 key={item.id}
                 onClick={() => handleSelect(item)}
-                className={`p-2.5 rounded-xl border flex items-center justify-between transition cursor-pointer ${
+                className={`group p-2.5 rounded-xl border flex items-center justify-between transition cursor-pointer ${
                   idx === selectedIndex
-                    ? 'bg-slate-800/90 border-amber-500/50 shadow'
-                    : 'bg-slate-950/40 border-transparent hover:bg-slate-850'
+                    ? 'bg-[color-mix(in_srgb,var(--rp-leather-700)_40%,transparent)] border-tavern-accent'
+                    : 'border-transparent hover:bg-[color-mix(in_srgb,var(--rp-leather-700)_30%,transparent)] hover:text-[var(--rp-parchment-100)]'
                 }`}
               >
                 <div className="flex items-center space-x-3">
-                  <div className="p-2 bg-slate-900 rounded-lg border border-slate-800">
+                  <div className="p-2 bg-tavern-bg rounded-lg border border-tavern-border">
                     {item.icon}
                   </div>
                   <div>
-                    <div className="text-xs font-bold text-slate-100 flex items-center space-x-2">
+                    <div className="text-xs font-bold text-[var(--rp-parchment-100)] flex items-center space-x-2">
                       <span>{item.title}</span>
-                      <span className="text-[9px] font-mono px-1.5 py-0.2 bg-slate-900 border border-slate-800 text-slate-400 rounded">
+                      <span className="text-[10px] px-1 text-tavern-accent [font-variant:small-caps] tracking-wider">
                         {item.category}
                       </span>
                     </div>
-                    <div className="text-[10px] text-slate-400 font-mono mt-0.5">{item.subtitle}</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] mt-0.5">{item.subtitle}</div>
                   </div>
                 </div>
 
-                <ArrowRight className="w-3.5 h-3.5 text-slate-500 group-hover:text-amber-400" />
+                <ArrowRight className="w-3.5 h-3.5 text-[var(--rp-leather-600)] group-hover:text-tavern-accent" />
               </div>
             ))
           )}
         </div>
 
         {/* Footer */}
-        <div className="p-2.5 bg-slate-950 border-t border-slate-800 flex items-center justify-between text-[10px] font-mono text-slate-500">
+        <div className="p-2.5 bg-tavern-bg border-t border-tavern-border flex items-center justify-between text-[10px] font-mono text-[var(--rp-parchment-300)]">
           <div className="flex items-center space-x-2">
-            <span>Navigation & Compendium Hot-Search</span>
+            <span>Navigation &amp; Compendium Hot-Search</span>
           </div>
           <div className="flex items-center space-x-2">
             <span>Select: ↵</span>

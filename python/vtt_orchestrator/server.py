@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import hashlib
@@ -15,11 +16,12 @@ from typing import Dict, Any, List, Optional
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
-from .routing.engine_client import EngineUnavailableError
+from .routing.engine_client import EngineRejectedError, EngineUnavailableError
 from .storage import MemoryStore, PostgresStore, init_storage, public_user
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
+from .agents.tool_agent import EngineToolAgent
 from .simulation.faction_simulation import FactionSimulationGOAP
 from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
@@ -59,6 +61,7 @@ spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
+tool_agent = EngineToolAgent(streaming_gateway)
 pdf_renderer = CharacterSheetPDFRenderer()
 empirical_playtester = EmpiricalPlaytester()
 
@@ -274,7 +277,13 @@ def _require_user_id(token: str) -> str:
 
 def _auth_response(profile: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
-    token = _sign_token({"user_id": profile["id"], "exp": now + TOKEN_TTL_SECONDS})
+    # `role` travels inside the signed payload so the Rust engine's RBAC
+    # layer (gm/admin/spectator/player) can authorize without a DB lookup.
+    token = _sign_token({
+        "user_id": profile["id"],
+        "role": profile.get("role", "player"),
+        "exp": now + TOKEN_TTL_SECONDS,
+    })
     return {"token": token, "expires_in": TOKEN_TTL_SECONDS, "user": profile}
 
 
@@ -296,12 +305,24 @@ async def auth_signup(req: AuthSignupRequest):
     return _auth_response(public_user(record))
 
 
+# Seed credentials are environment-gated: no hardcoded backdoor accounts.
+SEED_GM_EMAIL = os.environ.get("AETHERTABLE_SEED_GM_EMAIL", "").strip().lower()
+SEED_GM_PASSWORD = os.environ.get("AETHERTABLE_SEED_GM_PASSWORD", "")
+
+
 @app.post("/api/v1/auth/login")
 async def auth_login(req: AuthLoginRequest):
     key = req.email.strip().lower()
     record = await storage_backend.get_user_by_email(key)
-    # Seed default GM account on first use so the demo flow works out of the box.
-    if record is None and key == "gm@aethertable.io" and req.password == "dragonlance":
+    # Optionally seed a GM account on first use, ONLY when the operator has
+    # provisioned explicit credentials via AETHERTABLE_SEED_GM_* env vars.
+    if (
+        record is None
+        and SEED_GM_EMAIL
+        and SEED_GM_PASSWORD
+        and key == SEED_GM_EMAIL
+        and req.password == SEED_GM_PASSWORD
+    ):
         record = await storage_backend.create_user(
             email=key,
             username="gm",
@@ -513,15 +534,17 @@ class EngineSessionRequest(BaseModel):
 
 
 class EngineAttackRequest(BaseModel):
+    """Trust-inversion lockdown: clients may ONLY reference entities by id.
+    Attack bonuses, ACs and damage dice live in server-side stat blocks and
+    are resolved inside vtt-core — any client-supplied math is refused here
+    before it can even reach the engine."""
     session_id: str
     attacker_id: str
     target_id: str
-    attack_bonus: int
-    target_ac: int
-    damage_expression: str = "1d8+3"
-    damage_type: str = "slashing"
-    advantage: bool = False
-    disadvantage: bool = False
+    action_index: int = 0
+
+    class Config:
+        extra = "forbid"
 
 
 class EngineCheckRequest(BaseModel):
@@ -545,11 +568,12 @@ class EngineConcentrationRequest(BaseModel):
 
 
 class EngineDeathSaveRequest(BaseModel):
-    successes: int = 0
-    failures: int = 0
-    is_stabilized: bool = False
-    is_dead: bool = False
-    natural_roll: Optional[int] = None
+    """Server-authoritative death saves: only the entity reference travels."""
+    session_id: str
+    entity_id: str
+
+    class Config:
+        extra = "forbid"
 
 
 class EngineMapGenerateRequest(BaseModel):
@@ -564,6 +588,13 @@ async def _engine_call(coro) -> Any:
         return await coro
     except EngineUnavailableError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+    except EngineRejectedError as exc:
+        # Surface the engine's authoritative rejection verbatim (404/409/422).
+        try:
+            detail = json.loads(exc.detail)
+        except (TypeError, ValueError):
+            detail = exc.detail
+        raise HTTPException(status_code=exc.status_code, detail=detail)
 
 
 @app.post("/api/v1/engine/session")
@@ -573,12 +604,13 @@ async def engine_create_session(req: EngineSessionRequest):
 
 @app.post("/api/v1/engine/attack")
 async def engine_resolve_attack(req: EngineAttackRequest):
-    action = req.model_dump(exclude={"session_id"})
-    # The engine's AttackActionReq types attacker/target as UUIDs and
-    # DamageType deserializes snake_case ("fire", "piercing", ...).
-    action["attacker_id"] = engine_client._coerce_uuid(action["attacker_id"])
-    action["target_id"] = engine_client._coerce_uuid(action["target_id"])
-    action["damage_type"] = action["damage_type"].lower()
+    # Reference-only payload: ids + optional action index. No math crosses
+    # this boundary in either direction — the engine owns every modifier.
+    action = {
+        "attacker_id": engine_client._coerce_uuid(req.attacker_id),
+        "target_id": engine_client._coerce_uuid(req.target_id),
+        "action_index": req.action_index,
+    }
     return await _engine_call(engine_client.resolve_attack(req.session_id, action))
 
 
@@ -603,7 +635,7 @@ async def engine_resolve_concentration(req: EngineConcentrationRequest):
 
 @app.post("/api/v1/engine/death-save")
 async def engine_resolve_death_save(req: EngineDeathSaveRequest):
-    return await _engine_call(engine_client.resolve_death_save(req.model_dump()))
+    return await _engine_call(engine_client.resolve_death_save(req.session_id, req.entity_id))
 
 
 @app.post("/api/v1/engine/map/generate")
@@ -627,6 +659,61 @@ async def engine_room_presence(room_id: str):
     return await _engine_call(
         engine_client.engine_request("GET", f"/api/v1/rooms/{room_id}/presence")
     )
+
+
+# --- Engine session durability bridge ----------------------------------------
+# vtt-server holds live sessions in memory; these endpoints snapshot them to
+# PostgreSQL (or the memory fallback) and hydrate them back, so an engine
+# restart no longer loses the world.
+
+class EnginePersistRequest(BaseModel):
+    session_id: str
+    owner_user_id: Optional[str] = None
+
+
+@app.post("/api/v1/engine-session/persist")
+async def persist_engine_session(req: EnginePersistRequest):
+    raw = await _engine_call(
+        engine_client.engine_request("GET", f"/api/v1/sessions/{req.session_id}")
+    )
+    await storage_backend.save_engine_snapshot(req.session_id, req.owner_user_id, raw)
+    return {
+        "status": "PERSISTED",
+        "session_id": req.session_id,
+        "entities": len(raw.get("entities", {})),
+        "events": len(raw.get("ledger", {}).get("events", [])),
+    }
+
+
+class EngineHydrateRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/api/v1/engine-session/hydrate")
+async def hydrate_engine_session(req: EngineHydrateRequest):
+    snapshot = await storage_backend.load_engine_snapshot(req.session_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="No persisted snapshot for this session")
+    result = await _engine_call(
+        engine_client.engine_request(
+            "PUT", f"/api/v1/sessions/{req.session_id}/restore", snapshot
+        )
+    )
+    return {"status": "HYDRATED", "engine_response": result}
+
+
+# --- Multi-agent tool-calling loop --------------------------------------------
+
+class AgentTurnRequest(BaseModel):
+    """One agentic turn: the LLM emits structured tool calls that execute
+    exclusively through the authenticated authoritative engine API."""
+    user_intent: str
+    session_id: str
+
+
+@app.post("/api/v1/agent/turn")
+async def agent_turn(req: AgentTurnRequest):
+    return await tool_agent.run_turn(req.user_intent, req.session_id)
 
 
 @app.post("/api/v1/character/export-pdf")
@@ -684,6 +771,129 @@ def export_campaign_bundle(req: CampaignExportBundleRequest):
         raise HTTPException(status_code=500, detail=f"Bundle packaging failed: {str(e)}")
 
 
+class BundleImportRequest(BaseModel):
+    """Base64-encoded .vttbundle archive."""
+    bundle_b64: str
+    session_name: str = "Imported Bundle"
+
+
+@app.post("/api/v1/campaign/import-bundle")
+async def import_campaign_bundle(req: BundleImportRequest, token: str = Query(...)):
+    # Importing a world mutates shared state — authenticated users only.
+    _require_user_id(token)
+    import base64 as _b64
+
+    try:
+        campaign = global_bundle_packager.import_bundle(_b64.b64decode(req.bundle_b64))
+    except Exception as exc:
+        # BadZipFile / missing manifest / malformed members all reject cleanly.
+        raise HTTPException(status_code=422, detail=f"Invalid .vttbundle: {exc}")
+
+    manifest = campaign.get("manifest", {})
+    map_layout = campaign.get("map_layout", {})
+    tokens = campaign.get("tokens", [])
+
+    # Hydrate a live engine session from the bundle (lobby-to-canvas flow).
+    created = await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            "/api/v1/sessions",
+            {
+                "campaign_id": "00000000-0000-0000-0000-000000000002",
+                "session_name": req.session_name or manifest.get("title", "Imported"),
+            },
+        )
+    )
+    session_id = created["session_id"]
+
+    width = int(map_layout.get("grid_width", 16))
+    height = int(map_layout.get("grid_height", 12))
+    walls = [(int(w["x"]), int(w["y"])) for w in map_layout.get("walls", [])
+             if isinstance(w, dict) and "x" in w and "y" in w]
+    if walls:
+        await _engine_call(
+            engine_client.engine_request(
+                "PUT",
+                f"/api/v1/sessions/{session_id}/map",
+                {
+                    "width": width,
+                    "height": height,
+                    "solid_cells": walls,
+                    "difficult_terrain": [],
+                    "cell_size_feet": 5.0,
+                },
+            )
+        )
+
+    spawned = 0
+    for tok in tokens[:64]:
+        try:
+            entity = _bundle_token_to_entity(tok)
+            await _engine_call(
+                engine_client.engine_request(
+                    "POST",
+                    f"/api/v1/sessions/{session_id}/entities",
+                    entity,
+                )
+            )
+            spawned += 1
+        except Exception:
+            continue  # malformed token — skip rather than poison the import
+
+    return {
+        "status": "IMPORTED",
+        "session_id": session_id,
+        "title": manifest.get("title"),
+        "map_walls_applied": len(walls),
+        "tokens_spawned": spawned,
+    }
+
+
+def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a bundle token into an engine AddEntity payload. The engine's
+    request flattens the EntityState with an optional `ingress` sibling;
+    ingress gating is validated server-side (the verified flag is advisory)."""
+    entity_id = engine_client._coerce_uuid(str(tok.get("id") or tok.get("name", "token")))
+    hp = int(tok.get("hp", tok.get("max_hp", 10)) or 10)
+    x = float(tok.get("x", 2.5) or 2.5)
+    y = float(tok.get("y", 2.5) or 2.5)
+    return {
+        "id": entity_id,
+        "compendium_id": str(tok.get("compendium_id", "bundle_token")),
+        "name": str(tok.get("name", "Token")),
+        "is_player": bool(tok.get("is_player", False)),
+        "current_hp": hp,
+        "max_hp": hp,
+        "temp_hp": 0,
+        "ac": int(tok.get("ac", 10) or 10),
+        "speed_feet": float(tok.get("speed", 30) or 30),
+        "position": [x, y, 0.0],
+        "zone_id": "Zone_Default",
+        "abilities": {"strength": 10, "dexterity": 10, "constitution": 10,
+                      "intelligence": 10, "wisdom": 10, "charisma": 10},
+        "conditions": [],
+        "action_budget": {"action": True, "bonus_action": True, "reaction": True,
+                          "movement_remaining_feet": 30.0,
+                          "free_object_interaction": True},
+        "spell_slots_remaining": {},
+        "attacks": [],
+        "resistances": [],
+        "vulnerabilities": [],
+        "immunities": [],
+        "inventory": {"items": {}},
+        "is_conscious": True,
+        "is_dead": False,
+        "is_visible": True,
+        "ingress": {
+            "entity_id": entity_id,
+            "ingress_type": "SPAWN_EVENT",
+            "source_point": [0.0, 0.0, 0.0],
+            "target_point": [x, y, 0.0],
+            "verified": False,
+        },
+    }
+
+
 @app.post("/api/v1/homebrew/parse-markdown")
 def parse_homebrew_markdown(req: HomebrewParseRequest):
     return global_homebrew_parser.parse_statblock(req.markdown_text)
@@ -714,15 +924,80 @@ async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
     # Ground the narration in SRD 5.2 stat blocks whenever the player's
     # action names a known monster or spell.
     srd_facts = extract_srd_context(req.user_intent)
-    generator = streaming_gateway.stream_narrative(
+    raw_generator = streaming_gateway.stream_narrative(
         user_intent=req.user_intent,
         engine_payload=req.engine_execution_payload,
         context={"srd": srd_facts},
     )
+
+    async def audited_stream():
+        """Pre-commit invariant interception ON the streaming path.
+
+        Tokens are forwarded as they arrive, but completed sentences are
+        audited against the live engine payload. A genuine invariant
+        violation (e.g. narrated death of a still-breathing target) emits a
+        corrective system event and CUTS the stream — unaudited continuation
+        never reaches the client.
+        """
+        import json as _json
+
+        buffer = ""
+
+        def audit(sentence: str) -> list:
+            verdict = auditor.audit_proposal(
+                turn_index=req.turn_index,
+                entity_id=req.entity_id,
+                proposed_narrative=sentence,
+                engine_execution_payload=req.engine_execution_payload,
+                active_entity_count=req.active_entity_count,
+                previous_entity_count=req.previous_entity_count,
+                ingress_verified_count=req.ingress_count,
+                egress_verified_count=req.egress_count,
+            )
+            return list(verdict.failures)
+
+        async for chunk in raw_generator:
+            yield chunk
+
+            # Extract the token text from the SSE frame to build the buffer.
+            if chunk.startswith("data: "):
+                try:
+                    frame = _json.loads(chunk[len("data: "):])
+                    buffer += frame.get("token", "")
+                except (ValueError, TypeError):
+                    pass
+
+            # Audit at sentence boundaries (oldest complete sentence first).
+            while True:
+                match = _SENTENCE_END_RE.search(buffer)
+                if match is None or match.end() >= len(buffer):
+                    # No fully-terminated sentence pending audit.
+                    break
+                sentence = buffer[:match.end()]
+                failures = audit(sentence)
+                if failures:
+                    corrective = "; ".join(f.corrective_constraint for f in failures)
+                    payload = _json.dumps({
+                        "token": f" [SYSTEM: narrative halted by Pre-Commit Auditor — {corrective}]",
+                        "done": False,
+                    })
+                    yield f"data: {payload}\n\n"
+                    yield f"data: {_json.dumps({'token': '', 'done': True})}\n\n"
+                    return
+                buffer = buffer[match.end():]
+
+        # Final audit on any trailing fragment.
+        if buffer.strip():
+            if audit(buffer):
+                yield 'data: {"token": "", "done": true, "auditor_violation": true}\n\n'
+
     return StreamingResponse(
-        generator,
+        audited_stream(),
         media_type="text/event-stream",
     )
+
+
+_SENTENCE_END_RE = re.compile(r"[.!?…](\s|$)")
 
 
 @app.get("/api/v1/compendium/lore-lookup")
@@ -733,7 +1008,12 @@ def compendium_lore_lookup(
 
 
 @app.post("/api/v1/lore/assert")
-def assert_lore(assertion: LoreAssertionPayload):
+def assert_lore(
+    assertion: LoreAssertionPayload,
+    token: str = Query(..., description="HMAC session token"),
+):
+    # Lore canon is shared world state — writes require an authenticated user.
+    _require_user_id(token)
     return lore_graph.submit_assertion(assertion)
 
 

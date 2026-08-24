@@ -25,3 +25,12 @@ env_logger = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
+
+[dev-dependencies]
+actix-http = "3"

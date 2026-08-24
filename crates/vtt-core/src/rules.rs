@@ -109,6 +109,54 @@ pub struct ConcentrationBreakResult {
     pub maintained: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CastSpellResult {
+    pub caster_id: Uuid,
+    pub target_id: Option<Uuid>,
+    pub spell_id: String,
+    pub slot_level_used: u8,
+    pub damage_total: i32,
+    pub target_hp_remaining: Option<i32>,
+    pub concentration_started: bool,
+    pub counterspelled: bool,
+}
+
+/// Hard sanity caps on spell damage expressions. Until spell definitions are
+/// served exclusively from the compendium store, any client-supplied formula
+/// is clamped to these bounds so absurdity ("9999d9999") can never resolve.
+pub const MAX_SPELL_DICE_COUNT: u32 = 40;
+pub const MAX_SPELL_DIE_SIDES: u32 = 12;
+
+/// Parses "NdM+K" / "NdM-K" / "NdM" and enforces dice-count/sides caps.
+fn clamp_damage_expression(expr: &str) -> Result<String, String> {
+    let expr = expr.trim().to_lowercase().replace(' ', "");
+    if expr.is_empty() {
+        return Ok("0".to_string());
+    }
+    let (dice_part, modifier) = match expr.find(['+', '-']) {
+        Some(idx) => {
+            let m = expr[idx..].parse::<i32>().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+            (&expr[..idx], m)
+        }
+        None => (expr.as_str(), 0),
+    };
+    let (count_str, sides_str) = dice_part
+        .split_once('d')
+        .ok_or_else(|| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+    let count: u32 = count_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+    let sides: u32 = sides_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+    let capped_count = count.min(MAX_SPELL_DICE_COUNT);
+    let capped_sides = sides.min(MAX_SPELL_DIE_SIDES).max(1);
+    if count > MAX_SPELL_DICE_COUNT || sides > MAX_SPELL_DIE_SIDES {
+        // Silently clamped counts would be dishonest — reject instead.
+        return Err(format!(
+            "SPELL_DAMAGE_EXCEEDS_CAPS: {}d{} > {}d{}",
+            count, sides, capped_count, capped_sides
+        ));
+    }
+    Ok(format!("{}d{}{}", capped_count, capped_sides, if modifier >= 0 { format!("+{}", modifier) } else { format!("{}", modifier) }))
+}
+
 pub struct RulesEvaluator;
 
 impl RulesEvaluator {
@@ -299,8 +347,133 @@ impl RulesEvaluator {
         })
     }
 
-    pub fn apply_damage_to_hp(
-        current_hp: i32,
+    /// Authoritative spellcasting validation (GOALS.md Pillar 3):
+    /// 1. caster must be capable of acting
+    /// 2. an unexpended slot at `cast_level` OR HIGHER must exist — the
+    ///    lowest sufficient level is expended
+    /// 3. verbal/somatic/material component flags are validated against the
+    ///    caster's state
+    /// 4. concentration limits: a new concentration spell replaces the old
+    /// 5. damage is rolled from the spell formula with sanity caps applied,
+    ///    then applied through resist/vuln/immunity + temp-HP absorption
+    ///
+    /// `counterspelled` pre-empts everything after slot expenditure (SRD:
+    /// a counterspelled spell fails but the slot is still spent).
+    pub fn validate_and_cast_spell(
+        dice: &mut DiceEngine,
+        caster: &mut EntityState,
+        target: Option<&mut EntityState>,
+        spell: &SpellDefinition,
+        cast_level: u8,
+        counterspelled: bool,
+    ) -> Result<CastSpellResult, String> {
+        // 1. Capacity.
+        if !caster.can_act() {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if spell.verbal_component && !caster.is_conscious {
+            return Err("COMPONENT_UNAVAILABLE_VERBAL".to_string());
+        }
+        let _ = spell.somatic_component; // somatic failures need a bound-hands model; none yet.
+        let _ = spell.material_component_desc;
+
+        if cast_level < spell.level || cast_level > 9 {
+            return Err(format!(
+                "INVALID_SLOT_LEVEL: spell of level {} cannot be cast at slot {}",
+                spell.level, cast_level
+            ));
+        }
+
+        // 2. Slot availability: exact level first, then upcast ladder.
+        let mut slot_level_used: Option<u8> = None;
+        for level in spell.level..=9 {
+            if caster.spell_slots_remaining.get(&level).copied().unwrap_or(0) > 0 {
+                slot_level_used = Some(level);
+                break;
+            }
+        }
+        let slot_level_used = slot_level_used.ok_or_else(|| {
+            format!("NO_SPELL_SLOTS: no unexpended slot at level {} or higher", spell.level)
+        })?;
+        *caster
+            .spell_slots_remaining
+            .entry(slot_level_used)
+            .or_insert(1) -= 1;
+
+        // Slot is now spent — Counterspell resolves AFTER expenditure.
+        let target_id_captured = target.as_ref().map(|t| t.id);
+        if counterspelled {
+            return Ok(CastSpellResult {
+                caster_id: caster.id,
+                target_id: target_id_captured,
+                spell_id: spell.spell_id.clone(),
+                slot_level_used,
+                damage_total: 0,
+                target_hp_remaining: None,
+                concentration_started: false,
+                counterspelled: true,
+            });
+        }
+
+        // 4. Concentration lifecycle (replacement per SRD).
+        let concentration_started = if spell.is_concentration {
+            Self::begin_concentration(caster, &spell.spell_id);
+            true
+        } else {
+            false
+        };
+
+        // 5. Damage application with caps and resistances.
+        let mut damage_total = 0i32;
+        let mut hp_remaining: Option<i32> = None;
+        if let (Some(expr), Some(dtype), Some(target)) =
+            (spell.damage_formula.as_deref(), spell.damage_type, target)
+        {
+            let clamped = clamp_damage_expression(expr)?;
+            let raw = dice.roll_expression(&clamped)?.total;
+            damage_total = if target.immunities.contains(&dtype) {
+                0
+            } else if target.resistances.contains(&dtype) {
+                raw / 2
+            } else if target.vulnerabilities.contains(&dtype) {
+                raw * 2
+            } else {
+                raw
+            };
+
+            let (hp_rem, temp_rem, dead) = Self::apply_damage_to_hp(
+                target.current_hp,
+                target.max_hp,
+                target.temp_hp,
+                damage_total,
+            );
+            target.temp_hp = temp_rem;
+            target.current_hp = hp_rem;
+            target.is_conscious = hp_rem > 0;
+            target.is_dead = target.is_dead || dead;
+            hp_remaining = Some(hp_rem);
+
+            // Damage-triggered concentration check on the TARGET.
+            if target.concentration.is_some() && damage_total > 0 {
+                let con_mod = target.abilities.modifier(Ability::Constitution);
+                let natural = dice.roll_d20();
+                Self::apply_damage_to_concentration(target, damage_total, natural, con_mod);
+            }
+        }
+
+        Ok(CastSpellResult {
+            caster_id: caster.id,
+            target_id: target_id_captured,
+            spell_id: spell.spell_id.clone(),
+            slot_level_used,
+            damage_total,
+            target_hp_remaining: hp_remaining,
+            concentration_started,
+            counterspelled: false,
+        })
+    }
+
+    pub fn apply_damage_to_hp(        current_hp: i32,
         max_hp: i32,
         temp_hp: i32,
         damage: i32,

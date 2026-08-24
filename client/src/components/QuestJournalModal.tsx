@@ -36,6 +36,19 @@ interface QuestJournalModalProps {
   onShareToChat?: (text: string) => void;
 }
 
+/** Status → printed-book badge variant (failed kept for the type contract). */
+const STATUS_BADGE: Record<QuestItem['status'], string> = {
+  active: 'vtt-badge',
+  completed: 'vtt-badge vtt-badge-success',
+  failed: 'vtt-badge vtt-badge-danger',
+};
+
+const DISPOSITION_BADGE: Record<NPCDossier['disposition'], string> = {
+  friendly: 'vtt-badge vtt-badge-success',
+  neutral: 'vtt-badge',
+  hostile: 'vtt-badge vtt-badge-danger',
+};
+
 export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
   isOpen,
   onClose,
@@ -165,6 +178,13 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
     setTimeout(() => setShareAlert(null), 2500);
   };
 
+  const TABS: { id: typeof activeTab; label: string }[] = [
+    { id: 'quests', label: `Active Quests (${quests.length})` },
+    { id: 'npcs', label: `NPC Dossiers (${npcs.length})` },
+    { id: 'chronicles', label: 'Session Chronicles' },
+    { id: 'loot', label: 'Party Treasury & Loot' },
+  ];
+
   return (
     <ModalShell
       isOpen={isOpen}
@@ -177,7 +197,7 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
         <div className="flex justify-end">
           <button
             onClick={onClose}
-            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
+            className="vtt-btn vtt-btn-primary font-display tracking-wide"
           >
             Close Journal
           </button>
@@ -185,63 +205,35 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
       }
     >
       {/* Tab Navigation */}
-        <div className="flex border-b border-slate-800 bg-slate-950 px-6 pt-2 font-mono text-xs space-x-2">
-          <button
-            onClick={() => setActiveTab('quests')}
-            className={`px-4 py-2 border-b-2 font-bold transition cursor-pointer ${
-              activeTab === 'quests'
-                ? 'border-amber-500 text-amber-300'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Active Quests ({quests.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('npcs')}
-            className={`px-4 py-2 border-b-2 font-bold transition cursor-pointer ${
-              activeTab === 'npcs'
-                ? 'border-purple-500 text-purple-300'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            NPC Dossiers ({npcs.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('chronicles')}
-            className={`px-4 py-2 border-b-2 font-bold transition cursor-pointer ${
-              activeTab === 'chronicles'
-                ? 'border-sky-500 text-sky-300'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Session Chronicles
-          </button>
-          <button
-            onClick={() => setActiveTab('loot')}
-            className={`px-4 py-2 border-b-2 font-bold transition cursor-pointer ${
-              activeTab === 'loot'
-                ? 'border-emerald-500 text-emerald-300'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Party Treasury & Loot
-          </button>
+        <div className="vtt-tabbar w-full font-mono text-xs">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              data-active={activeTab === tab.id}
+              className="vtt-tab"
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
 
         {/* Content Body */}
-        <div className="p-6 overflow-y-auto flex-1 max-h-[60vh]">
+        <div className="p-6 overflow-y-auto flex-1 max-h-[60vh] vtt-scrollbar">
           {shareAlert && (
-            <div className="p-2.5 mb-4 bg-emerald-950/80 border border-emerald-600/50 rounded-xl text-xs font-mono text-emerald-300 flex items-center space-x-2 animate-fadeIn">
-              <Sparkles className="w-4 h-4 text-emerald-400" />
-              <span>{shareAlert}</span>
+            <div
+              className="mb-4 border-l-4 border-[var(--state-success)] bg-[color-mix(in_srgb,var(--state-success)_10%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2 animate-fadeIn"
+            >
+              <Sparkles className="w-4 h-4 shrink-0" style={{ color: 'var(--state-success)' }} />
+              <span className="text-[var(--rp-parchment-200)]">{shareAlert}</span>
             </div>
           )}
 
           {/* Quests Tab */}
           {activeTab === 'quests' && (
             <div className="grid grid-cols-3 gap-6 h-full">
-              {/* Quest List */}
-              <div className="col-span-1 space-y-2 border-r border-slate-800 pr-4 font-mono text-xs">
+              {/* Quest List — ledger entries on tavern chrome */}
+              <div className="col-span-1 space-y-2 border-r border-tavern-border pr-4 font-mono text-xs">
                 {quests.map((q) => {
                   const isSelected = q.id === activeQuest.id;
                   return (
@@ -253,20 +245,14 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
                       }}
                       className={`p-3 rounded-xl border transition cursor-pointer space-y-1 ${
                         isSelected
-                          ? 'bg-amber-950/40 border-amber-500 text-amber-200 shadow'
-                          : 'bg-slate-950/50 border-slate-800 hover:border-slate-700 text-slate-300'
+                          ? 'bg-tavern-surface border-tavern-accent shadow-[0_0_14px_rgba(217,119,6,0.2)]'
+                          : 'vtt-surface rounded-xl hover:border-[var(--rp-leather-600)]'
                       }`}
                     >
-                      <div className="font-bold truncate">{q.title}</div>
-                      <div className="flex items-center justify-between text-[10px] text-slate-400">
+                      <div className={`font-bold truncate ${isSelected ? 'text-tavern-accent' : 'text-[var(--rp-parchment-100)]'}`}>{q.title}</div>
+                      <div className="flex items-center justify-between text-[10px] text-[var(--rp-parchment-300)]">
                         <span>{q.location}</span>
-                        <span
-                          className={`px-1.5 py-0.2 rounded font-bold uppercase ${
-                            q.status === 'completed'
-                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                              : 'bg-amber-950 text-amber-400 border border-amber-800'
-                          }`}
-                        >
+                        <span className={`${STATUS_BADGE[q.status]} uppercase`}>
                           {q.status}
                         </span>
                       </div>
@@ -275,66 +261,77 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
                 })}
               </div>
 
-              {/* Quest Details Card */}
+              {/* Quest Details — the quest prints as an in-world document */}
               <div className="col-span-2 space-y-4 flex flex-col justify-between">
                 <div className="space-y-4">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <h3 className="text-lg font-bold font-serif text-slate-100">{activeQuest.title}</h3>
-                      <div className="text-xs text-slate-400 font-mono mt-0.5">
-                        Giver: <strong className="text-slate-200">{activeQuest.giver}</strong> · Region:{' '}
-                        <strong className="text-slate-200">{activeQuest.location}</strong>
+                  <div className="vtt-parchment rounded-xl p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <h3 className="text-lg font-bold font-display tracking-wide" style={{ color: 'var(--parchment-ink)' }}>
+                          {activeQuest.title}
+                        </h3>
+                        <div className="text-xs mt-0.5" style={{ color: 'var(--parchment-ink)', opacity: 0.75 }}>
+                          Giver: <strong className="font-display" style={{ color: 'var(--statblock-header)' }}>{activeQuest.giver}</strong> · Region:{' '}
+                          <strong style={{ color: 'var(--parchment-ink)' }}>{activeQuest.location}</strong>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-2 text-xs shrink-0">
+                        <span className="vtt-badge">🪙 {activeQuest.goldReward} GP</span>
+                        <span className="vtt-badge">⭐ {activeQuest.xpReward} XP</span>
                       </div>
                     </div>
 
-                    <div className="flex items-center space-x-2 text-xs font-mono">
-                      <span className="px-2 py-1 bg-amber-950 text-amber-300 border border-amber-800 rounded-lg">
-                        🪙 {activeQuest.goldReward} GP
-                      </span>
-                      <span className="px-2 py-1 bg-purple-950 text-purple-300 border border-purple-800 rounded-lg">
-                        ⭐ {activeQuest.xpReward} XP
-                      </span>
-                    </div>
-                  </div>
+                    <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>
+                      {activeQuest.description}
+                    </p>
 
-                  <p className="text-xs text-slate-300 leading-relaxed font-sans bg-slate-950/60 p-3 rounded-xl border border-slate-800">
-                    {activeQuest.description}
-                  </p>
-
-                  {/* Step Checklist */}
-                  <div className="space-y-2">
-                    <div className="text-xs font-mono font-bold text-slate-400 uppercase tracking-wider">
-                      Objective Steps
-                    </div>
-                    <div className="space-y-1.5">
-                      {activeQuest.steps.map((step, idx) => (
-                        <div
-                          key={idx}
-                          onClick={() => handleToggleStep(idx)}
-                          className="flex items-center space-x-2.5 p-2 bg-slate-950/80 rounded-lg border border-slate-800 hover:border-slate-700 transition cursor-pointer text-xs"
-                        >
+                    {/* Step Checklist — inked checkboxes: leather ring when
+                        open, iron-ink fill once struck through */}
+                    <div className="space-y-2">
+                      <div
+                        className="text-xs font-display tracking-wider uppercase"
+                        style={{ color: 'var(--statblock-header)' }}
+                      >
+                        Objective Steps
+                      </div>
+                      <div className="space-y-1.5">
+                        {activeQuest.steps.map((step, idx) => (
                           <div
-                            className={`w-4 h-4 rounded flex items-center justify-center border ${
-                              step.done
-                                ? 'bg-emerald-600 border-emerald-500 text-white'
-                                : 'border-slate-700 bg-slate-900'
-                            }`}
+                            key={idx}
+                            onClick={() => handleToggleStep(idx)}
+                            className="flex items-center space-x-2.5 p-2 rounded-lg border cursor-pointer transition text-xs"
+                            style={{ borderColor: 'var(--rp-leather-700)' }}
                           >
-                            {step.done && <Check className="w-3 h-3" />}
+                            <div
+                              className={`w-4 h-4 rounded-full flex items-center justify-center border ${
+                                step.done ? '' : 'bg-transparent'
+                              }`}
+                              style={{
+                                borderColor: step.done ? 'var(--rp-leather-700)' : 'var(--rp-leather-600)',
+                                backgroundColor: step.done ? 'var(--parchment-ink)' : 'transparent',
+                                boxShadow: step.done ? 'inset 0 0 0 1px var(--rp-leather-700)' : undefined,
+                              }}
+                            >
+                              {step.done && <Check className="w-3 h-3" style={{ color: 'var(--parchment-paper)' }} />}
+                            </div>
+                            <span
+                              style={{ color: 'var(--parchment-ink)', opacity: step.done ? 0.55 : 0.95 }}
+                              className={step.done ? 'line-through' : ''}
+                            >
+                              {step.text}
+                            </span>
                           </div>
-                          <span className={step.done ? 'line-through text-slate-500' : 'text-slate-200'}>
-                            {step.text}
-                          </span>
-                        </div>
-                      ))}
+                        ))}
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="flex justify-end pt-3 border-t border-slate-800">
+                <div className="flex justify-end pt-3 border-t border-tavern-border">
                   <button
                     onClick={() => handleShare(`📜 Quest Update: "${activeQuest.title}" (${activeQuest.status.toUpperCase()})`)}
-                    className="flex items-center space-x-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
+                    className="vtt-btn vtt-btn-primary font-display tracking-wide"
                   >
                     <Share2 className="w-3.5 h-3.5" />
                     <span>Share Quest to Chat</span>
@@ -344,30 +341,30 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
             </div>
           )}
 
-          {/* NPCs Tab */}
+          {/* NPCs Tab — dossier cards as parchment records */}
           {activeTab === 'npcs' && (
             <div className="grid grid-cols-3 gap-4">
               {npcs.map((npc) => (
-                <div key={npc.id} className="p-4 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
+                <div key={npc.id} className="vtt-parchment p-4 rounded-xl space-y-2">
                   <div className="flex items-center space-x-2.5">
                     <span className="text-2xl">{npc.avatarIcon}</span>
                     <div>
-                      <div className="text-sm font-bold text-slate-100">{npc.name}</div>
-                      <div className="text-[10px] text-slate-400 font-mono">{npc.role} · {npc.faction}</div>
+                      {/* Dossier nameplate — Cinzel small caps crimson, book style */}
+                      <div
+                        className="text-sm font-bold font-display tracking-wide lowercase"
+                        style={{ fontVariant: 'small-caps', color: 'var(--statblock-header)' }}
+                      >
+                        {npc.name}
+                      </div>
+                      <div className="text-[10px]" style={{ color: 'var(--parchment-ink)', opacity: 0.7 }}>
+                        {npc.role} · {npc.faction}
+                      </div>
                     </div>
                   </div>
-                  <p className="text-xs text-slate-300 font-sans">{npc.notes}</p>
-                  <div className="pt-2 border-t border-slate-800 text-[10px] font-mono">
+                  <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>{npc.notes}</p>
+                  <div className="pt-2 border-t text-[10px]" style={{ borderColor: 'var(--rp-leather-700)', color: 'var(--parchment-ink)', opacity: 0.8 }}>
                     Disposition:{' '}
-                    <span
-                      className={`font-bold uppercase ${
-                        npc.disposition === 'friendly'
-                          ? 'text-emerald-400'
-                          : npc.disposition === 'neutral'
-                          ? 'text-amber-400'
-                          : 'text-rose-400'
-                      }`}
-                    >
+                    <span className={`${DISPOSITION_BADGE[npc.disposition]} uppercase ml-1`}>
                       {npc.disposition}
                     </span>
                   </div>
@@ -380,11 +377,11 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
           {activeTab === 'chronicles' && (
             <div className="space-y-3">
               {chronicles.map((ch, idx) => (
-                <div key={idx} className="p-3.5 bg-slate-950 rounded-xl border border-slate-800 flex items-start space-x-3">
-                  <span className="px-2 py-1 bg-sky-950 text-sky-400 border border-sky-800 rounded font-mono text-xs font-bold">
+                <div key={idx} className="vtt-surface rounded-xl p-3.5 flex items-start space-x-3">
+                  <span className="vtt-badge shrink-0 font-mono font-bold">
                     {ch.date}
                   </span>
-                  <p className="text-xs text-slate-200 font-sans flex-1 mt-0.5">{ch.entry}</p>
+                  <p className="text-xs text-[var(--rp-parchment-200)] flex-1 mt-0.5">{ch.entry}</p>
                 </div>
               ))}
             </div>
@@ -395,29 +392,29 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
             <div className="space-y-6">
               {/* Coin Pouch */}
               <div className="grid grid-cols-3 gap-4">
-                <div className="p-4 bg-amber-950/30 border border-amber-800/50 rounded-xl text-center">
-                  <div className="text-2xl font-bold font-mono text-amber-300">🪙 {loot.gold}</div>
-                  <div className="text-xs text-slate-400 font-mono uppercase mt-1">Gold Pieces (GP)</div>
+                <div className="vtt-card-elevated rounded-xl p-4 text-center">
+                  <div className="text-2xl font-bold font-mono text-tavern-accent">🪙 {loot.gold}</div>
+                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Gold Pieces (GP)</div>
                 </div>
-                <div className="p-4 bg-sky-950/30 border border-sky-800/50 rounded-xl text-center">
-                  <div className="text-2xl font-bold font-mono text-sky-300">💎 {loot.platinum}</div>
-                  <div className="text-xs text-slate-400 font-mono uppercase mt-1">Platinum Pieces (PP)</div>
+                <div className="vtt-card-elevated rounded-xl p-4 text-center">
+                  <div className="text-2xl font-bold font-mono text-[var(--rp-parchment-100)]">💎 {loot.platinum}</div>
+                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Platinum Pieces (PP)</div>
                 </div>
-                <div className="p-4 bg-purple-950/30 border border-purple-800/50 rounded-xl text-center">
-                  <div className="text-2xl font-bold font-mono text-purple-300">✨ {loot.electrum}</div>
-                  <div className="text-xs text-slate-400 font-mono uppercase mt-1">Electrum (EP)</div>
+                <div className="vtt-card-elevated rounded-xl p-4 text-center">
+                  <div className="text-2xl font-bold font-mono text-[var(--rp-crimson-400)]">✨ {loot.electrum}</div>
+                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Electrum (EP)</div>
                 </div>
               </div>
 
               {/* Magical Inventory */}
               <div className="space-y-2">
-                <div className="text-xs font-mono font-bold text-slate-400 uppercase tracking-wider">
+                <div className="vtt-section-header text-xs font-bold">
                   Shared Party Magical Items
                 </div>
                 <div className="grid grid-cols-2 gap-2 font-mono text-xs">
                   {loot.items.map((item, idx) => (
-                    <div key={idx} className="p-3 bg-slate-950 rounded-lg border border-slate-800 text-slate-300 flex items-center space-x-2">
-                      <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+                    <div key={idx} className="vtt-surface rounded-lg p-3 text-[var(--rp-parchment-200)] flex items-center space-x-2">
+                      <Sparkles className="w-4 h-4 text-tavern-accent shrink-0" />
                       <span>{item}</span>
                     </div>
                   ))}

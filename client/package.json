@@ -10,8 +10,11 @@
     "test": "tsc --noEmit"
   },
   "dependencies": {
+    "@3d-dice/dice-box": "^1.1.4",
+    "@ricky0123/vad-web": "^0.0.30",
     "@tailwindcss/vite": "^4.3.3",
     "lucide-react": "^0.363.0",
+    "pixi.js": "^8.20.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwindcss": "^4.3.3",
@@ -24,6 +27,7 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.2.1",
+    "playwright-core": "^1.62.1",
     "typescript": "^5.4.0",
     "vite": "^5.2.0"
   }

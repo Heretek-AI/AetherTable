@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS narrative_state.campaign_saves (
 
 CREATE INDEX IF NOT EXISTS idx_campaign_saves_owner_updated
     ON narrative_state.campaign_saves (owner_user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS narrative_state.engine_session_snapshots (
+    session_id    UUID PRIMARY KEY,
+    owner_user_id TEXT,
+    snapshot      JSONB NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -79,6 +86,7 @@ class MemoryStore:
         self.users: Dict[str, Dict[str, Any]] = {}       # email.lower() -> record
         self.saves: Dict[str, Dict[str, Any]] = {}        # save_id -> record
         self.campaign_names: Dict[str, Dict[str, str]] = {}  # owner -> {name -> campaign_id}
+        self.engine_snapshots: Dict[str, Dict[str, Any]] = {}  # session_id -> snapshot
         self._counter = 0
 
     @property
@@ -170,6 +178,21 @@ class MemoryStore:
             "round_number": record["round_number"],
             "updated_at": record["updated_at"],
         }
+
+    # -- engine session snapshots (durability bridge to vtt-server) --
+
+    async def save_engine_snapshot(self, session_id: str, owner_user_id: Optional[str],
+                                   snapshot: Dict[str, Any]) -> None:
+        self.engine_snapshots[session_id] = {
+            "session_id": session_id,
+            "owner_user_id": owner_user_id,
+            "snapshot": snapshot,
+            "updated_at": time.time(),
+        }
+
+    async def load_engine_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
+        record = self.engine_snapshots.get(session_id)
+        return record["snapshot"] if record else None
 
 
 class PostgresStore:
@@ -296,6 +319,33 @@ class PostgresStore:
             owner_user_id, save_id,
         )
         return status.endswith("1")
+
+    # -- engine session snapshots (durability bridge to vtt-server) --
+
+    async def save_engine_snapshot(self, session_id: str, owner_user_id: Optional[str],
+                                   snapshot: Dict[str, Any]) -> None:
+        await self.pool.execute(
+            """INSERT INTO narrative_state.engine_session_snapshots
+                   (session_id, owner_user_id, snapshot, updated_at)
+               VALUES ($1, $2, $3::jsonb, now())
+               ON CONFLICT (session_id)
+               DO UPDATE SET snapshot = EXCLUDED.snapshot,
+                             owner_user_id = EXCLUDED.owner_user_id,
+                             updated_at = now()""",
+            session_id, owner_user_id, json_dumps(snapshot),
+        )
+
+    async def load_engine_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
+        row = await self.pool.fetchrow(
+            "SELECT snapshot FROM narrative_state.engine_session_snapshots WHERE session_id = $1",
+            session_id,
+        )
+        if row is None:
+            return None
+        snap = row["snapshot"]
+        if isinstance(snap, str):
+            return json.loads(snap)
+        return snap
 
 
 def json_dumps(value: Any) -> str:

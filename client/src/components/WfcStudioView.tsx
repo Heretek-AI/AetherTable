@@ -88,27 +88,27 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
   };
 
   return (
-    <div className="flex-1 flex flex-col md:flex-row h-full bg-slate-950 overflow-hidden">
+    <div className="flex-1 flex flex-col md:flex-row h-full bg-tavern-bg overflow-hidden">
       {/* Left Config Controls Sidebar */}
-      <div className="w-full md:w-80 h-full vtt-glass-panel border-r border-slate-800 p-5 flex flex-col justify-between overflow-y-auto vtt-scrollbar">
+      <div className="w-full md:w-80 h-full vtt-glass-panel border-r border-tavern-border p-5 flex flex-col justify-between overflow-y-auto vtt-scrollbar">
         <div className="space-y-5">
-          <div className="flex items-center gap-2.5 pb-4 border-b border-slate-800">
-            <div className="w-8 h-8 rounded-lg bg-purple-950 border border-purple-800 flex items-center justify-center text-purple-300">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-tavern-border">
+            <div className="w-8 h-8 rounded-lg bg-[color-mix(in_srgb,var(--tavern-accent)_12%,transparent)] border border-tavern-border flex items-center justify-center text-tavern-accent">
               <Map className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="font-bold text-sm text-slate-100 font-display">WFC Dungeon Studio</h2>
-              <div className="text-[11px] text-purple-400 font-mono">Wave Function Collapse</div>
+              <h2 className="vtt-statblock-nameplate text-sm font-bold">WFC Dungeon Studio</h2>
+              <div className="text-[11px] text-tavern-accent font-prose italic">Wave Function Collapse</div>
             </div>
           </div>
 
           {/* Theme Selector */}
           <div className="space-y-1.5">
-            <label className="text-xs font-mono font-bold text-slate-400">ENVIRONMENT THEME</label>
+            <label className="text-xs font-display [font-variant:small-caps] tracking-wide font-bold text-[var(--rp-parchment-300)]">Environment Theme</label>
             <select
               value={theme}
               onChange={(e) => setTheme(e.target.value)}
-              className="w-full p-2 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none focus:border-purple-500 font-mono"
+              className="vtt-select w-full font-prose"
             >
               <option value="dungeon_catacomb">Ancient Catacombs (Stone & Iron)</option>
               <option value="crypt_vampire">Baron's Crypt (Obsidian & Gold)</option>
@@ -119,8 +119,8 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
           {/* Grid Size Sliders */}
           <div className="space-y-3">
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>Width: {gridWidth} Cells ({gridWidth * 5} ft)</span>
+              <div className="flex justify-between text-xs font-display [font-variant:small-caps] tracking-wide text-[var(--rp-parchment-300)] mb-1">
+                <span>Width: <span className="font-prose text-parchment-paper">{gridWidth}</span> Cells (<span className="font-prose text-parchment-paper">{gridWidth * 5}</span> ft)</span>
               </div>
               <input
                 type="range"
@@ -128,12 +128,12 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
                 max={24}
                 value={gridWidth}
                 onChange={(e) => setGridWidth(Number(e.target.value))}
-                className="w-full accent-purple-500"
+                className="w-full accent-tavern-accent"
               />
             </div>
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>Height: {gridHeight} Cells ({gridHeight * 5} ft)</span>
+              <div className="flex justify-between text-xs font-display [font-variant:small-caps] tracking-wide text-[var(--rp-parchment-300)] mb-1">
+                <span>Height: <span className="font-prose text-parchment-paper">{gridHeight}</span> Cells (<span className="font-prose text-parchment-paper">{gridHeight * 5}</span> ft)</span>
               </div>
               <input
                 type="range"
@@ -141,23 +141,23 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
                 max={18}
                 value={gridHeight}
                 onChange={(e) => setGridHeight(Number(e.target.value))}
-                className="w-full accent-purple-500"
+                className="w-full accent-tavern-accent"
               />
             </div>
           </div>
 
           {/* Seed Display */}
-          <div className="p-3 bg-slate-900/80 rounded-lg border border-slate-800 font-mono text-xs text-slate-400 space-y-1">
-            <div className="text-[10px] text-slate-500">CSPRNG ENTROPY SEED</div>
-            <div className="text-purple-300 font-bold">#{seed}</div>
-            <div className="text-[10px] text-emerald-400">Socket Compatibility: 100% Guaranteed Solvable</div>
+          <div className="p-3 bg-tavern-bg rounded-lg border border-tavern-border text-xs space-y-1">
+            <div className="text-[10px] font-display [font-variant:small-caps] tracking-wide text-[var(--rp-parchment-300)]">CSPRNG Entropy Seed</div>
+            <div className="text-tavern-accent font-bold font-prose">#{seed}</div>
+            <div className="text-[10px] font-prose text-emerald-400">Socket Compatibility: 100% Guaranteed Solvable</div>
           </div>
 
           {/* Generate Button */}
           <button
             onClick={handleGenerate}
             disabled={isGenerating}
-            className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-purple-600 hover:bg-purple-500 text-white font-semibold text-xs rounded-lg transition shadow-lg shadow-purple-950/60"
+            className="vtt-btn vtt-btn-primary w-full disabled:opacity-50 cursor-pointer"
           >
             <RefreshCw className={`w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`} />
             <span>{isGenerating ? 'Synthesizing Wave Collapse...' : 'Synthesize Procedural Map'}</span>
@@ -165,10 +165,10 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
         </div>
 
         {/* Apply Map to Live Battle Map */}
-        <div className="pt-4 border-t border-slate-800">
+        <div className="pt-4 border-t border-tavern-border">
           <button
             onClick={() => onApplyMapToSession(generatedGrid, gridWidth, gridHeight)}
-            className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg transition shadow-lg shadow-emerald-950"
+            className="vtt-btn vtt-btn-secondary w-full cursor-pointer"
           >
             <Check className="w-4 h-4" />
             <span>Deploy to Active Tabletop</span>
@@ -177,37 +177,39 @@ export const WfcStudioView: React.FC<WfcStudioViewProps> = ({ onApplyMapToSessio
       </div>
 
       {/* Right Map Canvas Preview */}
-      <div className="flex-1 h-full bg-slate-950 p-6 flex flex-col items-center justify-center overflow-auto vtt-scrollbar">
-        <div className="text-center mb-4 font-mono text-xs text-slate-400">
-          WFC Dungeon Matrix ({gridWidth} × {gridHeight} Tiles) · Seed #{seed}
+      <div className="flex-1 h-full bg-tavern-bg p-6 flex flex-col items-center justify-center overflow-auto vtt-scrollbar">
+        <div className="text-center mb-4 text-xs font-display [font-variant:small-caps] tracking-wide text-[var(--rp-parchment-300)]">
+          WFC Dungeon Matrix (<span className="font-prose text-parchment-paper">{gridWidth} × {gridHeight}</span>) · Seed <span className="font-prose text-tavern-accent">#{seed}</span>
         </div>
 
-        {/* Map Visualization Grid */}
-        <div
-          className="grid p-3 bg-slate-900/90 rounded-2xl border-2 border-slate-800 shadow-2xl shadow-purple-950/20"
-          style={{
-            gridTemplateColumns: `repeat(${gridWidth}, 32px)`,
-            gridTemplateRows: `repeat(${gridHeight}, 32px)`,
-            gap: '2px',
-          }}
-        >
-          {generatedGrid.map((row, y) =>
-            row.map((cell, x) => (
-              <div
-                key={`prev-${x}-${y}`}
-                className={`w-8 h-8 rounded-sm flex items-center justify-center text-[9px] font-mono transition-colors ${
-                  cell === 1
-                    ? 'bg-slate-800 border border-slate-700 text-slate-600'
-                    : cell === 2
-                    ? 'bg-purple-950 border border-purple-800 text-purple-400'
-                    : 'bg-slate-950/90 border border-slate-900 text-slate-800'
-                }`}
-              >
-                {cell === 1 && <Shield className="w-3.5 h-3.5 opacity-40 text-slate-400" />}
-                {cell === 2 && '✦'}
-              </div>
-            ))
-          )}
+        {/* Map Visualization Grid — tavern frame on leather matting */}
+        <div className="rounded-2xl p-4 bg-[color-mix(in_srgb,var(--rp-leather-700)_55%,black)] shadow-2xl">
+          <div
+            className="grid p-3 rounded-xl border-2 border-tavern-border shadow-inner"
+            style={{
+              gridTemplateColumns: `repeat(${gridWidth}, 32px)`,
+              gridTemplateRows: `repeat(${gridHeight}, 32px)`,
+              gap: '2px',
+            }}
+          >
+            {generatedGrid.map((row, y) =>
+              row.map((cell, x) => (
+                <div
+                  key={`prev-${x}-${y}`}
+                  className={`w-8 h-8 rounded-sm flex items-center justify-center text-[9px] font-mono transition-colors ${
+                    cell === 1
+                      ? 'bg-[var(--rp-iron-800)] border border-[var(--rp-leather-600)] text-[var(--rp-parchment-300)]'
+                      : cell === 2
+                      ? 'bg-[color-mix(in_srgb,var(--rp-crimson-650)_30%,transparent)] border border-[var(--rp-crimson-650)] text-[var(--rp-crimson-400)]'
+                      : 'bg-black/40 border border-black/50 text-transparent'
+                  }`}
+                >
+                  {cell === 1 && <Shield className="w-3.5 h-3.5 opacity-40" />}
+                  {cell === 2 && '✦'}
+                </div>
+              ))
+            )}
+          </div>
         </div>
       </div>
     </div>

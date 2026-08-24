@@ -1,0 +1,171 @@
+//! Write-through Postgres persistence (availability-first).
+//!
+//! A background tailer drains each session's in-memory ledger into
+//! `narrative_state.event_sourcing_log` within ~1.5 s of commit. The engine
+//! NEVER blocks gameplay on the database: connection failure degrades to
+//! memory-only operation with a `persistence_failures` counter surfaced in
+//! `/metrics`, and successful flushes resume automatically.
+
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Recovery note: full-state hydration from history is served by the
+/// orchestrator's `/api/v1/engine-session/hydrate` endpoint pushing persisted
+/// snapshots into `PUT /sessions/{id}/restore`. This module owns incremental
+/// event durability only.
+
+/// Idempotent DDL mirroring database/postgres/02_event_sourcing_and_session_schema.sql.
+/// Executed statement-by-statement: Postgres forbids multiple commands in a
+/// single prepared statement, which is what sqlx uses internally.
+const ENSURE_DDL: &[&str] = &[
+    "CREATE SCHEMA IF NOT EXISTS narrative_state",
+    r#"CREATE TABLE IF NOT EXISTS narrative_state.sessions (
+        session_id UUID PRIMARY KEY,
+        campaign_id UUID,
+        session_name TEXT NOT NULL DEFAULT '',
+        round_number INT NOT NULL DEFAULT 1,
+        is_active BOOL NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS narrative_state.event_sourcing_log (
+        log_id BIGSERIAL PRIMARY KEY,
+        session_id UUID NOT NULL,
+        campaign_id UUID,
+        actor_id UUID,
+        event_type VARCHAR(64),
+        payload JSONB,
+        state_hash VARCHAR(64),
+        sequence_id BIGINT,
+        is_reverted BOOL NOT NULL DEFAULT FALSE,
+        committed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )"#,
+    // The migration's `sequence_id` is a BIGSERIAL row id; the ENGINE's
+    // logical ledger sequence gets its own column + index.
+    "ALTER TABLE narrative_state.event_sourcing_log \
+         ADD COLUMN IF NOT EXISTS ledger_sequence BIGINT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_log_ledger_seq \
+         ON narrative_state.event_sourcing_log (session_id, ledger_sequence)",
+];
+
+pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(database_url)
+        .await?;
+    for stmt in ENSURE_DDL {
+        sqlx::query(stmt).execute(&pool).await?;
+    }
+    Ok(pool)
+}
+
+pub async fn ensure_session_row(
+    pool: &PgPool,
+    session_id: Uuid,
+    campaign_id: Uuid,
+    session_name: &str,
+    round_number: u32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO narrative_state.sessions
+               (session_id, campaign_id, session_name, round_number)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (session_id) DO UPDATE SET
+               round_number = EXCLUDED.round_number,
+               updated_at = now()"#,
+    )
+    .bind(session_id)
+    .bind(campaign_id)
+    .bind(session_name)
+    .bind(round_number as i32)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_event(
+    pool: &PgPool,
+    session_id: Uuid,
+    campaign_id: Uuid,
+    actor_id: Uuid,
+    event_type: &str,
+    payload: serde_json::Value,
+    state_hash: &str,
+    sequence_id: u64,
+    is_reverted: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO narrative_state.event_sourcing_log
+               (session_id, campaign_id, actor_id, event_type, payload,
+                state_hash, ledger_sequence, is_reverted)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+    )
+    .bind(session_id)
+    .bind(campaign_id)
+    .bind(actor_id)
+    .bind(event_type)
+    .bind(payload)
+    .bind(state_hash)
+    .bind(sequence_id as i64)
+    .bind(is_reverted)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Rebuilds a minimal GameSession skeleton from a session's persisted event
+/// stream using the same replay semantics as `GameSession::safety_rewind`:
+/// HP/consciousness/death from ATTACK_RESOLVED & DAMAGE_APPLIED payloads,
+/// positions from MOVE_ENTITY.
+pub fn replay_session_state(session: &mut vtt_core::GameSession) {
+    let mut hp_state: std::collections::HashMap<Uuid, (i32, bool, bool)> =
+        Default::default();
+    let mut pos_state: std::collections::HashMap<Uuid, (f32, f32, f32)> = Default::default();
+
+    for ev in session.ledger.events.iter().filter(|e| !e.is_reverted) {
+        match ev.event_type.as_str() {
+            "ATTACK_RESOLVED" => {
+                if let (Some(tid), Some(hp)) = (
+                    ev.payload.get("target_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()),
+                    ev.payload.get("target_hp_remaining").and_then(|v| v.as_i64()),
+                ) {
+                    hp_state.insert(tid, (hp as i32, hp > 0, ev.payload.get("target_is_dead").and_then(|v| v.as_bool()).unwrap_or(false)));
+                }
+            }
+            "DAMAGE_APPLIED" => {
+                if let (Some(tid), Some(hp)) = (
+                    ev.payload.get("target_id").and_then(|v| v.as_str()).and_then(|s| Uuid::parse_str(s).ok()),
+                    ev.payload.get("hp_remaining").and_then(|v| v.as_i64()),
+                ) {
+                    hp_state.insert(tid, (hp as i32, hp > 0, false));
+                }
+            }
+            "MOVE_ENTITY" => {
+                if let Some(arr) = ev.payload.get("to").and_then(|v| v.as_array()) {
+                    let to = (
+                        arr.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0) as f32,
+                        arr.get(2).and_then(|z| z.as_f64()).unwrap_or(0.0) as f32,
+                    );
+                    pos_state.insert(ev.actor_id, to);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (id, (hp, conscious, dead)) in hp_state {
+        if let Some(e) = session.entities.get_mut(&id) {
+            e.current_hp = hp;
+            e.is_conscious = conscious;
+            e.is_dead = dead;
+        }
+    }
+    for (id, pos) in pos_state {
+        if let Some(e) = session.entities.get_mut(&id) {
+            e.position = pos;
+        }
+    }
+}

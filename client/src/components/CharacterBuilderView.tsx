@@ -229,35 +229,32 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden">
+    <div className="flex-1 flex flex-col h-full bg-tavern-bg text-parchment-aged overflow-hidden">
       {/* Top Header */}
-      <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+      <div className="p-4 border-b border-tavern-border flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-bold font-display flex items-center gap-2">
-            <Sparkles className="w-5 h-5 text-purple-400" />
+          <h1 className="vtt-engraved text-lg font-bold flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-tavern-accent" />
             <span>5e Character Creation Studio</span>
           </h1>
-          <p className="text-xs text-slate-400 mt-0.5">
+          <p className="text-xs text-parchment-aged/70 mt-0.5">
             Strict Orcpub modifier graph, 27-point buy calculator, SRD spellbook, and 1-click vector PDF exporter.
           </p>
         </div>
 
         {/* Wizard Steps */}
-        <div className="flex items-center gap-2 bg-slate-900/90 p-1 rounded-xl border border-slate-800 font-mono text-xs">
+        <nav className="vtt-tabbar font-mono text-xs" aria-label="Character creation steps">
           {['1. Race', '2. Class', '3. Ability Scores', '4. Spellbook', '5. Review & Deploy'].map((label, idx) => (
             <button
               key={label}
               onClick={() => setStep(idx + 1)}
-              className={`px-3 py-1 rounded-lg transition font-semibold ${
-                step === idx + 1
-                  ? 'bg-purple-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              data-active={step === idx + 1}
+              className="vtt-tab"
             >
               {label}
             </button>
           ))}
-        </div>
+        </nav>
       </div>
 
       {/* Main Body */}
@@ -265,8 +262,8 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         {/* STEP 1: RACE */}
         {step === 1 && (
           <div className="space-y-4">
-            <h2 className="text-sm font-bold font-display uppercase tracking-wider text-purple-400">
-              Select Race & Ancestry
+            <h2 className="vtt-section-header text-base font-bold">
+              Select Race &amp; Ancestry
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {[
@@ -282,13 +279,13 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                   onClick={() => setSelectedRace(r.name)}
                   className={`p-4 rounded-xl border cursor-pointer transition ${
                     selectedRace === r.name
-                      ? 'bg-purple-950/50 border-purple-500 shadow-lg'
-                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
+                      ? 'bg-amber-950/40 border-tavern-accent shadow-lg'
+                      : 'vtt-surface hover:border-tavern-accent/40'
                   }`}
                 >
-                  <h3 className="font-bold text-sm text-slate-100 font-display">{r.name}</h3>
-                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">{r.desc}</p>
-                  <div className="text-[10px] font-mono text-purple-400 mt-2">Speed: {r.speed}</div>
+                  <h3 className="font-bold text-sm text-parchment-aged font-display">{r.name}</h3>
+                  <p className="text-xs text-parchment-aged/70 mt-1 leading-relaxed">{r.desc}</p>
+                  <div className="text-[10px] font-mono text-tavern-accent mt-2">Speed: {r.speed}</div>
                 </div>
               ))}
             </div>
@@ -298,8 +295,8 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         {/* STEP 2: CLASS */}
         {step === 2 && (
           <div className="space-y-4">
-            <h2 className="text-sm font-bold font-display uppercase tracking-wider text-purple-400">
-              Select Class & Archetype
+            <h2 className="vtt-section-header text-base font-bold">
+              Select Class &amp; Archetype
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {[
@@ -315,14 +312,14 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                   onClick={() => setSelectedClass(c.name)}
                   className={`p-4 rounded-xl border cursor-pointer transition ${
                     selectedClass === c.name
-                      ? 'bg-purple-950/50 border-purple-500 shadow-lg'
-                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
+                      ? 'bg-amber-950/40 border-tavern-accent shadow-lg'
+                      : 'vtt-surface hover:border-tavern-accent/40'
                   }`}
                 >
-                  <h3 className="font-bold text-sm text-slate-100 font-display">{c.name}</h3>
-                  <div className="text-[10px] font-mono text-purple-400 mt-0.5">Hit Die: {c.hitDie} · Primary: {c.primary}</div>
-                  <p className="text-xs text-slate-400 mt-2 leading-relaxed">{c.desc}</p>
-                  <div className="text-[10px] font-mono text-slate-500 mt-2">Saves: {c.saves}</div>
+                  <h3 className="font-bold text-sm text-parchment-aged font-display">{c.name}</h3>
+                  <div className="text-[10px] font-mono text-tavern-accent mt-0.5">Hit Die: {c.hitDie} · Primary: {c.primary}</div>
+                  <p className="text-xs text-parchment-aged/70 mt-2 leading-relaxed">{c.desc}</p>
+                  <div className="text-[10px] font-mono text-parchment-aged/50 mt-2">Saves: {c.saves}</div>
                 </div>
               ))}
             </div>
@@ -334,18 +331,18 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-sm font-bold font-display uppercase tracking-wider text-purple-400">
+                <h2 className="vtt-section-header text-base font-bold mb-2">
                   Ability Score Point Buy Calculator (5e SRD)
                 </h2>
-                <p className="text-xs text-slate-400">
-                  Points Spent: <strong className="text-purple-300">{calculatePointBuyTotal()} / 27</strong>
+                <p className="text-xs text-parchment-aged/80">
+                  Points Spent: <strong className="text-tavern-accent">{calculatePointBuyTotal()} / 27</strong>
                 </p>
               </div>
 
               <div className="flex items-center gap-2">
                 <button
                   onClick={roll4d6DropLowest}
-                  className="flex items-center gap-1 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-purple-300 rounded-lg text-xs font-mono border border-slate-800"
+                  className="vtt-btn vtt-btn-secondary text-xs font-mono"
                 >
                   <Dice5 className="w-4 h-4" />
                   <span>Roll 4d6 Drop Lowest</span>
@@ -363,29 +360,30 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                 return (
                   <div
                     key={ability}
-                    className="p-3 bg-slate-900/80 rounded-xl border border-slate-800 text-center flex flex-col items-center justify-between shadow"
+                    className="p-3 vtt-surface rounded-xl text-center flex flex-col items-center justify-between shadow"
+                    style={{ borderTopColor: 'var(--tavern-accent)' }}
                   >
-                    <span className="text-xs font-bold uppercase font-mono text-purple-300">{ability}</span>
-                    
+                    <span className="text-xs font-bold uppercase font-mono text-tavern-accent">{ability}</span>
+
                     <div className="my-2">
-                      <div className="text-2xl font-black font-display text-slate-100">{finalScore}</div>
-                      <div className="text-xs font-mono font-bold text-sky-400">{mod >= 0 ? `+${mod}` : mod}</div>
+                      <div className="text-2xl font-black font-display text-parchment-aged">{finalScore}</div>
+                      <div className="text-xs font-mono font-bold text-[color:var(--rp-parchment-300)]">{mod >= 0 ? `+${mod}` : mod}</div>
                     </div>
 
-                    <div className="text-[10px] font-mono text-slate-500 mb-2">
+                    <div className="text-[10px] font-mono text-parchment-aged/50 mb-2">
                       Base {base} {racial > 0 && <span className="text-emerald-400">+{racial}</span>}
                     </div>
 
                     <div className="flex items-center gap-1">
                       <button
                         onClick={() => adjustScore(ability, -1)}
-                        className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold"
+                        className="w-6 h-6 rounded bg-black/30 hover:bg-black/20 border border-tavern-border text-parchment-aged text-xs font-bold"
                       >
                         -
                       </button>
                       <button
                         onClick={() => adjustScore(ability, 1)}
-                        className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold"
+                        className="w-6 h-6 rounded bg-black/30 hover:bg-black/20 border border-tavern-border text-parchment-aged text-xs font-bold"
                       >
                         +
                       </button>
@@ -400,7 +398,7 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         {/* STEP 4: SPELLBOOK */}
         {step === 4 && (
           <div className="space-y-4">
-            <h2 className="text-sm font-bold font-display uppercase tracking-wider text-purple-400">
+            <h2 className="vtt-section-header text-base font-bold">
               Select Prepared Spells ({selectedSpells.length} Selected)
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -419,18 +417,18 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                     }}
                     className={`p-3 rounded-xl border cursor-pointer transition ${
                       isSelected
-                        ? 'bg-purple-950/60 border-purple-500 shadow'
-                        : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
+                        ? 'bg-amber-950/40 border-tavern-accent shadow'
+                        : 'vtt-surface hover:border-tavern-accent/40'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <h4 className="font-bold text-xs text-slate-100 font-display">{spell.name}</h4>
-                      {isSelected && <Check className="w-3.5 h-3.5 text-purple-400" />}
+                      <h4 className="font-bold text-xs text-parchment-aged font-display">{spell.name}</h4>
+                      {isSelected && <Check className="w-3.5 h-3.5 text-tavern-accent" />}
                     </div>
-                    <div className="text-[10px] font-mono text-purple-400 mt-0.5">
+                    <div className="text-[10px] font-mono text-tavern-accent mt-0.5">
                       {spell.level === 0 ? 'Cantrip' : `Level ${spell.level}`} · {spell.school}
                     </div>
-                    <p className="text-[11px] text-slate-400 mt-1 line-clamp-2">{spell.description}</p>
+                    <p className="text-[11px] text-parchment-aged/70 mt-1 line-clamp-2">{spell.description}</p>
                   </div>
                 );
               })}
@@ -441,25 +439,29 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         {/* STEP 5: REVIEW & DEPLOY */}
         {step === 5 && (
           <div className="space-y-6">
-            <div className="vtt-glass-panel p-6 rounded-2xl border border-slate-800">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-                <div>
+            <div className="vtt-parchment p-6 rounded-2xl">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="min-w-0">
                   <input
                     type="text"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="text-xl font-bold font-display bg-transparent border-b border-purple-500/50 text-slate-100 focus:outline-none focus:border-purple-400"
+                    aria-label="Character name"
+                    className="vtt-statblock-nameplate w-full text-xl font-bold bg-transparent border-b border-rule-red/50 focus:outline-none focus:border-rule-red"
                   />
-                  <div className="text-xs font-mono text-purple-300 mt-1">
+                  <div className="text-xs font-mono mt-1" style={{ color: 'var(--statblock-header)' }}>
                     Level {level} {selectedRace} {selectedClass} · {background}
                   </div>
+                  <p className="vtt-dropcap font-prose text-sm leading-relaxed mt-3 max-w-prose">
+                    {selectedRace} {selectedClass} of the {background} persuasion, sworn to a path of {alignment.toLowerCase()} purpose and tested steel.
+                  </p>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 shrink-0">
                   <button
                     onClick={handleExportPdf}
                     disabled={isExportingPdf}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-slate-900 hover:bg-slate-800 text-purple-300 rounded-xl text-xs font-mono font-bold border border-slate-700 transition shadow"
+                    className="vtt-btn vtt-btn-secondary text-xs font-mono"
                   >
                     <Download className="w-4 h-4" />
                     <span>{isExportingPdf ? 'Generating PDF...' : 'Export 5e PDF Sheet'}</span>
@@ -467,7 +469,7 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
 
                   <button
                     onClick={handleDeployToBattlefield}
-                    className="flex items-center gap-1.5 px-5 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-bold font-mono transition shadow-lg shadow-purple-950 active:scale-95"
+                    className="vtt-btn vtt-btn-primary px-5 text-xs font-mono active:scale-95"
                   >
                     <Plus className="w-4 h-4" />
                     <span>Deploy to Tabletop</span>
@@ -475,35 +477,38 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                 </div>
               </div>
 
+              {/* Ornamental rule between the header block and the vitals strip */}
+              <div className="vtt-divider my-5"><span /></div>
+
               {/* Combat Vitals Strip */}
               <div className="grid grid-cols-4 gap-3 my-6 font-mono text-center">
-                <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                  <div className="text-[10px] text-slate-500">ARMOR CLASS</div>
-                  <div className="text-xl font-bold text-sky-400">{computedAC}</div>
+                <div className="p-3 rounded-xl border border-[color:var(--rp-leather-700)]/50 bg-black/5">
+                  <div className="text-[10px]" style={{ color: 'var(--statblock-header)' }}>ARMOR CLASS</div>
+                  <div className="text-xl font-bold" style={{ color: 'var(--statblock-header)' }}>{computedAC}</div>
                 </div>
-                <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                  <div className="text-[10px] text-slate-500">HIT POINTS</div>
-                  <div className="text-xl font-bold text-emerald-400">{computedHP}</div>
+                <div className="p-3 rounded-xl border border-[color:var(--rp-leather-700)]/50 bg-black/5">
+                  <div className="text-[10px]" style={{ color: 'var(--statblock-header)' }}>HIT POINTS</div>
+                  <div className="text-xl font-bold" style={{ color: 'var(--state-success)' }}>{computedHP}</div>
                 </div>
-                <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                  <div className="text-[10px] text-slate-500">SPEED</div>
-                  <div className="text-xl font-bold text-amber-400">
+                <div className="p-3 rounded-xl border border-[color:var(--rp-leather-700)]/50 bg-black/5">
+                  <div className="text-[10px]" style={{ color: 'var(--statblock-header)' }}>SPEED</div>
+                  <div className="text-xl font-bold text-parchment-ink">
                     {selectedRace.includes('Dwarf') || selectedRace.includes('Halfling') ? '25 ft' : '30 ft'}
                   </div>
                 </div>
-                <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                  <div className="text-[10px] text-slate-500">PROFICIENCY</div>
-                  <div className="text-xl font-bold text-purple-400">+3</div>
+                <div className="p-3 rounded-xl border border-[color:var(--rp-leather-700)]/50 bg-black/5">
+                  <div className="text-[10px]" style={{ color: 'var(--statblock-header)' }}>PROFICIENCY</div>
+                  <div className="text-xl font-bold" style={{ color: 'var(--statblock-header)' }}>+3</div>
                 </div>
               </div>
 
               {/* Final Ability Score Badges */}
               <div className="grid grid-cols-6 gap-2 text-center font-mono">
                 {(['str', 'dex', 'con', 'int', 'wis', 'cha'] as (keyof AbilityScores)[]).map((ab) => (
-                  <div key={ab} className="p-2.5 bg-slate-900/60 rounded-xl border border-slate-800/80">
-                    <div className="text-[10px] uppercase text-slate-400">{ab}</div>
-                    <div className="text-sm font-bold text-slate-100">{getFinalScore(ab)}</div>
-                    <div className="text-[11px] text-sky-400">
+                  <div key={ab} className="p-2.5 rounded-xl border border-[color:var(--rp-leather-700)]/40 bg-black/5">
+                    <div className="text-[10px] uppercase text-parchment-ink/70">{ab}</div>
+                    <div className="text-sm font-bold text-parchment-ink">{getFinalScore(ab)}</div>
+                    <div className="text-[11px]" style={{ color: 'var(--statblock-header)' }}>
                       {getModifier(ab) >= 0 ? `+${getModifier(ab)}` : getModifier(ab)}
                     </div>
                   </div>
@@ -515,22 +520,22 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
       </div>
 
       {/* Wizard Step Footer Navigation */}
-      <div className="p-4 border-t border-slate-800 bg-slate-900/80 flex items-center justify-between">
+      <div className="p-4 border-t border-tavern-border bg-tavern-surface/60 flex items-center justify-between">
         <button
           onClick={() => setStep(Math.max(1, step - 1))}
           disabled={step === 1}
-          className="flex items-center gap-1 px-4 py-1.5 rounded-lg text-xs font-mono text-slate-400 hover:text-slate-200 disabled:opacity-30"
+          className="flex items-center gap-1 px-4 py-1.5 rounded-lg text-xs font-mono text-parchment-aged/70 hover:text-parchment-aged disabled:opacity-30"
         >
           <ChevronLeft className="w-4 h-4" />
           <span>Previous</span>
         </button>
 
-        <span className="text-xs font-mono text-slate-500">Step {step} of 5</span>
+        <span className="text-xs font-mono text-parchment-aged/50">Step {step} of 5</span>
 
         <button
           onClick={() => setStep(Math.min(5, step + 1))}
           disabled={step === 5}
-          className="flex items-center gap-1 px-4 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 text-white rounded-lg text-xs font-mono font-semibold transition"
+          className="vtt-btn vtt-btn-primary text-xs font-mono disabled:opacity-30"
         >
           <span>Next</span>
           <ChevronRight className="w-4 h-4" />

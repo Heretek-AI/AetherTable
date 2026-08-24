@@ -31,7 +31,7 @@ export const MacroQuickbar: React.FC<MacroQuickbarProps> = ({ onExecuteRoll }) =
 
   const quickMacros = [
     { name: 'Initiative', formula: '1d20 + 2', icon: <Zap className="w-3 h-3 text-amber-400" /> },
-    { name: 'Perception', formula: '1d20 + 1', icon: <Eye className="w-3 h-3 text-sky-400" /> },
+    { name: 'Perception', formula: '1d20 + 1', icon: <Eye className="w-3 h-3 text-[var(--rp-parchment-300)]" /> },
     { name: 'Stealth', formula: '1d20 + 2', icon: <EyeOff className="w-3 h-3 text-[var(--tavern-accent)]" /> },
     { name: 'Athletics', formula: '1d20 + 4', icon: <Shield className="w-3 h-3 text-emerald-400" /> },
     { name: 'Death Save', formula: '1d20', icon: <Skull className="w-3 h-3 text-rose-400" /> },

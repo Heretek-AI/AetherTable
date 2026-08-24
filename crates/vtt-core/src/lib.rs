@@ -32,5 +32,9 @@ pub use rules::{
     AttackRollResult, ConcentrationBreakResult, MonsterArchetype, RulesEvaluator,
     SavingThrowResult, SpellDefinition,
 };
-pub use state::{ConcentrationState, EntityState, GameSession, InitiativeCombatState};
+pub use state::{
+    ArmedReaction, AttackAction, ConditionTimer, ConcentrationState, EndOfTurnSave, EntityState,
+    GameSession, InitiativeCombatState, MoveOutcome, ReactionType, RewindReport, RoundAdvanceReport,
+    SessionMap,
+};
 pub use types::*;

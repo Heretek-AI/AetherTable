@@ -3,15 +3,9 @@ import { useFocusTrap } from './ui/useFocusTrap';
 import {
   Video,
   Radio,
-  Share2,
   X,
-  Sparkles,
-  Zap,
   Check,
-  Eye,
   Tv,
-  MessageSquare,
-  ShieldAlert,
   Send,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
@@ -58,18 +52,19 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center p-4" style={{ zIndex: 'var(--z-modal)' }}>
       <div ref={containerRef} tabIndex={-1} role="dialog" aria-modal="true">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col font-sans animate-fadeIn">
+      <div className="vtt-glass-panel rounded-2xl max-w-xl w-full max-h-[85vh] overflow-hidden shadow-2xl flex flex-col font-sans animate-fadeIn">
         {/* Header */}
-        <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/80">
+        <div className="p-5 border-b border-tavern-border flex items-center justify-between bg-tavern-bg/80">
           <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-gradient-to-br from-rose-500 to-indigo-600 rounded-xl text-white shadow-lg">
+            {/* Flat tavern tile with gold-leaf icon (no cold gradient chrome) */}
+            <div className="p-2.5 bg-tavern-bg border border-tavern-border rounded-xl text-tavern-accent">
               <Video className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-bold font-serif text-slate-100">
+              <h2 className="vtt-engraved text-xl font-bold font-display">
                 Streamer Broadcast & Discord Relay
               </h2>
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-[var(--rp-parchment-300)]">
                 OBS clean overlay mode, cinematic turn auto-focus, and Discord webhook live roll alerts.
               </p>
             </div>
@@ -79,32 +74,36 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
             onClick={onClose}
             aria-label="Close modal"
             autoFocus  // move keyboard focus into the dialog on open
-                        className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition cursor-pointer"
+                        className="p-1.5 text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] rounded-lg hover:bg-white/10 transition cursor-pointer"
           >
               <X className="w-5 h-5" aria-hidden="true" />
           </button>
         </div>
 
         {/* Content Body */}
-        <div className="p-6 space-y-6 overflow-y-auto max-h-[60vh]">
+        <div className="p-6 space-y-6 overflow-y-auto vtt-scrollbar max-h-[60vh]">
           {/* Cinematic Mode Toggle Card */}
-          <div className="p-4 bg-slate-950 rounded-2xl border border-slate-800 flex items-center justify-between shadow-inner">
+          <div className="p-4 vtt-surface rounded-2xl flex items-center justify-between shadow-inner">
             <div className="space-y-1">
               <div className="flex items-center space-x-2">
-                <Tv className="w-4 h-4 text-purple-400" />
-                <span className="text-sm font-bold text-slate-100">Cinematic Broadcast Mode</span>
+                <Tv className="w-4 h-4 text-tavern-accent" />
+                <span className="text-sm font-bold text-[var(--rp-parchment-100)]">Cinematic Broadcast Mode</span>
+                {/* State chip — printed-book badge carries the on/off state */}
+                <span className={isCinematicActive ? 'vtt-badge vtt-badge-success' : 'vtt-badge'}>
+                  {isCinematicActive ? 'ACTIVE' : 'OFF'}
+                </span>
               </div>
-              <p className="text-xs text-slate-400 font-sans">
+              <p className="text-xs text-[var(--rp-parchment-300)] font-sans">
                 Hides debug bars, telemetry, and administrative chrome for clean OBS window capture.
               </p>
             </div>
 
             <button
               onClick={handleToggleCinematic}
-              className={`px-4 py-2 rounded-xl text-xs font-mono font-bold transition cursor-pointer ${
+              className={`px-4 py-2 rounded-xl text-xs font-mono font-bold transition cursor-pointer border ${
                 isCinematicActive
-                  ? 'bg-purple-600 text-white shadow-lg shadow-purple-950/50 animate-pulse'
-                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  ? 'bg-gradient-to-b from-[var(--rp-amber-500)] to-[var(--rp-amber-600)] text-[var(--rp-ink-900)] border-[color-mix(in_srgb,var(--rp-amber-500)_70%,black)]'
+                  : 'vtt-btn-secondary'
               }`}
             >
               {isCinematicActive ? 'ACTIVE (OBS Clean)' : 'Enable Cinematic'}
@@ -113,49 +112,52 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
 
           {/* Discord Webhook Relay Form */}
           <form onSubmit={handleSendTestWebhook} className="space-y-4">
-            <div className="text-xs font-mono font-bold text-slate-300 uppercase tracking-wider flex items-center space-x-1.5">
-              <Radio className="w-4 h-4 text-indigo-400 animate-pulse" />
+            <div
+              className="text-xs font-bold uppercase tracking-wider flex items-center space-x-1.5"
+              style={{ color: 'var(--tavern-accent)' }}
+            >
+              <Radio className="w-4 h-4 animate-pulse" />
               <span>Live Discord Webhook Broadcaster</span>
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-mono text-slate-400">Discord Channel Webhook URL</label>
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)]">Discord Channel Webhook URL</label>
               <input
                 type="text"
                 value={discordWebhookUrl}
                 onChange={(e) => setDiscordWebhookUrl(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
+                className="vtt-input w-full font-mono text-xs"
               />
             </div>
 
             {/* Event Checkboxes */}
             <div className="space-y-2 pt-2">
-              <label className="flex items-center space-x-2.5 text-xs font-mono text-slate-300 cursor-pointer">
+              <label className="flex items-center space-x-2.5 text-xs font-mono text-[var(--rp-parchment-200)] cursor-pointer">
                 <input
                   type="checkbox"
                   checked={relayCrits}
                   onChange={(e) => setRelayCrits(e.target.checked)}
-                  className="accent-indigo-500 rounded"
+                  className="accent-[var(--tavern-accent)] rounded"
                 />
                 <span>Broadcast Critical Hits & Fumbles (Natural 20s / 1s)</span>
               </label>
 
-              <label className="flex items-center space-x-2.5 text-xs font-mono text-slate-300 cursor-pointer">
+              <label className="flex items-center space-x-2.5 text-xs font-mono text-[var(--rp-parchment-200)] cursor-pointer">
                 <input
                   type="checkbox"
                   checked={relayDeathSaves}
                   onChange={(e) => setRelayDeathSaves(e.target.checked)}
-                  className="accent-indigo-500 rounded"
+                  className="accent-[var(--tavern-accent)] rounded"
                 />
                 <span>Broadcast Character Death Saves</span>
               </label>
 
-              <label className="flex items-center space-x-2.5 text-xs font-mono text-slate-300 cursor-pointer">
+              <label className="flex items-center space-x-2.5 text-xs font-mono text-[var(--rp-parchment-200)] cursor-pointer">
                 <input
                   type="checkbox"
                   checked={relayBossKills}
                   onChange={(e) => setRelayBossKills(e.target.checked)}
-                  className="accent-indigo-500 rounded"
+                  className="accent-[var(--tavern-accent)] rounded"
                 />
                 <span>Broadcast Boss Monster Defeat Fanfares</span>
               </label>
@@ -163,19 +165,19 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
 
             <button
               type="submit"
-              className="flex items-center space-x-2 px-4 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
+              className="vtt-btn vtt-btn-secondary font-mono"
             >
-              {testSent ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Send className="w-3.5 h-3.5" />}
+              {testSent ? <Check className="w-3.5 h-3.5" style={{ color: 'var(--state-success)' }} /> : <Send className="w-3.5 h-3.5" />}
               <span>{testSent ? 'Test Payload Dispatched to Discord!' : 'Dispatch Test Webhook Alert'}</span>
             </button>
           </form>
         </div>
 
         {/* Footer */}
-        <div className="p-4 bg-slate-950/80 border-t border-slate-800 flex justify-end">
+        <div className="p-4 bg-tavern-bg/80 border-t border-tavern-border flex justify-end">
           <button
             onClick={onClose}
-            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
+            className="vtt-btn vtt-btn-primary font-display tracking-wide"
           >
             Save & Close Streamer HUD
           </button>

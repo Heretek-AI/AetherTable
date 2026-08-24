@@ -1,8 +1,16 @@
 import os
 import json
 import asyncio
-from typing import Dict, Any, AsyncGenerator, Optional
+from typing import Dict, Any, AsyncGenerator, Optional, List
 import httpx
+
+
+class ToolCallRound:
+    """One assistant message that requests tool executions."""
+
+    def __init__(self, tool_calls: List[Dict[str, Any]], content: Optional[str] = None):
+        self.tool_calls = tool_calls
+        self.content = content
 
 
 class LLMConfig:
@@ -41,6 +49,42 @@ class LLMStreamingGateway:
 
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
+
+    async def complete_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """One non-streaming chat-completions round with function/tool schemas.
+
+        Returns the raw assistant message dict, which may contain either
+        `content` or `tool_calls` per the OpenAI-compatible contract.
+        Raises RuntimeError when only mock mode is configured — a tool-calling
+        agent must NEVER silently fall back to canned strings.
+        """
+        if self.config.is_mock:
+            raise RuntimeError(
+                "NO_LLM_KEY: configure LLM_KEY/OPENAI_API_KEY for the tool-calling agent"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 600,
+            "temperature": 0.4,
+        }
+        endpoint = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(endpoint, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        return data["choices"][0]["message"]
 
     async def stream_narrative(
         self,

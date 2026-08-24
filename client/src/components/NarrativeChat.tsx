@@ -1,14 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Send, 
-  Sparkles, 
-  Terminal, 
-  User, 
-  ShieldAlert, 
-  Mic, 
-  MicOff, 
-  Volume2, 
-  Flame, 
+import {
+  Send,
+  Sparkles,
+  Terminal,
+  User,
+  ShieldAlert,
+  Mic,
+  MicOff,
+  Volume2,
+  Flame,
   Skull,
   Radio,
   Lock,
@@ -48,6 +48,9 @@ interface NarrativeChatProps {
   onBroadcastPing?: () => void;
 }
 
+const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
+const INK_MUTED = 'color-mix(in srgb, var(--parchment-ink) 65%, transparent)';
+
 export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   messages,
   onSendMessage,
@@ -77,8 +80,8 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
     if (!isRecording) {
       setIsRecording(true);
       globalAudio.playTurnAdvance();
-      await globalVoiceCapture.startRecording((volume) => {
-        setVoiceVolume(volume);
+      await globalVoiceCapture.startRecording({
+        onVolumeUpdate: (volume) => setVoiceVolume(volume),
       });
     } else {
       setIsRecording(false);
@@ -106,50 +109,31 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
     return true;
   });
 
+  const channels: Array<{ id: ChatChannel; label: string; icon: React.ReactNode }> = [
+    { id: 'all', label: 'All Table', icon: <MessageSquare className="w-3 h-3" /> },
+    { id: 'party', label: 'Party', icon: <Users className="w-3 h-3" /> },
+    { id: 'gm', label: 'GM Whispers', icon: <Lock className="w-3 h-3" /> },
+    { id: 'combat', label: 'Combat Log', icon: <Dices className="w-3 h-3" /> },
+  ];
+
   return (
-    <div className="h-60 border-t border-slate-800 bg-slate-950/95 flex flex-col text-slate-100 font-sans shadow-2xl shrink-0 select-none">
+    <div className="h-60 border-t border-tavern-border bg-tavern-bg/95 flex flex-col text-[var(--rp-parchment-200)] shadow-2xl shrink-0 select-none">
       {/* Top Telemetry Strip & Channel Tabs */}
-      <div className="h-8 px-3 border-b border-slate-800/80 bg-slate-900/60 flex items-center justify-between text-[11px] font-mono text-slate-400 shrink-0">
-        <div className="flex items-center gap-1.5 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
-          <button
-            onClick={() => setActiveChannel('all')}
-            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
-              activeChannel === 'all' ? 'bg-amber-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <MessageSquare className="w-3 h-3" />
-            <span>All Table</span>
-          </button>
-
-          <button
-            onClick={() => setActiveChannel('party')}
-            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
-              activeChannel === 'party' ? 'bg-emerald-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Users className="w-3 h-3" />
-            <span>Party</span>
-          </button>
-
-          <button
-            onClick={() => setActiveChannel('gm')}
-            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
-              activeChannel === 'gm' ? 'bg-purple-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Lock className="w-3 h-3" />
-            <span>GM Whispers</span>
-          </button>
-
-          <button
-            onClick={() => setActiveChannel('combat')}
-            className={`flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-bold transition cursor-pointer ${
-              activeChannel === 'combat' ? 'bg-rose-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Dices className="w-3 h-3" />
-            <span>Combat Log</span>
-          </button>
+      <div className="h-8 px-3 border-b border-tavern-border bg-tavern-surface/60 flex items-center justify-between text-[11px] shrink-0">
+        <div className="vtt-tabbar">
+          {channels.map(({ id, label, icon }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setActiveChannel(id)}
+              data-active={activeChannel === id}
+              title={label}
+              className={`vtt-tab ${activeChannel === id ? '' : 'cursor-pointer'} flex items-center gap-1 text-[10px] font-semibold`}
+            >
+              {icon}
+              <span>{label}</span>
+            </button>
+          ))}
         </div>
 
         <div className="flex items-center gap-2">
@@ -159,80 +143,106 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
                 onBroadcastPing();
                 globalAudio.playTurnAdvance();
               }}
-              className="flex items-center space-x-1 px-2 py-0.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-amber-300 rounded text-[10px] font-bold transition cursor-pointer"
+              className="vtt-btn vtt-btn-secondary"
+              style={{ padding: '0.15rem 0.5rem', fontSize: '10px' }}
               title="Broadcast tactical beacon ping to party"
             >
-              <MapPin className="w-3 h-3 text-amber-400 animate-bounce" />
+              <MapPin className="w-3 h-3 text-tavern-accent animate-bounce" />
               <span className="hidden sm:inline">Map Ping</span>
             </button>
           )}
 
-          <div className="flex items-center gap-1.5 text-slate-500 font-mono text-[10px]">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-slate-400">Thorin (50%) · Lyra (50%)</span>
+          <div className="flex items-center gap-1.5 text-[10px] text-[var(--rp-parchment-300)]">
+            <span
+              className="w-1.5 h-1.5 rounded-full animate-pulse"
+              style={{ backgroundColor: 'var(--state-success)' }}
+            />
+            <span>Thorin (50%) · Lyra (50%)</span>
           </div>
         </div>
       </div>
 
       {/* Narrative Messages Stream */}
-      <div className="flex-1 p-3 overflow-y-auto space-y-2 text-xs font-mono">
+      <div className="flex-1 p-3 overflow-y-auto space-y-2">
         {filteredMessages.map((msg) => {
           const isDm = msg.role === 'dm';
           const isSystem = msg.role === 'system';
           const isWhisper = msg.channel === 'gm';
+          // In-world prose (GM narration / whispers) prints on paper; table chatter
+          // stays on dark tavern chrome.
+          const onPaper = (isDm || isWhisper) && !isSystem;
 
           return (
             <div
               key={msg.id}
-              className={`p-2 rounded-xl border transition-all ${
-                isWhisper
-                  ? 'bg-purple-950/40 border-purple-500/50 shadow-md'
-                  : isDm
-                  ? 'bg-slate-900/90 border-slate-800 text-slate-200'
-                  : isSystem
-                  ? 'bg-amber-950/20 border-amber-500/30 text-amber-200'
-                  : 'bg-slate-950 border-slate-850 text-slate-300'
+              className={`rounded-lg p-2 transition-all ${
+                onPaper ? 'vtt-parchment' : 'vtt-surface'
               }`}
+              style={
+                isWhisper
+                  ? { borderColor: 'color-mix(in srgb, var(--statblock-header) 55%, transparent)' }
+                  : undefined
+              }
             >
               <div className="flex items-center justify-between mb-1 text-[10px]">
-                <div className="flex items-center space-x-1.5">
+                <div className="flex items-center gap-1.5 flex-wrap">
                   <span
-                    className={`font-bold ${
-                      isWhisper
-                        ? 'text-purple-300'
-                        : isDm
-                        ? 'text-amber-400'
+                    className="font-display uppercase tracking-widest font-semibold"
+                    style={{
+                      color: onPaper
+                        ? CRIMSON_TEXT
                         : isSystem
-                        ? 'text-sky-400'
-                        : 'text-emerald-400'
-                    }`}
+                        ? 'var(--tavern-accent)'
+                        : 'var(--rp-parchment-300)',
+                    }}
                   >
                     {msg.sender}
                   </span>
                   {isWhisper && (
-                    <span className="px-1.5 py-0.2 bg-purple-900 border border-purple-500/50 text-purple-200 rounded text-[9px] font-bold">
-                      SECRET WHISPER
+                    <span className="vtt-badge-danger" style={{ fontSize: '9px', padding: '0.05rem 0.4rem' }}>
+                      Secret Whisper
                     </span>
                   )}
                   {msg.channel && msg.channel !== 'all' && !isWhisper && (
-                    <span className="px-1.5 py-0.2 bg-slate-800 rounded text-[9px] uppercase text-slate-400">
+                    <span
+                      className="vtt-badge"
+                      style={{ fontSize: '9px', padding: '0.05rem 0.4rem', textTransform: 'uppercase' }}
+                    >
                       {msg.channel}
                     </span>
                   )}
                 </div>
-                <span className="text-slate-600">{msg.timestamp}</span>
+                <span style={{ color: onPaper ? INK_MUTED : 'var(--rp-parchment-300)' }}>{msg.timestamp}</span>
               </div>
 
-              <div className="leading-relaxed font-sans text-xs selectable-text">{msg.content}</div>
+              {/* Drop cap only on scene-setting GM prose, never on chat chatter. */}
+              <div
+                className={`leading-relaxed selectable-text ${
+                  onPaper ? 'font-prose text-sm vtt-dropcap' : 'text-xs'
+                }`}
+                style={!onPaper ? { color: 'var(--rp-parchment-200)' } : undefined}
+              >
+                {msg.content}
+              </div>
 
               {msg.diceRollDetails && (
-                <div className="mt-1.5 p-1.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center space-x-2 text-[10px] font-mono">
-                  <Dices className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="text-slate-400">Expression: {msg.diceRollDetails.expression}</span>
-                  <span className="text-slate-600">•</span>
-                  <span className="text-amber-300 font-bold">Total: {msg.diceRollDetails.total}</span>
-                  <span className="text-slate-600">•</span>
-                  <span className="text-slate-500">[{msg.diceRollDetails.rolls.join(', ')}]</span>
+                <div className="mt-1.5 flex items-center flex-wrap gap-x-2 gap-y-1">
+                  <span className="vtt-badge" style={{ fontSize: '10px' }}>
+                    <Dices className="w-3 h-3" style={{ color: onPaper ? CRIMSON_TEXT : 'var(--tavern-accent)' }} />
+                    {msg.diceRollDetails.expression}
+                  </span>
+                  <span
+                    className={`${onPaper ? 'vtt-badge-success' : 'vtt-badge'}`}
+                    style={{ fontSize: '10px' }}
+                  >
+                    Total: {msg.diceRollDetails.total}
+                  </span>
+                  <span
+                    className="text-[10px]"
+                    style={{ color: onPaper ? INK_MUTED : 'var(--rp-parchment-300)', fontFamily: 'var(--font-serif-prose)' }}
+                  >
+                    [{msg.diceRollDetails.rolls.join(', ')}]
+                  </span>
                 </div>
               )}
             </div>
@@ -241,9 +251,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
 
         {/* Live Peer Typing Indicator */}
         {(activePeerTyping || isStreamingResponse) && (
-          <div className="p-2 bg-slate-900/60 border border-slate-800 rounded-xl flex items-center space-x-2 text-xs font-mono text-purple-300 animate-pulse">
-            <Sparkles className="w-3.5 h-3.5 text-purple-400 animate-spin" />
-            <span>
+          <div className="vtt-surface rounded-lg p-2 flex items-center gap-2 text-xs animate-pulse">
+            <Sparkles className="w-3.5 h-3.5 text-tavern-accent animate-spin" />
+            <span className="text-[var(--rp-parchment-200)]">
               {activePeerTyping ? `${activePeerTyping} is typing...` : 'AI Narrative Director is forging story...'}
             </span>
           </div>
@@ -253,18 +263,15 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       </div>
 
       {/* Message Input & Action Bar */}
-      <form onSubmit={handleSend} className="p-2 border-t border-slate-800/80 bg-slate-900/80 flex items-center gap-2">
+      <form onSubmit={handleSend} className="p-2 border-t border-tavern-border bg-tavern-surface/80 flex items-center gap-2">
         <button
           type="button"
           onClick={toggleRecording}
-          className={`p-2 rounded-xl border transition cursor-pointer ${
-            isRecording
-              ? 'bg-red-600 text-white border-red-500 animate-pulse'
-              : 'bg-slate-800 text-slate-300 border-slate-700 hover:text-white'
-          }`}
+          className={`vtt-btn ${isRecording ? 'vtt-btn-danger' : 'vtt-btn-secondary'}`}
+          style={{ padding: '0.45rem' }}
           title={isRecording ? 'Stop Recording' : 'Push-to-Talk (Microphone Ingestion)'}
         >
-          {isRecording ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+          {isRecording ? <MicOff className="w-4 h-4 animate-pulse" /> : <Mic className="w-4 h-4" />}
         </button>
 
         <input
@@ -281,13 +288,14 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
               ? 'Speak to party members...'
               : "Declare action (e.g. 'I cast Fireball at the warlord', 'I roll Athletics to leap')..."
           }
-          className="flex-1 bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
+          className="vtt-input flex-1 text-xs font-prose"
         />
 
         <button
           type="submit"
           disabled={!inputText.trim()}
-          className="px-4 py-1.5 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 disabled:opacity-30 text-white text-xs font-bold font-mono rounded-xl shadow transition cursor-pointer flex items-center space-x-1"
+          className="vtt-btn vtt-btn-primary disabled:opacity-30 disabled:cursor-not-allowed text-xs"
+          style={{ padding: '0.35rem 0.8rem' }}
         >
           <Send className="w-3.5 h-3.5" />
           <span>Send</span>

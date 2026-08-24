@@ -58,6 +58,25 @@ mod tests {
     }
 
     #[test]
+    fn test_wasm_fuel_ceiling_clamps_client_requests() {
+        let engine = SandboxedWasmEngine::new().unwrap();
+        let wat = r#"
+            (module
+                (func (export "add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add
+                )
+            )
+        "#;
+        // A client requesting near-maximal fuel must still be clamped to the
+        // host ceiling — and the call must succeed within it.
+        let res = engine.execute_wat(wat, "add", &[2, 3], u64::MAX);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().output_value, 5);
+    }
+
+    #[test]
     fn test_rhai_scripting_engine() {
         let engine = RhaiNarrativeEngine::new();
         let ctx = ScriptExecutionContext {

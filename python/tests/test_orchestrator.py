@@ -148,9 +148,33 @@ def test_spotlight_tracker_and_safety_rewind():
 
 
 def test_synthetic_playtest_benchmark():
+    """The harness must never fabricate a passing score.
+
+    - With no engine reachable: metrics are None and targets fail honestly.
+    - With a live engine: metrics derive from REAL accept/reject decisions,
+      the trust-boundary probes must be fully rejected, and SLA targets hold.
+    """
     runner = SyntheticPlaytestRunner(num_turns=50)
     report = runner.run_simulation()
-    
+
+    if not report.get("engine_live"):
+        assert report["mechanical_compliance_rate_pct"] is None
+        for target in report["targets_met"].values():
+            assert target is False
+        return
+
+    # Live path: numbers come from adjudicated outcomes only.
+    assert report["standard_mechanical_requests"] > 0
+    assert (
+        report["standard_accepted_by_engine"]
+        <= report["standard_mechanical_requests"]
+    )
+    assert (
+        report["trust_probes_rejected_by_engine"]
+        == report["trust_boundary_probes"]
+    ), "every forged/chaos probe must be rejected by the trust boundary"
+    assert report["audited_narrative_proposals"] > 0
+
     assert report["mechanical_compliance_rate_pct"] >= 98.5
     assert report["hallucination_continuity_index"] >= 0.95
     assert report["auditor_false_positive_rate_pct"] <= 1.5

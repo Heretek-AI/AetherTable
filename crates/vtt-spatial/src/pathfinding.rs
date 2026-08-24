@@ -32,6 +32,28 @@ pub struct PathResult {
 
 pub struct AStarPathfinder;
 
+/// Per-cell movement cost overlay for difficult terrain. A cost of 2 means
+/// "each step into this cell consumes 2 steps of movement" (SRD difficult
+/// terrain). Cells absent from the map cost 1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TerrainOverlay {
+    pub costs: HashMap<(usize, usize, usize), u32>,
+}
+
+impl TerrainOverlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_cost(&mut self, x: usize, y: usize, z: usize, cost: u32) {
+        self.costs.insert((x, y, z), cost.max(1));
+    }
+
+    fn step_cost(&self, pos: (usize, usize, usize)) -> usize {
+        *self.costs.get(&pos).unwrap_or(&1) as usize
+    }
+}
+
 impl AStarPathfinder {
     pub fn find_path(
         grid: &GridCollisionMap,
@@ -39,7 +61,19 @@ impl AStarPathfinder {
         end_world: &Vector3,
         speed_budget_feet: f32,
     ) -> PathResult {
-        let start = grid.world_to_grid(start_world);
+        Self::find_path_with_terrain(grid, &TerrainOverlay::new(), start_world, end_world, speed_budget_feet)
+    }
+
+    /// Dijkstra pathfinding honoring per-cell difficult-terrain multipliers.
+    /// Movement cost accumulates `step_cost` per entered cell so a 2x-cost
+    /// cell consumes twice the speed budget.
+    pub fn find_path_with_terrain(
+        grid: &GridCollisionMap,
+        terrain: &TerrainOverlay,
+        start_world: &Vector3,
+        end_world: &Vector3,
+        speed_budget_feet: f32,
+    ) -> PathResult {        let start = grid.world_to_grid(start_world);
         let goal = grid.world_to_grid(end_world);
 
         if grid.is_solid(start.0, start.1, start.2) || grid.is_solid(goal.0, goal.1, goal.2) {
@@ -88,7 +122,7 @@ impl AStarPathfinder {
                    nz >= 0 && nz < grid.depth as i32 {
                     let npos = (nx as usize, ny as usize, nz as usize);
                     if !grid.is_solid(npos.0, npos.1, npos.2) {
-                        let next_cost = cost + 1;
+                        let next_cost = cost + terrain.step_cost(npos);
                         if next_cost < *dist.get(&npos).unwrap_or(&usize::MAX) {
                             dist.insert(npos, next_cost);
                             came_from.insert(npos, pos);

@@ -217,7 +217,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   }}
                   className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
-                  <BookOpen className="w-4 h-4 text-sky-400 shrink-0" />
+                  <BookOpen className="w-4 h-4 text-[var(--rp-parchment-300)] shrink-0" />
                   <div>
                     <div className="font-bold">Quest & Campaign Journal</div>
                     <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Active Objectives & NPC Dossiers</div>
@@ -245,7 +245,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 onClick={() => handleNavClick('bundles')}
                 className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
-                <Package className="w-4 h-4 text-sky-400 shrink-0" />
+                <Package className="w-4 h-4 text-tavern-accent shrink-0" />
                 <div>
                   <div className="font-bold">Campaign Bundles</div>
                   <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">.vttbundle Exporter/Importer</div>
@@ -353,7 +353,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 onClick={() => handleNavClick('wfc')}
                 className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
               >
-                <Layers className="w-4 h-4 text-indigo-400 shrink-0" />
+                <Layers className="w-4 h-4 text-[var(--rp-crimson-400)] shrink-0" />
                 <div>
                   <div className="font-bold">WFC Dungeon Studio</div>
                   <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Procedural Dungeon Synthesis</div>
@@ -459,7 +459,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   }}
                   className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
                 >
-                  <Music className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <Music className="w-4 h-4 text-[var(--rp-parchment-300)] shrink-0" />
                   <div>
                     <div className="font-bold">Jukebox & Soundscapes</div>
                     <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Ambient multi-track audio</div>

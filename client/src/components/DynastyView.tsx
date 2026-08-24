@@ -1,21 +1,21 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Crown, 
-  Shield, 
-  Eye, 
-  Sparkles, 
-  Swords, 
-  GitBranch, 
-  Layers, 
-  Flame, 
-  BookOpen, 
-  Plus, 
-  Check, 
-  RefreshCw, 
-  Activity, 
-  ShieldAlert, 
-  Zap, 
-  Users 
+import {
+  Crown,
+  Shield,
+  Eye,
+  Sparkles,
+  Swords,
+  GitBranch,
+  Layers,
+  Flame,
+  BookOpen,
+  Plus,
+  Check,
+  RefreshCw,
+  Activity,
+  ShieldAlert,
+  Zap,
+  Users
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
@@ -131,15 +131,15 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden select-none">
+    <div className="flex-1 flex flex-col h-full bg-tavern-bg text-parchment-paper overflow-hidden select-none">
       {/* Top Bar */}
-      <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+      <div className="p-4 border-b border-tavern-border flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-bold font-display flex items-center gap-2">
-            <Crown className="w-5 h-5 text-purple-400" />
+          <h1 className="vtt-engraved text-lg font-bold flex items-center gap-2">
+            <Crown className="w-5 h-5 text-tavern-accent" />
             <span>Dynasty Lineage & Faction Feud Studio</span>
           </h1>
-          <p className="text-xs text-slate-400 mt-0.5">
+          <p className="text-xs text-[var(--rp-parchment-300)] mt-0.5 font-prose">
             Procedural noble bloodline trees, inherited genetic traits, and empirical party balance benchmarks (opendnd & dnddata).
           </p>
         </div>
@@ -147,7 +147,7 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
         <div className="flex items-center gap-3">
           <button
             onClick={fetchDynasties}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-slate-300 rounded-xl text-xs font-mono border border-slate-800 transition"
+            className="vtt-btn vtt-btn-secondary text-xs"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
             <span>Regenerate Lineages</span>
@@ -155,7 +155,7 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
 
           <button
             onClick={handleInjectLore}
-            className="flex items-center gap-2 px-5 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold font-mono shadow-lg shadow-purple-950 transition active:scale-95"
+            className="vtt-btn vtt-btn-primary text-xs active:scale-95"
           >
             <Sparkles className="w-4 h-4" />
             <span>Inject Dynasty Lore into Campaign</span>
@@ -164,7 +164,7 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
       </div>
 
       {injectedStatus && (
-        <div className="bg-emerald-950/80 border-b border-emerald-800 px-4 py-2 text-xs font-mono text-emerald-300 flex items-center gap-2 animate-fadeIn">
+        <div className="border-b px-4 py-2 text-xs font-prose text-emerald-300 flex items-center gap-2 animate-fadeIn bg-[color-mix(in_srgb,var(--state-success)_10%,transparent)] border-[color-mix(in_srgb,var(--state-success)_45%,transparent)]">
           <Check className="w-4 h-4 text-emerald-400" />
           <span>{injectedStatus}</span>
         </div>
@@ -175,8 +175,8 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
         {/* Left Column: Noble House Selector & Empirical Playtester Stats */}
         <div className="lg:col-span-1 space-y-6">
           <div>
-            <h2 className="text-xs font-bold font-display uppercase tracking-wider text-purple-400 mb-3 flex items-center gap-1.5">
-              <Layers className="w-4 h-4" />
+            <h2 className="vtt-section-header text-xs mb-3">
+              <Layers className="w-4 h-4 shrink-0" />
               <span>Great Noble Houses</span>
             </h2>
 
@@ -192,8 +192,8 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                     }}
                     className={`w-full text-left p-3.5 rounded-xl border transition shadow flex items-center justify-between ${
                       isSelected
-                        ? 'bg-purple-950/60 border-purple-500 ring-1 ring-purple-500'
-                        : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
+                        ? 'bg-[color-mix(in_srgb,var(--tavern-accent)_10%,transparent)] border-tavern-accent ring-1 ring-tavern-accent'
+                        : 'bg-[color-mix(in_srgb,var(--tavern-surface)_60%,transparent)] border-tavern-border hover:border-[var(--rp-leather-600)]'
                     }`}
                   >
                     <div className="flex items-center gap-3">
@@ -204,8 +204,8 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                         {renderCrestIcon(h.crest_icon)}
                       </div>
                       <div>
-                        <div className="font-bold text-xs font-display text-slate-100">{h.name}</div>
-                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]">{h.motto}</div>
+                        <div className="font-bold text-xs font-display [font-variant:small-caps] text-parchment-paper">{h.name}</div>
+                        <div className="text-[10px] text-[var(--rp-parchment-300)] font-prose truncate max-w-[140px]">{h.motto}</div>
                       </div>
                     </div>
                   </button>
@@ -215,30 +215,30 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
           </div>
 
           {/* Empirical Benchmark Card */}
-          <div className="vtt-glass-panel p-4 rounded-xl border border-slate-800 space-y-3 shadow-lg">
-            <h3 className="text-xs font-bold font-display uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-              <Activity className="w-4 h-4" />
+          <div className="vtt-glass-panel p-4 rounded-xl space-y-3 shadow-lg">
+            <h3 className="vtt-section-header text-xs">
+              <Activity className="w-4 h-4 shrink-0" />
               <span>Empirical Party Balance (dnddata)</span>
             </h3>
 
-            <div className="space-y-2 text-xs font-mono">
-              <div className="flex justify-between text-slate-400">
+            <div className="space-y-2 text-xs font-prose">
+              <div className="flex justify-between text-[var(--rp-parchment-300)]">
                 <span>Simulations:</span>
-                <strong className="text-slate-200">{empiricalStats.total_simulations} Turns</strong>
+                <strong className="text-parchment-paper">{empiricalStats.total_simulations}</strong>
               </div>
-              <div className="flex justify-between text-slate-400">
+              <div className="flex justify-between text-[var(--rp-parchment-300)]">
                 <span>Party Win Rate:</span>
-                <strong className="text-emerald-400">{empiricalStats.win_rate}%</strong>
+                <strong className="text-emerald-300">{empiricalStats.win_rate}%</strong>
               </div>
-              <div className="flex justify-between text-slate-400">
+              <div className="flex justify-between text-[var(--rp-parchment-300)]">
                 <span>Avg Turns to Clear:</span>
-                <strong className="text-purple-400">{empiricalStats.average_turns}</strong>
+                <strong className="text-tavern-accent">{empiricalStats.average_turns}</strong>
               </div>
-              <div className="flex justify-between text-slate-400">
+              <div className="flex justify-between text-[var(--rp-parchment-300)]">
                 <span>Avg Remaining HP:</span>
-                <strong className="text-sky-400">{empiricalStats.average_remaining_hp_pct}%</strong>
+                <strong className="text-tavern-accent">{empiricalStats.average_remaining_hp_pct}%</strong>
               </div>
-              <div className="pt-2 border-t border-slate-800 text-[10px] text-slate-500">
+              <div className="pt-2 border-t border-tavern-border text-[10px] text-[var(--rp-parchment-300)]">
                 Seeded with 10,000+ real character sheets.
               </div>
             </div>
@@ -249,7 +249,7 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
         {selectedHouse ? (
           <div className="lg:col-span-3 space-y-6">
             {/* House Banner */}
-            <div className="vtt-glass-panel p-5 rounded-2xl border border-slate-800 flex items-center justify-between shadow-xl">
+            <div className="vtt-card-elevated rounded-2xl p-5 flex items-center justify-between shadow-xl">
               <div className="flex items-center gap-4">
                 <div
                   className="w-14 h-14 rounded-2xl flex items-center justify-center text-white shadow-xl"
@@ -259,12 +259,12 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                 </div>
 
                 <div>
-                  <h2 className="text-xl font-bold font-display text-slate-100">{selectedHouse.name}</h2>
-                  <div className="text-xs font-mono text-purple-300 italic mt-0.5">"{selectedHouse.motto}"</div>
-                  <div className="text-[11px] text-slate-400 font-mono mt-1 flex items-center gap-3">
-                    <span>Seat of Power: <strong className="text-slate-200">{selectedHouse.seat_of_power}</strong></span>
+                  <h2 className="vtt-statblock-nameplate text-xl font-bold">{selectedHouse.name}</h2>
+                  <div className="text-xs text-tavern-accent font-prose italic mt-0.5">"{selectedHouse.motto}"</div>
+                  <div className="text-[11px] text-[var(--rp-parchment-300)] font-prose mt-1 flex items-center gap-3">
+                    <span>Seat of Power: <strong className="text-parchment-paper">{selectedHouse.seat_of_power}</strong></span>
                     <span>·</span>
-                    <span>Core Virtue: <strong className="text-slate-200">{selectedHouse.primary_virtue}</strong></span>
+                    <span>Core Virtue: <strong className="text-parchment-paper">{selectedHouse.primary_virtue}</strong></span>
                   </div>
                 </div>
               </div>
@@ -272,8 +272,8 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
 
             {/* Generational Lineage Tree */}
             <div className="space-y-4">
-              <h3 className="text-xs font-bold font-display uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
-                <GitBranch className="w-4 h-4" />
+              <h3 className="vtt-section-header text-xs">
+                <GitBranch className="w-4 h-4 shrink-0" />
                 <span>3-Generation Bloodline Tree & Inherited Traits</span>
               </h3>
 
@@ -284,48 +284,39 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
 
                   return (
                     <div key={`gen_${gen}`} className="space-y-2">
-                      <div className="text-[11px] font-mono font-bold text-slate-500 uppercase flex items-center gap-2">
+                      <div className="text-[11px] font-display [font-variant:small-caps] tracking-wider text-[var(--rp-parchment-300)] flex items-center gap-2">
                         <span>Generation {gen}: {gen === 1 ? 'Founders' : gen === 2 ? 'Reigning Sovereigns' : 'Heirs & Scions'}</span>
-                        <div className="flex-1 h-px bg-slate-800" />
+                        <div className="vtt-divider flex-1"><span /></div>
                       </div>
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                         {genMembers.map((member) => (
                           <div
                             key={member.id}
-                            className="p-3.5 bg-slate-900/70 border border-slate-800 rounded-xl space-y-2 shadow hover:border-slate-700 transition"
+                            className="vtt-card-elevated p-3.5 rounded-xl space-y-2"
                           >
                             <div className="flex items-center justify-between">
                               <div>
-                                <h4 className="font-bold text-xs font-display text-slate-100">{member.name}</h4>
-                                <span className="text-[10px] font-mono text-purple-300">{member.title}</span>
+                                <h4 className="font-bold text-xs font-display [font-variant:small-caps] text-parchment-paper">{member.name}</h4>
+                                <span className="text-[10px] font-prose text-tavern-accent">{member.title}</span>
                               </div>
-                              <span
-                                className={`text-[9px] font-mono px-2 py-0.5 rounded uppercase font-bold border ${
-                                  member.is_alive
-                                    ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
-                                    : 'bg-slate-800 text-slate-400 border-slate-700'
-                                }`}
-                              >
+                              <span className={`vtt-badge ${member.is_alive ? 'vtt-badge-success' : ''}`}>
                                 {member.is_alive ? 'Living' : 'Deceased'}
                               </span>
                             </div>
 
-                            <p className="text-[11px] text-slate-400 leading-relaxed font-sans">{member.personality}</p>
+                            <p className="selectable-text text-[11px] text-[var(--rp-parchment-200)] leading-relaxed font-prose">{member.personality}</p>
 
                             {member.historical_event && (
-                              <div className="text-[10px] text-amber-300/90 font-mono bg-amber-950/40 p-1.5 rounded border border-amber-900/50">
+                              <div className="vtt-parchment selectable-text text-[10px] font-prose leading-relaxed p-2 rounded-sm">
                                 ⚔ Historical Event: {member.historical_event}
                               </div>
                             )}
 
                             {/* Inherited Traits */}
-                            <div className="pt-2 border-t border-slate-800 flex flex-wrap gap-1.5">
+                            <div className="pt-2 border-t border-tavern-border flex flex-wrap gap-1.5">
                               {member.traits.map((t, idx) => (
-                                <span
-                                  key={idx}
-                                  className="text-[9px] font-mono px-2 py-0.5 rounded-md bg-purple-950 text-purple-200 border border-purple-800/80 shadow-sm"
-                                >
+                                <span key={idx} className="vtt-badge">
                                   {t}
                                 </span>
                               ))}
@@ -341,8 +332,8 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
 
             {/* Faction Feuds & Diplomatic Tensions */}
             <div className="space-y-3 pt-2">
-              <h3 className="text-xs font-bold font-display uppercase tracking-wider text-purple-400 flex items-center gap-1.5">
-                <Swords className="w-4 h-4" />
+              <h3 className="vtt-section-header text-xs">
+                <Swords className="w-4 h-4 shrink-0" />
                 <span>Inter-Dynasty Feuds & Diplomatic Tensions</span>
               </h3>
 
@@ -350,23 +341,18 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                 {Object.entries(selectedHouse.feuds).map(([targetId, rel]) => {
                   const isFeud = rel.toLowerCase().includes('feud');
                   const isAllied = rel.toLowerCase().includes('allied');
+                  const relBadgeClass = isFeud ? 'vtt-badge-danger' : isAllied ? 'vtt-badge-success' : '';
 
                   return (
                     <div
                       key={targetId}
-                      className={`p-3 rounded-xl border flex items-center justify-between text-xs font-mono shadow ${
-                        isFeud
-                          ? 'bg-rose-950/30 border-rose-900 text-rose-300'
-                          : isAllied
-                          ? 'bg-sky-950/30 border-sky-900 text-sky-300'
-                          : 'bg-slate-900/60 border-slate-800 text-slate-300'
-                      }`}
+                      className="p-3 rounded-xl border border-tavern-border bg-[color-mix(in_srgb,var(--tavern-surface)_60%,transparent)] flex items-center justify-between text-xs font-prose shadow"
                     >
                       <div className="flex items-center gap-2">
-                        {isFeud ? <ShieldAlert className="w-4 h-4 text-rose-400" /> : <Shield className="w-4 h-4 text-sky-400" />}
-                        <span className="font-bold uppercase text-[11px]">{targetId.replace('_', ' ')}:</span>
+                        {isFeud ? <ShieldAlert className="w-4 h-4 text-[var(--rp-crimson-400)]" /> : <Shield className="w-4 h-4 text-tavern-accent" />}
+                        <span className="font-bold uppercase text-[11px] font-display [font-variant:small-caps] text-parchment-paper">{targetId.replace('_', ' ')}</span>
                       </div>
-                      <span className="text-[11px] font-semibold">{rel}</span>
+                      <span className={`vtt-badge ${relBadgeClass}`}>{rel}</span>
                     </div>
                   );
                 })}
@@ -374,7 +360,7 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
             </div>
           </div>
         ) : (
-          <div className="lg:col-span-3 flex items-center justify-center p-12 text-slate-500 font-mono text-xs">
+          <div className="lg:col-span-3 flex items-center justify-center p-12 text-[var(--rp-parchment-300)] font-prose text-xs">
             Loading Noble House Lineages...
           </div>
         )}

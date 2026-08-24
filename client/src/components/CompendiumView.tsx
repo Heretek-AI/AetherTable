@@ -1,36 +1,27 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { useFocusTrap } from './ui/useFocusTrap';
-import { 
-  BookOpen, 
-  Search, 
-  Shield, 
-  Skull, 
-  Flame, 
-  Sparkles, 
-  Wand2, 
-  Zap, 
-  Plus, 
-  Clock, 
-  Compass, 
-  Filter,
-  Layers,
-  ChevronRight,
-  ChevronLeft,
-  ChevronsLeft,
-  ChevronsRight,
-  Eye,
-  Check,
-  X,
-  Award,
-  Heart,
-  Sword,
+import React, { useEffect, useState } from 'react';
+import {
+  BookOpen,
+  Search,
+  Skull,
+  Sparkles,
   Gem,
   Feather,
   PawPrint,
   ScrollText,
+  Wand2,
+  Plus,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Check,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { Token } from './TacticalCanvas';
 import { globalAudio } from '../render/audio_manager';
+import { ModalShell } from './ui/ModalShell';
+import { Statblock } from '../ui/Statblock';
+import type { StatblockKind } from '../ui/Statblock';
 
 interface CompendiumViewProps {
   onSpawnToken: (tokenData: Omit<Token, 'id' | 'x' | 'y'>) => void;
@@ -76,6 +67,40 @@ const FALLBACK_SPELLS = [
 
 export type CompendiumTab = 'monsters' | 'spells' | 'magic-items' | 'feats' | 'animals' | 'glossary';
 
+/** Tab identity doubles as the card-kind discriminator for CompendiumCard. */
+const TABS: { id: CompendiumTab; label: string; icon: LucideIcon }[] = [
+  { id: 'monsters', label: 'Monsters', icon: Skull },
+  { id: 'spells', label: 'Spells', icon: Sparkles },
+  { id: 'magic-items', label: 'Magic Items', icon: Gem },
+  { id: 'feats', label: 'Feats', icon: Feather },
+  { id: 'animals', label: 'Animals', icon: PawPrint },
+  { id: 'glossary', label: 'Glossary', icon: ScrollText },
+];
+
+const CARD_ICONS: Record<CompendiumTab, LucideIcon> = Object.fromEntries(
+  TABS.map((t) => [t.id, t.icon]),
+) as Record<CompendiumTab, LucideIcon>;
+
+const SPELL_SCHOOLS = [
+  'Abjuration',
+  'Conjuration',
+  'Divination',
+  'Enchantment',
+  'Evocation',
+  'Illusion',
+  'Necromancy',
+  'Transmutation',
+];
+
+const CR_FILTERS = ['All', '0', '1/4', '1/2', '1', '2', '3', '5', '7', '10', '13', '17', '21'];
+
+/** Tab → shared Statblock renderer kind. Feats print like items. */
+function statblockKindForTab(tab: CompendiumTab): StatblockKind {
+  if (tab === 'spells') return 'spell';
+  if (tab === 'monsters' || tab === 'animals') return 'monster';
+  return 'item';
+}
+
 export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) => {
   const [activeTab, setActiveTab] = useState<CompendiumTab>('monsters');
   const [searchQuery, setSearchQuery] = useState('');
@@ -89,7 +114,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
   const [animals, setAnimals] = useState<any[]>([]);
   const [glossaryTerms, setGlossaryTerms] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selectedItem, setSelectedItem] = useState<any | null>(null);
+  const [selectedItem, setSelectedItem] = useState<Record<string, any> | null>(null);
   const [spawnSuccess, setSpawnSuccess] = useState<string | null>(null);
 
   // Pagination State
@@ -185,6 +210,15 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
   const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
   const paginatedItems = activeItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
 
+  const tabCounts: Record<CompendiumTab, number> = {
+    monsters: filteredMonsters.length,
+    spells: filteredSpells.length,
+    'magic-items': filteredMagicItems.length,
+    feats: filteredFeats.length,
+    animals: filteredAnimals.length,
+    glossary: filteredGlossary.length,
+  };
+
   const handlePageChange = (newPage: number) => {
     if (newPage >= 1 && newPage <= totalPages) {
       setCurrentPage(newPage);
@@ -193,7 +227,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     }
   };
 
-  const handleSpawnMonster = (monster: any) => {
+  const handleSpawnMonster = (monster: Record<string, any>) => {
     const tokenData: Omit<Token, 'id' | 'x' | 'y'> = {
       name: monster.name,
       hp: monster.hit_points || monster.hp || 30,
@@ -224,425 +258,160 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     return pages;
   };
 
+  const openEntry = (entry: Record<string, any>) => {
+    // Glossary entries key on term/definition; normalize so the Statblock
+    // renderer (which prints item.name/item.description) sees both.
+    if (activeTab === 'glossary') {
+      setSelectedItem({ ...entry, name: entry.term, description: entry.definition });
+    } else {
+      setSelectedItem(entry);
+    }
+  };
+
+  const selectedCanSpawn = activeTab === 'monsters' || activeTab === 'animals';
+
+  const pageNavBtn =
+    'vtt-btn vtt-btn-secondary disabled:opacity-30 disabled:pointer-events-none';
+
   return (
-    <div className="w-full h-full flex flex-col overflow-hidden p-6 max-w-7xl mx-auto space-y-4 font-sans select-none">
-      {/* Header Banner (D&D Beyond Style) */}
-      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 shadow-2xl relative overflow-hidden backdrop-blur-sm shrink-0">
-        <div className="absolute -right-6 -bottom-6 w-40 h-40 bg-amber-500/5 rounded-full blur-3xl pointer-events-none" />
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+    <div className="w-full h-full flex flex-col overflow-hidden p-6 max-w-7xl mx-auto space-y-4 select-none">
+      {/* Header Banner */}
+      <header className="bg-tavern-surface border border-tavern-border rounded-2xl p-5 shadow-lg relative overflow-hidden shrink-0">
+        <div className="absolute -right-6 -bottom-6 w-40 h-40 bg-tavern-accent/5 rounded-full blur-3xl pointer-events-none" />
+        <div className="relative flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="flex items-center space-x-3.5">
-            <div className="p-3 bg-amber-950/50 border border-amber-500/30 rounded-xl text-amber-400 shadow-inner">
+            <div className="p-3 bg-tavern-bg border border-tavern-border rounded-xl text-tavern-accent shadow-inner">
               <BookOpen className="w-6 h-6" />
             </div>
             <div>
               <div className="flex items-center space-x-2.5">
-                <h2 className="text-xl font-bold font-serif tracking-wide text-slate-100">
-                  D&D 5e Compendium Codex
+                <h2 className="vtt-engraved text-xl font-bold tracking-wide">
+                  D&amp;D 5e Compendium Codex
                 </h2>
-                <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-950 text-amber-300 border border-amber-600/50 rounded-full font-mono">
-                  SRD 5.2
-                </span>
+                <span className="vtt-badge">SRD 5.2</span>
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
+              <p className="text-xs text-[var(--rp-parchment-300)] mt-0.5">
                 Explore monster statblocks, spell grimoires, and spawn tokens directly to the tactical canvas.
               </p>
             </div>
           </div>
 
-          {/* Search Bar & Tab Switcher */}
+          {/* Search Bar, Filters & Tab Switcher */}
           <div className="flex flex-wrap items-center gap-3">
-            <div className="relative w-full sm:w-64">
-              <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-500" />
+            <div className="relative w-full sm:w-56">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[var(--rp-parchment-300)] pointer-events-none" />
               <input
                 type="text"
                 placeholder="Search monsters, spells, rules..."
+                aria-label="Search the compendium"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-slate-950/90 border border-slate-700 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-amber-500 shadow-inner font-mono"
+                className="vtt-input w-full pl-9 text-xs font-mono"
               />
             </div>
 
-            <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 font-mono text-xs">
-              <button
-                onClick={() => setActiveTab('monsters')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'monsters'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+            {activeTab === 'spells' && (
+              <select
+                aria-label="Filter by school of magic"
+                value={selectedSchool}
+                onChange={(e) => setSelectedSchool(e.target.value)}
+                className="vtt-select text-xs font-mono"
               >
-                <Skull className="w-3.5 h-3.5" />
-                <span>Monsters ({filteredMonsters.length})</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('spells')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'spells'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                <option value="All">All Schools</option>
+                {SPELL_SCHOOLS.map((school) => (
+                  <option key={school} value={school}>
+                    {school}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            {(activeTab === 'monsters' || activeTab === 'animals') && (
+              <select
+                aria-label="Filter by challenge rating"
+                value={selectedCR}
+                onChange={(e) => setSelectedCR(e.target.value)}
+                className="vtt-select text-xs font-mono"
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Spells ({filteredSpells.length})</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('magic-items')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'magic-items'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Gem className="w-3.5 h-3.5" />
-                <span>Magic Items ({filteredMagicItems.length})</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('feats')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'feats'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Feather className="w-3.5 h-3.5" />
-                <span>Feats ({filteredFeats.length})</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('animals')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'animals'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <PawPrint className="w-3.5 h-3.5" />
-                <span>Animals ({filteredAnimals.length})</span>
-              </button>
-              <button
-                onClick={() => setActiveTab('glossary')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition cursor-pointer flex items-center space-x-1.5 ${
-                  activeTab === 'glossary'
-                    ? 'bg-amber-600 text-white shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <ScrollText className="w-3.5 h-3.5" />
-                <span>Glossary ({filteredGlossary.length})</span>
-              </button>
-            </div>
+                {CR_FILTERS.map((cr) => (
+                  <option key={cr} value={cr}>
+                    {cr === 'All' ? 'All CRs' : `CR ${cr}`}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <nav aria-label="Compendium sections" className="vtt-tabbar flex-wrap max-w-full overflow-x-auto">
+              {TABS.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setActiveTab(id)}
+                  data-active={activeTab === id}
+                  aria-current={activeTab === id ? 'page' : undefined}
+                  className="vtt-tab whitespace-nowrap flex items-center space-x-1.5"
+                >
+                  <Icon className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>
+                    {label} ({tabCounts[id]})
+                  </span>
+                </button>
+              ))}
+            </nav>
           </div>
         </div>
-      </div>
+      </header>
 
       {/* Main Content Grid (Scrollable) */}
-      <div className="flex-1 overflow-y-auto pr-1 min-h-0">
+      <div className="flex-1 overflow-y-auto vtt-scrollbar pr-1 min-h-0">
         {paginatedItems.length === 0 ? (
-          <div className="p-12 text-center text-slate-500 font-mono text-xs bg-slate-900/40 rounded-2xl border border-slate-800">
+          <div className="p-12 text-center text-[var(--rp-parchment-300)] font-mono text-xs bg-tavern-bg border border-tavern-border rounded-xl">
             No entries found matching "{searchQuery}".
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {activeTab === 'monsters' &&
-              paginatedItems.map((monster: any, index: number) => (
-                <div
-                  key={monster.id || index}
-                  onClick={() => setSelectedItem(monster)}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center space-x-3">
-                        <div className="p-2 bg-rose-950/50 border border-rose-600/40 rounded-xl text-rose-400 group-hover:scale-105 transition-transform">
-                          <Skull className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-amber-300 transition-colors">
-                            {monster.name}
-                          </h3>
-                          <p className="text-[10px] text-slate-400 font-mono capitalize">
-                            {monster.size || 'Medium'} {monster.type || 'Monstrosity'}
-                          </p>
-                        </div>
-                      </div>
-
-                      <span className="px-2 py-0.5 bg-amber-950 text-amber-300 border border-amber-600/40 text-[11px] font-mono font-bold rounded">
-                        CR {monster.challenge_rating || monster.cr || '1'}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 mt-3 text-center font-mono text-xs">
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">AC</div>
-                        <div className="font-bold text-sky-400">{monster.armor_class || monster.ac || 14}</div>
-                      </div>
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">HP</div>
-                        <div className="font-bold text-emerald-400">{monster.hit_points || monster.hp || 30}</div>
-                      </div>
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">SPEED</div>
-                        <div className="font-bold text-amber-400 truncate">{monster.speed || '30 ft'}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between font-mono text-xs">
-                    <span className="text-[10px] text-slate-400">
-                      XP: {monster.xp || 100}
-                    </span>
-
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSpawnMonster(monster);
-                      }}
-                      className="flex items-center space-x-1 px-2.5 py-1 bg-amber-600/20 hover:bg-amber-600 text-amber-300 hover:text-white border border-amber-600/40 rounded-lg text-xs font-semibold transition cursor-pointer"
-                    >
-                      {spawnSuccess === monster.name ? (
-                        <>
-                          <Check className="w-3 h-3 text-emerald-300" />
-                          <span>Spawned!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Plus className="w-3 h-3" />
-                          <span>Spawn</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              ))}
-
-            {activeTab === 'spells' &&
-              paginatedItems.map((spell: any, index: number) => (
-                <div
-                  key={spell.id || index}
-                  onClick={() => setSelectedItem(spell)}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-sky-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center space-x-3">
-                        <div className="p-2 bg-indigo-950/50 border border-indigo-600/40 rounded-xl text-indigo-400 group-hover:scale-105 transition-transform">
-                          <Wand2 className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-sky-300 transition-colors">
-                            {spell.name}
-                          </h3>
-                          <p className="text-[10px] text-slate-400 font-mono">
-                            {spell.level === 0 ? 'Cantrip' : `Level ${spell.level}`} · {spell.school}
-                          </p>
-                        </div>
-                      </div>
-
-                      <span className="px-2 py-0.5 bg-indigo-950 text-indigo-300 border border-indigo-600/40 text-[10px] font-mono font-bold rounded">
-                        {spell.school}
-                      </span>
-                    </div>
-
-                    <p className="text-xs text-slate-300 mt-3 line-clamp-2 font-sans leading-relaxed">
-                      {spell.description}
-                    </p>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] font-mono text-slate-400">
-                    <span>{spell.casting_time || '1 action'}</span>
-                    <span>{spell.range || '60 ft'}</span>
-                  </div>
-                </div>
-              ))}
-
-            {activeTab === 'magic-items' &&
-              paginatedItems.map((item: any, index: number) => (
-                <div
-                  key={item.id || index}
-                  onClick={() => setSelectedItem(item)}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-purple-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center space-x-3">
-                        <div className="p-2 bg-purple-950/50 border border-purple-600/40 rounded-xl text-purple-400 group-hover:scale-105 transition-transform">
-                          <Gem className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-purple-300 transition-colors">
-                            {item.name}
-                          </h3>
-                          <p className="text-[10px] text-slate-400 font-mono capitalize">{item.item_type || item.category}</p>
-                        </div>
-                      </div>
-
-                      <span className={`px-2 py-0.5 border text-[10px] font-mono font-bold rounded ${
-                        item.rarity === 'Legendary' ? 'bg-orange-950 text-orange-300 border-orange-600/40'
-                        : item.rarity === 'Very Rare' ? 'bg-violet-950 text-violet-300 border-violet-600/40'
-                        : item.rarity === 'Rare' ? 'bg-sky-950 text-sky-300 border-sky-600/40'
-                        : item.rarity === 'Uncommon' ? 'bg-emerald-950 text-emerald-300 border-emerald-600/40'
-                        : 'bg-slate-800 text-slate-300 border-slate-600/40'
-                      }`}>
-                        {item.rarity || 'Common'}
-                      </span>
-                    </div>
-
-                    <p className="text-xs text-slate-300 mt-3 line-clamp-2 font-sans leading-relaxed">
-                      {item.description}
-                    </p>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-[10px] font-mono text-slate-400">
-                    <span className="capitalize">{item.category}</span>
-                    {item.requires_attunement && (
-                      <span className="px-1.5 py-0.5 bg-amber-950/60 text-amber-300 border border-amber-600/30 rounded">Attunement</span>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-            {activeTab === 'feats' &&
-              paginatedItems.map((feat: any, index: number) => (
-                <div
-                  key={feat.id || index}
-                  onClick={() => setSelectedItem(feat)}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-emerald-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center space-x-3">
-                        <div className="p-2 bg-emerald-950/50 border border-emerald-600/40 rounded-xl text-emerald-400 group-hover:scale-105 transition-transform">
-                          <Feather className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-emerald-300 transition-colors">
-                            {feat.name}
-                          </h3>
-                          <p className="text-[10px] text-slate-400 font-mono">{feat.category} Feat</p>
-                        </div>
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-slate-300 mt-3 line-clamp-3 font-sans leading-relaxed">
-                      {feat.description}
-                    </p>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center text-[10px] font-mono text-slate-400">
-                    <span>{feat.prerequisite ? `Requires: ${feat.prerequisite}` : 'No prerequisite'}</span>
-                  </div>
-                </div>
-              ))}
-
-            {activeTab === 'animals' &&
-              paginatedItems.map((animal: any, index: number) => (
-                <div
-                  key={animal.id || index}
-                  onClick={() => setSelectedItem(animal)}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-lime-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group flex flex-col justify-between"
-                >
-                  <div>
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center space-x-3">
-                        <div className="p-2 bg-lime-950/50 border border-lime-600/40 rounded-xl text-lime-400 group-hover:scale-105 transition-transform">
-                          <PawPrint className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-lime-300 transition-colors">
-                            {animal.name}
-                          </h3>
-                          <p className="text-[10px] text-slate-400 font-mono capitalize">
-                            {animal.size || 'Medium'} Beast
-                          </p>
-                        </div>
-                      </div>
-
-                      <span className="px-2 py-0.5 bg-lime-950 text-lime-300 border border-lime-600/40 text-[11px] font-mono font-bold rounded">
-                        CR {animal.challenge_rating || '1/4'}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 mt-3 text-center font-mono text-xs">
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">AC</div>
-                        <div className="font-bold text-sky-400">{animal.ac || 12}</div>
-                      </div>
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">HP</div>
-                        <div className="font-bold text-emerald-400">{animal.hp || 20}</div>
-                      </div>
-                      <div className="p-1.5 bg-slate-950/80 rounded-lg border border-slate-800">
-                        <div className="text-[9px] text-slate-500">SPEED</div>
-                        <div className="font-bold text-amber-400 truncate">{animal.speed || '30 ft'}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-3 pt-2.5 border-t border-slate-800/80 flex items-center justify-end">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSpawnMonster(animal);
-                      }}
-                      className="flex items-center space-x-1 px-2.5 py-1 bg-lime-600/20 hover:bg-lime-600 text-lime-300 hover:text-white border border-lime-600/40 rounded-lg text-xs font-semibold transition cursor-pointer"
-                    >
-                      {spawnSuccess === animal.name ? (
-                        <>
-                          <Check className="w-3 h-3 text-emerald-300" />
-                          <span>Spawned!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Plus className="w-3 h-3" />
-                          <span>Spawn</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              ))}
-
-            {activeTab === 'glossary' &&
-              paginatedItems.map((term: any, index: number) => (
-                <div
-                  key={term.id || index}
-                  onClick={() => setSelectedItem({ ...term, name: term.term, description: term.definition })}
-                  className="bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-cyan-500/50 rounded-2xl p-4 shadow-lg transition-all cursor-pointer group"
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="flex items-center space-x-3">
-                      <div className="p-2 bg-cyan-950/50 border border-cyan-600/40 rounded-xl text-cyan-400 group-hover:scale-105 transition-transform">
-                        <ScrollText className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <h3 className="text-sm font-bold font-serif text-slate-100 group-hover:text-cyan-300 transition-colors">
-                          {term.term}
-                        </h3>
-                        {term.tag && <p className="text-[10px] text-slate-400 font-mono">[{term.tag}]</p>}
-                      </div>
-                    </div>
-                  </div>
-
-                  <p className="text-xs text-slate-300 mt-3 line-clamp-3 font-sans leading-relaxed">
-                    {term.definition}
-                  </p>
-                </div>
-              ))}
+            {paginatedItems.map((entry: Record<string, any>, index: number) => (
+              <CompendiumCard
+                key={entry.id || index}
+                entry={entry}
+                kind={activeTab}
+                spawned={spawnSuccess === (entry.name ?? entry.term)}
+                onOpen={() => openEntry(entry)}
+                onSpawn={
+                  activeTab === 'monsters' || activeTab === 'animals'
+                    ? () => handleSpawnMonster(entry)
+                    : undefined
+                }
+              />
+            ))}
           </div>
         )}
       </div>
 
       {/* Bottom Responsive Pagination Bar */}
-      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0 font-mono text-xs">
-        <div className="text-slate-400 text-xs">
-          Showing <strong className="text-slate-200">{activeItems.length > 0 ? startIndex + 1 : 0}</strong>–
-          <strong className="text-slate-200">{Math.min(startIndex + ITEMS_PER_PAGE, activeItems.length)}</strong> of{' '}
-          <strong className="text-amber-400">{activeItems.length}</strong> {activeTab} (Page{' '}
-          <strong className="text-slate-200">{currentPage}</strong> of <strong className="text-slate-200">{totalPages}</strong>)
+      <footer className="bg-tavern-bg border border-tavern-border rounded-2xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0 font-mono text-xs text-[var(--rp-parchment-300)]">
+        <div className="text-xs">
+          Showing{' '}
+          <strong className="text-parchment-paper">
+            {activeItems.length > 0 ? startIndex + 1 : 0}
+          </strong>
+          –
+          <strong className="text-parchment-paper">
+            {Math.min(startIndex + ITEMS_PER_PAGE, activeItems.length)}
+          </strong>{' '}
+          of <strong className="text-tavern-accent">{activeItems.length}</strong> {activeTab} (Page{' '}
+          <strong className="text-parchment-paper">{currentPage}</strong> of{' '}
+          <strong className="text-parchment-paper">{totalPages}</strong>)
         </div>
 
-        <div className="hidden lg:block text-[9px] text-slate-600">
+        <div className="hidden lg:block text-[9px] text-[var(--rp-parchment-300)] opacity-70">
           Rules content from the D&amp;D System Reference Document 5.2 © Wizards of the Coast (
-          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer" className="underline hover:text-slate-400">
+          <a
+            href="https://creativecommons.org/licenses/by/4.0/"
+            target="_blank"
+            rel="noreferrer"
+            className="underline hover:text-parchment-paper"
+          >
             CC BY 4.0
           </a>
           )
@@ -653,18 +422,18 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
           <button
             onClick={() => handlePageChange(1)}
             disabled={currentPage === 1}
-            className="p-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none border border-slate-800 rounded-lg text-slate-300 transition cursor-pointer"
+            className={pageNavBtn}
             title="First Page"
           >
-            <ChevronsLeft className="w-4 h-4" />
+            <ChevronsLeft className="w-4 h-4" aria-hidden="true" />
           </button>
           <button
             onClick={() => handlePageChange(currentPage - 1)}
             disabled={currentPage === 1}
-            className="p-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none border border-slate-800 rounded-lg text-slate-300 transition cursor-pointer"
+            className={pageNavBtn}
             title="Previous Page"
           >
-            <ChevronLeft className="w-4 h-4" />
+            <ChevronLeft className="w-4 h-4" aria-hidden="true" />
           </button>
 
           {/* Page Number Pills */}
@@ -672,10 +441,9 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
             <button
               key={num}
               onClick={() => handlePageChange(num)}
-              className={`w-7 h-7 rounded-lg border font-bold text-xs transition cursor-pointer ${
-                num === currentPage
-                  ? 'bg-amber-600 text-white border-amber-500 shadow'
-                  : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-800 hover:text-white'
+              aria-current={num === currentPage ? 'page' : undefined}
+              className={`vtt-btn w-7 h-7 text-xs ${
+                num === currentPage ? 'vtt-btn-primary' : 'vtt-btn-secondary'
               }`}
             >
               {num}
@@ -685,113 +453,228 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
           <button
             onClick={() => handlePageChange(currentPage + 1)}
             disabled={currentPage === totalPages}
-            className="p-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none border border-slate-800 rounded-lg text-slate-300 transition cursor-pointer"
+            className={pageNavBtn}
             title="Next Page"
           >
-            <ChevronRight className="w-4 h-4" />
+            <ChevronRight className="w-4 h-4" aria-hidden="true" />
           </button>
           <button
             onClick={() => handlePageChange(totalPages)}
             disabled={currentPage === totalPages}
-            className="p-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:pointer-events-none border border-slate-800 rounded-lg text-slate-300 transition cursor-pointer"
+            className={pageNavBtn}
             title="Last Page"
           >
-            <ChevronsRight className="w-4 h-4" />
+            <ChevronsRight className="w-4 h-4" aria-hidden="true" />
           </button>
         </div>
-      </div>
+      </footer>
 
-      {/* Rich Statblock Detail Modal — nested sheet: ESC/trap via the shared
-          hook, modal-nested rung so it layers above the compendium itself. */}
-      {selectedItem && (
-        <StatblockOverlay
-          item={selectedItem}
-          onClose={() => setSelectedItem(null)}
-          canSpawn={activeTab === 'monsters' || activeTab === 'animals'}
-          onSpawn={() => {
-            handleSpawnMonster(selectedItem);
-            setSelectedItem(null);
-          }}
-        />
-      )}
+      {/* Rich Statblock Detail Sheet — ModalShell owns the dialog pattern
+          (ESC/trap/backdrop) and the book-red small-caps header; Statblock
+          prints the printed-book body. Nested rung so it layers above the
+          compendium itself. */}
+      <ModalShell
+        isOpen={!!selectedItem}
+        onClose={() => setSelectedItem(null)}
+        title="SRD 5.2 Statblock"
+        size="lg"
+        tone="statblock"
+        nested
+        footer={
+          selectedCanSpawn ? (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className="vtt-btn vtt-btn-primary"
+                onClick={() => {
+                  if (selectedItem) handleSpawnMonster(selectedItem);
+                  setSelectedItem(null);
+                }}
+              >
+                <Plus className="w-4 h-4" aria-hidden="true" />
+                <span>Spawn to Canvas</span>
+              </button>
+            </div>
+          ) : undefined
+        }
+      >
+        <Statblock item={selectedItem ?? {}} kind={statblockKindForTab(activeTab)} />
+      </ModalShell>
     </div>
   );
 };
 
 /**
- * Nested statblock detail sheet, extracted from CompendiumView so the shared
- * focus-trap hook can be called unconditionally (hooks are illegal inside a
- * conditional render in the parent view). Sits on the modal-nested rung.
+ * One card to rule all six tabs — the per-tab markup that used to be copied
+ * six times (~lines 346–665) now branches on `kind` alone. Surface treatment
+ * is uniform (vtt-card-elevated); only the details row differs per kind:
+ *   monsters/animals → CR badge + mini AC/HP/SPEED statblock strip + Spawn CTA
+ *   spells           → school badge + description + casting time/range footer
+ *   magic-items      → rarity badge + attunement flag
+ *   feats            → category + prerequisite footer
+ *   glossary         → [tag] + definition prose
  */
-function StatblockOverlay({
-  item,
-  onClose,
-  canSpawn,
-  onSpawn,
-}: {
-  // Matches the parent's selectedItem state (loosely typed compendium entries).
-  item: any;
-  onClose: () => void;
-  canSpawn: boolean;
-  onSpawn: () => void;
-}) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  useFocusTrap({ active: true, containerRef, onEscape: onClose });
+interface CompendiumCardProps {
+  /** Loosely typed SRD compendium entry (shapes vary per endpoint). */
+  entry: Record<string, any>;
+  /** Which tab this card belongs to — drives icon, badges, detail rows. */
+  kind: CompendiumTab;
+  /** True while the spawn confirmation toast is showing for this entry. */
+  spawned?: boolean;
+  /** Open the full statblock sheet (card click / Enter / Space). */
+  onOpen: () => void;
+  /** Present only for spawneable kinds (monsters, animals). */
+  onSpawn?: () => void;
+}
+
+/** One cell of the compact AC/HP/SPEED strip inside creature cards. */
+function MiniAttr({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="min-w-0 text-center">
+      <dt className="vtt-attr-label text-[9px] leading-tight">{label}</dt>
+      <dd className="vtt-attr-value text-xs truncate" title={String(value ?? '')}>
+        {value ?? '—'}
+      </dd>
+    </div>
+  );
+}
+
+function CompendiumCard({ entry, kind, spawned, onOpen, onSpawn }: CompendiumCardProps) {
+  const Icon = CARD_ICONS[kind];
+  const isCreature = kind === 'monsters' || kind === 'animals';
+
+  let title = entry.name ?? entry.term ?? 'Untitled';
+  let tagline = '';
+  switch (kind) {
+    case 'monsters':
+      tagline = `${entry.size || 'Medium'} ${entry.type || 'Monstrosity'}`;
+      break;
+    case 'animals':
+      tagline = `${entry.size || 'Medium'} Beast`;
+      break;
+    case 'spells':
+      tagline = `${entry.level === 0 ? 'Cantrip' : `Level ${entry.level}`} · ${entry.school ?? ''}`;
+      break;
+    case 'magic-items':
+      tagline = entry.item_type || entry.category || '';
+      break;
+    case 'feats':
+      tagline = `${entry.category ?? ''} Feat`;
+      break;
+    case 'glossary':
+      tagline = entry.tag ? `[${entry.tag}]` : 'Rules Term';
+      break;
+  }
+
+  const badge =
+    isCreature
+      ? `CR ${entry.challenge_rating || entry.cr || '1'}`
+      : kind === 'spells'
+        ? entry.school
+        : kind === 'magic-items'
+          ? entry.rarity || 'Common'
+          : null;
+
+  const body =
+    kind === 'spells' || kind === 'magic-items' || kind === 'feats' || kind === 'glossary'
+      ? entry.description ?? entry.definition
+      : null;
 
   return (
     <div
-      className="fixed inset-0 bg-black/85 backdrop-blur-md flex items-center justify-center p-4"
-      style={{ zIndex: 'var(--z-modal-nested)' }}
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onOpen();
+        }
       }}
+      className="vtt-card-elevated rounded-xl p-4 cursor-pointer group flex flex-col justify-between focus-visible:outline-2 focus-visible:outline-tavern-accent"
     >
-      <div
-        ref={containerRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        className="vtt-glass-panel rounded-2xl max-w-xl w-full max-h-[85vh] overflow-y-auto vtt-scrollbar p-6 shadow-2xl space-y-4 animate-fadeIn"
-      >
-        <div className="flex items-start justify-between border-b border-[var(--tavern-border)] pb-3">
-          <div>
-            <h3 className="vtt-engraved text-xl font-bold">{item.name}</h3>
-            <p className="text-xs text-[var(--rp-parchment-300)] font-mono mt-0.5">
-              {item.size || (item.level === 0 ? 'Cantrip' : `Level ${item.level}`)}{' '}
-              {item.type || item.school}
-            </p>
+      <div>
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center space-x-3 min-w-0">
+            <div className="shrink-0 p-2 bg-tavern-bg border border-tavern-border rounded-xl text-tavern-accent group-hover:scale-105 transition-transform">
+              <Icon className="w-4 h-4" aria-hidden="true" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="vtt-engraved text-sm font-bold truncate">{title}</h3>
+              <p className="text-[10px] text-[var(--rp-parchment-300)] font-mono capitalize truncate">
+                {tagline}
+              </p>
+            </div>
           </div>
-          <button
-            onClick={onClose}
-            aria-label="Close statblock"
-            className="p-1.5 text-[var(--rp-parchment-300)] hover:text-white rounded-lg hover:bg-[var(--rp-leather-700)] transition cursor-pointer"
-          >
-            <X className="w-5 h-5" />
-          </button>
+
+          {badge && <span className="vtt-badge shrink-0">{badge}</span>}
         </div>
 
-        <p className="selectable-text text-xs text-[var(--rp-parchment-200)] leading-relaxed font-sans bg-black/30 p-4 rounded-xl border border-[var(--tavern-border)]">
-          {item.description}
-        </p>
+        {/* Creature cards carry the printed-book attribute strip; the paper
+            background needs ink-dark values, hence text-parchment-ink here. */}
+        {isCreature && (
+          <dl className="vtt-statblock-attr grid grid-cols-3 gap-2 px-2.5 py-1.5 mt-3 rounded-sm text-parchment-ink">
+            <MiniAttr label="AC" value={entry.armor_class || entry.ac || 14} />
+            <MiniAttr label="HP" value={entry.hit_points || entry.hp || 30} />
+            <MiniAttr label="Speed" value={entry.speed || '30 ft'} />
+          </dl>
+        )}
 
-        <div className="flex justify-end space-x-2 pt-2 border-t border-[var(--tavern-border)]">
-          {canSpawn && (
-            <button
-              onClick={onSpawn}
-              className="flex items-center space-x-1.5 px-4 py-2 bg-[var(--rp-amber-600)] hover:bg-[var(--rp-amber-500)] text-white font-bold text-xs font-mono rounded-xl shadow transition cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Spawn to Canvas</span>
-            </button>
-          )}
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-black/30 hover:bg-[var(--rp-leather-700)] text-[var(--rp-parchment-100)] text-xs font-mono rounded-xl transition cursor-pointer"
-          >
-            Close
-          </button>
-        </div>
+        {body && (
+          <p className="font-prose text-xs text-parchment-paper/80 mt-3 line-clamp-3 leading-relaxed selectable-text">
+            {body}
+          </p>
+        )}
       </div>
+
+      {(isCreature || kind === 'spells' || kind === 'magic-items' || kind === 'feats') && (
+        <>
+          <div className="vtt-divider my-2">
+            <span />
+          </div>
+          <div className="flex items-center justify-between font-mono text-xs text-[var(--rp-parchment-300)]">
+            {kind === 'monsters' && <span className="text-[10px]">XP: {entry.xp || 100}</span>}
+
+            {kind === 'spells' && (
+              <>
+                <span>{entry.casting_time || '1 action'}</span>
+                <span>{entry.range || '60 ft'}</span>
+              </>
+            )}
+
+            {kind === 'magic-items' && (
+              <>
+                <span className="capitalize">{entry.category}</span>
+                {entry.requires_attunement && <span className="vtt-badge">Attunement</span>}
+              </>
+            )}
+
+            {kind === 'feats' && (
+              <span>{entry.prerequisite ? `Requires: ${entry.prerequisite}` : 'No prerequisite'}</span>
+            )}
+
+            {isCreature &&
+              (spawned ? (
+                <span className="vtt-badge vtt-badge-success">
+                  <Check className="w-3 h-3" aria-hidden="true" /> Spawned!
+                </span>
+              ) : (
+                onSpawn && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSpawn();
+                    }}
+                    className="vtt-btn vtt-btn-primary text-[11px]"
+                  >
+                    <Plus className="w-3 h-3" aria-hidden="true" />
+                    <span>Spawn</span>
+                  </button>
+                )
+              ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

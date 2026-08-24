@@ -15,7 +15,7 @@ pub mod zone_graph;
 
 pub use cover::{CoverCalculator, CoverType};
 pub use geometry::{AreaOfEffect, Vector3};
-pub use pathfinding::{AStarPathfinder, PathResult};
+pub use pathfinding::{AStarPathfinder, PathResult, TerrainOverlay};
 pub use raycast::GridCollisionMap;
 pub use zone_graph::{RangeBand, TopologicalZoneGraph, ZoneEdge, ZoneNode};
 

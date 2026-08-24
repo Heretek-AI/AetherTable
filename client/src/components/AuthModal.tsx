@@ -129,15 +129,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     >
       <div className="space-y-5">
         {/* Tab Switcher */}
-        <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 font-mono text-xs">
+        <div className="vtt-tabbar w-full font-display text-xs">
           <button
             onClick={() => {
               setTab('signin');
               setError(null);
             }}
-            className={`flex-1 py-1.5 rounded-md font-bold transition cursor-pointer ${
-              tab === 'signin' ? 'bg-amber-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
+            data-active={tab === 'signin'}
+            className="vtt-tab flex-1 text-center"
           >
             Sign In
           </button>
@@ -146,16 +145,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               setTab('signup');
               setError(null);
             }}
-            className={`flex-1 py-1.5 rounded-md font-bold transition cursor-pointer ${
-              tab === 'signup' ? 'bg-amber-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
+            data-active={tab === 'signup'}
+            className="vtt-tab flex-1 text-center"
           >
             Create Account
           </button>
         </div>
 
         {error && (
-          <div className="p-3 bg-rose-950/80 border border-rose-600/50 rounded-lg text-xs text-rose-300 font-mono">
+          <div className="p-3 rounded-lg border border-[color-mix(in_srgb,var(--state-danger)_55%,transparent)] bg-[color-mix(in_srgb,var(--state-danger)_10%,transparent)] text-xs text-[var(--rp-crimson-400)] font-mono">
             {error}
           </div>
         )}
@@ -164,8 +162,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         {tab === 'signin' && (
           <form onSubmit={handleSignIn} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-mono text-slate-300 flex items-center space-x-1.5">
-                <Mail className="w-3.5 h-3.5 text-amber-400" />
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)] flex items-center space-x-1.5">
+                <Mail className="w-3.5 h-3.5 text-tavern-accent" />
                 <span>Email or Username</span>
               </label>
               <input
@@ -173,13 +171,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="admin@aethertable.io or thorin"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+                className="vtt-input w-full text-xs"
               />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-mono text-slate-300 flex items-center space-x-1.5">
-                <Lock className="w-3.5 h-3.5 text-amber-400" />
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)] flex items-center space-x-1.5">
+                <Lock className="w-3.5 h-3.5 text-tavern-accent" />
                 <span>Password</span>
               </label>
               <div className="relative">
@@ -188,12 +186,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••••••"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-3 pr-9 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+                  className="vtt-input w-full pr-9 text-xs"
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-2.5 top-2.5 text-slate-500 hover:text-slate-300"
+                  className="absolute right-2.5 top-2.5 text-[var(--rp-parchment-300)] hover:text-tavern-accent"
                 >
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
@@ -202,7 +200,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
             <button
               type="submit"
-              className="w-full py-2.5 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white font-bold text-xs rounded-lg shadow-lg shadow-amber-950/60 transition cursor-pointer"
+              className="vtt-btn vtt-btn-primary w-full font-display tracking-wide"
             >
               Sign In to Tabletop
             </button>
@@ -213,44 +211,44 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         {tab === 'signup' && (
           <form onSubmit={handleSignUp} className="space-y-3.5">
             <div className="space-y-1">
-              <label className="text-xs font-mono text-slate-300">Display Name</label>
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)]">Display Name</label>
               <input
                 type="text"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Lord Valen Shadowbane"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+                className="vtt-input w-full text-xs"
               />
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-mono text-slate-300">Email Address</label>
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)]">Email Address</label>
               <input
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="valen@adventurers.org"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+                className="vtt-input w-full text-xs"
               />
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-mono text-slate-300">Password</label>
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)]">Password</label>
               <input
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••••••"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500"
+                className="vtt-input w-full text-xs"
               />
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-mono text-slate-300">Primary Role</label>
+              <label className="text-xs font-mono text-[var(--rp-parchment-300)]">Primary Role</label>
               <select
                 value={role}
                 onChange={(e) => setRole(e.target.value as UserRole)}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-amber-500 font-mono"
+                className="vtt-select w-full text-xs"
               >
                 <option value="player">Player Character (Hero)</option>
                 <option value="gm">Dungeon Master (GM)</option>
@@ -261,7 +259,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
             <button
               type="submit"
-              className="w-full py-2.5 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white font-bold text-xs rounded-lg shadow-lg shadow-amber-950/60 transition cursor-pointer"
+              className="vtt-btn vtt-btn-primary w-full font-display tracking-wide"
             >
               Create Account & Launch
             </button>
@@ -269,10 +267,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         )}
 
         {/* 1-Click Fast Demo Accounts Switcher */}
-        <div className="pt-3 border-t border-slate-800 space-y-2">
+        <div className="pt-3 border-t border-tavern-border space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-wider flex items-center space-x-1">
-              <Zap className="w-3 h-3 text-amber-400" />
+            <span className="vtt-section-header text-[11px] font-bold">
+              <Zap className="w-3 h-3 shrink-0 text-tavern-accent" />
               <span>Instant Fast Demo Logins (Multi-User)</span>
             </span>
           </div>
@@ -282,18 +280,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <button
                 key={demo.user.id}
                 onClick={() => handleQuickDemoLogin(demo)}
-                className="p-2.5 bg-slate-950 hover:bg-slate-850 border border-slate-800 hover:border-amber-500/50 rounded-xl text-left transition-all group cursor-pointer flex flex-col justify-between"
+                className="p-2.5 vtt-surface rounded-xl text-left transition-all group cursor-pointer flex flex-col justify-between hover:border-tavern-accent hover:bg-[color-mix(in_srgb,var(--tavern-accent)_8%,transparent)]"
               >
                 <div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-200 group-hover:text-amber-300 transition-colors">
+                    <span className="text-xs font-bold text-[var(--rp-parchment-100)] group-hover:text-tavern-accent transition-colors font-display">
                       {demo.user.displayName.split(' ')[0]}
                     </span>
-                    <span className="text-[9px] font-mono px-1.5 py-0.2 bg-slate-900 border border-slate-700 rounded text-slate-400">
-                      {demo.user.role.toUpperCase()}
-                    </span>
+                    <span className="vtt-badge">{demo.user.role.toUpperCase()}</span>
                   </div>
-                  <p className="text-[10px] text-slate-400 line-clamp-1 mt-0.5">{demo.description}</p>
+                  <p className="text-[10px] text-[var(--rp-parchment-300)] line-clamp-1 mt-0.5">{demo.description}</p>
                 </div>
               </button>
             ))}

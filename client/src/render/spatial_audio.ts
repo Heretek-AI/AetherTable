@@ -22,6 +22,21 @@ export class SpatialAudioEngine {
         this.masterGain = this.ctx.createGain();
         this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
         this.masterGain.connect(this.ctx.destination);
+        // Listener sits ON the board plane; sources are placed relative to it
+        // so the HRTF convolution produces true azimuth + elevation cues.
+        const listener = this.ctx.listener;
+        const now = this.ctx.currentTime;
+        if (listener.positionX) {
+          listener.positionX.setValueAtTime(this.listenerPos.x, now);
+          listener.positionY.setValueAtTime(1.5, now);
+          listener.positionZ.setValueAtTime(this.listenerPos.y, now);
+          listener.forwardX.setValueAtTime(0, now);
+          listener.forwardY.setValueAtTime(-1, now);
+          listener.forwardZ.setValueAtTime(0, now);
+          listener.upX.setValueAtTime(0, now);
+          listener.upY.setValueAtTime(0, now);
+          listener.upZ.setValueAtTime(1, now);
+        }
       }
     }
     if (this.ctx && this.ctx.state === 'suspended') {
@@ -31,6 +46,11 @@ export class SpatialAudioEngine {
 
   public setListenerPosition(x: number, y: number) {
     this.listenerPos = { x, y };
+    if (this.ctx?.listener.positionX) {
+      const t = this.ctx.currentTime;
+      this.ctx.listener.positionX.setValueAtTime(x, t);
+      this.ctx.listener.positionZ.setValueAtTime(y, t);
+    }
   }
 
   public getListenerPosition(): { x: number; y: number } {
@@ -73,17 +93,65 @@ export class SpatialAudioEngine {
     return { pan, gain, distance };
   }
 
+  /**
+   * Builds a true 3D spatialization chain for one-shot cues:
+   *   input gain -> PannerNode (HRTF binaural, inverse-distance rolloff,
+   *   occluder-free plane) -> master.
+   *
+   * The PannerNode handles azimuth AND attenuation natively from world
+   * coordinates, replacing the legacy tanh StereoPanner math. Where
+   * PannerNode is unavailable (or spatial is disabled) we fall back to the
+   * original stereo-pan + computed-gain path so behavior never regresses.
+   */
+  private buildSpatialChain(
+    sourceX: number,
+    sourceY: number
+  ): { input: GainNode; pan: number; gain: number } {
+    const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const ctx = this.ctx!;
+    const soundGain = ctx.createGain();
+
+    if (ctx.createPanner && this.isSpatialEnabled) {
+      const panner = ctx.createPanner();
+      panner.panningModel = 'HRTF';
+      panner.distanceModel = 'inverse';
+      panner.refDistance = 1;
+      panner.rolloffFactor = 0.15;
+      panner.coneInnerAngle = 360;
+      if (panner.positionX) {
+        const t = ctx.currentTime;
+        panner.positionX.setValueAtTime(sourceX, t);
+        panner.positionY.setValueAtTime(1.5, t);
+        panner.positionZ.setValueAtTime(sourceY, t);
+      } else {
+        // Legacy setPosition API.
+        (panner as any).setPosition(sourceX, 1.5, sourceY);
+      }
+      soundGain.connect(panner);
+      panner.connect(this.masterGain!);
+    } else if (ctx.createStereoPanner) {
+      const panner = ctx.createStereoPanner();
+      panner.pan.setValueAtTime(pan, ctx.currentTime);
+      soundGain.gain.setValueAtTime(gain, ctx.currentTime);
+      soundGain.connect(panner);
+      panner.connect(this.masterGain!);
+    } else {
+      soundGain.gain.setValueAtTime(gain, ctx.currentTime);
+      soundGain.connect(this.masterGain!);
+    }
+
+    return { input: soundGain, pan, gain };
+  }
+
   public playSpatialImpact(sourceX: number, sourceY: number) {
     if (this.isMuted) return;
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
-    const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
     const now = this.ctx.currentTime;
-
-    // Create Stereo Panner & Gain Nodes
-    const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
-    const soundGain = this.ctx.createGain();
+    void gain; // attenuation is handled natively by the HRTF PannerNode
 
     // 8 ms linear attack before the decay: starting at full amplitude causes
     // an audible click (hard waveform onset); ramping up from near-silence
@@ -91,14 +159,6 @@ export class SpatialAudioEngine {
     soundGain.gain.setValueAtTime(0.0001, now);
     soundGain.gain.linearRampToValueAtTime(gain * 0.6, now + 0.008);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
-
-    if (panner) {
-      panner.pan.setValueAtTime(pan, now);
-      soundGain.connect(panner);
-      panner.connect(this.masterGain);
-    } else {
-      soundGain.connect(this.masterGain);
-    }
 
     // Impact Tone
     const osc = this.ctx.createOscillator();
@@ -116,24 +176,16 @@ export class SpatialAudioEngine {
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
-    const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
     const now = this.ctx.currentTime;
 
-    const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
-    const soundGain = this.ctx.createGain();
 
     // Attack ramp as in playSpatialImpact — kills onset click.
     soundGain.gain.setValueAtTime(0.0001, now);
     soundGain.gain.linearRampToValueAtTime(gain * 0.5, now + 0.01);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
 
-    if (panner) {
-      panner.pan.setValueAtTime(pan, now);
-      soundGain.connect(panner);
-      panner.connect(this.masterGain);
-    } else {
-      soundGain.connect(this.masterGain);
-    }
 
     // Resonant Chord
     [520, 650, 780].forEach((freq, i) => {
@@ -153,24 +205,16 @@ export class SpatialAudioEngine {
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
-    const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
     const now = this.ctx.currentTime;
 
-    const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
-    const soundGain = this.ctx.createGain();
 
     // Attack ramp as in playSpatialImpact — kills onset click.
     soundGain.gain.setValueAtTime(0.0001, now);
     soundGain.gain.linearRampToValueAtTime(gain * 0.5, now + 0.008);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
 
-    if (panner) {
-      panner.pan.setValueAtTime(pan, now);
-      soundGain.connect(panner);
-      panner.connect(this.masterGain);
-    } else {
-      soundGain.connect(this.masterGain);
-    }
 
     const osc = this.ctx.createOscillator();
     osc.type = 'sawtooth';
@@ -188,24 +232,16 @@ export class SpatialAudioEngine {
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
-    const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
     const now = this.ctx.currentTime;
 
-    const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
-    const soundGain = this.ctx.createGain();
 
     // Shortest cue → shortest attack (4 ms) so the dice rattle stays crisp.
     soundGain.gain.setValueAtTime(0.0001, now);
     soundGain.gain.linearRampToValueAtTime(gain * 0.35, now + 0.004);
     soundGain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
 
-    if (panner) {
-      panner.pan.setValueAtTime(pan, now);
-      soundGain.connect(panner);
-      panner.connect(this.masterGain);
-    } else {
-      soundGain.connect(this.masterGain);
-    }
 
     const osc = this.ctx.createOscillator();
     osc.type = 'square';

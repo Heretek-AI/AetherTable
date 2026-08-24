@@ -64,21 +64,18 @@ export async function ensureEngineSession(): Promise<string | null> {
 export async function engineAttack(params: {
   attackerId: string;
   targetId: string;
-  attackBonus: number;
-  targetAc: number;
-  damageExpression: string;
-  damageType?: string;
+  /** Index into the attacker's server-side stat-block attack list. */
+  actionIndex?: number;
 }): Promise<EngineAttackResult | null> {
   const sessionId = await ensureEngineSession();
   if (!sessionId) return null;
+  // Reference-only payload: every modifier, AC and damage die resolves inside
+  // vtt-core from the entity stat blocks. Clients never send combat math.
   return enginePost<EngineAttackResult>('/api/v1/engine/attack', {
     session_id: sessionId,
     attacker_id: params.attackerId,
     target_id: params.targetId,
-    attack_bonus: params.attackBonus,
-    target_ac: params.targetAc,
-    damage_expression: params.damageExpression,
-    damage_type: params.damageType ?? 'slashing',
+    action_index: params.actionIndex ?? 0,
   });
 }
 

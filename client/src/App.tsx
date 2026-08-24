@@ -54,8 +54,8 @@ const ShortcutsModal = lazy(() => import('./components/ShortcutsModal').then((m)
 
 /** Themed loading placeholder shown while a lazily-split view/modal chunk loads. */
 const ChunkFallback = ({ label }: { label: string }) => (
-  <div className="flex-1 flex items-center justify-center bg-slate-950" role="status" aria-live="polite">
-    <div className="flex flex-col items-center gap-3 text-slate-400">
+  <div className="flex-1 flex items-center justify-center bg-tavern-bg" role="status" aria-live="polite">
+    <div className="flex flex-col items-center gap-3 text-[var(--rp-parchment-300)]">
       <div className="w-8 h-8 border-2 border-amber-500/30 border-t-amber-500 rounded-full animate-spin" />
       <span className="text-sm tracking-wide">{label}</span>
     </div>
@@ -66,7 +66,9 @@ import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
+import { YjsCrdtClient } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
+import { listSaves, loadCampaign } from './api/campaign_store';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
 
 // --- Roll history persistence ---------------------------------------------
@@ -182,11 +184,68 @@ export function App() {
   const particleFXRef = useRef<ParticleFXManager | null>(null);
   const diceBoxRef = useRef<DiceBox3D | null>(null);
 
-  // Live CRDT sync with the engine relay (tokens sync across peers; solo-safe).
+  // Live CRDT sync. When a Yjs relay (VITE_YSYNC_WS_URL) is configured,
+  // token + fog state merges causally through a real Y.Doc; otherwise we
+  // fall back to the engine's LWW JSON relay (tokens only, solo-safe).
   const syncClientRef = useRef<VttCrdtSyncClient | null>(null);
   useEffect(() => {
-    const engineWsUrl =
-      (import.meta as any).env?.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
+    const env = (import.meta as any).env ?? {};
+    const engineWsUrl = env.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
+    // Yjs is the DEFAULT transport; the legacy engine LWW relay is the
+    // fallback when no CRDT relay is reachable.
+    const ysyncUrl = (env.VITE_YSYNC_WS_URL as string | undefined) ?? 'ws://localhost:6380';
+    let disposed = false;
+
+    const startLegacyRelay = () => {
+      if (disposed) return;
+      syncClientRef.current?.disconnect();
+      const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
+      client.connect();
+      syncClientRef.current = client;
+
+      client.onRemoteTokenUpdate((update: TokenTransformData) => {
+        setTokens((prev) =>
+          prev.map((t) =>
+            t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t
+          )
+        );
+      });
+    };
+
+    const yjs = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
+    yjs.connect();
+    syncClientRef.current = {
+      connect: () => yjs.connect(),
+      disconnect: () => yjs.destroy(),
+      get isConnected() {
+        return yjs.isConnected;
+      },
+      onRemoteTokenUpdate: yjs.onRemoteTokenUpdate.bind(yjs),
+      updateTokenPosition: yjs.updateTokenPosition.bind(yjs),
+    } as VttCrdtSyncClient;
+
+    const unsubscribeYjs = yjs.onRemoteTokenUpdate((update: TokenTransformData) => {
+      setTokens((prev) =>
+        prev.map((t) => (t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t))
+      );
+    });
+
+    // If the CRDT relay never connects, fall back to the engine relay.
+    const fallbackTimer = setTimeout(() => {
+      if (!disposed && !yjs.isConnected) {
+        console.warn('[Sync] Yjs relay unreachable — falling back to engine LWW relay.');
+        startLegacyRelay();
+      }
+    }, 3500);
+
+    return () => {
+      disposed = true;
+      clearTimeout(fallbackTimer);
+      unsubscribeYjs();
+      yjs.destroy();
+      syncClientRef.current = null;
+    };
+
     const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
     client.connect();
     syncClientRef.current = client;
@@ -435,10 +494,6 @@ export function App() {
     const result = await engineAttack({
       attackerId: selectedToken?.id || 'thorin',
       targetId: target.id,
-      attackBonus: 7,
-      targetAc: 15,
-      damageExpression: damageFormula,
-      damageType,
     });
     const isHit = result?.is_hit ?? true;
     const isCritical = result?.is_critical_hit ?? false;
@@ -511,10 +566,6 @@ export function App() {
     const result = await engineAttack({
       attackerId: selectedToken?.id || 'lyra',
       targetId: target.id,
-      attackBonus: 8,
-      targetAc: 15,
-      damageExpression: spellDamageExpression,
-      damageType: 'fire',
     });
     const isHit = result?.is_hit ?? true;
     const naturalRoll = result?.natural_roll ?? localD20();
@@ -755,7 +806,7 @@ export function App() {
     addSystemMessage(`Custom Homebrew Creature ${newToken.name} instantiated on the battlefield at [K8]!`);
   };
 
-  const handleLaunchFromLobby = (seatId: string) => {
+  const handleLaunchFromLobby = async (seatId: string) => {
     if (seatId === 'seat_gm') {
       setUserRole('gm');
       addSystemMessage('Joined session as Game Master (Omniscient view enabled).');
@@ -765,6 +816,23 @@ export function App() {
     } else {
       setUserRole('player');
       addSystemMessage(`Joined session as Player (Bound to active seat).`);
+    }
+
+    // Lobby-to-canvas hydration: prefer the latest persisted campaign state;
+    // fall back to the demo encounter ONLY when nothing is stored.
+    try {
+      const saves = await listSaves();
+      if (saves.length > 0) {
+        const snapshot = await loadCampaign(saves[0].save_id);
+        if (snapshot) {
+          applyCampaignSnapshot(snapshot);
+          setCurrentView('tabletop');
+          return;
+        }
+      }
+      addSystemMessage('No stored campaign found — loading the staging encounter.');
+    } catch {
+      addSystemMessage('Campaign store unreachable — loading the staging encounter.');
     }
     setCurrentView('tabletop');
   };
@@ -916,7 +984,7 @@ export function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 font-sans overflow-hidden">
+    <div className="vtt-scrollbar flex flex-col h-screen w-screen bg-tavern-bg text-[var(--rp-parchment-100)] font-sans overflow-hidden">
       {/* Top Universal Navbar */}
       <Navbar
         currentView={currentView}

@@ -20,6 +20,17 @@ import {
 } from 'lucide-react';
 import { User, UserRole, SubscriptionTier } from '../types/auth';
 
+/* Out-of-world (admin) palette: the dark tavern chrome carries amber gold-leaf,
+   book crimson, forest and leather accents — never cold slate/purple. Bright
+   variants are color-mixed toward parchment purely for legibility of small
+   type on iron (raw --state-success/--rp-leather-600 are too dark on #2c241d). */
+const C = {
+  amber: 'var(--tavern-accent)',
+  crimsonText: 'var(--rp-crimson-400)', // the only crimson allowed as text-size accent on dark
+  forestBright: 'color-mix(in srgb, var(--state-success) 45%, var(--rp-parchment-100))',
+  leatherBright: 'color-mix(in srgb, var(--rp-leather-600) 45%, var(--rp-parchment-200))',
+};
+
 interface AdminDashboardViewProps {
   onReturnToApp?: () => void;
 }
@@ -121,87 +132,113 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-6 shadow-2xl relative overflow-hidden backdrop-blur-sm">
+      <div className="vtt-glass-panel rounded-xl p-6 relative overflow-hidden">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
           <div className="flex items-center space-x-4">
-            <div className="p-3.5 bg-rose-950/40 border border-rose-500/30 rounded-xl text-rose-400 shadow-inner">
+            <div
+              className="p-3.5 rounded-xl border border-tavern-border shadow-inner"
+              style={{ background: 'color-mix(in srgb, var(--rp-crimson-650) 14%, transparent)', color: C.crimsonText }}
+            >
               <ShieldAlert className="w-8 h-8" />
             </div>
             <div>
               <div className="flex items-center space-x-3">
-                <h2 className="text-2xl font-bold font-serif tracking-wide text-slate-100">
+                <h2 className="text-2xl font-bold vtt-engraved tracking-wide">
                   Platform Administrator Console
                 </h2>
-                <span className="px-2.5 py-0.5 text-xs font-semibold bg-rose-950/60 border border-rose-600/50 text-rose-300 rounded-full font-mono">
-                  ROOT ADMIN
-                </span>
+                <span className="vtt-badge vtt-badge-danger font-mono">ROOT ADMIN</span>
               </div>
-              <p className="text-xs text-slate-400 mt-1">
+              <p className="text-xs text-[color-mix(in_srgb,var(--rp-parchment-300)_80%,transparent)] mt-1">
                 Oversee multi-user authentication, live campaign rooms, system invariant telemetry, and RBAC permissions.
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-2 font-mono text-xs">
-            <div className="px-3 py-1.5 bg-slate-950 rounded-lg border border-slate-800 flex items-center space-x-2">
-              <Activity className="w-4 h-4 text-emerald-400 animate-pulse" />
-              <span className="text-slate-300">Cluster Status: <strong className="text-emerald-400">HEALTHY</strong></span>
-            </div>
+            <span className="vtt-badge vtt-badge-success px-3 py-1.5">
+              <Activity className="w-4 h-4 animate-pulse" style={{ color: C.forestBright }} />
+              Cluster Status: HEALTHY
+            </span>
           </div>
         </div>
       </div>
 
       {/* Cluster Telemetry Stats */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-xl shadow-lg font-mono">
-          <div className="text-[10px] text-slate-400 uppercase font-bold">Total Registered Users</div>
-          <div className="text-2xl font-extrabold text-amber-400 mt-1">1,420</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">+48 this week</div>
+        <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
+          <div
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            style={{ color: C.leatherBright }}
+          >
+            Total Registered Users
+          </div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>1,420</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">+48 this week</div>
         </div>
 
-        <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-xl shadow-lg font-mono">
-          <div className="text-[10px] text-slate-400 uppercase font-bold">Active Multiplayer Rooms</div>
-          <div className="text-2xl font-extrabold text-sky-400 mt-1">42 Rooms</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">184 connected peers</div>
+        <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
+          <div
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            style={{ color: C.leatherBright }}
+          >
+            Active Multiplayer Rooms
+          </div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.crimsonText }}>42 Rooms</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">184 connected peers</div>
         </div>
 
-        <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-xl shadow-lg font-mono">
-          <div className="text-[10px] text-slate-400 uppercase font-bold">Mechanical Compliance</div>
-          <div className="text-2xl font-extrabold text-emerald-400 mt-1">100.0%</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">MCR Invariant Active</div>
+        <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
+          <div
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            style={{ color: C.leatherBright }}
+          >
+            Mechanical Compliance
+          </div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.forestBright }}>100.0%</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">MCR Invariant Active</div>
         </div>
 
-        <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-xl shadow-lg font-mono">
-          <div className="text-[10px] text-slate-400 uppercase font-bold">Rust Hot-Path Latency</div>
-          <div className="text-2xl font-extrabold text-purple-400 mt-1">8 ms</div>
-          <div className="text-[10px] text-slate-500 mt-0.5">Zero runtime allocations</div>
+        <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
+          <div
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            style={{ color: C.leatherBright }}
+          >
+            Rust Hot-Path Latency
+          </div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>8 ms</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">Zero runtime allocations</div>
         </div>
       </div>
 
       {/* User Directory & RBAC Table */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 shadow-lg space-y-4">
+      <div className="vtt-surface rounded-xl p-5 shadow-lg space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center space-x-2">
-            <Users className="w-5 h-5 text-amber-400" />
-            <h3 className="text-sm font-bold font-serif text-slate-100">User Management & Permissions Directory</h3>
+            <Users className="w-5 h-5" style={{ color: C.amber }} />
+            <h3
+              className="font-display text-sm tracking-[0.05em]"
+              style={{ color: C.amber }}
+            >
+              User Management &amp; Permissions Directory
+            </h3>
           </div>
 
           <div className="flex items-center space-x-3">
             <div className="relative">
-              <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-500" />
+              <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-[color-mix(in_srgb,var(--rp-parchment-300)_55%,transparent)]" />
               <input
                 type="text"
                 placeholder="Search by name, email..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="bg-slate-950 border border-slate-700 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500 w-52"
+                className="vtt-input pl-8 pr-3 py-1.5 text-xs w-52"
               />
             </div>
 
             <select
               value={selectedRoleFilter}
               onChange={(e) => setSelectedRoleFilter(e.target.value)}
-              className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-amber-500 font-mono"
+              className="vtt-select px-2.5 py-1.5 text-xs font-mono"
             >
               <option value="all">All Roles</option>
               <option value="admin">Admins</option>
@@ -214,8 +251,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
 
         {/* Table */}
         <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs font-mono">
-            <thead className="bg-slate-950/80 text-slate-400 border-b border-slate-800 uppercase text-[10px]">
+          <table className="vtt-table vtt-table--dark w-full text-left text-xs font-mono">
+            <thead className="uppercase text-[10px]">
               <tr>
                 <th className="p-3">User</th>
                 <th className="p-3">Email</th>
@@ -225,21 +262,22 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
                 <th className="p-3 text-right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/60 text-slate-200">
+            <tbody>
               {filteredUsers.map((u) => (
-                <tr key={u.id} className="hover:bg-slate-850/50 transition">
-                  <td className="p-3 font-semibold text-slate-100 flex items-center space-x-2">
-                    <div className="w-6 h-6 rounded bg-slate-800 flex items-center justify-center text-[10px] font-bold text-amber-300">
+                <tr key={u.id} className="hover:bg-white/5 transition">
+                  <td className="p-3 font-semibold flex items-center space-x-2">
+                    <div className="w-6 h-6 rounded bg-tavern-bg border border-tavern-border flex items-center justify-center text-[10px] font-bold" style={{ color: C.amber }}>
                       {u.displayName.charAt(0)}
                     </div>
                     <span>{u.displayName}</span>
                   </td>
-                  <td className="p-3 text-slate-400">{u.email}</td>
+                  <td className="p-3 text-[color-mix(in_srgb,var(--rp-parchment-300)_75%,transparent)]">{u.email}</td>
                   <td className="p-3">
                     <select
                       value={u.role}
                       onChange={(e) => handleUpdateRole(u.id, e.target.value as UserRole)}
-                      className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-amber-300 font-bold"
+                      className="vtt-select px-2 py-1 text-[11px] font-bold"
+                      style={{ color: C.amber }}
                     >
                       <option value="admin">ADMIN</option>
                       <option value="gm">GM</option>
@@ -251,18 +289,19 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
                     <select
                       value={u.subscriptionTier}
                       onChange={(e) => handleUpdateTier(u.id, e.target.value as SubscriptionTier)}
-                      className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-purple-300 font-bold uppercase"
+                      className="vtt-select px-2 py-1 text-[11px] font-bold uppercase"
+                      style={{ color: C.crimsonText }}
                     >
                       <option value="free">FREE</option>
                       <option value="hero">HERO</option>
                       <option value="master">MASTER</option>
                     </select>
                   </td>
-                  <td className="p-3 text-slate-400">
+                  <td className="p-3 text-[color-mix(in_srgb,var(--rp-parchment-300)_75%,transparent)]">
                     {u.assignedTokenIds.includes('*') ? 'All Battlefield Tokens' : u.assignedTokenIds.join(', ') || 'Read-only'}
                   </td>
                   <td className="p-3 text-right">
-                    <button className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300 text-[10px] font-bold cursor-pointer">
+                    <button className="vtt-btn vtt-btn-secondary px-2 py-1 text-[10px]">
                       Inspect
                     </button>
                   </td>
@@ -274,25 +313,28 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
       </div>
 
       {/* Active Multiplayer Rooms Inspector */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 shadow-lg space-y-3">
+      <div className="vtt-surface rounded-xl p-5 shadow-lg space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
-            <Radio className="w-5 h-5 text-purple-400 animate-pulse" />
-            <h3 className="text-sm font-bold font-serif text-slate-100">Live Campaign Room Sessions</h3>
+            <Radio className="w-5 h-5 animate-pulse" style={{ color: C.crimsonText }} />
+            <h3
+              className="font-display text-sm tracking-[0.05em]"
+              style={{ color: C.amber }}
+            >
+              Live Campaign Room Sessions
+            </h3>
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           {activeRooms.map((room) => (
-            <div key={room.id} className="p-4 bg-slate-950 rounded-xl border border-slate-800 space-y-2 text-xs font-mono">
+            <div key={room.id} className="p-4 vtt-card-elevated rounded-xl space-y-2 text-xs font-mono">
               <div className="flex items-center justify-between">
-                <span className="font-bold text-slate-100">{room.title}</span>
-                <span className="px-2 py-0.5 bg-emerald-950 text-emerald-300 border border-emerald-600/40 rounded text-[10px]">
-                  {room.peers} Peers
-                </span>
+                <span className="font-bold text-[var(--rp-parchment-100)]">{room.title}</span>
+                <span className="vtt-badge vtt-badge-success">{room.peers} Peers</span>
               </div>
-              <div className="text-slate-400 text-[11px]">GM: {room.gm}</div>
-              <div className="flex items-center justify-between text-[10px] text-slate-500 pt-2 border-t border-slate-800">
+              <div className="text-[11px] text-[color-mix(in_srgb,var(--rp-parchment-300)_75%,transparent)]">GM: {room.gm}</div>
+              <div className="flex items-center justify-between text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_55%,transparent)] pt-2 border-t border-tavern-border">
                 <span>Status: {room.status}</span>
                 <span>Latency: {room.latency}</span>
               </div>

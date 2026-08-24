@@ -10,7 +10,13 @@ pub struct WasmExecutionResult {
 
 pub struct SandboxedWasmEngine {
     engine: Engine,
+    /// Absolute fuel ceiling. Client-requested limits are clamped to this —
+    /// a caller may never grant itself more compute than the host allows.
+    pub max_fuel: u64,
 }
+
+/// Server-side absolute fuel ceiling (requests may ask for less, never more).
+pub const MAX_FUEL_CEILING: u64 = 1_000_000;
 
 impl Default for SandboxedWasmEngine {
     fn default() -> Self {
@@ -23,7 +29,10 @@ impl SandboxedWasmEngine {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config)?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            max_fuel: MAX_FUEL_CEILING,
+        })
     }
 
     pub fn execute_wat(
@@ -31,8 +40,14 @@ impl SandboxedWasmEngine {
         wat_source: &str,
         function_name: &str,
         params: &[i32],
-        fuel_limit: u64,
+        requested_fuel_limit: u64,
     ) -> Result<WasmExecutionResult, String> {
+        // Clamp to the host-side ceiling; a zero limit falls back to a sane default.
+        let fuel_limit = if requested_fuel_limit == 0 {
+            self.max_fuel.min(100_000)
+        } else {
+            requested_fuel_limit.min(self.max_fuel)
+        };
         let start_time = std::time::Instant::now();
         let module = Module::new(&self.engine, wat_source).map_err(|e| format!("Module compile error: {}", e))?;
         let mut store = Store::new(&self.engine, ());
