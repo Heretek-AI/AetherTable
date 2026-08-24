@@ -119,5 +119,22 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 22 | honesty | LLM error logs record exception types (httpx timeouts stringified to ""); live e2e sim run verified vs llm.heretek.one — endpoint unreachable from network, harness fell back honestly, all actions accepted | see git log | pytest ✓ |
 
 
+| 51 | P10-wire | Roll20 import endpoint: auth'd, owner-scoped persistence, deliberate Foundry 501 stub | 24e0d1c | pytest ✓ |
+| 52 | privacy | Wire-level relay RBAC: hidden tokens, spectator ingress, private fog (real WS tests) | f83eb76 | cargo ✓ |
+| 53 | docs | README/CLAUDE/AGENTS claims verified against code; fabricated tables removed | aaab3fa | manual ✓ |
+| 54 | P1 | AI companion PCs (tank/skirmisher/healer) with honest realizability matrix | fdca883 | pytest ✓ |
+| 55-56 | live-LLM | Opt-in live suite + SSE-tolerant non-streaming calls; live run all-green vs heretek.one | 30850a5/bfe3273 | live ✓ |
+| 57 | relay | WS initial-state sync snapshots role-projected, before join ordering | 4af74be | cargo ✓ |
+| 58-60 | hygiene | Docs honesty pass; party-merged spectator fog; clippy -D warnings clean | 9df1589 | all ✓ |
+| 61-62 | SLA | Honest latency measurement harness: rules 0.39ms p50, spatial 0.35ms, intent 1.10ms — all PASS | 1409e3b | measured ✓ |
+| 63 | sync | Atmosphere sync over CRDT relay with documented LWW convergence | 1939bb1 | tsc ✓ |
+| 64 | gameplay | Grapple/shove contested actions end-to-end with reach/RBAC/economy gates | 708db19 | cargo ✓ |
+| 65-66 | A4-fix | Gate-integrity skips; wizard export header-auth; clipboard honesty; token-move ownership gate; hidden-delta parity; cursor cap | c3b3f78/9db3e48 | all ✓ |
+| 67 | A5-fix | Roll20 honesty seam: unparsable speed warns+None, identity fields neutral-empty with warnings | 682228c | pytest ✓ |
+| 68-70 | honesty | Empty-SSE ≠ completed turn; SLA rows disclose keyword-vs-LLM; WITHHELD can't read green | de7d011 | pytest ✓ |
+| 71-72 | combat+fix | Combat maneuvers UI panel; Ready action e2e; deploy speed crash + clamp disclosure | 133d15b/511c627 | all ✓ |
+| 73 | P9 | Broadcast viewport mirrors spectator-filtered board only | fde0035 | tsc ✓ |
+| 74 | combat | Two-weapon fighting + Help action across all four layers | see log | all ✓ |
+
 ### Iteration-50 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall 20/20, trust boundary held. Suite: 399 passed / 2 skipped.
