@@ -136,5 +136,12 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 73 | P9 | Broadcast viewport mirrors spectator-filtered board only | fde0035 | tsc ✓ |
 | 74 | combat | Two-weapon fighting + Help action across all four layers | see log | all ✓ |
 
+| 75 | P2-wire | Encounter builder on live compendium + engine spawn proxy, SRD XP budget | ab078ae | tsc ✓ |
+| 76 | P3/6-wire | Spellbook casts real spells via engine slot pipeline; fabricated stats deleted | f921ecc | tsc ✓ |
+| 77 | data | Conservative spell-damage extraction: 73/352 enriched, warn-not-guess, deterministic CLI | 96676b4 | pytest ✓ |
+
+### Iteration-80 milestone gate
+(pending)
+
 ### Iteration-50 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall 20/20, trust boundary held. Suite: 399 passed / 2 skipped.
