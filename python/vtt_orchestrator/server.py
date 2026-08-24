@@ -30,6 +30,10 @@ from .simulation.safety_gateway import SafetyGateway
 from .simulation.dynasty_engine import global_dynasty_engine, DynastyEngine
 from .simulation.empirical_playtester import EmpiricalPlaytester
 from .compendium.bundle_packager import global_bundle_packager
+from .compendium.starter_adventures import (
+    build_starter_bundle_bytes,
+    list_starter_adventures,
+)
 from .compendium.homebrew_parser import global_homebrew_parser
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .routing.intent_router import LLM_CLASSIFIER_KILL_SWITCH_ENV
@@ -1618,6 +1622,33 @@ class BundleImportRequest(BaseModel):
     """Base64-encoded .vttbundle archive."""
     bundle_b64: str
     session_name: str = "Imported Bundle"
+
+
+# --- Starter adventures (GOALS.md Pillar 2) --------------------------------------
+
+@app.get("/api/v1/adventures/starter")
+def list_starter_bundles():
+    """Catalog of out-of-the-box starter adventures shippable as .vttbundle."""
+    return {"adventures": list_starter_adventures()}
+
+
+@app.post("/api/v1/adventures/starter/{key}/export")
+def export_starter_adventure(key: str, token: str = Query(...)):
+    """Build a starter adventure on demand and return its .vttbundle archive.
+
+    Layouts come from the engine's WFC when reachable, else the documented
+    seeded fallback (provenance recorded inside adventure.json)."""
+    # Minting a shareable campaign archive — authenticated users only.
+    _require_user_id(token)
+    try:
+        zip_bytes = build_starter_bundle_bytes(key)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown starter adventure: {key}")
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{key}.vttbundle"'},
+    )
 
 
 @app.post("/api/v1/campaign/import-bundle")

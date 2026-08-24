@@ -29,6 +29,11 @@ class CampaignBundlePackager:
             "lore_propositions_count": len(campaign_data.get("lore_graph", {}).get("edges", [])),
         }
 
+        # Starter-adventure modules carry a full structured artifact
+        # (encounters, lore seeds, layout provenance) as an optional member.
+        if campaign_data.get("adventure"):
+            manifest["adventure_key"] = campaign_data["adventure"].get("key")
+
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             # 1. Manifest
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
@@ -52,6 +57,10 @@ class CampaignBundlePackager:
 
             # 6. Loot & Room Dressing Tables
             zf.writestr("loot_tables.json", json.dumps(campaign_data.get("loot_tables", {}), indent=2))
+
+            # 7. Structured starter-adventure artifact (optional member)
+            if campaign_data.get("adventure"):
+                zf.writestr("adventure.json", json.dumps(campaign_data["adventure"], indent=2))
 
         return zip_buffer.getvalue()
 
@@ -77,6 +86,8 @@ class CampaignBundlePackager:
                 campaign_data["lore_graph"] = json.loads(zf.read("lore_graph.json").decode("utf-8"))
             if "loot_tables.json" in file_list:
                 campaign_data["loot_tables"] = json.loads(zf.read("loot_tables.json").decode("utf-8"))
+            if "adventure.json" in file_list:
+                campaign_data["adventure"] = json.loads(zf.read("adventure.json").decode("utf-8"))
 
         return campaign_data
 
