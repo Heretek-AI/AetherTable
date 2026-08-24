@@ -113,6 +113,17 @@ const ROLL_HISTORY_CAP = 50;
  */
 const WHISPER_MARKER = '[WHISPER TO GM]';
 
+/**
+ * Pillar 9 spatial fallback: a user with no identifiable board token (GM with
+ * wildcard assignment, spectators, unregistered peers) anchors the listener —
+ * or an unmapped peer's voice pin — at this board center coordinate.
+ */
+const BOARD_CENTER_FALLBACK = { x: 4, y: 4 };
+
+/** Mirrors webrtc_mesh sanitizeId so mesh userIds compare equal to auth ids. */
+const normalizeUserIdForBinding = (raw: string): string =>
+  raw.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
   const [campaignTitle, setCampaignTitle] = useState('The Fall of Baron Vane');
@@ -545,6 +556,82 @@ export function App() {
     },
     [isSpectator]
   );
+
+  // --- Pillar 9: peer ↔ token spatial voice binding -------------------------
+  // Remote peer microphones are positioned on the board so HRTF panning and
+  // distance attenuation track their character token (GOALS.md Pillar 9).
+  //
+  // BINDING STRATEGY (identity-based): the mesh exposes each remote's userId
+  // (parsed from its `at-<lobby>-<userId>` signaling id) and hello display
+  // name. We match userId against known accounts' `assignedTokenIds` first,
+  // then fall back to an exact display-name match on a player token. A
+  // wildcard ('*') assignment means table authority, NOT a physical body —
+  // GMs/spectators deliberately stay unbound.
+  //
+  // HONEST LIMITS:
+  //  - Peers with no identifiable token are pinned by the mesh at listener
+  //    distance with neutral pan. That is a FIXED placement; no simulated
+  //    movement is ever generated for them here or in webrtc_mesh.ts.
+  //  - Ownership comes from the static DEMO_ACCOUNTS registry + CRDT identity;
+  //    there is no server-side seat→token assignment yet, so a signed-in user
+  //    outside this registry binds only via display-name coincidence.
+  //  - Token elevation is ignored by the audio graph (planar listener/source
+  //    model in spatial_audio.ts).
+  const resolveTokenForUser = useCallback(
+    (userId: string, peerName: string): Token | null => {
+      const uid = normalizeUserIdForBinding(userId);
+      if (uid) {
+        const account = DEMO_ACCOUNTS.find(
+          (a) => normalizeUserIdForBinding(a.user.id) === uid
+        );
+        if (account) {
+          for (const tid of account.user.assignedTokenIds) {
+            if (tid === '*') break; // authority ≠ a body on the map
+            const owned = tokens.find((t) => t.id === tid);
+            if (owned) return owned;
+          }
+        }
+      }
+      return (
+        tokens.find(
+          (t) =>
+            t.isPlayer &&
+            (!!peerName && (t.name === peerName || normalizeUserIdForBinding(t.name) === normalizeUserIdForBinding(peerName)))
+        ) ?? null
+      );
+    },
+    [tokens]
+  );
+
+  // Push every connected peer's bound token position into the mesh (~10 Hz
+  // throttled inside updatePeerPosition). Re-runs on any token state change —
+  // local drags AND CRDT-remote moves — and re-subscribes when the roster
+  // changes so peers joining mid-session get placed immediately.
+  useEffect(() => {
+    const syncPeerPositions = () => {
+      for (const peer of globalWebRTCMesh.getRemoteTiles()) {
+        const bound = resolveTokenForUser(peer.userId, peer.name);
+        if (bound) {
+          globalWebRTCMesh.updatePeerPosition(peer.peerId, bound.x, bound.y, bound.id);
+        } else {
+          globalWebRTCMesh.markPeerUnmapped(peer.peerId);
+        }
+      }
+    };
+    syncPeerPositions();
+    return globalWebRTCMesh.onRosterUpdated(syncPeerPositions);
+  }, [tokens, resolveTokenForUser]);
+
+  // The local LISTENER follows our own bound token (board-center fallback),
+  // so every one-shot cue and mapped peer voice is heard from our seat.
+  useEffect(() => {
+    const ownToken = resolveTokenForUser(currentUser.id, currentUser.displayName);
+    if (ownToken) {
+      globalSpatialAudio.setListenerPosition(ownToken.x, ownToken.y);
+    } else {
+      globalSpatialAudio.setListenerPosition(BOARD_CENTER_FALLBACK.x, BOARD_CENTER_FALLBACK.y);
+    }
+  }, [tokens, currentUser, resolveTokenForUser]);
   const addSystemMessage = (text: string) => {
     setMessages((prev) => [
       ...prev,
@@ -562,7 +649,8 @@ export function App() {
     setTokens((prev) =>
       prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
     );
-    globalWebRTCMesh.updatePeerPosition(tokenId, newX, newY);
+    // Peer spatial positions are pushed by the tokens effect below, which also
+    // covers CRDT-remote moves that never pass through this handler.
     // Broadcast the move through the engine's CRDT relay (no-op when offline).
     syncClientRef.current?.updateTokenPosition(tokenId, newX, newY, 0);
   };

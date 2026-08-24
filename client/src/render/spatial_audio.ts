@@ -1,7 +1,35 @@
 /**
  * Positional 3D Web Audio Spatial Engine
  * Computes azimuth stereo panning and distance-attenuated gain based on token coordinates.
+ *
+ * Two kinds of spatialization live here:
+ *  1. One-shot cues (impact/spell/roar/dice) built per play call.
+ *  2. PERSISTENT VOICE SOURCES (Pillar 9): one long-lived HRTF PannerNode chain
+ *     per remote peer microphone, registered via `attachMediaStream` and moved
+ *     across the board with `setSourcePosition(peerId, x, y)` as the peer's
+ *     bound token moves. Distance attenuation and azimuth therefore track the
+ *     tactical map in real time.
+ *
+ * Honest limits:
+ *  - A peer with no identifiable board token is PINNED at the listener's
+ *    coordinates (distance 0 ⇒ unity gain, azimuth 0 ⇒ neutral pan). That is a
+ *    FIXED placement decided at pin time — the engine never invents motion.
+ *  - `attachMediaStream` fails honestly (returns false) when the AudioContext
+ *    cannot run yet (autoplay policy before a user gesture) or spatial mode is
+ *    off; callers must fall back to plain element playback in that case.
+ *  - Sources are positioned on the same plane as the listener (y = 1.5 world
+ *    height for both), so elevation differences between tokens are NOT modeled.
  */
+
+interface VoiceSourceNodes {
+  tap: MediaStreamAudioSourceNode;
+  /** Per-source volume/mute stage feeding the panner. */
+  gain: GainNode;
+  /** HRTF panner, null when only a dry gain path could be built. */
+  panner: PannerNode | null;
+  x: number;
+  y: number;
+}
 
 export class SpatialAudioEngine {
   private ctx: AudioContext | null = null;
@@ -9,10 +37,21 @@ export class SpatialAudioEngine {
   private isSpatialEnabled: boolean = true;
   private masterGain: GainNode | null = null;
   private listenerPos: { x: number; y: number } = { x: 4, y: 4 };
+  /** Persistent peer-voice chains, keyed by peer id. */
+  private voiceSources = new Map<string, VoiceSourceNodes>();
+  /**
+   * Positions requested before a source's audio graph exists (or remembered
+   * across detach/reattach), so a re-attached peer lands where its token is,
+   * not back at the listener.
+   */
+  private desiredPositions = new Map<string, { x: number; y: number }>();
 
   constructor() {
     // Lazy initialized on first user interaction
   }
+
+  /** Time constant for positional setTargetAtTime smoothing (≈10 Hz feed). */
+  private static readonly POSITION_SMOOTHING_TC = 0.04;
 
   private initContext() {
     if (!this.ctx) {
@@ -70,6 +109,115 @@ export class SpatialAudioEngine {
 
   public getSpatialEnabled(): boolean {
     return this.isSpatialEnabled;
+  }
+
+  // -- persistent peer-voice sources (Pillar 9) ------------------------------
+
+  /**
+   * Routes a live (remote) MediaStream through this source's persistent HRTF
+   * chain: stream tap → volume gain → PannerNode(HRTF, inverse rolloff) →
+   * master. Returns true when routing succeeded; false means the caller MUST
+   * keep ordinary element playback (autoplay-blocked context, Web Audio
+   * unavailable, or spatial mode disabled) — nothing is silently dropped.
+   *
+   * The initial placement is the last `setSourcePosition` value for this id if
+   * one exists, otherwise the listener's current coordinates (neutral pan,
+ * unity distance) — a fixed pin, never simulated movement.
+   */
+  public attachMediaStream(
+    id: string,
+    stream: MediaStream,
+    opts?: { volume?: number }
+  ): boolean {
+    try {
+      this.initContext();
+      const ctx = this.ctx;
+      if (!ctx || !this.masterGain || !ctx.createMediaStreamSource) return false;
+      // A suspended context would swallow the voice entirely once we mute the
+      // fallback element, so refuse to take over until it is actually running.
+      if (ctx.state !== 'running') return false;
+      if (!this.isSpatialEnabled) return false;
+
+      this.detachSource(id);
+      const start = this.desiredPositions.get(id) ?? { ...this.listenerPos };
+      const tap = ctx.createMediaStreamSource(stream);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(Math.max(0, Math.min(1, opts?.volume ?? 1)), ctx.currentTime);
+
+      let panner: PannerNode | null = null;
+      if (ctx.createPanner) {
+        panner = ctx.createPanner();
+        panner.panningModel = 'HRTF';
+        panner.distanceModel = 'inverse';
+        panner.refDistance = 1;
+        panner.rolloffFactor = 0.15;
+        panner.coneInnerAngle = 360;
+        this.writePannerPosition(panner, start.x, start.y);
+        gain.connect(panner);
+        panner.connect(this.masterGain);
+      } else {
+        gain.connect(this.masterGain);
+      }
+      tap.connect(gain);
+
+      this.voiceSources.set(id, { tap, gain, panner, x: start.x, y: start.y });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Tears down one peer's voice chain (idempotent, safe on unknown ids). */
+  public detachSource(id: string): void {
+    const s = this.voiceSources.get(id);
+    if (!s) return;
+    try {
+      s.tap.disconnect();
+      s.gain.disconnect();
+      s.panner?.disconnect();
+    } catch {
+      /* already disconnected by context teardown */
+    }
+    this.voiceSources.delete(id);
+  }
+
+  public hasSource(id: string): boolean {
+    return this.voiceSources.has(id);
+  }
+
+  /**
+   * Moves a peer's voice to board coordinates (x, y). Called from the mesh at
+   * ≈10 Hz as the peer's bound token moves; positions are smoothed with
+   * setTargetAtTime so stepped updates do not zipper the HRTF filter.
+   */
+  public setSourcePosition(id: string, x: number, y: number): void {
+    this.desiredPositions.set(id, { x, y });
+    const s = this.voiceSources.get(id);
+    if (!s || !this.ctx) return;
+    s.x = x;
+    s.y = y;
+    if (s.panner) this.writePannerPosition(s.panner, x, y);
+  }
+
+  /** Per-source loudness (mixer slider); no-op for unknown sources. */
+  public setSourceVolume(id: string, volume: number): void {
+    const s = this.voiceSources.get(id);
+    if (!s || !this.ctx) return;
+    s.gain.gain.setTargetAtTime(Math.max(0, Math.min(1, volume)), this.ctx.currentTime, 0.03);
+  }
+
+  private writePannerPosition(panner: PannerNode, x: number, y: number): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    if (panner.positionX) {
+      panner.positionX.setTargetAtTime(x, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
+      panner.positionY.setTargetAtTime(1.5, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
+      panner.positionZ.setTargetAtTime(y, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
+    } else {
+      // Legacy setPosition API has no smoothing; step directly.
+      (panner as unknown as { setPosition(x: number, y: number, z: number): void }).setPosition(x, 1.5, y);
+    }
   }
 
   public calculateSpatialParameters(sourceX: number, sourceY: number): { pan: number; gain: number; distance: number } {

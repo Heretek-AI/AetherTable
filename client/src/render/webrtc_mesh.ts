@@ -12,6 +12,19 @@
  *  - Every failure surfaces as machine-readable status + a human reason
  *    (`getStatus()` / `onStatus`) instead of a silent mock.
  *
+ * Spatial voice binding (GOALS.md Pillar 9):
+ *  - Each remote peer's microphone is routed through a persistent HRTF
+ *    PannerNode chain in spatial_audio (`attachMediaStream`). When Web Audio
+ *    cannot take over yet (autoplay-blocked context) the plain <audio> element
+ *    keeps playing and the mesh retries on the next mixer interaction.
+ *  - The MESH does not guess which token a peer owns. App.tsx resolves
+ *    identity → token (peer userId vs. account assignedTokenIds, then peer
+ *    display name vs. player-token name) and reports results through
+ *    `updatePeerPosition(peerId, x, y, tokenId)` at ≈10 Hz (throttled here).
+ *  - Peers with NO identifiable token are pinned by `markPeerUnmapped` at the
+ *    listener's coordinates: distance 0 ⇒ unity gain, azimuth 0 ⇒ neutral pan.
+ *    That is a FIXED placement — this file fabricates no movement for them.
+ *
  * Design decisions:
  *  - Full mesh (every peer calls every peer). Fine at AetherTable sizes (≤8
  *    seats ⇒ ≤7 outbound calls/client); an SFU would be over-engineering here.
@@ -30,6 +43,7 @@
 
 import Peer from 'peerjs';
 import type { DataConnection, MediaConnection, PeerError } from 'peerjs';
+import { globalSpatialAudio } from './spatial_audio';
 
 // ---------------------------------------------------------------------------
 // Public types (also consumed by components via ../types/webrtc)
@@ -93,6 +107,12 @@ const SIGNAING_PATH = '/peerjs';
 const ROSTER_POLL_MS = 5000;
 /** Mic RMS threshold matching the previous voice-detection behaviour. */
 const SPEAK_RMS_THRESHOLD = 0.06;
+/**
+ * Spatial position feed is throttled to ~10 Hz (GOALS.md Pillar 9): token
+ * drags fire far faster than HRTF needs, and setTargetAtTime smoothing inside
+ * spatial_audio absorbs the stepping between flushes.
+ */
+const PEER_POSITION_THROTTLE_MS = 100;
 
 /** PeerJS ids allow [A-Za-z0-9_-]; clamp length so ids stay readable. */
 function sanitizeId(raw: string): string {
@@ -124,6 +144,21 @@ interface RemoteEntry {
   volume: number;
   isMuted: boolean;
   audioEl: HTMLAudioElement | null;
+  /**
+   * Board position of the token this peer's identity was bound to, or null
+   * while unbound. Written ONLY by updatePeerPosition (App-resolved binding) —
+   * the mesh never invents coordinates.
+   */
+  boardX: number | null;
+  boardY: number | null;
+  /** Token id reported alongside the last bound position, '' when unmapped. */
+  boundTokenId: string;
+  /** True once App confirmed an identity→token mapping for this peer. */
+  positionMapped: boolean;
+  /** Guards the one-time neutral pin so unmapped peers never drift. */
+  pinnedNeutral: boolean;
+  /** True while their mic plays through the spatial_audio HRTF chain. */
+  spatialRouted: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +186,9 @@ export class WebRTCMeshManager {
   private vadFrame: number | null = null;
 
   private rosterTimer: ReturnType<typeof setInterval> | null = null;
+  /** Coalesced spatial position writes awaiting the ~10 Hz flush. */
+  private pendingPositions = new Map<string, { x: number; y: number }>();
+  private positionFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   private rosterListeners = new Set<(remotes: RemoteVideoTile[]) => void>();
   private statusListeners = new Set<(s: MeshStatus) => void>();
@@ -407,8 +445,13 @@ export class WebRTCMeshManager {
       volume: 1,
       isMuted: false,
       audioEl: null,
+      boardX: null,
+      boardY: null,
+      boundTokenId: '',
+      positionMapped: false,
+      pinnedNeutral: false,
+      spatialRouted: false,
     };
-
     // Duplicate dials (glare residue) resolve to the first live connection.
     const prior = this.remotes.get(conn.peer);
     if (prior?.conn && prior.conn.open) {
@@ -450,6 +493,12 @@ export class WebRTCMeshManager {
         volume: 1,
         isMuted: false,
         audioEl: null,
+        boardX: null,
+        boardY: null,
+        boundTokenId: '',
+        positionMapped: false,
+        pinnedNeutral: false,
+        spatialRouted: false,
       } satisfies RemoteEntry);
     this.remotes.set(call.peer, entry);
 
@@ -463,6 +512,11 @@ export class WebRTCMeshManager {
   private wireRemoteStream(entry: RemoteEntry, call: MediaConnection): void {
     call.on('stream', (remote: MediaStream) => {
       entry.stream = remote;
+      // Pillar 9: route their mic through the HRTF chain so voice attenuates
+      // with board distance. The <audio> element stays attached either way —
+      // Chrome wants a live element sink behind a MediaStreamSource tap — but
+      // it is muted while spatially routed to avoid double playback.
+      this.trySpatialRoute(entry);
       // Dedicated audio sink lets mixer volume/mute act on real playback
       // while tiles render the (muted) video element from the same stream.
       if (!entry.audioEl) {
@@ -471,11 +525,16 @@ export class WebRTCMeshManager {
         entry.audioEl.srcObject = remote;
         entry.audioEl.volume = entry.volume;
         entry.audioEl.muted = entry.isMuted;
+        if (entry.spatialRouted) {
+          entry.audioEl.muted = true;
+          entry.audioEl.volume = 1;
+        }
         void entry.audioEl.play().catch(() => {
           /* autoplay policy: unmutes on first user gesture via toggle */
         });
       } else {
         entry.audioEl.srcObject = remote;
+        this.applyElementAudioState(entry);
       }
       this.notifyRoster();
     });
@@ -496,6 +555,9 @@ export class WebRTCMeshManager {
     entry.call?.close();
     entry.audioEl?.pause();
     if (entry.audioEl) entry.audioEl.srcObject = null;
+    // Drop their voice from the HRTF graph and any queued position write.
+    globalSpatialAudio.detachSource(peerId);
+    this.pendingPositions.delete(peerId);
     this.remotes.delete(peerId);
     this.notifyRoster();
   }
@@ -540,13 +602,113 @@ export class WebRTCMeshManager {
     this.analyser = null;
   }
 
+  // -- spatial binding (Pillar 9) ---------------------------------------------
+  //
+  // Binding strategy: this manager holds NO token knowledge. App.tsx matches
+  // each remote peer's userId (parsed from the `at-<lobby>-<userId>` peer id)
+  // against account assignedTokenIds — falling back to hello display name vs.
+  // player-token names — and pushes results here. Unknown/unmappable peers are
+  // reported via markPeerUnmapped and pinned at listener distance with neutral
+  // pan; they are never given simulated coordinates.
+
+  /**
+   * Records the board position of the token a remote peer's identity was
+   * bound to and feeds it to the spatial engine (throttled to ~10 Hz).
+   *
+   * Calls for unknown peer ids are ignored — there is nothing real to move.
+   * The mixer radar snapshots (`getLegacyPeers`) pick up the new position on
+   * the next flush so the UI never leads the audio graph.
+   */
+  public updatePeerPosition(peerId: string, x: number, y: number, tokenId = ''): void {
+    const entry = this.remotes.get(peerId);
+    if (!entry) return;
+
+    entry.positionMapped = true;
+    entry.boundTokenId = tokenId;
+    this.pendingPositions.set(peerId, { x, y });
+
+    if (this.positionFlushTimer !== null) return;
+    this.positionFlushTimer = setTimeout(() => this.flushPendingPositions(), PEER_POSITION_THROTTLE_MS);
+  }
+
+  /**
+   * Marks a peer as having no identifiable board token. Their voice is pinned
+   * ONCE at the listener's current coordinates (unity distance, neutral pan)
+   * and stays there — a documented fixed placement, not simulated movement.
+   */
+  public markPeerUnmapped(peerId: string): void {
+    const entry = this.remotes.get(peerId);
+    if (!entry) return;
+    entry.positionMapped = false;
+    entry.boundTokenId = '';
+    this.pendingPositions.delete(peerId);
+    if (!entry.pinnedNeutral) {
+      const l = globalSpatialAudio.getListenerPosition();
+      globalSpatialAudio.setSourcePosition(peerId, l.x, l.y);
+      entry.boardX = l.x;
+      entry.boardY = l.y;
+      entry.pinnedNeutral = true;
+    }
+  }
+
+  private flushPendingPositions(): void {
+    this.positionFlushTimer = null;
+    for (const [peerId, pos] of this.pendingPositions) {
+      const entry = this.remotes.get(peerId);
+      if (!entry) {
+        this.pendingPositions.delete(peerId);
+        continue;
+      }
+      entry.boardX = pos.x;
+      entry.boardY = pos.y;
+      entry.pinnedNeutral = false;
+      globalSpatialAudio.setSourcePosition(peerId, pos.x, pos.y);
+    }
+    this.pendingPositions.clear();
+  }
+
+  /**
+   * Attempts to hand a peer's remote stream to the spatial engine. On failure
+   * (context suspended by autoplay policy, Web Audio missing, spatial mode
+   * off) the plain element path keeps working and later mixer interactions
+   * retry the takeover.
+   */
+  private trySpatialRoute(entry: RemoteEntry): void {
+    if (!entry.stream) return;
+    if (globalSpatialAudio.hasSource(entry.peerId)) return;
+    const routed = globalSpatialAudio.attachMediaStream(entry.peerId, entry.stream, {
+      volume: entry.isMuted ? 0 : entry.volume,
+    });
+    entry.spatialRouted = routed;
+    this.applyElementAudioState(entry);
+  }
+
+  /** Keeps exactly one audible path per peer (HRTF chain XOR <audio> element). */
+  private applyElementAudioState(entry: RemoteEntry): void {
+    if (!entry.audioEl) return;
+    if (entry.spatialRouted) {
+      entry.audioEl.muted = true;
+      entry.audioEl.volume = 1;
+    } else {
+      entry.audioEl.volume = entry.volume;
+      entry.audioEl.muted = entry.isMuted;
+    }
+  }
+
   // -- mixer controls (legacy surface kept intact) ---------------------------
 
   public setPeerVolume(peerId: string, volume: number): void {
     const entry = this.remotes.get(peerId);
     if (!entry) return;
     entry.volume = Math.max(0, Math.min(1, volume));
-    if (entry.audioEl) entry.audioEl.volume = entry.volume;
+    if (entry.spatialRouted) {
+      globalSpatialAudio.setSourceVolume(peerId, entry.isMuted ? 0 : entry.volume);
+    } else {
+      // Retry spatial takeover now that a user gesture has likely unlocked
+      // the AudioContext.
+      this.trySpatialRoute(entry);
+    }
+    this.applyElementAudioState(entry);
     this.notifyRoster();
     this.notifyLegacy();
   }
@@ -555,15 +717,14 @@ export class WebRTCMeshManager {
     const entry = this.remotes.get(peerId);
     if (!entry) return;
     entry.isMuted = !entry.isMuted;
-    if (entry.audioEl) entry.audioEl.muted = entry.isMuted;
+    if (entry.spatialRouted) {
+      globalSpatialAudio.setSourceVolume(peerId, entry.isMuted ? 0 : entry.volume);
+    } else {
+      this.trySpatialRoute(entry);
+    }
+    this.applyElementAudioState(entry);
     this.notifyRoster();
     this.notifyLegacy();
-  }
-
-  /** Kept for App.tsx compatibility; tokens no longer bind to mesh peers. */
-  public updatePeerPosition(_tokenId: string, _x: number, _y: number): void {
-    /* Spatial binding of tokens to peers returns with the spatial-audio wave;
-       the mixer radar shows unmapped peers at origin meanwhile. */
   }
 
   // -- subscriptions ---------------------------------------------------------
@@ -637,9 +798,11 @@ export class WebRTCMeshManager {
     return Array.from(this.remotes.values()).map((e) => ({
       peerId: e.peerId,
       name: e.name,
-      tokenId: '',
-      x: 0,
-      y: 0,
+      // Real binding data when App resolved this identity to a token; ''
+      // and the pinned neutral coordinates otherwise (no fabricated ids).
+      tokenId: e.boundTokenId,
+      x: e.boardX ?? 0,
+      y: e.boardY ?? 0,
       volume: e.volume,
       isMuted: e.isMuted,
       isSpeaking: false, // remote VAD arrives with the spatial-audio wave
@@ -674,11 +837,15 @@ export class WebRTCMeshManager {
   public destroy(): void {
     if (this.rosterTimer !== null) clearInterval(this.rosterTimer);
     this.rosterTimer = null;
+    if (this.positionFlushTimer !== null) clearTimeout(this.positionFlushTimer);
+    this.positionFlushTimer = null;
+    this.pendingPositions.clear();
     this.stopMicLevelMeter();
     for (const entry of this.remotes.values()) {
       entry.call?.close();
       entry.conn?.close();
       entry.audioEl?.pause();
+      globalSpatialAudio.detachSource(entry.peerId);
     }
     this.remotes.clear();
     this.localStream?.getTracks().forEach((t) => t.stop());
