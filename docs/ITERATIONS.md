@@ -145,7 +145,7 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 80 | P5-depth | Concordia social-dialogue phase in campaign sim with norms enforcement + stance shifts; 11 tests | 7a104a7 | pytest ✓ |
 
 ### Iteration-80 milestone gate
-(running)
+ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, recall 23/23, trust boundary held.
 
 
 ### Iteration-50 milestone gate
