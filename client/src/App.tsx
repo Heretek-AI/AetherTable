@@ -245,24 +245,6 @@ export function App() {
       yjs.destroy();
       syncClientRef.current = null;
     };
-
-    const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
-    client.connect();
-    syncClientRef.current = client;
-
-    const unsubscribe = client.onRemoteTokenUpdate((update: TokenTransformData) => {
-      setTokens((prev) =>
-        prev.map((t) =>
-          t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t
-        )
-      );
-    });
-
-    return () => {
-      unsubscribe();
-      client.disconnect();
-      syncClientRef.current = null;
-    };
   }, []);
 
   // Authoritative Tokens

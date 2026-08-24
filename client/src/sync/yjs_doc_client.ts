@@ -12,6 +12,7 @@
 
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import { IndexeddbPersistence } from 'y-indexeddb';
 
 export interface TokenTransformData {
   tokenId: string;
@@ -29,6 +30,7 @@ type RemoteTokenListener = (payload: TokenTransformData) => void;
 export class YjsCrdtClient {
   private doc = new Y.Doc();
   private provider: WebsocketProvider | null = null;
+  private idb: IndexeddbPersistence | null = null;
   private tokens: Y.Map<Record<string, unknown>>;
   private fog: Y.Map<Uint8Array>;
   private remoteListeners = new Set<RemoteTokenListener>();
@@ -38,6 +40,15 @@ export class YjsCrdtClient {
   constructor(serverUrl: string, roomId: string) {
     this.tokens = this.doc.getMap('tokens');
     this.fog = this.doc.getMap('fog');
+
+    // Offline persistence: mirror the Y.Doc into IndexedDB so a room survives
+    // page reloads even when the relay is unreachable. Scoped per room.
+    try {
+      this.idb = new IndexeddbPersistence(`aethertable-${roomId.split('?')[0]}`, this.doc);
+      this.idb.on('synced', () => console.debug('[YjsSync] local room restored from IndexedDB'));
+    } catch (e) {
+      console.warn('[YjsSync] IndexedDB persistence unavailable:', e);
+    }
 
     const base = serverUrl.replace(/\/$/, '').replace(/^http/, 'ws');
     try {
@@ -132,6 +143,7 @@ export class YjsCrdtClient {
 
   public destroy(): void {
     this.tokenObservers.forEach((off) => off());
+    this.idb?.destroy();
     this.provider?.destroy();
     this.doc.destroy();
   }
