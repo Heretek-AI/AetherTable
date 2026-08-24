@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Literal, Optional
 
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
@@ -1029,6 +1029,25 @@ class EngineArmReactionRequest(BaseModel):
     reaction_type: str
 
 
+class EngineHealRequest(BaseModel):
+    """Ids-only heal request mirroring the engine's HealEntityReq: the client
+    names WHO gets how much — the engine clamps to max_hp server-side."""
+    session_id: str
+    entity_id: str
+    amount: int = Field(ge=0)
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineRestRequest(BaseModel):
+    session_id: str
+    kind: Literal["short", "long"]
+
+    class Config:
+        extra = "forbid"
+
+
 @app.post("/api/v1/engine/spawn")
 async def engine_spawn(req: EngineSpawnRequest, token: str = Query(...)):
     payload = dict(req.entity)
@@ -1113,6 +1132,35 @@ async def engine_arm_reaction(req: EngineArmReactionRequest, token: str = Query(
                 "entity_id": engine_client._coerce_uuid(req.entity_id),
                 "reaction_type": req.reaction_type,
             },
+            actor=_caller_actor(token),
+        )
+    )
+
+
+@app.post("/api/v1/engine/heal")
+async def engine_heal(req: EngineHealRequest, token: str = Query(...)):
+    # Healing math (deficit clamping, death-save wipe) is engine-owned; the
+    # gateway forwards the caller identity so its RBAC checks entity ownership.
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/heal",
+            {
+                "entity_id": engine_client._coerce_uuid(req.entity_id),
+                "amount": req.amount,
+            },
+            actor=_caller_actor(token),
+        )
+    )
+
+
+@app.post("/api/v1/engine/rest")
+async def engine_rest(req: EngineRestRequest, token: str = Query(...)):
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/rest",
+            {"kind": req.kind},
             actor=_caller_actor(token),
         )
     )

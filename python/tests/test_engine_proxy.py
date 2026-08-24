@@ -6,6 +6,7 @@ still passes. The engine-down case always runs and asserts the 502 contract.
 """
 
 import os
+import uuid
 
 import httpx
 import pytest
@@ -278,6 +279,129 @@ class TestProxyIdentity:
         )
         assert resp.status_code == 200
         assert captured["actor"] is None
+
+class TestHealRestProxyIdentity:
+    """Identity forwarding + payload contract for the heal/rest proxies
+    (POST /api/v1/engine/heal, POST /api/v1/engine/rest).
+
+    The engine owns ALL healing/rest math (clamping to max_hp deficit, long-rest
+    restoration); the gateway only forwards ids plus the caller's real identity
+    so the engine's RBAC authorizes the actual actor."""
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token(
+            {"user_id": user_id, "role": role, "exp": _time.time() + 600}
+        )
+
+    def test_heal_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/heal",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": "s", "entity_id": "e", "amount": 5},
+        )
+        assert resp.status_code == 401
+
+    def test_rest_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/rest",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": "s", "kind": "long"},
+        )
+        assert resp.status_code == 401
+
+    def test_heal_requires_a_token(self):
+        resp = client.post(
+            "/api/v1/engine/heal",
+            json={"session_id": "s", "entity_id": "e", "amount": 5},
+        )
+        assert resp.status_code == 422, "missing required token query param"
+
+    def test_rest_requires_a_token(self):
+        resp = client.post("/api/v1/engine/rest", json={"session_id": "s", "kind": "short"})
+        assert resp.status_code == 422, "missing required token query param"
+
+    def test_valid_player_token_forwards_identity_and_payload_shape(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {"status": "HEALED", "amount_applied": 5}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        session_id = "11111111-2222-3333-4444-555555555555"
+        token = self._token("player-7", "player")
+        resp = client.post(
+            "/api/v1/engine/heal",
+            params={"token": token},
+            json={"session_id": session_id, "entity_id": "thorin", "amount": 5},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "HEALED", "amount_applied": 5}
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        assert captured["method"] == "POST"
+        assert captured["path"] == f"/api/v1/sessions/{session_id}/heal"
+        # Ids-only payload, coerced to UUIDs like every other proxy.
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin")),
+            "amount": 5,
+        }
+
+    def test_gm_token_forwards_gm_role_on_long_rest(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {"status": "RESTED", "restored_entities": 2}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/rest",
+            params={"token": token},
+            json={"session_id": session_id, "kind": "long"},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+        assert captured["path"] == f"/api/v1/sessions/{session_id}/rest"
+        assert captured["payload"] == {"kind": "long"}
+
+    def test_rest_rejects_unknown_kind(self, monkeypatch):
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            raise AssertionError("engine must not be called for an invalid kind")
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/rest",
+            params={"token": token},
+            json={"session_id": "s", "kind": "lunch"},
+        )
+        assert resp.status_code == 422
+
+    def test_heal_rejects_extra_fields(self):
+        """Trust-inversion regression: no HP overrides smuggled past the proxy."""
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/heal",
+            params={"token": token},
+            json={
+                "session_id": "s",
+                "entity_id": "e",
+                "amount": 5,
+                "hp_override": 9999,
+            },
+        )
+        assert resp.status_code == 422
 
     def test_actor_token_carries_role_claim_for_engine_rbac(self):
         """The forwarded token must be verifiable by the engine and carry the
