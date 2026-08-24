@@ -482,6 +482,26 @@ async fn add_entity(
         }
     }
 
+    // Spawn-authority gating: GM-controlled creatures (non-player entities) are
+    // board-warping content — spawning one requires a GM seat. The orchestrator
+    // service principal keeps its deploy privilege (it binds `owner_player_id`
+    // on behalf of authenticated players, so its spawns are owned player
+    // characters by construction). Spectators never reach this point
+    // (FORBIDDEN_ROLE above).
+    //
+    // Disclosed residual allowance: an UNOWNED player-flagged token may still
+    // be spawned by any participant. It confers no authority beyond what the
+    // control rules already grant (anyone non-spectator may act as an unowned
+    // entity), and legacy clients rely on it.
+    if !role.is_gm() && identity.user_id != SERVICE_PRINCIPAL && !entity.is_player {
+        return reject(
+            &data,
+            403,
+            "MONSTER_SPAWN_FORBIDDEN",
+            "spawning GM-controlled monsters requires a GM seat",
+        );
+    }
+
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
         match session.add_entity(entity, req.ingress.clone()) {
@@ -675,9 +695,15 @@ pub struct CastSpellReq {
     #[serde(default)]
     pub target_id: Option<Uuid>,
     /// Full spell definition. Until spells are served exclusively from a
-    /// compendium-backed store, damage formulas are clamped by hard caps
-    /// inside vtt-core (MAX_SPELL_DICE_COUNT / MAX_SPELL_DIE_SIDES).
+    /// compendium-backed store, damage formulas are bounded by the two-tier
+    /// caps inside vtt-core (MAX_SPELL_DICE_COUNT / MAX_SPELL_DIE_SIDES):
+    /// overshoot within 2x is gently clamped; beyond that
+    /// (`SPELL_DAMAGE_FORMULA_ABSURD`) the cast is rejected outright — and the
+    /// check runs BEFORE any spell slot is spent.
     pub spell: vtt_core::SpellDefinition,
+    /// Slot level to expend. Omitted/0 means "the spell's own level" (cantrips
+    /// included). An explicit level BELOW the spell's level is rejected with
+    /// HTTP 422 `INVALID_SLOT_LEVEL` rather than silently upgraded.
     #[serde(default)]
     pub cast_level: u8,
     #[serde(default)]
@@ -713,6 +739,29 @@ async fn resolve_cast_spell(
             }
         }
 
+        // Explicit UNDER-LEVEL slot requests are refused, never silently
+        // upgraded. The spell's stats are client-authored here (until the
+        // compendium store owns them), so a request like "cast Fireball
+        // (level 3) with cast_level 1" is either a client bug or an attempt to
+        // underpay for upcast math — both deserve a machine rejection rather
+        // than a quiet `cast_level.max(spell.level)` rewrite.
+        //
+        // Scope: only when the caller EXPLICITLY asked for a lower slot
+        // (`cast_level >= 1`). A bare `0` means "unspecified" (serde default —
+        // cantrips and ordinary un-upcast casts travel that way) and keeps the
+        // historical normalization to the spell's own level.
+        if req.cast_level >= 1 && req.cast_level < req.spell.level {
+            return reject(
+                &data,
+                422,
+                "INVALID_SLOT_LEVEL",
+                &format!(
+                    "spell of level {} cannot be cast at slot {}; send cast_level >= {} or omit it",
+                    req.spell.level, req.cast_level, req.spell.level
+                ),
+            );
+        }
+
         // Reaction interrupt stack: an armed Counterspell fizzles the spell
         // (the slot is still spent per SRD — handled inside core).
         let counterspelled = match req.target_id {
@@ -721,6 +770,9 @@ async fn resolve_cast_spell(
         };
 
         let spell = req.spell.clone();
+        // Only the "unspecified" (0) case reaches here — explicit under-level
+        // requests were rejected above. Normalize 0 up to the spell's own level
+        // so cantrips and plain casts need no client-side slot math.
         let cast_level = req.cast_level.max(spell.level);
         let target_present = req.target_id.is_some();
         let target_id_val = req.target_id;
@@ -1014,17 +1066,15 @@ async fn resolve_attack(
             attacker.position.2,
             target.position.2,
         );
-        // SRD Help: an ally's standing promise grants Advantage on THIS attack
-        // roll and is consumed exactly once. A hostile attacker never benefits
-        // (consume_help_advantage checks side parity) and leaves it standing.
-        let help_advantage = session.consume_help_advantage(req.attacker_id, req.target_id);
-        let advantage = advantage || (help_advantage && !disadvantage);
 
         let grid = build_collision_grid(&session.map);
         let attacker_pos = Vector3::new(attacker.position.0, attacker.position.1, attacker.position.2);
         let target_pos = Vector3::new(target.position.0, target.position.1, target.position.2);
         let half_cell = session.map.cell_size_feet / 2.0;
 
+        // LOS / total-cover rejections happen BEFORE the Help promise is
+        // touched: a refused attack must not permanently burn an ally's
+        // standing Advantage (mirrors the off-hand route's ordering).
         if !grid.has_line_of_sight(&attacker_pos, &target_pos) {
             return reject(
                 &data,
@@ -1042,6 +1092,12 @@ async fn resolve_attack(
                 "target is fully covered and cannot be targeted",
             );
         }
+
+        // SRD Help: an ally's standing promise grants Advantage on THIS attack
+        // roll and is consumed exactly once. A hostile attacker never benefits
+        // (consume_help_advantage checks side parity) and leaves it standing.
+        let help_advantage = session.consume_help_advantage(req.attacker_id, req.target_id);
+        let advantage = advantage || (help_advantage && !disadvantage);
 
         // Reaction interrupt: a readied Shield spell raises AC by +5 when the
         // attack would land. The reaction is spent whether or not it matters.
@@ -1999,7 +2055,8 @@ pub struct OffhandActionReq {
     pub attacker_id: Uuid,
     pub target_id: Uuid,
     /// Index into the attacker's stat-block attack list for the OFF-HAND
-    /// weapon (the main-hand weapon defaults to index 0). Server-side only.
+    /// weapon (the main-hand weapon is index 0, so it may not be reused here —
+    /// `OFFHAND_INDEX_MATCHES_MAIN`). Server-side only.
     #[serde(default)]
     pub offhand_index: usize,
     /// Optional deterministic seed pinning the roll.
@@ -2090,6 +2147,18 @@ async fn resolve_offhand_action(
         let distance = attacker.distance_to_feet(&target);
         if distance > CONTEST_REACH_FEET {
             return reject(&data, 409, "OUT_OF_REACH", "an off-hand strike requires the target within 5 ft");
+        }
+
+        // The off-hand weapon must be a DIFFERENT weapon than the main hand:
+        // index 0 IS the main-hand entry, so accepting it would let one Light
+        // weapon satisfy two-weapon fighting by itself.
+        if req.offhand_index == 0 {
+            return reject(
+                &data,
+                422,
+                "OFFHAND_INDEX_MATCHES_MAIN",
+                "the off-hand weapon cannot be the main-hand weapon (index 0)",
+            );
         }
 
         // Both weapons must be Light — server-side stat blocks decide.

@@ -902,14 +902,21 @@ impl GameSession {
         }
 
         // Single action-economy enforcement point: rejects an Action-less or
-        // incapacitated helper BEFORE anything is granted.
-        self.entities
+        // incapacitated helper BEFORE anything is granted. The lookups cannot
+        // miss here — both ids were `contains_key`-checked above — but they
+        // propagate as `ENTITY_NOT_FOUND` instead of panicking, matching the
+        // `Result`-returning style of every other GameSession mutator.
+        let helper = self
+            .entities
             .get_mut(&entity_id)
-            .expect("checked above")
-            .spend_action()?;
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        helper.spend_action()?;
 
-        self.entities.get_mut(&target_entity_id).expect("checked above").next_attacker_has_advantage_against =
-            Some(entity_id.to_string());
+        let beneficiary = self
+            .entities
+            .get_mut(&target_entity_id)
+            .ok_or_else(|| "TARGET_NOT_FOUND".to_string())?;
+        beneficiary.next_attacker_has_advantage_against = Some(entity_id.to_string());
 
         self.ledger.append_event(
             self.session_id,
@@ -964,11 +971,16 @@ impl GameSession {
             return false; // hostile attack: the ally's benefit stays standing
         }
 
-        self.entities
-            .get_mut(&target_id)
-            .expect("checked above")
-            .next_attacker_has_advantage_against = None;
-        true
+        // The target was `contains_key`-checked at the top, so this branch is
+        // unreachable in practice; guard anyway rather than panic — a racing
+        // despawn simply means there is no promise left to clear.
+        match self.entities.get_mut(&target_id) {
+            Some(t) => {
+                t.next_attacker_has_advantage_against = None;
+                true
+            }
+            None => false,
+        }
     }
 
     // ---------------------------------------------------- condition lifecycle

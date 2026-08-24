@@ -1163,7 +1163,12 @@ class EngineCastSpellRequest(BaseModel):
     caster_id: str
     target_id: Optional[str] = None
     spell: Dict[str, Any]
-    cast_level: int = Field(1, ge=0, le=9)
+    # Default 0 means "unspecified": the engine normalizes it to the spell's
+    # own level (cantrips included). An EXPLICIT level below the spell's level
+    # is rejected by the engine with HTTP 422 INVALID_SLOT_LEVEL — the gateway
+    # must not fabricate a slot level that would turn a refused under-level
+    # request into an accidental valid one.
+    cast_level: int = Field(0, ge=0, le=9)
 
 
 class EngineMoveRequest(BaseModel):

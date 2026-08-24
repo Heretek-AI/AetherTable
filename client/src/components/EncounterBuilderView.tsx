@@ -152,8 +152,10 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ engi
   };
 
   /* --- Spawning -------------------------------------------------------------
-   * Every selected copy goes to the engine one at a time. The engine's verdict
-   * (or its machine rejection code, quoted verbatim — FORBIDDEN_ROLE,
+   * Every selected copy goes to the engine one at a time. A GM seat is
+   * required: the engine rejects monster spawns from any other seat with
+   * MONSTER_SPAWN_FORBIDDEN. The engine's verdict (or its machine rejection
+   * code, quoted verbatim — FORBIDDEN_ROLE, MONSTER_SPAWN_FORBIDDEN,
    * OWNERSHIP_CLAIM_FORBIDDEN, …) is the only thing shown. NO optimistic board
    * mutation happens here: after spawning we issue a plain read of the
    * projected session state so the GM sees what the ENGINE actually reports;

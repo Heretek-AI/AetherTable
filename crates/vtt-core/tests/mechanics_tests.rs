@@ -185,11 +185,11 @@ fn test_spell_rejected_without_slots() {
 }
 
 #[test]
-fn test_absurd_damage_expression_is_capped() {
+fn test_absurd_damage_expression_is_rejected_without_spending_a_slot() {
     use vtt_core::dice::DiceEngine;
     let mut dice = DiceEngine::with_seed(9);
-    // roll_expression on an uncapped string is fine at engine level; the CAP
-    // lives in validate_and_cast_spell via clamp_damage_expression.
+    // roll_expression on an uncapped string is fine at engine level; the
+    // two-tier CAP lives in validate_and_cast_spell via clamp_damage_expression.
     let mut session = session_with_pair();
     let caster_id = *session.entities.keys().next().unwrap();
     let target_id = *session.entities.keys().find(|k| **k != caster_id).unwrap();
@@ -227,7 +227,126 @@ fn test_absurd_damage_expression_is_capped() {
     .unwrap_err();
     session.entities.insert(target_id, target);
 
-    assert!(err.contains("SPELL_DAMAGE_EXCEEDS_CAPS"), "got: {}", err);
+    assert!(
+        err.contains("SPELL_DAMAGE_FORMULA_ABSURD"),
+        "implausible math must be rejected outright, got: {}",
+        err
+    );
+    // The formula guard fires BEFORE slot expenditure — the 9th-level slot survives.
+    assert_eq!(
+        session.entities[&caster_id].spell_slots_remaining.get(&9).copied(),
+        Some(1),
+        "an absurd formula must not burn the caster's spell slot"
+    );
+}
+
+#[test]
+fn test_moderate_overshoot_is_gently_clamped_and_resolves() {
+    use vtt_core::dice::DiceEngine;
+    use vtt_core::rules::{MAX_SPELL_DICE_COUNT, MAX_SPELL_DIE_SIDES};
+    let mut dice = DiceEngine::with_seed(11);
+    let mut session = session_with_pair();
+    let caster_id = *session.entities.keys().next().unwrap();
+    let target_id = *session.entities.keys().find(|k| **k != caster_id).unwrap();
+    session.entities.get_mut(&caster_id).unwrap().spell_slots_remaining.insert(3, 1);
+
+    // 60d6 overshoots the 40d12 caps but stays within the documented 2x homebrew
+    // guard, so it resolves with the count clamped to 40 (40d6 ≤ 240 damage).
+    let base = SpellDefinition {
+        spell_id: "homebrew_blast".into(),
+        name: "Homebrew Blast".into(),
+        level: 3,
+        school: "Evocation".into(),
+        casting_time: "1 action".into(),
+        range_feet: 150,
+        area_of_effect_shape: None,
+        area_of_effect_size_feet: None,
+        verbal_component: true,
+        somatic_component: true,
+        material_component_desc: None,
+        save_attribute: None,
+        damage_formula: Some("60d6".to_string()),
+        damage_type: Some(DamageType::Fire),
+        duration_rounds: 0,
+        is_concentration: false,
+        is_ritual: false,
+    };
+    let homebrew = base.clone();
+
+    // 60d6 sits above the count cap but within the 2x hard-reject guard
+    // (40 < 60 <= 80), i.e. squarely in gentle-clamp territory.
+
+    let mut target = session.entities.remove(&target_id).unwrap();
+    target.immunities.clear();
+    let hp_before = target.current_hp;
+    let res = RulesEvaluator::validate_and_cast_spell(
+        &mut dice,
+        session.entities.get_mut(&caster_id).unwrap(),
+        Some(&mut target),
+        &homebrew,
+        3,
+        false,
+    )
+    .expect("moderate overshoot must resolve under the gentle clamp");
+    session.entities.insert(target_id, target);
+
+    assert!(res.damage_total > 0);
+    assert!(
+        res.damage_total <= (MAX_SPELL_DICE_COUNT as i32) * (MAX_SPELL_DIE_SIDES as i32),
+        "clamped roll cannot exceed {}d{}",
+        MAX_SPELL_DICE_COUNT,
+        MAX_SPELL_DIE_SIDES
+    );
+    assert_eq!(
+        session.entities[&caster_id].spell_slots_remaining.get(&3).copied(),
+        Some(0),
+        "the clamped cast spends its slot normally"
+    );
+    assert!(session.entities[&target_id].current_hp < hp_before);
+}
+
+#[test]
+fn test_sides_overshoot_beyond_the_guard_is_rejected() {
+    use vtt_core::dice::DiceEngine;
+    let mut dice = DiceEngine::with_seed(5);
+    let mut session = session_with_pair();
+    let caster_id = *session.entities.keys().next().unwrap();
+    let target_id = *session.entities.keys().find(|k| **k != caster_id).unwrap();
+    session.entities.get_mut(&caster_id).unwrap().spell_slots_remaining.insert(1, 1);
+
+    let d100_wand = SpellDefinition {
+        spell_id: "homebrew_d100".into(),
+        name: "Homebrew d100 Wand".into(),
+        level: 1,
+        school: "Evocation".into(),
+        casting_time: "1 action".into(),
+        range_feet: 30,
+        area_of_effect_shape: None,
+        area_of_effect_size_feet: None,
+        verbal_component: true,
+        somatic_component: true,
+        material_component_desc: None,
+        save_attribute: None,
+        damage_formula: Some("1d100".to_string()),
+        damage_type: Some(DamageType::Force),
+        duration_rounds: 0,
+        is_concentration: false,
+        is_ritual: false,
+    };
+
+    let mut target = session.entities.remove(&target_id).unwrap();
+    let err = RulesEvaluator::validate_and_cast_spell(
+        &mut dice,
+        session.entities.get_mut(&caster_id).unwrap(),
+        Some(&mut target),
+        &d100_wand,
+        1,
+        false,
+    )
+    .unwrap_err();
+    session.entities.insert(target_id, target);
+
+    assert!(err.contains("SPELL_DAMAGE_FORMULA_ABSURD"), "got: {}", err);
 }
 
 #[test]

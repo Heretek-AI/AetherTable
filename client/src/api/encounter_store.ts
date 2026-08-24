@@ -240,13 +240,15 @@ interface BuiltEntity {
  *
  * Honesty rules enforced here:
  *  - Every stat comes from the compendium record; nothing is defaulted into
- *    existence. Missing HP/AC/speed abort the build with a warning instead.
+ *    existence. Missing HP/AC/speed abort the build with a warning instead;
+ *    missing ABILITY scores default to 10 but are disclosed as warnings.
  *  - Attacks are forwarded ONLY where the SRD importer produced structured
  *    fields AND the damage type is one the engine enum knows; everything else
  *    is reported as a warning, never silently dropped or made up.
- *  - No owner_player_id is claimed: spawns are GM-controlled entities. (A
- *    non-GM claiming someone else's identity is refused by the engine with
- *    OWNERSHIP_CLAIM_FORBIDDEN — that rejection surfaces verbatim upstream.)
+ *  - No owner_player_id is claimed: spawns are GM-controlled entities, so the
+ *    engine requires a GM seat — a non-GM spawn is rejected with
+ *    MONSTER_SPAWN_FORBIDDEN (and claiming someone else's identity with
+ *    OWNERSHIP_CLAIM_FORBIDDEN). Those rejections surface verbatim upstream.
  */
 export function buildMonsterEntity(
   monster: CompendiumMonster,
@@ -260,10 +262,17 @@ export function buildMonsterEntity(
   if (typeof monster.ac !== 'number') throw new Error(`${monster.name} has no armor class in the compendium`);
 
   const abil = monster.abilities ?? {};
-  const score = (k: string): number => {
+  const defaultedAbilities: string[] = [];
+  // Stated rule: a missing ability score defaults to 10 — but never silently.
+  // Every default is reported once per monster through `warnings`, which the
+  // caller surfaces verbatim alongside the spawn outcome.
+  const score = (k: string): { value: number; warned: boolean } => {
     const v = abil[k];
-    return typeof v === 'number' ? v : 10;
+    if (typeof v === 'number') return { value: v, warned: false };
+    defaultedAbilities.push(k);
+    return { value: 10, warned: true };
   };
+  const scoreOf = (k: string): number => score(k).value;
 
   const attacks: Record<string, unknown>[] = [];
   for (const action of monster.actions ?? []) {
@@ -305,12 +314,12 @@ export function buildMonsterEntity(
     position,
     zone_id: 'Zone_Default',
     abilities: {
-      strength: score('STR'),
-      dexterity: score('DEX'),
-      constitution: score('CON'),
-      intelligence: score('INT'),
-      wisdom: score('WIS'),
-      charisma: score('CHA'),
+      strength: scoreOf('STR'),
+      dexterity: scoreOf('DEX'),
+      constitution: scoreOf('CON'),
+      intelligence: scoreOf('INT'),
+      wisdom: scoreOf('WIS'),
+      charisma: scoreOf('CHA'),
     },
     conditions: [],
     action_budget: {
@@ -330,6 +339,13 @@ export function buildMonsterEntity(
     is_dead: false,
     is_visible: true,
   };
+  if (defaultedAbilities.length > 0) {
+    // One disclosure per monster listing every defaulted score — the default
+    // still applies (the engine needs a number), but it is never silent.
+    warnings.push(
+      `missing ability scores defaulted to 10: ${defaultedAbilities.join(', ')}`
+    );
+  }
   return { entity, warnings };
 }
 
@@ -337,8 +353,10 @@ export function buildMonsterEntity(
  * Spawn ONE monster into an engine session through the gateway proxy. The
  * route declares `token: str = Query(...)`, so the gateway session token is
  * appended to the URL (same convention as engineHeal/engineRest in
- * rules_engine.ts). Rejections come back verbatim in the outcome union —
- * including FORBIDDEN_ROLE and OWNERSHIP_CLAIM_FORBIDDEN — and NOTHING is
+ * rules_engine.ts). A GM seat is required: the engine rejects monster spawns
+ * from non-GM seats with MONSTER_SPAWN_FORBIDDEN. Rejections come back
+ * verbatim in the outcome union — including FORBIDDEN_ROLE,
+ * MONSTER_SPAWN_FORBIDDEN and OWNERSHIP_CLAIM_FORBIDDEN — and NOTHING is
  * applied locally on failure.
  */
 export async function spawnMonsterToEngine(params: {

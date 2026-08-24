@@ -187,7 +187,7 @@ async fn forged_signature_is_unauthorized() {
 #[actix_web::test]
 async fn valid_token_creates_session() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let req = test::TestRequest::post()
         .uri("/api/v1/sessions")
         .insert_header(bearer(&token))
@@ -203,7 +203,7 @@ async fn valid_token_creates_session() {
 #[actix_web::test]
 async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
 
     // 1. Create session.
@@ -369,7 +369,7 @@ async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
 #[actix_web::test]
 async fn spell_economy_move_budget_and_xcard_rewind() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
 
     let req = test::TestRequest::post()
@@ -674,7 +674,7 @@ async fn rbac_enforcement_spectator_player_gm() {
 #[actix_web::test]
 async fn map_geometry_blocks_line_of_sight_attacks() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
 
     let req = test::TestRequest::post()
@@ -752,7 +752,7 @@ async fn spectator_cannot_create_sessions_or_advance_rounds() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
     // A GM sets up a table; the spectator still cannot drive its rounds.
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let req = test::TestRequest::post()
         .uri("/api/v1/sessions")
         .insert_header(bearer(&gm))
@@ -774,7 +774,7 @@ async fn spectator_cannot_create_sessions_or_advance_rounds() {
 #[actix_web::test]
 async fn restore_session_requires_owner_gm_or_service() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let other = sign_token_with_role("player-9", "player", TEST_SECRET);
     let service = sign_token("orchestrator-service", TEST_SECRET);
 
@@ -840,7 +840,7 @@ async fn restore_session_requires_owner_gm_or_service() {
 #[actix_web::test]
 async fn x_card_open_to_players_blocked_for_spectators() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let spec = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
     let player = sign_token_with_role("player-2", "player", TEST_SECRET);
 
@@ -921,7 +921,7 @@ fn json_str(id: &Uuid) -> serde_json::Value {
 #[actix_web::test]
 async fn heal_happy_path_restores_hp_consciousness_and_death_saves() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &gm).await;
 
     // A dying hero: 0 HP, unconscious, two failed death saves banked.
@@ -972,7 +972,7 @@ async fn heal_happy_path_restores_hp_consciousness_and_death_saves() {
 #[actix_web::test]
 async fn over_heal_clamps_to_max_hp() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &gm).await;
 
     let hero_id = Uuid::new_v4();
@@ -1003,7 +1003,7 @@ async fn over_heal_clamps_to_max_hp() {
 #[actix_web::test]
 async fn heal_rejects_dead_targets_unknown_entities_and_negative_amounts() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &gm).await;
 
     let corpse_id = Uuid::new_v4();
@@ -1116,7 +1116,7 @@ async fn heal_enforces_spectator_and_ownership_rbac() {
 #[actix_web::test]
 async fn rewind_past_heal_restores_prior_hp() {
     let app = test_app().await;
-    let gm = sign_token("gm-1", TEST_SECRET);
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&gm);
     let session_id = create_session_as(&app, &gm).await;
 
@@ -1709,7 +1709,7 @@ async fn post_actions(
     path: &str,
     payload: serde_json::Value,
 ) -> serde_json::Value {
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let req = test::TestRequest::post()
         .uri(path)
         .insert_header(bearer(&token))
@@ -1981,7 +1981,7 @@ async fn concentration_fixture() -> (
     Uuid,
 ) {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
 
     let caster_id = Uuid::new_v4();
@@ -2198,7 +2198,7 @@ async fn passed_concentration_save_maintains_spell_without_break_event() {
 #[actix_web::test]
 async fn no_concentration_check_when_target_not_concentrating() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
 
     let hero_id = Uuid::new_v4();
@@ -2435,7 +2435,7 @@ async fn create_opportunity_session(
 #[actix_web::test]
 async fn move_provoke_reports_opportunity_attack() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
     let session_id = create_opportunity_session(&app, &auth).await;
 
@@ -2518,7 +2518,7 @@ async fn move_provoke_reports_opportunity_attack() {
 #[actix_web::test]
 async fn disengaged_mover_move_response_omits_opportunity_attack() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
     let session_id = create_opportunity_session(&app, &auth).await;
 
@@ -2549,7 +2549,7 @@ async fn disengaged_mover_move_response_omits_opportunity_attack() {
 #[actix_web::test]
 async fn move_without_adjacent_armed_enemies_omits_opportunity_attack() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
     let session_id = create_opportunity_session(&app, &auth).await;
 
@@ -2712,7 +2712,7 @@ async fn x_card_snapshot_projected_for_players_full_for_gm() {
 #[actix_web::test]
 async fn move_provoke_reports_all_attackers_in_opportunity_attacks_detail() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
     let session_id = create_opportunity_session(&app, &auth).await;
 
@@ -2788,7 +2788,7 @@ async fn move_provoke_reports_all_attackers_in_opportunity_attacks_detail() {
 #[actix_web::test]
 async fn combat_begin_rolls_order_and_end_clears_it() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
 
     // Create session + spawn three combatants with distinct DEX scores.
@@ -2886,7 +2886,7 @@ async fn combat_begin_rolls_order_and_end_clears_it() {
 #[actix_web::test]
 async fn combat_begin_on_empty_board_is_rejected() {
     let app = test_app().await;
-    let token = sign_token("gm-1", TEST_SECRET);
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
     let auth = bearer(&token);
 
     let req = test::TestRequest::post()
@@ -2922,7 +2922,7 @@ async fn combat_begin_on_empty_board_is_rejected() {
 #[actix_web::test]
 async fn spectator_cannot_begin_or_end_combat() {
     let app = test_app().await;
-    let gm_auth = bearer(&sign_token("gm-1", TEST_SECRET));
+    let gm_auth = bearer(&sign_token_with_role("gm-1", "gm", TEST_SECRET));
     let spectator_auth = bearer(&sign_token_with_role("watcher", "spectator", TEST_SECRET));
 
     let req = test::TestRequest::post()
@@ -3780,7 +3780,7 @@ async fn dash_adds_one_speed_once_per_turn_then_resets() {
 #[actix_web::test]
 async fn disengage_suppresses_opportunity_attack_provocation_until_refresh() {
     let app = test_app().await;
-    let token = sign_token("gm-disengage", TEST_SECRET);
+    let token = sign_token_with_role("gm-disengage", "gm", TEST_SECRET);
     let auth = bearer(&token);
     let session_id = create_opportunity_session(&app, &auth).await;
     let hero_id = Uuid::new_v4();
@@ -4255,7 +4255,7 @@ async fn setup_twf_duel() -> (
     Uuid,
 ) {
     let app = test_app().await;
-    let token = sign_token("gm-twf", TEST_SECRET);
+    let token = sign_token_with_role("gm-twf", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     let orc_id = Uuid::new_v4();
@@ -4405,7 +4405,7 @@ async fn offhand_requires_the_attack_action_first_and_rejects_non_light_weapons(
         &app,
         &token,
         session2,
-        serde_json::json!({"attacker_id": longsword_hero, "target_id": target, "seed": 7}),
+        serde_json::json!({"attacker_id": longsword_hero, "target_id": target, "offhand_index": 1, "seed": 7}),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
@@ -4514,7 +4514,7 @@ async fn offhand_enforces_rbac_target_gates_and_payload_shape() {
 #[actix_web::test]
 async fn help_grants_advantage_that_a_real_attack_consumes_exactly_once() {
     let app = test_app().await;
-    let token = sign_token("gm-help", TEST_SECRET);
+    let token = sign_token_with_role("gm-help", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let helper_id = Uuid::new_v4();
     let ally_id = Uuid::new_v4();
@@ -4630,7 +4630,7 @@ async fn help_grants_advantage_that_a_real_attack_consumes_exactly_once() {
 #[actix_web::test]
 async fn help_promise_clears_at_the_round_refresh_and_survives_hostile_attacks() {
     let app = test_app().await;
-    let token = sign_token("gm-help2", TEST_SECRET);
+    let token = sign_token_with_role("gm-help2", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let helper_id = Uuid::new_v4();
     let enemy_id = Uuid::new_v4();
@@ -4867,5 +4867,296 @@ async fn offhand_attack_consumes_a_standing_help_promise() {
     assert!(
         snap["entities"][orc_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
         "the off-hand attack burns the Help promise"
+    );
+}
+
+// --- Fifth-audit remediation ---------------------------------------------------
+
+/// A monster stat block: GM-controlled content, not a player character.
+fn monster_json(id: Uuid, name: &str) -> serde_json::Value {
+    let mut e = entity_json(id, name, 60, 13, 4, "2d6+2");
+    e["is_player"] = serde_json::json!(false);
+    e
+}
+
+fn spell_body(caster_id: Uuid, level: u8, cast_level: u8, damage_formula: Option<&str>) -> serde_json::Value {
+    let mut spell = serde_json::json!({
+        "spell_id": format!("test_spell_{level}"), "name": "Test Spell", "level": level,
+        "school": "Evocation", "casting_time": "1 action", "range_feet": 60,
+        "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+        "verbal_component": true, "somatic_component": true,
+        "material_component_desc": null, "save_attribute": null,
+        "damage_formula": damage_formula,
+        "damage_type": if damage_formula.is_some() { serde_json::json!("force") } else { serde_json::Value::Null },
+        "duration_rounds": 0, "is_concentration": false, "is_ritual": false
+    });
+    if damage_formula.is_none() {
+        spell["damage_type"] = serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "spell": spell,
+        "caster_id": caster_id,
+        "cast_level": cast_level
+    })
+}
+
+async fn post_cast_spell(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+        .insert_header(bearer(token))
+        .set_json(body)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+#[actix_web::test]
+async fn refused_line_of_sight_attack_leaves_the_help_promise_standing() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-f1-help", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    // Wall column splitting the arena. Helper and enemy sit TOGETHER on the far
+    // side (so Help is grantable); the attacker is walled off from the enemy.
+    let wall: Vec<(usize, usize)> = (0..32).map(|y| (15, y)).collect();
+    put_map(&app, &token, session_id, 32, 32, 5.0, wall).await;
+
+    let helper_id = Uuid::new_v4();
+    let ally_id = Uuid::new_v4();
+    let enemy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id,
+        entity_at(entity_json(helper_id, "Helper", 30, 14, 0, "1d4"), 85.0, 12.5)).await;
+    spawn(&app, &token, session_id,
+        entity_at(entity_json(ally_id, "Walled Archer", 30, 15, 8, "1d8+3"), 10.0, 12.5)).await;
+    spawn(&app, &token, session_id,
+        entity_at(entity_json(enemy_id, "Ogre", 200, 16, 0, "1d4"), 90.0, 12.5)).await;
+
+    // Grant Help: the helper stands within 5 ft of the enemy.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": enemy_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // The walled-off attack attempt must be REFUSED — and must NOT burn the
+    // promise nor spend the attacker's Action.
+    let (status, body) = attack(&app, &token, session_id, ally_id, enemy_id, 3).await;
+    assert_eq!(status, StatusCode::CONFLICT, "wall must block this attack line");
+    assert_eq!(body["error"], serde_json::json!("NO_LINE_OF_SIGHT"));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"],
+        json_str(&helper_id),
+        "a refused attack must leave the standing Help promise intact"
+    );
+    assert_eq!(
+        snap["entities"][ally_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "the refused attempt spends nothing"
+    );
+
+    // The wall comes down; the NEXT legal attack cashes the surviving promise.
+    put_map(&app, &token, session_id, 32, 32, 5.0, Vec::new()).await;
+    let (status, body) = attack(&app, &token, session_id, ally_id, enemy_id, 3).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["help_advantage_consumed"], serde_json::json!(true));
+    assert_eq!(body["advantage"], serde_json::json!(true));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
+        "the first LEGAL attack consumes the promise exactly once"
+    );
+}
+
+#[actix_web::test]
+async fn explicit_under_level_cast_request_is_rejected_not_silently_upgraded() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-f2-slot", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let caster_id = Uuid::new_v4();
+    let mut caster = entity_json(caster_id, "Caster", 30, 12, 0, "1d4");
+    caster["spell_slots_remaining"] = serde_json::json!({"1": 1, "3": 1});
+    spawn(&app, &token, session_id, caster).await;
+
+    // A level-3 spell explicitly asked for at slot level 1 is a machine
+    // rejection, not a silent upgrade.
+    let (status, body) =
+        post_cast_spell(&app, &token, session_id, spell_body(caster_id, 3, 1, None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("INVALID_SLOT_LEVEL"));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][caster_id.to_string()]["spell_slots_remaining"]["3"],
+        serde_json::json!(1),
+        "the rejected request spends no slot"
+    );
+
+    // Omitting cast_level (serde default 0) stays legal for ordinary casts:
+    // the engine normalizes it to the spell's own level.
+    let mut body = spell_body(caster_id, 1, 0, None);
+    body.as_object_mut().unwrap().remove("cast_level");
+    let (status, body) = post_cast_spell(&app, &token, session_id, body).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["result"]["slot_level_used"], serde_json::json!(1));
+}
+
+#[actix_web::test]
+async fn absurd_spell_damage_formula_is_rejected_not_clamped_and_spends_no_slot() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-f2-dmg", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let caster_id = Uuid::new_v4();
+    let mut caster = entity_json(caster_id, "Nuker", 30, 12, 0, "1d4");
+    caster["spell_slots_remaining"] = serde_json::json!({"9": 2});
+    spawn(&app, &token, session_id, caster).await;
+    let dummy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id,
+        entity_at(entity_json(dummy_id, "Dummy", 500, 10, 0, "1d4"), 7.5, 2.5)).await;
+
+    let mut nuke = spell_body(caster_id, 9, 9, Some("9999d9999"));
+    nuke["target_id"] = json_str(&dummy_id);
+
+    // Implausible math is REJECTED outright (not clamped to 40d12)...
+    let (status, body) = post_cast_spell(&app, &token, session_id, nuke.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("SPELL_REJECTED"));
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("SPELL_DAMAGE_FORMULA_ABSURD"),
+        "rejection must name the homebrew guard, got: {}",
+        detail
+    );
+
+    // ...and because the guard fires before slot expenditure, no slot burned.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][caster_id.to_string()]["spell_slots_remaining"]["9"],
+        serde_json::json!(2),
+        "an absurd formula must not burn spell slots"
+    );
+    assert_eq!(
+        snap["entities"][dummy_id.to_string()]["current_hp"],
+        serde_json::json!(500),
+        "nothing was rolled or applied"
+    );
+
+    // Moderate overshoot (within the documented 2x guard) still resolves via
+    // the gentle clamp instead of being refused.
+    let mut homebrew = spell_body(caster_id, 9, 9, Some("60d6"));
+    homebrew["target_id"] = json_str(&dummy_id);
+    let (status, _) = post_cast_spell(&app, &token, session_id, homebrew).await;
+    assert_eq!(status, StatusCode::OK, "60d6 sits inside the gentle-clamp tier");
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let hp = snap["entities"][dummy_id.to_string()]["current_hp"].as_i64().unwrap();
+    assert!(
+        (260..499).contains(&hp),
+        "clamped 40d6 deals at most 240 damage (final hp must be >= 260), got {}",
+        hp
+    );
+}
+
+#[actix_web::test]
+async fn monster_spawns_require_a_gm_seat_but_owned_player_deploys_pass() {
+    let app = test_app().await;
+    let gm_token = sign_token_with_role("gm-f3", "gm", TEST_SECRET);
+    let player_token = sign_token_with_role("player-f3", "player", TEST_SECRET);
+    let service_token = sign_token("orchestrator-service", TEST_SECRET); // gateway principal
+    let spectator_token = sign_token_with_role("watcher-f3", "spectator", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm_token).await;
+
+    // A PLAYER cannot spawn an unowned monster.
+    let (status, body) = post_contest_spawn(&app, &player_token, session_id, monster_json(Uuid::new_v4(), "Player Orc")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("MONSTER_SPAWN_FORBIDDEN"));
+
+    // A SPECTATOR is unchanged: plain FORBIDDEN_ROLE, never a spawn.
+    let (status, body) = post_contest_spawn(&app, &spectator_token, session_id, monster_json(Uuid::new_v4(), "Sneaky Orc")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+
+    // The GM spawns monsters freely.
+    let (status, _) = post_contest_spawn(&app, &gm_token, session_id, monster_json(Uuid::new_v4(), "GM Orc")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deploy-style: the service principal binds ownership on behalf of an
+    // authenticated player — owned player characters stay spawnable.
+    let mut deploy = entity_json(Uuid::new_v4(), "Deployed Hero", 20, 14, 6, "1d8");
+    deploy["owner_player_id"] = serde_json::json!("player-f3");
+    let (status, _) = post_contest_spawn(&app, &service_token, session_id, deploy).await;
+    assert_eq!(status, StatusCode::OK, "deploy path must keep working");
+
+    // And so does a player spawning their OWN owned character directly.
+    let mut own_pc = entity_json(Uuid::new_v4(), "Own Hero", 20, 14, 6, "1d8");
+    own_pc["owner_player_id"] = serde_json::json!("player-f3");
+    let (status, _) = post_contest_spawn(&app, &player_token, session_id, own_pc).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+async fn post_contest_spawn(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    entity: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(token))
+        .set_json(entity)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+#[actix_web::test]
+async fn offhand_index_zero_is_refused_as_matching_the_main_hand() {
+    let (app, token, session_id, hero_id, orc_id) = setup_twf_duel().await;
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK, "main-hand attack must resolve first");
+
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "offhand_index": 0, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("OFFHAND_INDEX_MATCHES_MAIN"));
+
+    // Nothing was spent by the refused attempt.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["action_budget"]["bonus_action"],
+        serde_json::json!(true),
+        "the rejected off-hand attempt keeps the Bonus Action"
     );
 }

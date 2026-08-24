@@ -165,11 +165,30 @@ pub struct CastSpellResult {
 
 /// Hard sanity caps on spell damage expressions. Until spell definitions are
 /// served exclusively from the compendium store, any client-supplied formula
-/// is clamped to these bounds so absurdity ("9999d9999") can never resolve.
+/// is bounded by these values so absurdity ("9999d9999") can never resolve.
+///
+/// The caps are enforced in TWO tiers by [`RulesEvaluator::clamp_damage_expression`]:
+///
+/// 1. GENTLE CLAMP (≤ [`MAX_SPELL_DICE_HARD_REJECT_FACTOR`]× overshoot):
+///    a formula that exceeds a cap but stays within twice it is treated as
+///    generous homebrew — the expression is silently capped to
+///    `MAX_SPELL_DICE_COUNT`d`MAX_SPELL_DIE_SIDES` (+ modifier) and resolves.
+/// 2. HARD REJECT (> factor× overshoot): a formula blowing past the caps by
+///    more than twice their value is implausible client-authored math, not
+///    homebrew. It is REJECTED with `SPELL_DAMAGE_FORMULA_ABSURD`; nothing is
+///    rolled and (because validation happens before slot expenditure) no slot
+///    is spent.
 pub const MAX_SPELL_DICE_COUNT: u32 = 40;
 pub const MAX_SPELL_DIE_SIDES: u32 = 12;
 
-/// Parses "NdM+K" / "NdM-K" / "NdM" and enforces dice-count/sides caps.
+/// Overshoot multiple (of each cap) beyond which a damage formula stops being
+/// clamped and starts being rejected outright. 2 means e.g. up to `80d24`
+/// still resolves (clamped to `40d12`), while `81d6`, `1d25`, or `9999d9999`
+/// are refused.
+pub const MAX_SPELL_DICE_HARD_REJECT_FACTOR: u32 = 2;
+
+/// Parses "NdM+K" / "NdM-K" / "NdM" and enforces the two-tier dice-count/sides
+/// guard documented on [`MAX_SPELL_DICE_COUNT`].
 fn clamp_damage_expression(expr: &str) -> Result<String, String> {
     let expr = expr.trim().to_lowercase().replace(' ', "");
     if expr.is_empty() {
@@ -187,15 +206,18 @@ fn clamp_damage_expression(expr: &str) -> Result<String, String> {
         .ok_or_else(|| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
     let count: u32 = count_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
     let sides: u32 = sides_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
-    let capped_count = count.min(MAX_SPELL_DICE_COUNT);
-    let capped_sides = sides.clamp(1, MAX_SPELL_DIE_SIDES);
-    if count > MAX_SPELL_DICE_COUNT || sides > MAX_SPELL_DIE_SIDES {
-        // Silently clamped counts would be dishonest — reject instead.
+    // Tier 2 — implausible math is refused outright, never silently reshaped.
+    let reject_count = MAX_SPELL_DICE_COUNT * MAX_SPELL_DICE_HARD_REJECT_FACTOR;
+    let reject_sides = MAX_SPELL_DIE_SIDES * MAX_SPELL_DICE_HARD_REJECT_FACTOR;
+    if count > reject_count || sides > reject_sides {
         return Err(format!(
-            "SPELL_DAMAGE_EXCEEDS_CAPS: {}d{} > {}d{}",
-            count, sides, capped_count, capped_sides
+            "SPELL_DAMAGE_FORMULA_ABSURD: {}d{} exceeds the documented homebrew guard (more than {}x the {}d{} cap)",
+            count, sides, MAX_SPELL_DICE_HARD_REJECT_FACTOR, MAX_SPELL_DICE_COUNT, MAX_SPELL_DIE_SIDES
         ));
     }
+    // Tier 1 — modest overshoot is homebrew generosity: clamp gently.
+    let capped_count = count.min(MAX_SPELL_DICE_COUNT);
+    let capped_sides = sides.clamp(1, MAX_SPELL_DIE_SIDES);
     Ok(format!("{}d{}{}", capped_count, capped_sides, if modifier >= 0 { format!("+{}", modifier) } else { format!("{}", modifier) }))
 }
 
@@ -494,8 +516,9 @@ impl RulesEvaluator {
     /// 3. verbal/somatic/material component flags are validated against the
     ///    caster's state
     /// 4. concentration limits: a new concentration spell replaces the old
-    /// 5. damage is rolled from the spell formula with sanity caps applied,
-    ///    then applied through resist/vuln/immunity + temp-HP absorption
+    /// 5. damage is rolled from the spell formula with sanity caps applied
+    ///    (validated up-front, before slots are spent), then applied through
+    ///    resist/vuln/immunity + temp-HP absorption
     ///
     /// `counterspelled` pre-empts everything after slot expenditure (SRD:
     /// a counterspelled spell fails but the slot is still spent).
@@ -523,6 +546,14 @@ impl RulesEvaluator {
                 spell.level, cast_level
             ));
         }
+
+        // Damage-formula sanity runs BEFORE any slot is spent: a malformed or
+        // absurd client-authored expression (see the two-tier caps on
+        // [`MAX_SPELL_DICE_COUNT`]) must never burn spell slots.
+        let normalized_damage = match spell.damage_formula.as_deref() {
+            Some(expr) => Some(clamp_damage_expression(expr)?),
+            None => None,
+        };
 
         // 2. Slot availability: exact level first, then upcast ladder.
         let mut slot_level_used: Option<u8> = None;
@@ -567,10 +598,9 @@ impl RulesEvaluator {
         let mut damage_total = 0i32;
         let mut hp_remaining: Option<i32> = None;
         if let (Some(expr), Some(dtype), Some(target)) =
-            (spell.damage_formula.as_deref(), spell.damage_type, target)
+            (normalized_damage.as_deref(), spell.damage_type, target)
         {
-            let clamped = clamp_damage_expression(expr)?;
-            let raw = dice.roll_expression(&clamped)?.total;
+            let raw = dice.roll_expression(expr)?.total;
             damage_total = if target.immunities.contains(&dtype) {
                 0
             } else if target.resistances.contains(&dtype) {

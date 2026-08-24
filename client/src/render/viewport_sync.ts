@@ -17,11 +17,14 @@
  * position through the framing itself). Re-filtering here would silently
  * duplicate the one authoritative filter and invite drift between the two.
  *
- * Fog handling follows the same principle: the fitted region is the UNION of
- * every party-shared `user:*` reveal mask (the same union TacticalCanvas draws),
- * so the camera tracks explored terrain only. The GM keeps NO fog layer by
- * design (omniscient seats are layer-less — see fog_overlay.ts), which is why
- * the GM's map can never widen this frame.
+ * Fog handling is disclosed, not mirrored: the fitted region is the UNION of
+ * EVERY party-shared `user:*` reveal mask — own layer and peers alike. This is
+ * deliberately NOT the same mask TacticalCanvas draws for a seated player
+ * (which prefers that seat's OWN `user:<id>` layer and only falls back to the
+ * union while it has no layer yet). The camera therefore frames at least as
+ * much explored terrain as any single seat sees — never less — and an
+ * omniscient GM contributes no layer at all (layer-less by design, see
+ * fog_overlay.ts), so the GM view cannot widen this frame.
  *
  * ── WHAT THIS MODULE DOES NOT DO (honest limits) ────────────────────────────
  *  1. It never writes to the interactive canvas. Pan/zoom state lives inside
@@ -145,7 +148,8 @@ export interface BroadcastViewportInput {
 }
 
 interface PartyFogSummary {
-  /** Union of every party-shared `user:*` mask (null = no layers at all). */
+  /** Union of ALL party-shared `user:*` masks (null = no layers at all).
+   *  Wider-or-equal to any single seat's drawn mask — see summarizePartyFog. */
   unionMask: Uint8Array | null;
   /** How many distinct party layers were merged. */
   layerCount: number;
@@ -153,9 +157,14 @@ interface PartyFogSummary {
 }
 
 /**
- * Merge every party-shared fog layer exactly the way TacticalCanvas's
- * non-omnicient fallback path does (union of all `user:*` masks) and collect
- * the revealed cells so framing can include explored terrain beyond the party.
+ * Merge EVERY party-shared fog layer into one mask and collect the revealed
+ * cells so framing can include explored terrain beyond the party.
+ *
+ * Parity note: TacticalCanvas's seated view PREFERS the viewer's own
+ * `user:<id>` layer and only falls back to this union while that layer does
+ * not exist yet (see computeEffectiveFogMask there). This module always takes
+ * the full union — the union of all `user:*` masks, own layer included — so
+ * the broadcast frame covers at least everything any seat has explored.
  */
 function summarizePartyFog(
   syncClient: YjsCrdtClient | null,
