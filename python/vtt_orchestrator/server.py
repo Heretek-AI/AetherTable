@@ -2334,6 +2334,199 @@ def negotiate_concordia_pact(req: ConcordiaNegotiateRequest):
     return result
 
 
+# ---------------------------------------------------------------------------
+# NPC persona registry routes (GOALS.md Pillar 5 runtime surface)
+#
+# ConcordiaNPC sub-agents (agents/npc_sub_agent.py) become reachable at
+# runtime: a module-level registry of personas keyed to the starter
+# adventure's cast, all sharing ONE NpcDispositionEngine singleton so
+# stances persist across calls for the lifetime of the process.
+# ---------------------------------------------------------------------------
+
+from .agents.npc_sub_agent import (
+    ConcordiaNPC,
+    Goal,
+    GoalsComponent,
+    LinguisticStyleComponent,
+    MemoryComponent,
+    SocialNorm,
+    SocialNormsComponent,
+)
+from .simulation.npc_disposition import KNOWN_INTERACTION_KINDS, NpcDispositionEngine
+
+
+def _build_persona_registry(disposition_engine: NpcDispositionEngine) -> Dict[str, ConcordiaNPC]:
+    """Personas composed from the four components, keyed to the starter cast.
+
+    Every persona gets ``llm_gateway=streaming_gateway`` so the norms-gated
+    LLM path engages whenever an API key is configured; the gateway contract
+    returns None in mock mode and ConcordiaNPC falls back to its
+    deterministic template reply, so unconfigured deployments stay pure.
+    """
+    return {
+        # starter_adventures.py: NPC_Karas_Drowned_Steward — GUARDS the crypt.
+        "karas_drowned_steward": ConcordiaNPC(
+            npc_id="karas_drowned_steward",
+            name="The Drowned Steward",
+            role="Undead Warden of the Sunken Crypt of Karas",
+            memory=MemoryComponent(capacity=20),
+            goals=GoalsComponent([
+                Goal("Keep intruders out of the Sunken Crypt of Karas", priority=10),
+                Goal("Serve the will of Baron Vane without question", priority=6),
+                Goal("Find peace from the tide that binds him", priority=2),
+            ]),
+            norms=SocialNormsComponent([
+                SocialNorm.taboo(
+                    ["sunblade"],
+                    reason="never speak of the blade that burned him into service",
+                ),
+            ]),
+            style=LinguisticStyleComponent(
+                formality=0.9,
+                verbosity=0.4,
+                tone="drowned, reverent, mournful",
+                signature_phrases=("The tide keeps its own counsel.",),
+            ),
+            disposition_engine=disposition_engine,
+            llm_gateway=streaming_gateway,
+        ),
+        # starter_adventures.py: NPC_Baron_Vane — ENTOMBED_IN the crypt.
+        "baron_aldous_vane": ConcordiaNPC(
+            npc_id="baron_aldous_vane",
+            name="Baron Aldous Vane",
+            role="Entombed Lord of Oakhaven Keep",
+            memory=MemoryComponent(capacity=20),
+            goals=GoalsComponent([
+                Goal("Restore the honour of House Vane", priority=9),
+                Goal("Learn who dares disturb his tomb", priority=7),
+                Goal("Avenge his murder by the Shadow Cabal", priority=5),
+            ]),
+            norms=SocialNormsComponent([
+                SocialNorm.taboo(
+                    ["shadow cabal"],
+                    reason="the Baron refuses to name the cabal that betrayed him",
+                ),
+                SocialNorm.obligation(
+                    "never beg any mortal for mercy",
+                    lambda reply, ctx: "mercy" in reply.lower() if "please" in reply.lower() else None,
+                ),
+            ]),
+            style=LinguisticStyleComponent(
+                formality=0.95,
+                verbosity=0.8,
+                tone="imperious, sepulchral",
+                signature_phrases=("Oakhaven endures.",),
+            ),
+            disposition_engine=disposition_engine,
+            llm_gateway=streaming_gateway,
+        ),
+        # starter_adventures.py: Faction_Shadow_Cabal — SEEKS Item_Sunblade.
+        "shadow_cabal_emissary": ConcordiaNPC(
+            npc_id="shadow_cabal_emissary",
+            name="The Cabal Emissary",
+            role="Envoy of the Shadow Cabal",
+            memory=MemoryComponent(capacity=20),
+            goals=GoalsComponent([
+                Goal("Acquire the relic entombed beneath Karas", priority=10),
+                Goal("Recruit the speaker as an unwitting agent", priority=6),
+                Goal("Leave no witness who heard the offer", priority=3),
+            ]),
+            norms=SocialNormsComponent([
+                SocialNorm.taboo(
+                    ["pelor"],
+                    reason="the Cabal never utters the dawn god's name",
+                ),
+            ]),
+            style=LinguisticStyleComponent(
+                formality=0.2,
+                verbosity=0.6,
+                tone="silky, transactional",
+                signature_phrases=("Everyone has a price.",),
+            ),
+            disposition_engine=disposition_engine,
+            llm_gateway=streaming_gateway,
+        ),
+    }
+
+
+#: Shared disposition singleton: one engine, many personas, persistent stances.
+#: The zero-clock keeps decay deterministic (same convention as campaign_sim).
+_npc_disposition_engine = NpcDispositionEngine(clock=lambda: 0.0)
+_NPC_REGISTRY: Dict[str, ConcordiaNPC] = _build_persona_registry(_npc_disposition_engine)
+
+
+def reset_npc_registry() -> None:
+    """Rebuild pristine personas + disposition state (test isolation hook)."""
+    global _npc_disposition_engine, _NPC_REGISTRY
+    _npc_disposition_engine = NpcDispositionEngine(clock=lambda: 0.0)
+    _NPC_REGISTRY = _build_persona_registry(_npc_disposition_engine)
+
+
+class NpcRespondRequest(BaseModel):
+    utterance: str = Field(min_length=1, max_length=2000)
+
+
+class NpcInteractionRequest(BaseModel):
+    kind: str
+    magnitude: float = Field(default=1.0, gt=0.0)
+
+
+@app.get("/api/v1/npc/")
+async def list_npc_personas():
+    """Public metadata only: id/name/role. No goals, norms or internals."""
+    return {
+        "npcs": [
+            {"id": npc.npc_id, "name": npc.name, "role": npc.role}
+            for npc in _NPC_REGISTRY.values()
+        ]
+    }
+
+
+@app.post("/api/v1/npc/{npc_id}/respond")
+async def npc_respond(npc_id: str, req: NpcRespondRequest, token: str = Depends(_require_auth)):
+    """One in-character reply. Norms-violating candidates are replaced by the
+    deterministic fallback inside ConcordiaNPC and reported via norm_rejected."""
+    npc = _NPC_REGISTRY.get(npc_id)
+    if npc is None:
+        raise HTTPException(status_code=404, detail=f"Unknown NPC: {npc_id}")
+    player_id = _require_user_id(token)
+    result = await npc.respond_to(player_id, req.utterance)
+    payload: Dict[str, Any] = {
+        "reply": result["reply"],
+        "generator": result["generator"],
+        "stance": result["stance"],
+        "npc_id": result["npc_id"],
+    }
+    if "norm_rejected" in result:
+        payload["norm_rejected"] = result["norm_rejected"]
+    return payload
+
+
+@app.post("/api/v1/npc/{npc_id}/interactions")
+async def npc_record_interaction(
+    npc_id: str, req: NpcInteractionRequest, token: str = Depends(_require_auth)
+):
+    """Record one disposition outcome (aided/attacked/gifted/...) so the
+    stance used by /respond shifts and persists across calls."""
+    npc = _NPC_REGISTRY.get(npc_id)
+    if npc is None:
+        raise HTTPException(status_code=404, detail=f"Unknown NPC: {npc_id}")
+    if req.kind not in KNOWN_INTERACTION_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown interaction kind {req.kind!r}; expected one of {sorted(KNOWN_INTERACTION_KINDS)}",
+        )
+    player_id = _require_user_id(token)
+    npc.apply_outcome(req.kind, player_id, magnitude=req.magnitude)
+    return {
+        "npc_id": npc_id,
+        "player_id": player_id,
+        "kind": req.kind,
+        "stance": _npc_disposition_engine.stance(npc_id, player_id),
+        "disposition": _npc_disposition_engine.disposition(npc_id, player_id),
+    }
+
+
 def start_server():
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
