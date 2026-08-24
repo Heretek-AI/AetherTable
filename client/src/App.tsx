@@ -66,7 +66,7 @@ import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
-import { YjsCrdtClient } from './sync/yjs_doc_client';
+import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
 import { listSaves, loadCampaign } from './api/campaign_store';
 import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
@@ -189,6 +189,10 @@ export function App() {
   // token + fog state merges causally through a real Y.Doc; otherwise we
   // fall back to the engine's LWW JSON relay (tokens only, solo-safe).
   const syncClientRef = useRef<VttCrdtSyncClient | null>(null);
+  const yjsClientRef = useRef<YjsCrdtClient | null>(null);
+  // Real peer cursors from CRDT awareness. Starts empty and stays empty while
+  // alone or on the legacy relay — no fabricated stand-in cursors.
+  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   useEffect(() => {
     const env = (import.meta as any).env ?? {};
     const engineWsUrl = env.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
@@ -200,6 +204,10 @@ export function App() {
     const startLegacyRelay = () => {
       if (disposed) return;
       syncClientRef.current?.disconnect();
+      // The engine LWW relay carries no presence protocol: peer cursors are
+      // honestly empty on this transport.
+      setRemoteCursors([]);
+      yjsClientRef.current = null;
       const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
       client.connect();
       syncClientRef.current = client;
@@ -215,6 +223,9 @@ export function App() {
 
     const yjs = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
     yjs.connect();
+    yjsClientRef.current = yjs;
+    // Stamp the signed-in identity into awareness so peers see who this cursor is.
+    yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
     syncClientRef.current = {
       connect: () => yjs.connect(),
       disconnect: () => yjs.destroy(),
@@ -231,6 +242,9 @@ export function App() {
       );
     });
 
+    // Peer cursors stream straight off awareness — empty list when solo.
+    const unsubscribeCursors = yjs.onRemoteCursors(setRemoteCursors);
+
     // If the CRDT relay never connects, fall back to the engine relay.
     const fallbackTimer = setTimeout(() => {
       if (!disposed && !yjs.isConnected) {
@@ -243,9 +257,25 @@ export function App() {
       disposed = true;
       clearTimeout(fallbackTimer);
       unsubscribeYjs();
+      unsubscribeCursors();
+      setRemoteCursors([]);
       yjs.destroy();
+      yjsClientRef.current = null;
       syncClientRef.current = null;
     };
+  }, []);
+
+  // Keep awareness identity in step with the signed-in user (re-login / role swap).
+  useEffect(() => {
+    const yjs = yjsClientRef.current;
+    if (!yjs) return;
+    yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
+  }, [currentUser]);
+
+  // Publish our pointer to peers as the canvas reports hovered cells.
+  // No-op on the legacy relay fallback, where yjsClientRef is cleared.
+  const handleLocalCursorMove = useCallback((boardX: number, boardY: number) => {
+    yjsClientRef.current?.updateLocalCursor(boardX, boardY);
   }, []);
 
   // Authoritative Tokens
@@ -1091,6 +1121,8 @@ export function App() {
                   onSelectToken={(id) => setSelectedTokenId(id)}
                   onUpdateTokenElevation={handleUpdateTokenElevation}
                   currentUser={currentUser}
+                  remoteCursors={remoteCursors}
+                  onLocalCursorMove={handleLocalCursorMove}
                   activePing={activePing}
                   walls={customWalls}
                   particleFXRef={particleFXRef}

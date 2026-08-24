@@ -47,7 +47,10 @@ interface TacticalCanvasProps {
   onSelectToken: (tokenId: string) => void;
   onUpdateTokenElevation?: (tokenId: string, newElevation: number) => void;
   currentUser?: User;
+  /** Live peer pointers in BOARD coordinates. Empty array = no peers connected — nothing is rendered. */
   remoteCursors?: { id: string; name: string; color: string; x: number; y: number }[];
+  /** Emitted on board hover with the hovered cell so the app can publish our cursor via CRDT awareness. */
+  onLocalCursorMove?: (boardX: number, boardY: number) => void;
   activePing?: { x: number; y: number } | null;
   gridWidth?: number;
   gridHeight?: number;
@@ -66,10 +69,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   onSelectToken,
   onUpdateTokenElevation,
   currentUser,
-  remoteCursors = [
-    { id: 'usr_lyra', name: 'Lyra', color: '#818cf8', x: 6, y: 3 },
-    { id: 'usr_player1', name: 'Thorin', color: '#ef4444', x: 3, y: 5 },
-  ],
+  remoteCursors = [],
+  onLocalCursorMove,
   activePing = null,
   gridWidth = 16,
   gridHeight = 12,
@@ -619,6 +620,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
               const cx = Math.floor((event.clientX - rect.left) / cellSize);
               const cy = Math.floor((event.clientY - rect.top) / cellSize);
               handleCellClick(cx, cy);
+            }}
+            onMouseMove={(event) => {
+              if (!onLocalCursorMove) return;
+              // Same mapping as the click surface: pixel → grid-cell board coords.
+              const rect = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
+              const cx = Math.floor((event.clientX - rect.left) / cellSize);
+              const cy = Math.floor((event.clientY - rect.top) / cellSize);
+              if (cx >= 0 && cy >= 0 && cx < gridWidth && cy < gridHeight) {
+                onLocalCursorMove(cx, cy);
+              }
             }}
           />
 

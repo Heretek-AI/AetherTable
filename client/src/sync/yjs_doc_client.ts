@@ -13,6 +13,11 @@
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
+// Bundled transitively by y-websocket (^1.0.5). Resolved from the hoisted
+// node_modules root under the project's `moduleResolution: node` tsconfig and
+// Vite's export-map resolution alike. If it ever stops being a transitive dep,
+// promote `y-protocols` to an explicit dependency in client/package.json.
+import { Awareness } from 'y-protocols/awareness';
 
 export interface TokenTransformData {
   tokenId: string;
@@ -25,7 +30,51 @@ export interface TokenTransformData {
   timestamp: number;
 }
 
+/**
+ * A peer's live pointer position, already filtered to OTHER clients and
+ * expressed in BOARD coordinates (grid cells, same units as `Token.x/y` —
+ * NOT pixels). This is the shape TacticalCanvas's `remoteCursors` prop wants.
+ */
+export interface RemoteCursor {
+  id: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+}
+
+/** Flat awareness payload published by every client (including us). */
+interface CursorAwarenessState {
+  user_id: string;
+  name: string;
+  color: string;
+  /** Board coordinates in grid cells. */
+  x: number;
+  y: number;
+}
+
 type RemoteTokenListener = (payload: TokenTransformData) => void;
+type RemoteCursorListener = (cursors: RemoteCursor[]) => void;
+
+/** Peer cursor colors are assigned deterministically from user_id. */
+const CURSOR_PALETTE = [
+  '#818cf8', // indigo
+  '#ef4444', // red
+  '#34d399', // emerald
+  '#fbbf24', // amber
+  '#f472b6', // pink
+  '#38bdf8', // sky
+  '#a78bfa', // violet
+  '#fb923c', // orange
+];
+
+function colorForUser(userId: string): string {
+  let hash = 0;
+  for (let i = 0; i < userId.length; i++) {
+    hash = (hash * 31 + userId.charCodeAt(i)) | 0;
+  }
+  return CURSOR_PALETTE[Math.abs(hash) % CURSOR_PALETTE.length];
+}
 
 export class YjsCrdtClient {
   private doc = new Y.Doc();
@@ -35,7 +84,18 @@ export class YjsCrdtClient {
   private fog: Y.Map<Uint8Array>;
   private remoteListeners = new Set<RemoteTokenListener>();
   private tokenObservers = new Map<string, () => void>();
+  private cursorListeners = new Set<RemoteCursorListener>();
+  /** Presence protocol instance. The provider owns one; we only create our own for local-only mode. */
+  private awareness: Awareness | null = null;
+  private ownAwareness = false;
+  private localUser: { user_id: string; name: string; color: string } | null = null;
+  // Leading+trailing throttle state for cursor publication.
+  private pendingCursor: { x: number; y: number } | null = null;
+  private cursorFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
+
+  /** Local pointer updates are coalesced to at most one awareness write per tick. */
+  private static readonly CURSOR_THROTTLE_MS = 60;
 
   constructor(serverUrl: string, roomId: string) {
     this.tokens = this.doc.getMap('tokens');
@@ -70,6 +130,20 @@ export class YjsCrdtClient {
       console.warn('[YjsSync] provider unavailable; local-only CRDT mode:', e);
     }
 
+    // Presence: reuse the provider's awareness (y-websocket already encodes/
+    // broadcasts its updates over the same socket); fall back to a standalone
+    // instance so cursor state still round-trips locally in local-only mode.
+    if (this.provider?.awareness) {
+      this.awareness = this.provider.awareness;
+    } else {
+      this.awareness = new Awareness(this.doc);
+      this.ownAwareness = true;
+    }
+    this.awareness.on('change', () => {
+      const snapshot = this.collectRemoteCursors();
+      this.cursorListeners.forEach((listener) => listener(snapshot));
+    });
+
     // Fan out remote (and local-confirm) token changes to listeners.
     this.tokens.observe((event) => {
       if (!this.remoteListeners.size) return;
@@ -98,6 +172,85 @@ export class YjsCrdtClient {
     return () => {
       this.remoteListeners.delete(listener);
     };
+  }
+
+  // --- Awareness (live cursors) -------------------------------------------
+
+  /**
+   * Stamp the signed-in identity into local awareness. Call again if the
+   * signed-in user changes; the current pointer position (if any) is kept.
+   */
+  public setLocalUser(user: { user_id: string; name: string; color?: string }): void {
+    if (!this.awareness) return;
+    this.localUser = {
+      user_id: user.user_id,
+      name: user.name,
+      color: user.color ?? colorForUser(user.user_id),
+    };
+    const prev = this.awareness.getLocalState() ?? {};
+    this.awareness.setLocalState({ ...prev, ...this.localUser });
+  }
+
+  /** Publish our pointer position in BOARD coordinates (grid cells). Throttled. */
+  public updateLocalCursor(x: number, y: number): void {
+    this.pendingCursor = { x, y };
+    if (this.cursorFlushTimer !== null) return;
+    this.flushCursor();
+    // Trailing edge: guarantee the final resting position is published.
+    this.cursorFlushTimer = setTimeout(() => {
+      this.cursorFlushTimer = null;
+      this.flushCursor();
+    }, YjsCrdtClient.CURSOR_THROTTLE_MS);
+  }
+
+  private flushCursor(): void {
+    if (!this.awareness || !this.pendingCursor) return;
+    const { x, y } = this.pendingCursor;
+    this.pendingCursor = null;
+    const prev = this.awareness.getLocalState() ?? {};
+    this.awareness.setLocalState({ ...prev, x, y });
+  }
+
+  /**
+   * Subscribe to OTHER users' cursors. The callback receives the full list
+   * each time awareness changes — an empty array means no peers are present,
+   * and the UI must render nothing rather than fabricated stand-ins.
+   */
+  public onRemoteCursors(listener: RemoteCursorListener): () => void {
+    this.cursorListeners.add(listener);
+    // Deliver the current snapshot immediately so late subscribers render peers
+    // that connected before they mounted.
+    listener(this.collectRemoteCursors());
+    return () => {
+      this.cursorListeners.delete(listener);
+    };
+  }
+
+  private collectRemoteCursors(): RemoteCursor[] {
+    if (!this.awareness) return [];
+    const selfId = this.awareness.clientID;
+    const cursors: RemoteCursor[] = [];
+    this.awareness.getStates().forEach((state, clientId) => {
+      if (clientId === selfId || !state) return;
+      const s = state as Partial<CursorAwarenessState>;
+      if (
+        typeof s.user_id !== 'string' ||
+        typeof s.x !== 'number' ||
+        typeof s.y !== 'number' ||
+        !Number.isFinite(s.x) ||
+        !Number.isFinite(s.y)
+      ) {
+        return;
+      }
+      cursors.push({
+        id: String(s.user_id),
+        name: typeof s.name === 'string' ? s.name : String(s.user_id),
+        color: typeof s.color === 'string' ? s.color : colorForUser(String(s.user_id)),
+        x: s.x,
+        y: s.y,
+      });
+    });
+    return cursors;
   }
 
   /** CRDT-authoritative position write — merges causally with peers. */
@@ -143,6 +296,19 @@ export class YjsCrdtClient {
 
   public destroy(): void {
     this.tokenObservers.forEach((off) => off());
+    if (this.cursorFlushTimer !== null) {
+      clearTimeout(this.cursorFlushTimer);
+      this.cursorFlushTimer = null;
+    }
+    // Announce departure so peers drop our cursor immediately instead of
+    // waiting out the awareness stale timeout.
+    try {
+      this.awareness?.setLocalState(null);
+    } catch {
+      /* doc may already be torn down */
+    }
+    this.cursorListeners.clear();
+    if (this.ownAwareness) this.awareness?.destroy();
     this.idb?.destroy();
     this.provider?.destroy();
     this.doc.destroy();
