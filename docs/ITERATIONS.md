@@ -293,3 +293,5 @@ every 10 iterations; adversarial audit sweeps ~every 10.
 
 ## Iteration log
 
+### Iteration 1 — b111d02 — fix(server): role-project GET /sessions/{id} (P1.1) — cargo 236/18, clippy clean
+### Iteration 2 — this commit — feat(gateway): strict typed EngineSpawnEntity schema; deploy-math residue disclosed (P1.2) — pytest 569

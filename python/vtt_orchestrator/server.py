@@ -13,8 +13,8 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Literal, Optional, Tuple
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Dict, Any, List, Literal, Optional, Tuple, Union
 
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
@@ -1223,6 +1223,25 @@ class CharacterDeployRequest(BaseModel):
     y: float = 5.0
 
 
+def _derive_class_attack(level: int, klass: str, abilities: Dict[str, Any]) -> Dict[str, Any]:
+    """Sole surviving Python-side stat derivation on the deploy path — see the
+    ARCHITECTURE VIOLATION note in deploy_character for why it cannot live in
+    vtt-core yet. Kept as one named helper (not inline math) so the follow-up
+    Rust iteration deletes exactly this."""
+    proficiency = 2 + (level - 1) // 4
+    str_mod = (int(abilities.get("STR", 10)) - 10) // 2
+    dex_mod = (int(abilities.get("DEX", 10)) - 10) // 2
+    dmg_dice, uses_str = _CLASS_DAMAGE.get(klass, ("1d6", True))
+    ability_mod = str_mod if uses_str else dex_mod
+    attack_bonus = proficiency + ability_mod
+    return {
+        "name": f"{klass.title()} Strike",
+        "attack_bonus": attack_bonus,
+        "damage_expression": f"{dmg_dice}{'+' + str(ability_mod) if ability_mod >= 0 else str(ability_mod)}",
+        "damage_type": "slashing" if uses_str else "fire",
+    }
+
+
 @app.post("/api/v1/characters/{character_id}/deploy")
 async def deploy_character(character_id: str, req: CharacterDeployRequest, token: str = Depends(_require_auth)):
     """Materializes a stored character as an OWNED engine entity — RBAC binds
@@ -1236,15 +1255,23 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
 
     data = record["data"]
     abilities = data.get("abilities", {})
-    level = int(record.get("level", 1))
-    proficiency = 2 + (level - 1) // 4
-    str_mod = (int(abilities.get("STR", 10)) - 10) // 2
-    dex_mod = (int(abilities.get("DEX", 10)) - 10) // 2
 
     klass = record.get("character_class", "fighter").lower()
-    dmg_dice, uses_str = _CLASS_DAMAGE.get(klass, ("1d6", True))
-    attack_bonus = proficiency + (str_mod if uses_str else dex_mod)
-    damage_expression = f"{dmg_dice}{'+' + str(attack_bonus - proficiency) if (attack_bonus - proficiency) >= 0 else str(attack_bonus - proficiency)}"
+
+    # ARCHITECTURE VIOLATION (disclosed, minimized): per the engine's own
+    # contract ("Attack bonuses and damage dice live HERE — on the
+    # server-side authoritative stat block — never in client requests",
+    # vtt-core state.rs AttackAction) this derivation belongs in vtt-core.
+    # It cannot move there yet: the Rust spawn route accepts a fully-formed
+    # EntityState and has no class-based attack-derivation entry point
+    # (modifier_graph computes spell DCs/AC only), so the gateway must seed
+    # the stat block. This is now the SINGLE place Python math survives on
+    # the deploy path; everything else is copied verbatim from the stored
+    # record. TODO(crates follow-up): add an EntitySpec-with-class input to
+    # AddEntityReq (or a /entities/derive-stats endpoint) so vtt-core derives
+    # attack_bonus/damage from level+abilities, then delete this helper.
+    attack = _derive_class_attack(level=int(record.get("level", 1)),
+                                  klass=klass, abilities=abilities)
 
     # Roll20 imports persist speed as None when movement text cannot be
     # reduced to feet (the import warns and refuses to fabricate a default).
@@ -1285,12 +1312,7 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
                           "movement_remaining_feet": speed_feet,
                           "free_object_interaction": True},
         "spell_slots_remaining": {},
-        "attacks": [{
-            "name": f"{klass.title()} Strike",
-            "attack_bonus": attack_bonus,
-            "damage_expression": damage_expression,
-            "damage_type": "slashing" if uses_str else "fire",
-        }],
+        "attacks": [attack],
         "resistances": [],
         "vulnerabilities": [],
         "immunities": [],
@@ -1317,9 +1339,91 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
 
 # --- Engine action proxies ---------------------------------------------------------
 
+class SpawnAbilityScores(BaseModel):
+    """Mirrors vtt_core::types::AbilityScores — exactly six scores."""
+
+    model_config = ConfigDict(extra="forbid")
+    strength: int = Field(ge=1, le=30)
+    dexterity: int = Field(ge=1, le=30)
+    constitution: int = Field(ge=1, le=30)
+    intelligence: int = Field(ge=1, le=30)
+    wisdom: int = Field(ge=1, le=30)
+    charisma: int = Field(ge=1, le=30)
+
+
+class SpawnActionBudget(BaseModel):
+    """Mirrors vtt_core::types::ActionBudget (all fields required)."""
+
+    model_config = ConfigDict(extra="forbid")
+    action: bool
+    bonus_action: bool
+    reaction: bool
+    movement_remaining_feet: float = Field(ge=0)
+    free_object_interaction: bool
+
+
+class SpawnAttackAction(BaseModel):
+    """Mirrors vtt_core::state::AttackAction. Attack bonuses and damage dice
+    live HERE on the server-side stat block; clients reference them by index.
+    The gateway does not compute them (see deploy_character) but it refuses to
+    carry anything outside this shape."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    attack_bonus: int = Field(ge=-5, le=30)
+    damage_expression: str
+    damage_type: Literal[
+        "slashing", "piercing", "bludgeoning", "fire", "cold", "lightning",
+        "thunder", "poison", "acid", "psychic", "radiant", "necrotic", "force",
+    ]
+    light: bool = False
+
+
+class EngineSpawnEntity(BaseModel):
+    """Strict mirror of vtt_core::EntityState as consumed by the engine's
+    flattened AddEntityReq (POST /api/v1/sessions/{id}/entities).
+
+    This closes the last untyped trust-inversion hole in the engine proxies:
+    the attack route already enforces ids-only ("clients may ONLY reference
+    entities by id"), and deny-extra here makes smuggled client math on SPAWN
+    structurally impossible at the gateway too — an unknown field is a 422,
+    never silently forwarded to the engine.
+
+    Optional-with-default fields match the Rust serde defaults so legacy
+    callers that omit them still deserialize identically on both sides.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    compendium_id: str
+    name: str
+    is_player: bool
+    owner_player_id: Optional[str] = None
+    current_hp: int
+    max_hp: int
+    temp_hp: int = 0
+    ac: int
+    speed_feet: float = 30.0
+    position: Tuple[float, float, float] = (2.5, 2.5, 0.0)
+    zone_id: str = "Zone_Default"
+    abilities: SpawnAbilityScores
+    conditions: List[Union[str, Tuple[str, int]]] = []
+    action_budget: SpawnActionBudget
+    spell_slots_remaining: Dict[int, int] = {}
+    attacks: List[SpawnAttackAction] = []
+    resistances: List[str] = []
+    vulnerabilities: List[str] = []
+    immunities: List[str] = []
+    inventory: Dict[str, Any]
+    is_conscious: bool
+    is_dead: bool
+    is_visible: bool
+
+
 class EngineSpawnRequest(BaseModel):
     session_id: str
-    entity: Dict[str, Any]
+    entity: EngineSpawnEntity
     ingress: Optional[Dict[str, Any]] = None
 
 
@@ -1381,7 +1485,11 @@ class EngineRestRequest(BaseModel):
 
 @app.post("/api/v1/engine/spawn")
 async def engine_spawn(req: EngineSpawnRequest, token: str = Query(...)):
-    payload = dict(req.entity)
+    # JSON mode keeps tuples (position) as arrays on the wire; the engine's
+    # Option<String> owner_player_id is omitted rather than nulled.
+    payload = req.entity.model_dump(mode="json")
+    if payload.get("owner_player_id") is None:
+        payload.pop("owner_player_id")
     if req.ingress is not None:
         payload["ingress"] = req.ingress
     return await _engine_call(
