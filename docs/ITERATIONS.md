@@ -86,6 +86,16 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 27 | 4.11 | Automatic SRD concentration checks on damage (both hooks, CONCENTRATION_BROKEN ledger) | b0868dc | cargo ✓ |
 | 28 | 3.10+4.6 | Auth-header migration (header-first, ?token= back-compat); Neo4j-backed epistemic graph via HTTP Cypher, honest fallback | 2e97376 | all ✓ |
 | 29 | 5.9 | OA provocation surfaced on move responses without auto-execution | ed04c26 | cargo ✓ |
+| 30 | 5.4 | Sunken Crypt of Karas starter .vttbundle: real compendium stat blocks only, seeded WFC layout w/ provenance, canon lore seeds | 2517c09 | pytest ✓ |
+| 31 | 5.7 | Spectator privacy filtering: hidden tokens/private channels/GM surfaces gated; wire-level gaps documented | a5197bf | tsc ✓ |
+| 32 | 4.7 | Qdrant compendium RAG over REST, config-derived collection, honest lexical-hash embedder + provenance; 29 tests | b9539dc | pytest ✓ |
+| 33 | 5.5 | Thematic atmosphere presets retinting semantic tokens; real-ambience bindings only; GM-gated selection | 8976b1f | tsc ✓ |
+| 34 | P5 | Concordia entity-component NPC sub-agents (Memory/Goals/Norms/Style); norms veto LLM replies | 6d6e914 | pytest ✓ |
+| 35 | 4.10 | In-house per-IP sliding-window rate limiting after cargo-deny rejected GPL actix-governor; DashMap deadlock fixed | 41972a1 | cargo+deny ✓ |
+| 36-37 | 5.6+spec | Combat initiative lifecycle end-to-end + role-projected session state/replay redaction | e65dee3 | all ✓ |
+| 38 | P5-wire | NPC dialogue endpoint with starter personas; persistent stances; norms gate at API | 35de876 | pytest ✓ |
+| 39 | 5.8-ui | Authoritative heal/rest controls in character sheet; rejection codes surfaced verbatim | f1534da | tsc ✓ |
+| 40 | gameplay | SRD exhaustion levels enforced automatically (speed/HP halving, death at 6); long-rest hook exported | c205e02 | cargo ✓ |
 | 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy; 9 tests | 0a182da | cargo+pytest ✓ |
 | 16 | A1-fix | Audit remediation: LONG_REST rewind arm, HEALED clears death-save baselines; 4 red-first tests | b3fda63 | cargo ✓ |
 | 17 | 3.8 | Honest analytics/admin: live /metrics proxy, offline "—", DEMO badges, fabricated cards removed | 8ac9980 | all ✓ |
