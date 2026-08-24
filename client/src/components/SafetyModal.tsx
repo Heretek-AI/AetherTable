@@ -57,7 +57,7 @@ export const SafetyModal: React.FC<SafetyModalProps> = ({
           not as decoration. Rose stays only where it carries danger meaning. */}
       <div className="space-y-4 text-xs text-[var(--rp-parchment-200)]">
           <p>
-            Invoking the <strong>X-Card</strong> instantly pauses narrative generation, removes the triggering topic from context memory, and executes an authoritative state rewind to the preceding game event.
+            Invoking the <strong>X-Card</strong> flags the topic for removal and requests an authoritative state rewind on the engine ledger, back to the preceding game event. Your local view re-syncs once the engine confirms the revert.
           </p>
 
           <div className="space-y-1.5">

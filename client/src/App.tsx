@@ -69,6 +69,7 @@ import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
 import { listSaves, loadCampaign } from './api/campaign_store';
+import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
 
 // --- Roll history persistence ---------------------------------------------
@@ -710,8 +711,33 @@ export function App() {
     addSystemMessage('Campaign state restored from database save.');
   };
 
+  /**
+   * X-card handler — server rewind + local scene convergence.
+   *
+   * Server side: POST /api/v1/safety/x-card records the intervention and
+   * forwards it to the engine session, whose safety_rewind replays its ledger
+   * back to target_sequence_id (restoring HP, positions, consciousness,
+   * concentration) and returns a count-only RewindReport.
+   *
+   * Client side convergence — what is and is NOT possible with current flows:
+   *  - Chat (reverted): local messages carry no engine sequence ids, but the
+   *    table emits a real turn-boundary marker ("Turn passed to …") on every
+   *    initiative pass. Everything after the latest such marker at trigger
+   *    time is the turn being reverted, so those lines are dropped when the
+   *    engine confirms it actually rewound events.
+   *  - Tokens (NOT reverted — documented drift): the RewindReport carries only
+   *    counts, not entity ids, and there is no read path back to the
+   *    post-rewind engine session for the browser (orchestrator /api/v1/engine/*
+   *    proxies are write-only; the engine's GET /sessions/{id} needs HMAC auth).
+   *    Local token HP/positions can therefore still show pre-rewind values
+   *    until a snapshot load (lobby hydration / Campaign Save modal) or CRDT
+   *    position updates arrive. See client/src/ui/safetyXCard.ts.
+   */
   const handleSafetyRewind = async (topic: string) => {
-    addSystemMessage(`SAFETY CARD TRIGGERED: Topic '${topic}' flagged. Scene state rewound 1 turn.`);
+    // Snapshot the pre-trigger chat so the revert plan is anchored to the
+    // exact moment before any safety messaging was appended.
+    const rewindPlan = computeLocalRewindPlan(messages);
+    addSystemMessage(`SAFETY CARD TRIGGERED: Topic '${topic}' flagged. Requesting authoritative scene rewind.`);
     // Apply the rewind against the authoritative engine ledger when online.
     const sessionId = await ensureEngineSession();
     fetch('/api/v1/safety/x-card', {
@@ -726,12 +752,36 @@ export function App() {
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        const engineStatus = data?.engine_rewind?.status;
-        addSystemMessage(
-          engineStatus === 'SAFETY_REWIND_SUCCESS'
-            ? `Engine ledger rewound (${data.engine_rewind.reverted_event_count ?? 0} events reverted).`
-            : 'Intervention recorded; engine ledger offline.'
-        );
+        const rewind = parseEngineRewind(data);
+        if (!rewind || rewind.status !== 'SAFETY_REWIND_SUCCESS') {
+          addSystemMessage('Intervention recorded; engine ledger offline.');
+          return;
+        }
+        const { reverted_event_count = 0, restored_entities = 0, removed_entities = 0 } = rewind.report;
+        // Local chat revert: drop the lines played out during the reverted
+        // turn. Only prune when the engine actually rewound something and we
+        // have a turn boundary to anchor on; the filter runs inside the
+        // functional update so chat typed while the request was in flight is
+        // preserved.
+        const shouldPrune = reverted_event_count > 0 && rewindPlan.droppedCount > 0;
+        setMessages((prev) => [
+          ...(shouldPrune ? prev.filter((m) => !rewindPlan.doomedIds.has(m.id)) : prev),
+          {
+            id: `sys_rewind_${Date.now()}`,
+            sender: 'System Auditor',
+            role: 'system',
+            content:
+              `Scene re-synced: engine reverted ${reverted_event_count} ledger event(s) ` +
+              `(${restored_entities} entity state(s) restored, ${removed_entities} removed); ` +
+              `${shouldPrune ? rewindPlan.droppedCount : 0} local chat line(s) dropped.` +
+              // Documented drift: without entity ids in the report the client
+              // cannot restore token HP/positions authoritatively here.
+              (reverted_event_count > 0 && !shouldPrune
+                ? ' Note: local token HP/positions may retain pre-rewind drift until the next authoritative snapshot.'
+                : ''),
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+        ]);
       })
       .catch(() => addSystemMessage('Intervention recorded locally.'));
     setMessages((prev) => [
@@ -740,7 +790,7 @@ export function App() {
         id: `dm_${Date.now()}`,
         sender: 'Director Agent (Safety)',
         role: 'dm',
-        content: `The scene shifts smoothly away from '${topic}'. State rewound to preceding stable event.`,
+        content: `The scene shifts smoothly away from '${topic}'. Rewinding to the preceding stable event.`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
     ]);
