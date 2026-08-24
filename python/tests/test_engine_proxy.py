@@ -425,3 +425,233 @@ class TestHealRestProxyIdentity:
         payload = _json.loads(_b64.urlsafe_b64decode(raw.encode()))
         assert payload["user_id"] == "player-7"
         assert payload["role"] == "player"
+
+
+class TestMetricsProxy:
+    """GET /api/v1/engine/metrics — read-only telemetry proxy.
+
+    The engine's GET /metrics sits on PUBLIC_PATHS (crates/vtt-server/src/
+    auth.rs), so the gateway must NOT mint an actor token for it and must
+    surface the engine's honest counters verbatim (no fabrication) with a 502
+    when the engine is unreachable so clients can render a degraded state.
+    """
+
+    ENGINE_METRICS = {
+        "mechanical_compliance_rate_pct": 98.7,
+        "total_actions": 1042,
+        "valid_actions": 1028,
+        "rejected_actions": 14,
+        "auditor_total": 1042,
+        "auditor_rejection_rate_pct": 1.3,
+        "persistence_failures": 0,
+        "target_sla_ms": 10,
+    }
+
+    def test_metrics_needs_no_actor_public_path(self, monkeypatch):
+        """/metrics is unauthenticated on the engine, so no actor is forwarded."""
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["actor"] = actor
+            return dict(self.ENGINE_METRICS)
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        resp = client.get("/api/v1/engine/metrics")
+        assert resp.status_code == 200
+        assert captured == {
+            "method": "GET",
+            "path": "/metrics",
+            "actor": None,
+        }
+        body = resp.json()
+        assert body["mechanical_compliance_rate_pct"] == 98.7
+        assert body["total_actions"] == 1042
+        assert body["valid_actions"] == 1028
+        assert body["rejected_actions"] == 14
+        assert body["auditor_rejection_rate_pct"] == 1.3
+        assert body["persistence_failures"] == 0
+
+    def test_metrics_is_read_only_get(self):
+        """Mutating verbs must not reach the engine through this route."""
+        assert client.post("/api/v1/engine/metrics").status_code == 405
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        resp = client.get("/api/v1/engine/metrics")
+        assert resp.status_code == 502
+        assert "unreachable" in resp.json()["detail"].lower()
+
+    def test_engine_error_status_is_surfaced_verbatim(self, monkeypatch):
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(404, '{"error": "not_found"}')
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        resp = client.get("/api/v1/engine/metrics")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == {"error": "not_found"}
+
+    def test_unknown_counter_keys_are_dropped(self, monkeypatch):
+        """The proxy whitelists counters; future engine fields do not leak."""
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            payload = dict(self.ENGINE_METRICS)
+            payload["internal_debug_secret"] = "do-not-expose"
+            return payload
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        resp = client.get("/api/v1/engine/metrics")
+        assert resp.status_code == 200
+        assert "internal_debug_secret" not in resp.json()
+
+
+class TestSessionStateProxy:
+    """POST /api/v1/engine/session-state — GET-style read proxy over the
+    engine's GET /api/v1/sessions/{id}.
+
+    Iteration-11 drift follow-up: after an X-card rewind the browser cannot
+    converge its local tokens because RewindReport carries only counts and
+    GET /sessions/{id} needs an HMAC token the browser never holds. This
+    proxy gives it one authoritative read through the orchestrator, with the
+    caller's real identity forwarded so the engine's RBAC applies."""
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token(
+            {"user_id": user_id, "role": role, "exp": _time.time() + 600}
+        )
+
+    SESSION_ID = "12345678-90ab-cdef-1234-567890abcdef"
+
+    def test_player_token_forwards_identity_and_uses_engine_get(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {
+                "session_id": self.SESSION_ID,
+                "entities": {"hero": {"current_hp": 30}},
+                "ledger": {"current_sequence": 7},
+            }
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("player-7", "player")
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            params={"token": token},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200
+        # The FULL authoritative session travels back verbatim — no counts,
+        # no projection — so the client can converge post-rewind state.
+        assert resp.json()["session_id"] == self.SESSION_ID
+        assert resp.json()["entities"]["hero"]["current_hp"] == 30
+        # It is a proxied GET against the canonical session resource...
+        assert captured["method"] == "GET"
+        assert captured["path"] == f"/api/v1/sessions/{self.SESSION_ID}"
+        assert captured["payload"] is None
+        # ...acting as the real caller, not orchestrator-service.
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+
+    def test_gm_token_forwards_gm_role(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["actor"] = actor
+            return {"session_id": self.SESSION_ID}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            params={"token": token},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_missing_token_stays_service_mediated(self, monkeypatch):
+        """Legacy callers that omit the token keep working via the service
+        principal instead of breaking."""
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["actor"] = actor
+            return {"session_id": self.SESSION_ID}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] is None
+
+    def test_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 401
+
+    def test_unknown_session_maps_engine_error_verbatim(self, monkeypatch):
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(404, '{"error": "Session not found"}')
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == {"error": "Session not found"}
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 502
+        assert "unreachable" in resp.json()["detail"].lower()
+
+    def test_extra_body_fields_are_rejected(self):
+        """Trust-inversion regression: no query overrides smuggled past the
+        read-only proxy."""
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            params={"token": token},
+            json={
+                "session_id": self.SESSION_ID,
+                "include_hidden_entities": True,
+            },
+        )
+        assert resp.status_code == 422
+
+    def test_only_a_get_reaches_the_engine(self, monkeypatch):
+        """Whatever the caller sends, this proxy must stay read-only."""
+
+        async def reject_non_get(method, path, payload=None, *, actor=None):
+            if method != "GET":
+                raise AssertionError(f"engine must only see GET, saw {method}")
+            return {"session_id": self.SESSION_ID}
+
+        monkeypatch.setattr(engine_client, "engine_request", reject_non_get)
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200

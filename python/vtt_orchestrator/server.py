@@ -720,6 +720,32 @@ async def engine_room_presence(room_id: str):
     )
 
 
+@app.get("/api/v1/engine/metrics")
+async def engine_metrics():
+    """Read-only telemetry proxy to the engine's public GET /metrics.
+
+    vtt-server exposes /metrics on PUBLIC_PATHS (crates/vtt-server/src/auth.rs),
+    so this call needs NO forwarded actor identity — it is service-mediated by
+    design and never mutates state. Returns the engine's honest counters
+    verbatim (MCR, action tallies, auditor rejection rate, persistence
+    failures); the gateway adds nothing and fabricates nothing. An unreachable
+    engine maps to 502 so clients can render an explicit degraded state.
+    """
+    raw = await _engine_call(engine_client.engine_request("GET", "/metrics"))
+    # Whitelist projection: only counters the dashboard is allowed to show.
+    keys = (
+        "mechanical_compliance_rate_pct",
+        "total_actions",
+        "valid_actions",
+        "rejected_actions",
+        "auditor_total",
+        "auditor_rejection_rate_pct",
+        "persistence_failures",
+        "target_sla_ms",
+    )
+    return {k: raw[k] for k in keys if k in raw}
+
+
 # --- Engine session durability bridge ----------------------------------------
 # vtt-server holds live sessions in memory; these endpoints snapshot them to
 # PostgreSQL (or the memory fallback) and hydrate them back, so an engine
@@ -1162,6 +1188,41 @@ async def engine_rest(req: EngineRestRequest, token: str = Query(...)):
             f"/api/v1/sessions/{req.session_id}/rest",
             {"kind": req.kind},
             actor=_caller_actor(token),
+        )
+    )
+
+
+class EngineSessionStateRequest(BaseModel):
+    """Body of the GET-style read proxy below: only the session reference."""
+    session_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/session-state")
+async def engine_session_state(
+    req: EngineSessionStateRequest, token: Optional[str] = Query(None)
+):
+    """GET-style read proxy over the engine's GET /api/v1/sessions/{id}.
+
+    The browser holds no HMAC engine token, so it has no direct readable path
+    to authoritative state (this is what left clients unable to converge local
+    tokens after an X-card rewind). This route gives it one round trip through
+    the orchestrator, forwarding the caller's identity so the engine's RBAC
+    authorizes the real participant; callers without a token stay
+    service-mediated like the other proxies.
+
+    NOTE: this exposes exactly what the caller could already see as a session
+    participant. If per-role visibility filtering (spectators vs players vs
+    GM) is ever needed on this payload, that is a separate iteration.
+    """
+    actor = _caller_actor(token) if token else None
+    return await _engine_call(
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}",
+            actor=actor,
         )
     )
 

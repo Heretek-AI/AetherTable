@@ -1708,10 +1708,19 @@ async fn trigger_safety_rewind(
         );
         let seq = event.sequence_id;
 
+        // Post-rewind authority travels WITH the response so a browser can
+        // converge its local tokens in one round trip — it holds no HMAC
+        // token and therefore cannot call GET /sessions/{id} itself.
+        // Payload size is fine here: in-memory sessions are small (entities +
+        // ledger), and this is an explicit safety intervention, not a hot path.
+        let snapshot = serde_json::to_value(&*session)
+            .unwrap_or_else(|_| serde_json::Value::Null);
+
         HttpResponse::Ok().json(serde_json::json!({
             "status": "SAFETY_REWIND_SUCCESS",
             "rewind_report": report,
-            "intervention_event_sequence": seq
+            "intervention_event_sequence": seq,
+            "snapshot": snapshot
         }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))

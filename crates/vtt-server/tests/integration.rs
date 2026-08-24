@@ -1175,6 +1175,140 @@ async fn rewind_past_heal_restores_prior_hp() {
     assert_eq!(hero["is_conscious"], post_damage_hp > 0);
 }
 
+/// Iteration-11 drift follow-up: the browser holds no HMAC engine token, so
+/// after an X-card it can never call GET /sessions/{id} to converge its local
+/// tokens. The rewind response itself must therefore carry the FULL
+/// post-rewind GameSession snapshot.
+#[actix_web::test]
+async fn x_card_response_includes_post_rewind_snapshot() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    for (id, name, hp, ac, ab) in [
+        (hero_id, "Snapshot Hero", 30, 14, 8),
+        (orc_id, "Snapshot Striker", 20, 11, 8),
+    ] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(entity_json(id, name, hp, ac, ab, "2d6"))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Land one seeded hit + provenance-checked damage commit so the hero is
+    // demonstrably wounded below max before the rewind.
+    let mut post_damage_hp = None;
+    for seed in 1..=50u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "attacker_id": orc_id, "target_id": hero_id,
+                "action_index": 0, "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let attack: serde_json::Value = test::read_body_json(res).await;
+        if attack["is_hit"].as_bool() != Some(true) {
+            continue;
+        }
+        let seq = attack["event_sequence"].as_u64().unwrap();
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({"target_id": hero_id, "source_event_sequence": seq}))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let dmg: serde_json::Value = test::read_body_json(res).await;
+        post_damage_hp = Some(dmg["hp_remaining"].as_i64().unwrap());
+        break;
+    }
+    let post_damage_hp = post_damage_hp.expect("seeded hit must land and apply damage");
+    assert!(post_damage_hp < 30, "hero must actually be wounded");
+
+    // The ledger tail right now IS the DAMAGE_APPLIED event — rewind target.
+    // (Rewinding to a point BEFORE any HP-bearing event leaves current HP
+    // untouched in vtt-core's replay, so this is the deterministic
+    // post-rewind expectation: damage kept, subsequent heal undone.)
+    let seq_after_damage: u64 = {
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{}", session_id))
+            .insert_header(auth.clone())
+            .to_request();
+        let snap: serde_json::Value =
+            test::read_body_json(test::call_service(&app, req).await).await;
+        snap["ledger"]["current_sequence"].as_u64().unwrap()
+    };
+
+    // Heal the hero back up AFTER the damage event.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": hero_id, "amount": 30}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // X-card rewinds past the heal; the surviving DAMAGE event replays.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "player_id": "gm-1",
+            "topic": "violence",
+            "target_sequence_id": seq_after_damage
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
+
+    // THE CONTRACT: a full serialized GameSession rides along with the report.
+    let snapshot = &body["snapshot"];
+    assert!(
+        snapshot.is_object(),
+        "x-card response must embed the post-rewind session snapshot"
+    );
+    assert_eq!(
+        snapshot["session_id"].as_str(),
+        Some(session_id.to_string().as_str()),
+        "snapshot must be the rewound session itself"
+    );
+
+    // Snapshot HP matches POST-rewind expectations (heal undone, damage kept).
+    let snap_hero = &snapshot["entities"][&hero_id.to_string()];
+    assert_eq!(
+        snap_hero["current_hp"].as_i64().unwrap(),
+        post_damage_hp,
+        "embedded snapshot must show post-rewind HP"
+    );
+    assert_eq!(
+        snap_hero["is_conscious"],
+        post_damage_hp > 0,
+        "embedded snapshot consciousness must match post-rewind HP"
+    );
+
+    // And it must agree with what authoritative GET returns for the same
+    // entity (the browser's convergence target).
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let live: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    assert_eq!(
+        snap_hero["current_hp"],
+        live["entities"][&hero_id.to_string()]["current_hp"],
+        "embedded snapshot must match live engine state"
+    );
+}
+
 #[actix_web::test]
 async fn long_rest_restores_owned_entities_short_rest_is_a_hook() {
     let app = test_app().await;
