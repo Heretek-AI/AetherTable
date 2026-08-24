@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   User,
   Zap,
@@ -23,6 +23,16 @@ import {
   BookOpen
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
+import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
+import {
+  ABILITY_KEYS,
+  ABILITY_LABELS,
+  AbilityKey,
+  formatModifier,
+  getModifier,
+  passivePerception,
+  proficiencyBonus,
+} from '../api/character_math';
 
 interface CharacterSheetProps {
   activeToken: Token | null;
@@ -67,6 +77,68 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
 
   // Active Conditions State
   const [selectedConditions, setSelectedConditions] = useState<string[]>([]);
+
+  // Bound character record (real backend data). Null = nothing stored for this
+  // token — the sheet must then show an explicit empty state, never fake stats.
+  const [boundCharacter, setBoundCharacter] = useState<FullStoredCharacter | null>(null);
+  const [lookupDone, setLookupDone] = useState(false);
+
+  // Resolve the selected player token back to its persisted character (matched
+  // by name against the signed-in player's roster). No-op for hostiles and when
+  // unauthenticated/offline — findCharacterForToken resolves null in all cases.
+  useEffect(() => {
+    let cancelled = false;
+    setBoundCharacter(null);
+    setLookupDone(false);
+    if (!activeToken?.isPlayer || !activeToken.name) return undefined;
+    findCharacterForToken(activeToken.name)
+      .then((record) => {
+        if (!cancelled) {
+          setBoundCharacter(record);
+          setLookupDone(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLookupDone(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeToken?.isPlayer, activeToken?.name]);
+
+  /**
+   * All modifiers derived from the stored ability scores via the shared SRD
+   * math module. Null when there is no bound character with a complete ability
+   * block — callers render the "No character bound" empty state instead.
+   */
+  const derived = useMemo<{
+    level: number;
+    className: string;
+    profBonus: number;
+    speed: number | null;
+    abilities: Array<{ key: AbilityKey; label: string; score: number; mod: number }>;
+    mods: Record<AbilityKey, number>;
+  } | null>(() => {
+    const scores = boundCharacter?.data?.abilities;
+    if (!scores) return null;
+    const mods = {} as Record<AbilityKey, number>;
+    const abilities: Array<{ key: AbilityKey; label: string; score: number; mod: number }> = [];
+    for (const key of ABILITY_KEYS) {
+      const score = scores[ABILITY_LABELS[key] as keyof AbilityScoreMap];
+      if (typeof score !== 'number') return null; // incomplete record — don't guess
+      const mod = getModifier(score);
+      mods[key] = mod;
+      abilities.push({ key, label: ABILITY_LABELS[key], score, mod });
+    }
+    return {
+      level: boundCharacter!.level,
+      className: boundCharacter!.character_class,
+      profBonus: proficiencyBonus(boundCharacter!.level),
+      speed: typeof boundCharacter!.data?.speed === 'number' ? (boundCharacter!.data!.speed as number) : null,
+      abilities,
+      mods,
+    };
+  }, [boundCharacter]);
 
   const toggleSpellSlot = (level: number, slotIndex: number) => {
     setSpellSlots((prev) => {
@@ -152,14 +224,13 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     );
   }
 
-  const abilities = [
-    { name: 'STR', score: 18, mod: '+4' },
-    { name: 'DEX', score: 14, mod: '+2' },
-    { name: 'CON', score: 16, mod: '+3' },
-    { name: 'INT', score: 10, mod: '+0' },
-    { name: 'WIS', score: 12, mod: '+1' },
-    { name: 'CHA', score: 8, mod: '-1' },
-  ];
+  const abilities = derived?.abilities ?? [];
+
+  /** Explicit empty state — replaces every hardcoded stat when no record binds. */
+  const noBoundCharacter = !derived;
+  const classLabel = derived
+    ? derived.className.charAt(0).toUpperCase() + derived.className.slice(1)
+    : '';
 
   const tabs: Array<{ id: typeof activeTab; label: string }> = [
     { id: 'actions', label: 'Actions' },
@@ -206,10 +277,18 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               <h2 className="vtt-statblock-nameplate text-xl leading-tight truncate">{activeToken.name}</h2>
               <div className="flex items-center gap-2 text-xs mt-0.5">
                 <span className="vtt-statblock-tagline">
-                  {activeToken.isPlayer ? 'Level 5 Hero' : 'Hostile Entity'}
+                  {derived
+                    ? `Level ${derived.level} ${classLabel}`
+                    : activeToken.isPlayer
+                    ? 'No character bound'
+                    : 'Hostile Entity'}
                 </span>
-                <span style={{ color: 'var(--rp-leather-600)' }}>•</span>
-                <span className="vtt-statblock-tagline">Prof: +3</span>
+                {derived && (
+                  <>
+                    <span style={{ color: 'var(--rp-leather-600)' }}>•</span>
+                    <span className="vtt-statblock-tagline">Prof: {formatModifier(derived.profBonus)}</span>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -246,31 +325,54 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               {Math.max(0, activeToken.hp)} <span className="text-xs opacity-60">/ {activeToken.maxHp}</span>
             </div>
           </div>
-          <div className="vtt-statblock-attr rounded-md px-2 py-1.5">
+          <div className="vtt-statblock-attr rounded-md px-2 py-1.5" title={derived?.speed != null ? undefined : 'No bound character record'}>
             <div className="vtt-attr-label text-[9px]">Speed</div>
-            <div className="vtt-attr-value text-base leading-snug">30 ft</div>
+            <div className="vtt-attr-value text-base leading-snug">
+              {derived?.speed != null ? `${derived.speed} ft` : '—'}
+            </div>
           </div>
         </div>
 
+        {/* Everything below this line is derived from a real bound record.
+            Without one we render an explicit empty state — never fake numbers. */}
+        {noBoundCharacter ? (
+          <div className="rounded-md p-4 text-center space-y-2" style={{ border: '1px dashed var(--rp-leather-600)' }}>
+            <div
+              className="w-10 h-10 mx-auto rounded-full bg-tavern-surface flex items-center justify-center border border-tavern-border"
+              style={{ color: 'var(--rp-parchment-300)' }}
+            >
+              <User className="w-5 h-5" />
+            </div>
+            <div className="vtt-section-header text-xs">No character bound</div>
+            <p className="text-xs font-prose leading-relaxed" style={{ color: 'color-mix(in srgb, var(--parchment-ink) 72%, transparent)' }}>
+              {!lookupDone
+                ? 'Binding to your character roster…'
+                : activeToken.isPlayer
+                ? 'No stored character on your roster matches this token. Build and deploy one in the Character Builder — this sheet shows only real, stored stats.'
+                : 'Hostile entities have no player character record; only the live token vitals above are shown.'}
+            </p>
+          </div>
+        ) : (
+          <>
         {/* Ability Scores — hex shields */}
         <div className="space-y-1">
           <div className="vtt-section-header text-[11px]">Ability Scores</div>
           <div className="grid grid-cols-6 gap-1">
             {abilities.map((ab) => (
-              <div key={ab.name} className="group flex flex-col items-center cursor-default select-none" title={`${ab.name} ${ab.score}`}>
+              <div key={ab.key} className="group flex flex-col items-center cursor-default select-none" title={`${ab.label} ${ab.score}`}>
                 <div
                   className="w-full h-12 flex items-center justify-center transition-transform group-hover:scale-105"
                   style={{ clipPath: HEX_CLIP, background: 'var(--parchment-paper-aged)' }}
                 >
                   <span className="font-display font-bold text-base leading-none" style={{ color: INK }}>
-                    {ab.mod}
+                    {formatModifier(ab.mod)}
                   </span>
                 </div>
                 <span
                   className="text-[8px] font-display uppercase tracking-widest leading-tight"
                   style={{ color: CRIMSON_TEXT }}
                 >
-                  {ab.name}
+                  {ab.label}
                 </span>
                 <span className="text-[8px] font-prose opacity-60 leading-none" style={{ color: INK }}>
                   {ab.score}
@@ -280,17 +382,17 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
           </div>
         </div>
 
-        {/* Passive Senses */}
+        {/* Passive Senses — derived from WIS/INT modifiers (Perception includes proficiency) */}
         <div className="vtt-statblock-attr rounded-md px-2 py-1.5 flex items-center justify-between text-xs">
           <span className="flex items-center gap-1.5" style={{ color: INK }}>
             <Eye className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
-            Perception: <strong>{14}</strong>
+            Perception: <strong>{passivePerception(derived!.mods.wis)}</strong>
           </span>
           <span style={{ color: INK }}>
-            Insight: <strong>{11}</strong>
+            Insight: <strong>{10 + derived!.mods.wis}</strong>
           </span>
           <span style={{ color: INK }}>
-            Invest: <strong>{10}</strong>
+            Invest: <strong>{10 + derived!.mods.int}</strong>
           </span>
         </div>
 
@@ -327,7 +429,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
           <div className="space-y-3">
             <div className="space-y-2">
               <button
-                onClick={() => onExecuteAttack('Greataxe Slash', '1d12 + 4', 'slashing')}
+                onClick={() => onExecuteAttack('Greataxe Slash', `1d12 + ${derived!.mods.str}`, 'slashing')}
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">
@@ -338,7 +440,8 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                         Greataxe Slash
                       </span>
                       <span className="block text-xs font-prose" style={{ color: 'color-mix(in srgb, var(--parchment-ink) 72%, transparent)' }}>
-                        +6 to hit · <span style={{ color: CRIMSON_TEXT }}>1d12 + 4</span> Slashing
+                        {formatModifier(derived!.mods.str + derived!.profBonus)} to hit ·{' '}
+                        <span style={{ color: CRIMSON_TEXT }}>1d12 + {derived!.mods.str}</span> Slashing
                       </span>
                     </span>
                   </span>
@@ -347,7 +450,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               </button>
 
               <button
-                onClick={() => onExecuteAttack('Shortbow Shot', '1d6 + 2', 'piercing')}
+                onClick={() => onExecuteAttack('Shortbow Shot', `1d8 + ${derived!.mods.dex}`, 'piercing')}
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">
@@ -358,7 +461,8 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                         Shortbow Shot
                       </span>
                       <span className="block text-xs font-prose" style={{ color: 'color-mix(in srgb, var(--parchment-ink) 72%, transparent)' }}>
-                        +4 to hit · <span style={{ color: CRIMSON_TEXT }}>1d6 + 2</span> Piercing
+                        {formatModifier(derived!.mods.dex + derived!.profBonus)} to hit ·{' '}
+                        <span style={{ color: CRIMSON_TEXT }}>1d8 + {derived!.mods.dex}</span> Piercing
                       </span>
                     </span>
                   </span>
@@ -372,19 +476,20 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               <div className="vtt-section-header text-[11px]">Skill Checks</div>
               <div className="grid grid-cols-2 gap-1.5 mt-2">
                 {[
-                  { skill: 'Athletics', mod: 4, dc: 15 },
-                  { skill: 'Stealth', mod: 2, dc: 14 },
-                  { skill: 'Perception', mod: 1, dc: 12 },
-                  { skill: 'Arcana', mod: 0, dc: 15 },
-                ].map(({ skill, mod, dc }) => (
+                  { skill: 'Athletics', ability: ABILITY_LABELS.str, abilityMod: derived!.mods.str, dc: 15 },
+                  { skill: 'Stealth', ability: ABILITY_LABELS.dex, abilityMod: derived!.mods.dex, dc: 14 },
+                  { skill: 'Perception', ability: ABILITY_LABELS.wis, abilityMod: derived!.mods.wis, dc: 12 },
+                  { skill: 'Arcana', ability: ABILITY_LABELS.int, abilityMod: derived!.mods.int, dc: 15 },
+                ].map(({ skill, ability, abilityMod, dc }) => (
                   <button
                     key={skill}
-                    onClick={() => onRollCheck(skill, mod, dc)}
+                    onClick={() => onRollCheck(skill, abilityMod, dc)}
+                    title={`${skill}: raw ${ability} modifier (no proficiency recorded)`}
                     className="vtt-btn vtt-btn-secondary w-full font-prose text-sm"
                     style={{ justifyContent: 'flex-start', padding: '0.4rem 0.6rem' }}
                   >
                     <span style={{ color: INK }}>
-                      {skill} <span style={{ color: CRIMSON_TEXT }}>(+{mod})</span>
+                      {skill} <span style={{ color: CRIMSON_TEXT }}>({formatModifier(abilityMod)})</span>
                     </span>
                   </button>
                 ))}
@@ -485,8 +590,10 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
         {activeTab === 'inventory' && (
           <div className="space-y-2.5 text-sm font-prose">
             <div className="vtt-statblock-attr rounded-md px-2 py-1.5 flex justify-between items-center">
-              <span className="vtt-attr-label text-[10px]">Encumbrance Capacity</span>
-              <span className="vtt-attr-value text-xs">48.5 / 270 lbs</span>
+              <span className="vtt-attr-label text-[10px]">Encumbrance Capacity (STR × 15)</span>
+              <span className="vtt-attr-value text-xs">
+                {(derived!.abilities.find((a) => a.key === 'str')?.score ?? 0) * 15} lbs
+              </span>
             </div>
             <ul>
               {[
@@ -595,6 +702,8 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               </div>
             </div>
           </div>
+        )}
+          </>
         )}
       </div>
     </aside>

@@ -21,30 +21,25 @@ import {
 import { globalAudio } from '../render/audio_manager';
 import { Token } from './TacticalCanvas';
 import { saveCharacter } from '../api/lobby_store';
+import {
+  AbilityKey,
+  ABILITY_KEYS,
+  computedAC as deriveAC,
+  computedHP as deriveHP,
+  formatModifier,
+  getModifier,
+  passivePerception,
+  pointBuyCost,
+  pointBuyTotal,
+  proficiencyBonus,
+  racialBonus,
+} from '../api/character_math';
 
 interface CharacterBuilderViewProps {
   onDeployCharacter: (token: Omit<Token, 'id' | 'x' | 'y'>) => void;
 }
 
-interface AbilityScores {
-  str: number;
-  dex: number;
-  con: number;
-  int: number;
-  wis: number;
-  cha: number;
-}
-
-const POINT_BUY_COSTS: Record<number, number> = {
-  8: 0,
-  9: 1,
-  10: 2,
-  11: 3,
-  12: 4,
-  13: 5,
-  14: 7,
-  15: 9,
-};
+type AbilityScores = Record<AbilityKey, number>;
 
 export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDeployCharacter }) => {
   const [step, setStep] = useState<number>(1);
@@ -79,53 +74,22 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
       .catch((e) => console.error(e));
   }, []);
 
-  // Race bonuses
-  const getRacialBonus = (ability: keyof AbilityScores): number => {
-    switch (selectedRace) {
-      case 'Mountain Dwarf':
-        return ability === 'str' ? 2 : ability === 'con' ? 2 : 0;
-      case 'High Elf':
-        return ability === 'dex' ? 2 : ability === 'int' ? 1 : 0;
-      case 'Human':
-        return 1;
-      case 'Tiefling':
-        return ability === 'cha' ? 2 : ability === 'int' ? 1 : 0;
-      case 'Lightfoot Halfling':
-        return ability === 'dex' ? 2 : ability === 'cha' ? 1 : 0;
-      case 'Dragonborn':
-        return ability === 'str' ? 2 : ability === 'cha' ? 1 : 0;
-      default:
-        return 0;
-    }
-  };
+  // Race bonuses (shared SRD math)
+  const getRacialBonus = (ability: AbilityKey): number => racialBonus(selectedRace, ability);
 
-  const getFinalScore = (ability: keyof AbilityScores) => {
+  const getFinalScore = (ability: AbilityKey) => {
     return baseScores[ability] + getRacialBonus(ability);
   };
 
-  const getModifier = (ability: keyof AbilityScores) => {
-    const score = getFinalScore(ability);
-    return Math.floor((score - 10) / 2);
-  };
+  const calculatePointBuyTotal = () => pointBuyTotal(baseScores);
 
-  const calculatePointBuyTotal = () => {
-    return (
-      POINT_BUY_COSTS[baseScores.str] +
-      POINT_BUY_COSTS[baseScores.dex] +
-      POINT_BUY_COSTS[baseScores.con] +
-      POINT_BUY_COSTS[baseScores.int] +
-      POINT_BUY_COSTS[baseScores.wis] +
-      POINT_BUY_COSTS[baseScores.cha]
-    );
-  };
-
-  const adjustScore = (ability: keyof AbilityScores, delta: number) => {
+  const adjustScore = (ability: AbilityKey, delta: number) => {
     const current = baseScores[ability];
     const next = current + delta;
     if (next < 8 || next > 15) return;
 
     const currentCost = calculatePointBuyTotal();
-    const costDiff = POINT_BUY_COSTS[next] - POINT_BUY_COSTS[current];
+    const costDiff = pointBuyCost(next) - pointBuyCost(current);
 
     if (currentCost + costDiff <= 27 || delta < 0) {
       setBaseScores((prev) => ({ ...prev, [ability]: next }));
@@ -150,21 +114,15 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
     });
   };
 
-  // Calculate Computed Vitals
-  const dexMod = getModifier('dex');
-  const conMod = getModifier('con');
-  const strMod = getModifier('str');
-  const wisMod = getModifier('wis');
+  // Calculate Computed Vitals (shared SRD math)
+  const dexMod = getModifier(getFinalScore('dex'));
+  const conMod = getModifier(getFinalScore('con'));
+  const strMod = getModifier(getFinalScore('str'));
+  const wisMod = getModifier(getFinalScore('wis'));
 
-  const computedAC = selectedClass === 'Barbarian'
-    ? 10 + dexMod + conMod
-    : selectedClass === 'Monk'
-    ? 10 + dexMod + wisMod
-    : selectedClass === 'Wizard'
-    ? 10 + dexMod
-    : 14 + Math.min(2, dexMod) + 2; // Scale Mail + Shield for Fighter/Paladin
+  const computedAC = deriveAC(selectedClass, dexMod, conMod, wisMod);
 
-  const computedHP = (selectedClass === 'Barbarian' ? 12 : selectedClass === 'Fighter' || selectedClass === 'Paladin' ? 10 : 8) + (level - 1) * 6 + conMod * level;
+  const computedHP = deriveHP(selectedClass, level, conMod);
 
   const handleExportPdf = async () => {
     setIsExportingPdf(true);
@@ -188,10 +146,10 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
         cha_score: getFinalScore('cha'),
         str_mod: strMod,
         dex_mod: dexMod,
-        passive_perception: 10 + wisMod + 2,
+        passive_perception: passivePerception(wisMod),
         actions: [
-          { name: 'Primary Weapon Strike', atk: `+${strMod + 3}`, damage: '1d12 + ' + strMod + ' Slashing', range: 'Melee (5 ft)' },
-          { name: 'Secondary Ranged Attack', atk: `+${dexMod + 3}`, damage: '1d8 + ' + dexMod + ' Piercing', range: '80/320 ft' },
+          { name: 'Primary Weapon Strike', atk: `+${strMod + proficiencyBonus(level)}`, damage: '1d12 + ' + strMod + ' Slashing', range: 'Melee (5 ft)' },
+          { name: 'Secondary Ranged Attack', atk: `+${dexMod + proficiencyBonus(level)}`, damage: '1d8 + ' + dexMod + ' Piercing', range: '80/320 ft' },
         ],
         spells: selectedSpells.map((s) => ({ name: s, level: 1, school: 'Evocation', casting_time: '1 action', range: '60 ft' })),
       };
@@ -368,11 +326,11 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
             </div>
 
             <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-              {(['str', 'dex', 'con', 'int', 'wis', 'cha'] as (keyof AbilityScores)[]).map((ability) => {
+              {ABILITY_KEYS.map((ability) => {
                 const base = baseScores[ability];
                 const racial = getRacialBonus(ability);
                 const finalScore = base + racial;
-                const mod = Math.floor((finalScore - 10) / 2);
+                const mod = getModifier(finalScore);
 
                 return (
                   <div
@@ -515,18 +473,18 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
                 </div>
                 <div className="p-3 rounded-xl border border-[color:var(--rp-leather-700)]/50 bg-black/5">
                   <div className="text-[10px]" style={{ color: 'var(--statblock-header)' }}>PROFICIENCY</div>
-                  <div className="text-xl font-bold" style={{ color: 'var(--statblock-header)' }}>+3</div>
+                  <div className="text-xl font-bold" style={{ color: 'var(--statblock-header)' }}>{formatModifier(proficiencyBonus(level))}</div>
                 </div>
               </div>
 
               {/* Final Ability Score Badges */}
               <div className="grid grid-cols-6 gap-2 text-center font-mono">
-                {(['str', 'dex', 'con', 'int', 'wis', 'cha'] as (keyof AbilityScores)[]).map((ab) => (
+                {ABILITY_KEYS.map((ab) => (
                   <div key={ab} className="p-2.5 rounded-xl border border-[color:var(--rp-leather-700)]/40 bg-black/5">
                     <div className="text-[10px] uppercase text-parchment-ink/70">{ab}</div>
                     <div className="text-sm font-bold text-parchment-ink">{getFinalScore(ab)}</div>
                     <div className="text-[11px]" style={{ color: 'var(--statblock-header)' }}>
-                      {getModifier(ab) >= 0 ? `+${getModifier(ab)}` : getModifier(ab)}
+                      {formatModifier(getModifier(getFinalScore(ab)))}
                     </div>
                   </div>
                 ))}

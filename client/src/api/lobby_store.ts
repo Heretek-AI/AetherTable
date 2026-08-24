@@ -80,6 +80,25 @@ export interface StoredCharacter {
   level: number;
 }
 
+/** Uppercase ability score map as persisted by the builder's saveCharacter payload. */
+export type AbilityScoreMap = Partial<Record<'STR' | 'DEX' | 'CON' | 'INT' | 'WIS' | 'CHA', number>>;
+
+/**
+ * Full record as returned by GET /api/v1/characters/{id}. The list endpoint
+ * strips the `data` blob, so callers wanting abilities/hp/ac must fetch by id.
+ */
+export interface FullStoredCharacter extends StoredCharacter {
+  data?: {
+    race?: string;
+    abilities?: AbilityScoreMap;
+    hp?: number;
+    max_hp?: number;
+    ac?: number;
+    speed?: number;
+    [key: string]: unknown;
+  };
+}
+
 export async function saveCharacter(sheet: Record<string, unknown>): Promise<StoredCharacter | null> {
   if (!getToken()) return null;
   return req<StoredCharacter>('/api/v1/characters', {
@@ -93,6 +112,27 @@ export async function listCharacters(): Promise<StoredCharacter[]> {
   if (!getToken()) return [];
   const data = await req<{ characters: StoredCharacter[] }>(withToken('/api/v1/characters'));
   return data?.characters ?? [];
+}
+
+/** Fetch one character's full record, including the persisted sheet `data` blob. */
+export async function getCharacter(characterId: string): Promise<FullStoredCharacter | null> {
+  if (!getToken()) return null;
+  return req<FullStoredCharacter>(withToken(`/api/v1/characters/${encodeURIComponent(characterId)}`));
+}
+
+/**
+ * Resolve a deployed token back to its stored character record (matched by
+ * name), hydrating the full sheet data. Returns null when unauthenticated,
+ * offline, or when no owned character carries that name.
+ */
+export async function findCharacterForToken(tokenName: string): Promise<FullStoredCharacter | null> {
+  const roster = await listCharacters();
+  if (roster.length === 0) return null;
+  const meta =
+    roster.find((c) => c.name === tokenName) ??
+    roster.find((c) => c.name.toLowerCase() === tokenName.toLowerCase());
+  if (!meta) return null;
+  return getCharacter(meta.character_id);
 }
 
 export async function deployCharacter(
