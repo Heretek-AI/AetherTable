@@ -17,3 +17,7 @@ mitm_mcp_traffic.db
 client/*.png
 .env
 ydata/
+
+# Runtime logs (LLM call logger, engine output)
+logs/
+python/logs/

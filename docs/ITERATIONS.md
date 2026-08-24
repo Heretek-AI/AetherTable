@@ -10,26 +10,26 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [ ] 3.1 Yjs awareness protocol → real remote cursors (replace hardcoded props)
 - [ ] 3.2 Render fog-of-war layers from the CRDT fog API (currently zero callers)
 - [ ] 3.3 CharacterSheet derives modifiers from scores + wires listCharacters API
-- [ ] 3.4 Honor Silero VAD speech events; delete canned fake utterances
-- [ ] 3.5 X-card rewinds local client scene state (not just server call)
+- [x] 3.4 Honor Silero VAD speech events; delete canned fake utterances
+- [x] 3.5 X-card rewinds local client scene state (not just server call)
 - [ ] 3.6 Dead code removal: App.tsx duplicate sync block, audio_vad_pipeline.ts,
       ui/safety_xcard.ts, LiteLLMCircuitBreakerGateway
 - [ ] 3.7 Remove unused y-indexeddb dep or wire it; drop committed dist artifacts
 - [ ] 3.8 AnalyticsView/AdminDashboard fetch real endpoints or are labeled DEMO
 - [x] 3.9 LobbyView seats come from lobby member API (no hardcoded roster)
 - [ ] 3.10 Client sends auth tokens on all API calls (headers, not query strings)
-- [ ] 3.11 WebGPU preference option for Pixi init (env-gated)
-- [ ] 3.12 manualChunks splitting; kill >500 kB chunk warnings
+- [x] 3.11 WebGPU preference option for Pixi init (env-gated)
+- [x] 3.12 manualChunks splitting; kill >500 kB chunk warnings
 
 ### Phase 4 — Missing pillars & engine depth
 - [x] 4.1 Fail-forward margin bands (M = roll − DC) in vtt-core + tests
 - [x] 4.2 NPC disposition scoring (trust/fear/decay) in python simulation + tests
-- [ ] 4.3 Heal/rest endpoint in vtt-server; wire death-save tally reset
+- [x] 4.3 Heal/rest endpoint in vtt-server; wire death-save tally reset
 - [x] 4.4 Multi-term dice expressions ("2d6+1d4+3") in vtt-core DiceEngine
-- [ ] 4.5 Real loot tables replacing seed % 100 arithmetic
+- [x] 4.5 Real loot tables replacing seed % 100 arithmetic
 - [ ] 4.6 Neo4j-backed epistemic graph (driver optional; in-memory fallback)
 - [ ] 4.7 Qdrant-backed lore/compendium RAG lookup (optional; fallback offline)
-- [ ] 4.8 LLM-assisted intent classification with keyword fallback (.env LLM)
+- [x] 4.8 LLM-assisted intent classification with keyword fallback (.env LLM)
 - [x] 4.9 Degraded marker on SSE narrative fallback frames
 - [x] 4.10 Engine-tier rate limiting (actix-governor)
 - [x] 4.11 Concentration auto-check hooks on damage events
@@ -63,4 +63,12 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 4 | 3.9 | Live lobby roster from GET /lobbies/{id}; fake players/pings removed; real invite URLs | 7e3aead | tsc+vite ✓ |
 | 5 | 4.9 | SSE degradation markers: leading {degraded,reason} frame + per-frame tags on fallback; non-streaming degraded flag | 9367081 | pytest ✓ |
 | 6 | 4.4 + R1 | Multi-term dice expression evaluator in vtt-core (seeded, bounded); OSS crates rejected as unmaintained | see git log | cargo ✓ |
+| 7 | 3.11 + 3.12 | Vendor chunk splitting (pixi/yjs/react); dice-box offscreen worker emitted as static asset; VITE_PIXI_PREFERENCE=webgpu option; largest chunk 1447→691 kB | df35302 | tsc+vite ✓ |
+| 8 | 3.4 | Real Silero VAD speech state in NarrativeChat; canned utterances deleted; recording fabricates nothing | 2e81528 | tsc+vite ✓ |
+| 9 | 4.3 | Engine heal + rest endpoints (RBAC, clamps, death-save reset) + HEALED rewind replay arm; 7 integration tests | 9a267b9 | cargo ✓ |
+| 10 | 4.8 | LLM-assisted intent classifier w/ safety-trigger precedence, kill-switch, keyword fallback provenance; complete_json(); 12 tests | 7c755ca | pytest ✓ |
+| 11 | 3.5 | X-card local revert: rewound-turn chat pruned, honest re-sync audit line, overclaiming copy removed | 9445c99 | tsc+vite ✓ |
+| 12 | — | Heal/rest gateway proxies with identity forwarding; strict request models; 8 tests | 4527774 | pytest ✓ |
+| 13 | 4.12 | Genuine GOAP planner for factions: STRIPS actions, uniform-cost A*, deterministic, legacy fallback preserved; 19 tests | 50fe903 | pytest ✓ |
+| 14 | 4.5 | Weighted thematic loot tables (3 themes, rarity weights, tier multipliers) replacing seed%100; 8 tests incl. distribution sanity | b42d5a8 | cargo ✓ |
 
