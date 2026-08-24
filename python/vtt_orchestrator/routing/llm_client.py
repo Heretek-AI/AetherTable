@@ -47,6 +47,98 @@ def extract_json_object(raw: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _response_is_sse(resp: Any) -> bool:
+    """True when the upstream answered a NON-streaming request with SSE.
+
+    Some OpenAI-compatible proxies (verified against llm.heretek.one/v1)
+    respond `content-type: text/event-stream` even when `stream` was not
+    requested — HTTP 200 with `data: {...}` frames wrapping the real JSON.
+    Calling `.json()` on such a body always raises, so every non-streaming
+    call site must check this BEFORE parsing.
+    """
+    try:
+        content_type = resp.headers.get("content-type", "")
+    except AttributeError:
+        return False
+    return "text/event-stream" in content_type.lower()
+
+
+def _reassemble_sse_message(body_text: str) -> Dict[str, Any]:
+    """Rebuild one assistant message from an SSE frame body.
+
+    Handles both streaming-style frames (`choices[0].delta.content` fragments,
+    tool_call argument chunks merged by index) and proxy quirks that carry a
+    full `choices[0].message.content` per frame. `data: [DONE]`, comments,
+    and unparseable frames are skipped; if nothing usable arrives the caller
+    sees an empty content / no tool_calls — an honest failure, not a guess.
+    """
+    content_parts: List[str] = []
+    tool_calls: Dict[int, Dict[str, Any]] = {}
+
+    def _absorb_tool_call(slot: Dict[str, Any], fragment: Dict[str, Any]) -> None:
+        if fragment.get("id"):
+            slot["id"] = fragment["id"]
+        if fragment.get("type"):
+            slot["type"] = fragment["type"]
+        fn = fragment.get("function") or {}
+        name = fn.get("name")
+        if name:
+            current = slot["function"]["name"]
+            # Providers either send the whole name once or stream it forward.
+            slot["function"]["name"] = (
+                name if name.startswith(current) else current + name
+            )
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            slot["function"]["arguments"] += args
+
+    def _absorb_fragment(fragment: Dict[str, Any]) -> None:
+        if not isinstance(fragment, dict):
+            return
+        content = fragment.get("content")
+        if isinstance(content, str):
+            content_parts.append(content)
+        for tc in fragment.get("tool_calls") or []:
+            index = tc.get("index", 0) if isinstance(tc, dict) else 0
+            slot = tool_calls.setdefault(
+                index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            _absorb_tool_call(slot, tc if isinstance(tc, dict) else {})
+
+    for line in (body_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue  # comments ("event:", ": keepalive"), blanks, etc.
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            frame = json.loads(payload)
+        except (ValueError, TypeError):
+            continue  # malformed frame — skip honestly
+        choices = frame.get("choices") if isinstance(frame, dict) else None
+        for choice in choices or []:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                _absorb_fragment(message)
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                _absorb_fragment(delta)
+
+    reassembled: Dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+    }
+    if tool_calls:
+        reassembled["tool_calls"] = [
+            tool_calls[index] for index in sorted(tool_calls)
+        ]
+    return reassembled
+
+
 def _log_llm_call(record: Dict[str, Any]) -> None:
     """Appends one structured JSONL record per upstream LLM interaction.
 
@@ -144,7 +236,13 @@ class LLMStreamingGateway:
                 resp = await client.post(endpoint, headers=headers, json=payload)
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 resp.raise_for_status()
-                data = resp.json()
+                if _response_is_sse(resp):
+                    # Proxy answered a non-streaming request with SSE frames.
+                    transport = "sse_reassembled"
+                    data = {"choices": [{"message": _reassemble_sse_message(resp.text)}]}
+                else:
+                    transport = "json"
+                    data = resp.json()
             message = data["choices"][0]["message"]
             _log_llm_call({
                 "ts": time.time(),
@@ -153,6 +251,7 @@ class LLMStreamingGateway:
                 "base_url": self.config.base_url,
                 "latency_ms": round(latency_ms, 1),
                 "status": resp.status_code,
+                "transport": transport,
                 "tool_calls_emitted": len(message.get("tool_calls") or []),
                 "prompt_chars": len(json.dumps(messages)),
                 "response_chars": len(message.get("content") or ""),
@@ -213,7 +312,14 @@ class LLMStreamingGateway:
                 resp = await client.post(endpoint, headers=headers, json=payload)
                 resp_status = getattr(resp, "status_code", None)
                 resp.raise_for_status()
-                raw_content = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")
+                if _response_is_sse(resp):
+                    # Proxy answered a non-streaming request with SSE frames;
+                    # .json() would raise on that body. Reassemble instead.
+                    transport = "sse_reassembled"
+                    raw_content = _reassemble_sse_message(resp.text).get("content")
+                else:
+                    transport = "json"
+                    raw_content = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")
             parsed = extract_json_object(raw_content)
             _log_llm_call({
                 "ts": time.time(),
@@ -222,6 +328,7 @@ class LLMStreamingGateway:
                 "base_url": self.config.base_url,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
                 "status": resp_status,
+                "transport": transport,
                 "prompt_chars": len(system_prompt) + len(user_prompt),
                 "response_excerpt": (raw_content or "")[:2000],
                 "parsed_ok": parsed is not None,
@@ -455,7 +562,17 @@ class LLMStreamingGateway:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     resp = await client.post(endpoint, headers=headers, json=payload)
                     resp.raise_for_status()
-                    narrative = resp.json()["choices"][0]["message"]["content"] or ""
+                    if _response_is_sse(resp):
+                        # Proxy answered a non-streaming request with SSE frames.
+                        transport = "sse_reassembled"
+                        narrative = _reassemble_sse_message(resp.text).get("content") or ""
+                        if not narrative.strip():
+                            # Malformed/empty stream: degrade honestly instead of
+                            # returning degraded=False with blank narration.
+                            raise ValueError("sse_reassembly_produced_no_content")
+                    else:
+                        transport = "json"
+                        narrative = resp.json()["choices"][0]["message"]["content"] or ""
                 _log_llm_call({
                     "ts": time.time(),
                     "kind": "generate_narrative",
@@ -463,6 +580,7 @@ class LLMStreamingGateway:
                     "base_url": self.config.base_url,
                     "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
                     "status": resp.status_code,
+                    "transport": transport,
                     "response_chars": len(narrative),
                 })
                 return {"narrative": narrative, "degraded": False}
