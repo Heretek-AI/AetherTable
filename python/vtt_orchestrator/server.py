@@ -30,8 +30,10 @@ from .simulation.empirical_playtester import EmpiricalPlaytester
 from .compendium.bundle_packager import global_bundle_packager
 from .compendium.homebrew_parser import global_homebrew_parser
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
+from .routing.intent_router import LLM_CLASSIFIER_KILL_SWITCH_ENV
 from .schemas.models import (
     IntentClassificationResult,
+    IntentType,
     LoreAssertionPayload,
     AuditorDiagnosticReport,
     EpistemicTier,
@@ -60,6 +62,74 @@ app.add_middleware(
 
 # Global State Container
 router = IntentClassificationRouter()
+
+# ---------------------------------------------------------------------------
+# Intent-classification wiring (audit remediation)
+#
+# `IntentClassificationRouter.classify_with_llm()` shipped tested-but-uncalled.
+# These helpers are the single choke point the turn endpoint uses so the LLM
+# path engages ONLY when the kill switch allows it AND an API key exists; every
+# other environment keeps the pure deterministic keyword classifier with zero
+# network attempts and zero latency cost (the probe below is env-read-once).
+# ---------------------------------------------------------------------------
+
+_LLM_KEY_ENV_VARS = ("LLM_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY")
+_llm_classifier_available: Optional[bool] = None
+
+
+def reset_llm_classifier_cache() -> None:
+    """Invalidate the cached availability probe (used by tests)."""
+    global _llm_classifier_available
+    _llm_classifier_available = None
+
+
+def _llm_assist_enabled() -> bool:
+    """True only when VTT_LLM_CLASSIFIER != "0" AND an API key is configured.
+
+    Cached after the first read: the endpoint must never pay repeated env
+    parsing, and an unconfigured deployment short-circuits before the async
+    router is even entered.
+    """
+    global _llm_classifier_available
+    if _llm_classifier_available is None:
+        kill_switch_on = (
+            os.environ.get(LLM_CLASSIFIER_KILL_SWITCH_ENV, "1").strip().lower()
+            not in {"0", "false", "off"}
+        )
+        has_key = any(os.environ.get(var) for var in _LLM_KEY_ENV_VARS)
+        _llm_classifier_available = kill_switch_on and has_key
+    return _llm_classifier_available
+
+
+async def classify_turn_intent(
+    utterance: str, speaker_id: str = "player"
+) -> Dict[str, Any]:
+    """Classify a turn utterance via classify_with_llm when available.
+
+    Returns the classify_with_llm decision dict:
+    ``{"classification", "intent_type", "confidence", "classifier",
+    "fallback_reason"}``. Without LLM assist the same shape is produced from
+    the keyword fast path with ``classifier="keyword_fallback"`` and an honest
+    fallback_reason — callers see one contract either way.
+    """
+    if _llm_assist_enabled():
+        return await router.classify_with_llm(utterance, speaker_id)
+
+    keyword = router.classify_utterance(utterance, speaker_id)
+    switch_off = (
+        os.environ.get(LLM_CLASSIFIER_KILL_SWITCH_ENV, "1").strip().lower()
+        in {"0", "false", "off"}
+    )
+    reason = f"{LLM_CLASSIFIER_KILL_SWITCH_ENV}=0" if switch_off else "mock_mode: no LLM key configured"
+    return {
+        "classification": keyword,
+        "intent_type": keyword.intent_type,
+        "confidence": keyword.confidence,
+        "classifier": "keyword_fallback",
+        "fallback_reason": reason,
+    }
+
+
 lore_graph = EpistemicLoreGraphManager()
 auditor = PreCommitAuditorAgent(lore_graph=lore_graph)
 dm_agent = EncounterDMAgent()
@@ -1528,12 +1598,31 @@ async def _resolve_audit_inputs(req: NarrativeGenerateRequest) -> tuple[Dict[str
 @app.post("/api/v1/narrative/generate")
 @app.post("/api/v1/orchestrator/turn")
 async def execute_orchestrator_turn(req: NarrativeGenerateRequest):
+    # Classify FIRST (audit remediation): the LLM-assisted classifier runs when
+    # configured; a keyword safety hit short-circuits before any network call
+    # and before any engine grounding. Provenance ("classifier") is surfaced to
+    # the client as a top-level non-breaking field on every response shape.
+    decision = await classify_turn_intent(req.user_intent)
+
+    # Gate mirrors the synthetic playtest harness: only mechanically-classified
+    # intents reach the engine/audit turn cycle — pure lore, table talk, and
+    # safety interventions carry no compliance semantics.
+    if decision["intent_type"] is not IntentType.MECHANICAL_INVOCATION:
+        is_safety = decision["intent_type"] is IntentType.SAFETY_INTERVENTION
+        return {
+            "status": "SAFETY_INTERVENTION" if is_safety else "SKIPPED_NON_MECHANICAL",
+            "classified_intent": decision["intent_type"].value,
+            "confidence": decision["confidence"],
+            "classifier": decision["classifier"],
+            "fallback_reason": decision["fallback_reason"],
+        }
+
     audited_payload, active_count, previous_count = await _resolve_audit_inputs(req)
 
     def dm_draft(ctx=None):
         return dm_agent.generate_combat_draft(req.user_intent, audited_payload, ctx)
 
-    return retry_controller.run_turn_cycle(
+    cycle_result = retry_controller.run_turn_cycle(
         user_intent=req.user_intent,
         turn_index=req.turn_index,
         entity_id=req.entity_id,
@@ -1544,6 +1633,12 @@ async def execute_orchestrator_turn(req: NarrativeGenerateRequest):
         ingress_count=req.ingress_count,
         egress_count=req.egress_count,
     )
+    # Honest provenance additions (non-breaking): which classifier produced the
+    # intent that gated this turn.
+    cycle_result["classifier"] = decision["classifier"]
+    cycle_result["classified_intent"] = decision["intent_type"].value
+    cycle_result["fallback_reason"] = decision["fallback_reason"]
+    return cycle_result
 
 
 @app.post("/api/v1/narrative/stream")
