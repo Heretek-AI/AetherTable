@@ -855,6 +855,12 @@ impl GameSession {
         let mut hp_state: HashMap<Uuid, (i32, bool, bool)> = HashMap::new();
         let mut death_save_state: HashMap<Uuid, DeathSaveState> = HashMap::new();
         let mut pos_state: HashMap<Uuid, (f32, f32, f32)> = HashMap::new();
+        // Last-seen post-rest exhaustion level per entity, from surviving
+        // LONG_REST_APPLIED events carrying "exhaustion_level".
+        let mut exhaustion_state: HashMap<Uuid, u8> = HashMap::new();
+        // Last-seen combat phase from surviving COMBAT_BEGAN / COMBAT_ENDED
+        // events (`None` = no surviving combat events at all).
+        let mut combat_active: Option<bool> = None;
 
         for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
             match ev.event_type.as_str() {
@@ -901,24 +907,41 @@ impl GameSession {
                 }
                 // LONG_REST_APPLIED restores HP exactly like HEALED (absolute
                 // hp_remaining, conscious unless dead) and by SRD design also
-                // wipes death-save tallies — same cleanup.
+                // wipes death-save tallies — same cleanup. Events that also
+                // carry the post-rest "exhaustion_level" (emitted by the
+                // server's rest endpoint) restore the shed exhaustion level;
+                // exhaustion lives in `conditions` and no other event type
+                // records it, so last surviving rest event wins. Legacy
+                // payloads without the field replay HP only.
                 // SHORT_REST_APPLIED is intentionally NOT handled: it is a
                 // mechanical no-op today (hit-dice spending is a future hook),
                 // so a surviving short-rest event must change nothing during
                 // replay; it falls through to the catch-all arm.
                 "LONG_REST_APPLIED" => {
-                    let tid = ev.payload.get("target_id").and_then(|v| v.as_str());
-                    let hp = ev.payload.get("hp_remaining").and_then(|v| v.as_i64());
-                    if let (Some(tid), Some(hp)) = (tid, hp) {
-                        if let Ok(tid) = Uuid::parse_str(tid) {
+                    if let Some(tid) = ev
+                        .payload
+                        .get("target_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        if let Some(hp) = ev.payload.get("hp_remaining").and_then(|v| v.as_i64()) {
                             let hp = hp as i32;
                             hp_state.insert(tid, (hp, hp > 0, false));
                             if hp > 0 {
                                 death_save_state.insert(tid, DeathSaveState::default());
                             }
                         }
+                        if let Some(level) =
+                            ev.payload.get("exhaustion_level").and_then(|v| v.as_u64())
+                        {
+                            exhaustion_state.insert(tid, (level as u8).min(6));
+                        }
                     }
                 }
+                // Combat phase: the LAST surviving begin/end decides whether
+                // an engagement is active at the rewind point.
+                "COMBAT_BEGAN" => combat_active = Some(true),
+                "COMBAT_ENDED" => combat_active = Some(false),
                 "DEATH_SAVE_RESOLVED" => {
                     let tally = DeathSaveState {
                         successes: ev.payload.get("successes").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
@@ -975,6 +998,38 @@ impl GameSession {
                 }
             }
         }
+        // Exhaustion replay (after HP so `set_exhaustion`'s level-4+ cap
+        // clamp wins over a replayed higher total, mirroring live ordering
+        // where the rest sheds the level before refilling to the effective
+        // max). Last surviving LONG_REST_APPLIED event wins.
+        for (id, level) in exhaustion_state {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.set_exhaustion(level);
+                restored += 1;
+            }
+        }
+
+        // Combat-state replay: the ledger is authoritative at the rewind
+        // point. A surviving end (or no surviving begin at all) means no
+        // engagement is active — clear any drifted tracker. A surviving
+        // begin keeps combat live; entities removed after their spawn are
+        // NOT resurrected by this rewind (step 1 only despawns late spawns),
+        // so prune order slots referencing ids that no longer exist rather
+        // than leaving dangling entries that would reference ghosts.
+        // Simplification: round and turn_index are kept as-is — recomputing
+        // initiative mid-rewind is out of scope; `next_turn` tolerates an
+        // out-of-range index by yielding no actor until it wraps back in
+        // bounds.
+        match combat_active {
+            Some(false) | None => {
+                self.combat = InitiativeCombatState::default();
+            }
+            Some(true) => {
+                self.combat.in_combat = true;
+                self.combat.order.retain(|id| self.entities.contains_key(id));
+            }
+        }
+
         // Concentration is cleared wholesale on a rewind: any spell granting
         // it may have been undone, so conservatively end all concentration.
         for entity in self.entities.values_mut() {

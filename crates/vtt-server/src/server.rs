@@ -1481,7 +1481,7 @@ async fn take_rest(
 
                 let mut restored: Vec<serde_json::Value> = Vec::new();
                 for id in candidates {
-                    let (hp_restored_to, hp_remaining, exhaustion_reduced) = {
+                    let (hp_restored_to, hp_remaining, exhaustion_reduced, exhaustion_level) = {
                         let entity = session.entities.get_mut(&id).expect("checked above");
                         // Shed one level first so the refill below uses the
                         // post-rest effective maximum (see ordering note above).
@@ -1491,7 +1491,12 @@ async fn take_rest(
                         entity.temp_hp = 0;
                         entity.is_conscious = true;
                         entity.reset_death_saves_if_healed();
-                        (cap, entity.current_hp, exhaustion_reduced)
+                        // POST-rest level, recorded on the event so a rewind
+                        // replay can restore exactly this much exhaustion
+                        // (events carry no pre-rest level, and conditions are
+                        // not replayed — see safety_rewind).
+                        let exhaustion_level = entity.exhaustion_level();
+                        (cap, entity.current_hp, exhaustion_reduced, exhaustion_level)
                     };
                     session.ledger.append_event(
                         session_id,
@@ -1503,12 +1508,14 @@ async fn take_rest(
                             "hp_restored_to_max": hp_restored_to,
                             "hp_remaining": hp_remaining,
                             "exhaustion_reduced": exhaustion_reduced,
+                            "exhaustion_level": exhaustion_level,
                         }),
                     );
                     restored.push(serde_json::json!({
                         "entity_id": id,
                         "hp_remaining": hp_remaining,
                         "exhaustion_reduced": exhaustion_reduced,
+                        "exhaustion_level": exhaustion_level,
                     }));
                 }
 
@@ -2355,10 +2362,15 @@ pub fn configure_app_with(
 
     let wrap = |bucket| RateLimitFilter::new(RateLimit::new(limits, bucket));
     let read = wrap(Bucket::Read);
-    // One shared store per bucket: clones of a filter count against the SAME
-    // per-IP window, so /actions/check and /spatial/los share the moderate
-    // budget rather than each getting their own.
-    let action = || wrap(Bucket::Action);
+    // ONE RateLimit instance for the whole moderate bucket, shared by every
+    // action scope below. `RateLimit` is an Arc-backed cheap clone (the
+    // SlidingWindows store lives behind a single Arc), so cloning the filter
+    // counts every action scope's traffic against the SAME per-IP window —
+    // /actions/*, /spatial/*, /maps and /sessions/{id} share one 120/min
+    // budget instead of each silently getting their own. Constructing a fresh
+    // limiter per scope (the pre-audit behavior) multiplied the effective
+    // quota by the number of scopes.
+    let action = wrap(Bucket::Action);
     let script = wrap(Bucket::Script);
 
     cfg.route("/health", web::get().to(health_check))
@@ -2377,20 +2389,20 @@ pub fn configure_app_with(
                 )
                 .service(
                     web::scope("/actions")
-                        .wrap(action())
+                        .wrap(action.clone())
                         .route("/check", web::post().to(resolve_check))
                         .route("/save", web::post().to(resolve_save))
                         .route("/concentration", web::post().to(resolve_concentration)),
                 )
                 .service(
                     web::scope("/spatial")
-                        .wrap(action())
+                        .wrap(action.clone())
                         .route("/los", web::post().to(compute_los))
                         .route("/path", web::post().to(compute_path)),
                 )
                 .service(
                     web::scope("/maps")
-                        .wrap(action())
+                        .wrap(action.clone())
                         .route("/generate", web::post().to(generate_wfc_map)),
                 )
                 // Presence is a pure read: only the generous outer bucket.
@@ -2400,7 +2412,7 @@ pub fn configure_app_with(
                 )
                 .service(
                     web::scope("/sessions/{id}")
-                        .wrap(action())
+                        .wrap(action.clone())
                         .route("", web::get().to(get_session))
                         .route("/restore", web::put().to(restore_session))
                         .route("/entities", web::post().to(add_entity))

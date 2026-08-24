@@ -1477,6 +1477,10 @@ async fn long_rest_sheds_one_exhaustion_level_and_reports_it() {
     };
     assert_eq!(event_for(&tired_id)["payload"]["exhaustion_reduced"], true);
     assert_eq!(event_for(&fresh_id)["payload"]["exhaustion_reduced"], false);
+    // Post-rest levels ride the event so safety_rewind's replay can restore
+    // shed exhaustion (rewind blind-spot fix).
+    assert_eq!(event_for(&tired_id)["payload"]["exhaustion_level"], 1);
+    assert_eq!(event_for(&fresh_id)["payload"]["exhaustion_level"], 0);
 }
 
 #[actix_web::test]

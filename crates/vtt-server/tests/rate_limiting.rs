@@ -249,6 +249,74 @@ async fn action_bucket_throttles_while_reads_stay_open() {
     );
 }
 
+/// The moderate ACTION budget is SHARED across every action scope: requests
+/// alternating between `/actions/*` and `/spatial/*` drain ONE combined
+/// quota, so with actions pinned to 3/min the 4th total request 429s even
+/// though each individual route has seen at most 2.
+#[actix_web::test]
+async fn action_scopes_share_one_budget_across_routes() {
+    let limits = RateLimits::explicit(1_000_000, 3, 1_000_000);
+    let app = limited_app(limits).await;
+    let token = sign_token("gm-1");
+
+    // Alternate scopes: /actions/check and /spatial/los.
+    let mut statuses = Vec::new();
+    for i in 0..3u32 {
+        let uri = if i % 2 == 0 {
+            "/api/v1/actions/check"
+        } else {
+            "/api/v1/spatial/los"
+        };
+        let body = if i % 2 == 0 {
+            serde_json::json!({"modifier": 1, "dc": 10, "cost_margin": 5})
+        } else {
+            serde_json::json!({
+                "attacker_pos": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "target_pos": {"x": 5.0, "y": 5.0, "z": 0.0},
+                "target_radius": 1.0,
+                "grid_width": 32,
+                "grid_height": 32,
+                "solid_cells": []
+            })
+        };
+        let req = test::TestRequest::post()
+            .uri(uri)
+            .insert_header(bearer(&token))
+            .set_json(body)
+            .to_request();
+        statuses.push((i + 1, test::call_service(&app, req).await.status()));
+    }
+
+    for (n, status) in statuses {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "request {} of the shared 3/min action budget must pass",
+            n
+        );
+    }
+
+    // 4th TOTAL request across the two scopes — throttled, because both
+    // scopes count against the same sliding window.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/spatial/los")
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_pos": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "target_pos": {"x": 5.0, "y": 5.0, "z": 0.0},
+            "target_radius": 1.0,
+            "grid_width": 32,
+            "grid_height": 32,
+            "solid_cells": []
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the action budget must be shared across /actions and /spatial, not per-scope"
+    );
+}
+
 /// Fail-soft env parsing: garbage values fall back to defaults instead of
 /// panicking or zeroing out a bucket.
 #[actix_web::test]

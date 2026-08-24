@@ -652,6 +652,99 @@ fn test_safety_rewind_ignores_surviving_short_rest_event() {
     assert!(session.entities[&b_id].is_conscious);
 }
 
+#[test]
+fn test_safety_rewind_before_combat_began_ends_up_out_of_combat() {
+    let mut session = session_with_pair();
+    let baseline_seq = session.ledger.current_sequence;
+
+    // Combat begins (and advances) AFTER the baseline — the X-card reverts
+    // the whole engagement.
+    let mut dice = DiceEngine::with_seed(11);
+    session.begin_combat(&mut dice);
+    assert!(session.combat.in_combat);
+    session.combat.next_turn();
+
+    let report = session.safety_rewind(baseline_seq);
+    assert!(report.reverted_event_count >= 1, "COMBAT_BEGAN must revert");
+    assert!(
+        !session.combat.in_combat,
+        "rewinding to before COMBAT_BEGAN must leave the session out of combat"
+    );
+}
+
+#[test]
+fn test_safety_rewind_while_in_combat_prunes_dangling_order_ids() {
+    let mut session = session_with_pair();
+    let (a_id, b_id): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let mut dice = DiceEngine::with_seed(11);
+    let entries = session.begin_combat(&mut dice);
+    assert_eq!(entries.len(), 2);
+    let seq_after_begin = session.ledger.current_sequence;
+
+    // One combatant leaves the board mid-combat. The rewind point predates
+    // the despawn, but a rewind does not resurrect removed entities — so the
+    // surviving combat order must not keep referencing the gone id.
+    session.remove_entity(&b_id, "x-card");
+    assert!(session.combat.in_combat);
+
+    session.safety_rewind(seq_after_begin);
+
+    assert!(session.combat.in_combat, "combat was live at the rewind point");
+    for id in &session.combat.order {
+        assert!(
+            session.entities.contains_key(id),
+            "combat order must not reference a despawned entity after rewind"
+        );
+    }
+    assert_eq!(
+        session.combat.order,
+        vec![a_id],
+        "the surviving combatant keeps their slot; the dangling id is pruned"
+    );
+}
+
+#[test]
+fn test_safety_rewind_restores_exhaustion_from_surviving_long_rest_event() {
+    let mut session = session_with_pair();
+    let tired = *session.entities.keys().next().unwrap();
+
+    // Exhaustion 3, then a long rest sheds one level to 2 — recorded in the
+    // event's post-rest exhaustion_level.
+    session.entities.get_mut(&tired).unwrap().set_exhaustion(3);
+    let seq_after_rest = append_and_seq(
+        &mut session,
+        tired,
+        "LONG_REST_APPLIED",
+        serde_json::json!({
+            "target_id": tired.to_string(),
+            "hp_restored_to_max": 30,
+            "hp_remaining": 30,
+            "exhaustion_reduced": true,
+            "exhaustion_level": 2,
+        }),
+    );
+
+    // Later drift: another exhaustion source piled them back up to 5 before
+    // the X-card fired.
+    session
+        .entities
+        .get_mut(&tired)
+        .unwrap()
+        .set_exhaustion(5);
+
+    session.safety_rewind(seq_after_rest);
+
+    assert_eq!(
+        session.entities[&tired].exhaustion_level(),
+        2,
+        "replay must restore the post-rest level carried by the surviving LONG_REST_APPLIED"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fail-forward resolution engine (GOALS.md Pillar 8): non-binary skill-check
 // success margins M = Roll − DC.
