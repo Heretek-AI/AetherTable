@@ -1378,6 +1378,7 @@ export function App() {
             <VideoMeshTiles
               isVisible={isVideoMeshVisible}
               onToggleVisible={() => setIsVideoMeshVisible(false)}
+              currentUser={{ id: currentUser.id, displayName: currentUser.displayName }}
             />
 
             {/* Tabletop Center Workspace */}

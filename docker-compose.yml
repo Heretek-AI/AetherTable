@@ -158,18 +158,73 @@ services:
     networks:
       - vtt-net
 
+  vtt-peerjs:
+    # PeerJS signaling server for the REAL WebRTC video mesh (Pillar 9).
+    # Dependency-light on purpose: no image build, no runtime npm download —
+    # it requires the `peer` package already installed in ./client/node_modules
+    # (same hoisted mount trick as ysync-relay). allow_discovery is REQUIRED:
+    # the client roster is built by filtering this server's /peers listing by
+    # lobby peer-id prefix (see client/src/render/webrtc_mesh.ts).
+    image: node:20-alpine
+    container_name: vtt-peerjs
+    restart: unless-stopped
+    working_dir: /app/client
+    command: |-
+      node -e "
+        const { PeerServer } = require('peer');
+        PeerServer(
+          {
+            port: Number(process.env.PEERJS_PORT || 9000),
+            key: process.env.PEERJS_KEY || 'aethertable',
+            path: process.env.PEERJS_PATH || '/peerjs',
+            allow_discovery: true,
+          },
+          () => console.log('[peerjs] signaling ready on :' + (process.env.PEERJS_PORT || 9000) +
+            ' key=' + (process.env.PEERJS_KEY || 'aethertable') +
+            ' path=' + (process.env.PEERJS_PATH || '/peerjs') + ' discovery=on')
+        );
+      "
+    environment:
+      PEERJS_PORT: "9000"
+      PEERJS_KEY: aethertable
+      PEERJS_PATH: /peerjs
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./client/node_modules:/app/client/node_modules:ro,z
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:9000/peerjs/aethertable/peers', r => process.exit(r.statusCode && r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vtt-net
+
   vtt-client:
     build:
       context: .
       dockerfile: Dockerfile.client
     container_name: vtt-client
     restart: unless-stopped
+    environment:
+      # Vite bakes VITE_* vars at BUILD time; export/set these before
+      # `docker compose build vtt-client`. Unset, the client falls back to
+      # http://localhost:9000 + room `aethertable-live` (webrtc_mesh.ts).
+      PEERJS_URL: ${PEERJS_URL:-http://vtt-peerjs:9000}
+      VITE_PEERJS_URL: ${VITE_PEERJS_URL:-http://localhost:9000}
+      VITE_PEERJS_ROOM: ${VITE_PEERJS_ROOM:-aethertable-live}
     ports:
       - "3000:3000"
     depends_on:
       vtt-engine:
         condition: service_healthy
       vtt-orchestrator:
+        condition: service_healthy
+      vtt-peerjs:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/ || exit 1"]
