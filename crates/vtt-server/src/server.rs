@@ -1428,8 +1428,11 @@ async fn take_rest(
         let campaign_id = session.campaign_id;
 
         match req.kind {
-            // Short rest: no mechanical effect yet (SRD hit-dice spending is a
-            // future hook). Ledgered so the intent is auditable and rewirable.
+            // Short rest: no mechanical effect, and deliberately so for
+            // exhaustion — SRD 5e grants NO exhaustion recovery on a short
+            // rest (only hit dice / class features do). HP restoration via
+            // hit-dice spending is a future hook. Ledgered so the intent is
+            // auditable and rewirable.
             RestKind::Short => {
                 session.ledger.append_event(
                     session_id,
@@ -1444,10 +1447,26 @@ async fn take_rest(
                     "hook": "short-rest mechanics (hit dice) not yet implemented",
                 }))
             }
-            // Long rest: SRD restores hit points (and clears exhaustion —
-            // exhaustion tracking is engine-side TODO). Spell slots are NOT
-            // refilled because slot MAXIMA are not tracked engine-side yet;
-            // only remaining counts live on EntityState.
+            // Long rest: SRD restores hit points and sheds ONE exhaustion
+            // level (not all of them). Spell slots are NOT refilled because
+            // slot MAXIMA are not tracked engine-side yet; only remaining
+            // counts live on EntityState.
+            //
+            // Ordering decision: exhaustion is shed FIRST, then HP is filled
+            // to `effective_max_hp()` — i.e. the cap implied by the POST-rest
+            // exhaustion level. This keeps the two SRD clauses consistent:
+            // resting at level 4 lands on level 3 and returns to full max,
+            // while resting at level 5 lands on level 4 and tops out at the
+            // still-halved maximum. Filling first would strand HP below the
+            // lifted cap until the next rest. (`set_exhaustion` inside
+            // `take_long_rest_effects` also clamps current HP down to any
+            // surviving cap via `enforce_exhaustion_hp_cap`, so no overfill
+            // can slip through.)
+            //
+            // Dead entities are skipped entirely: our dead stay dead — no
+            // resurrection, and therefore no exhaustion bookkeeping either
+            // (SRD lets a corpse's exhaustion decay, but a dead creature has
+            // nothing left to rest toward). They emit no LONG_REST_APPLIED.
             RestKind::Long => {
                 // Only player characters / owned creatures rest here, and only
                 // those the caller controls (a player long-rests their own
@@ -1462,13 +1481,17 @@ async fn take_rest(
 
                 let mut restored: Vec<serde_json::Value> = Vec::new();
                 for id in candidates {
-                    let (max_hp, hp_remaining) = {
+                    let (hp_restored_to, hp_remaining, exhaustion_reduced) = {
                         let entity = session.entities.get_mut(&id).expect("checked above");
-                        entity.current_hp = entity.max_hp;
+                        // Shed one level first so the refill below uses the
+                        // post-rest effective maximum (see ordering note above).
+                        let exhaustion_reduced = entity.take_long_rest_effects();
+                        let cap = entity.effective_max_hp();
+                        entity.current_hp = cap;
                         entity.temp_hp = 0;
                         entity.is_conscious = true;
                         entity.reset_death_saves_if_healed();
-                        (entity.max_hp, entity.current_hp)
+                        (cap, entity.current_hp, exhaustion_reduced)
                     };
                     session.ledger.append_event(
                         session_id,
@@ -1477,13 +1500,15 @@ async fn take_rest(
                         "LONG_REST_APPLIED",
                         serde_json::json!({
                             "target_id": id.to_string(),
-                            "hp_restored_to_max": max_hp,
+                            "hp_restored_to_max": hp_restored_to,
                             "hp_remaining": hp_remaining,
+                            "exhaustion_reduced": exhaustion_reduced,
                         }),
                     );
                     restored.push(serde_json::json!({
                         "entity_id": id,
                         "hp_remaining": hp_remaining,
+                        "exhaustion_reduced": exhaustion_reduced,
                     }));
                 }
 
@@ -1491,7 +1516,7 @@ async fn take_rest(
                     "status": "LONG_REST_APPLIED",
                     "restored_entities": restored.len(),
                     "entities": restored,
-                    "note": "spell slots are not refilled (slot maxima untracked engine-side); exhaustion not modeled",
+                    "note": "spell slots are not refilled (slot maxima untracked engine-side); each long rest sheds exactly one exhaustion level",
                 }))
             }
         }

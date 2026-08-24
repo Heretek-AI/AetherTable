@@ -96,6 +96,11 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 38 | P5-wire | NPC dialogue endpoint with starter personas; persistent stances; norms gate at API | 35de876 | pytest ✓ |
 | 39 | 5.8-ui | Authoritative heal/rest controls in character sheet; rejection codes surfaced verbatim | f1534da | tsc ✓ |
 | 40 | gameplay | SRD exhaustion levels enforced automatically (speed/HP halving, death at 6); long-rest hook exported | c205e02 | cargo ✓ |
+| 41 | P10 | Foundry module importer (researched schema, NDJSON packs, unmapped-field accounting, fail-loud); 25 tests | 6db2419 | pytest ✓ |
+| 42 | wire-up | Rest endpoint sheds exhaustion via take_long_rest_effects; HP to post-rest effective max; 3 red-first tests | see log | cargo ✓ |
+
+### R1 research notes
+- Iteration 42 window: PeerJS (13.4k★) + peerjs-server (4.7k★) selected as the OSS path to replace the emoji-mock video mesh; SkyOffice (1.3k★) is the architectural reference. Queued as backlog item.
 | 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy; 9 tests | 0a182da | cargo+pytest ✓ |
 | 16 | A1-fix | Audit remediation: LONG_REST rewind arm, HEALED clears death-save baselines; 4 red-first tests | b3fda63 | cargo ✓ |
 | 17 | 3.8 | Honest analytics/admin: live /metrics proxy, offline "—", DEMO badges, fabricated cards removed | 8ac9980 | all ✓ |

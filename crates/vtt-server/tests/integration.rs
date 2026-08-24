@@ -883,6 +883,26 @@ async fn create_session_as(app: &impl Service<
     body["session_id"].as_str().unwrap().parse().unwrap()
 }
 
+/// Fetches the session snapshot as `token`.
+async fn snapshot_as(app: &impl Service<
+    actix_http::Request,
+    Response = ServiceResponse<EitherBody<BoxBody>>,
+    Error = actix_web::Error,
+>, token: &str, session_id: Uuid) -> serde_json::Value {
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{session_id}"))
+        .insert_header(bearer(token))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    test::read_body_json(res).await
+}
+
+/// Uuid as a JSON string value (ledger payloads stringify ids).
+fn json_str(id: &Uuid) -> serde_json::Value {
+    serde_json::json!(id.to_string())
+}
+
 #[actix_web::test]
 async fn heal_happy_path_restores_hp_consciousness_and_death_saves() {
     let app = test_app().await;
@@ -1385,6 +1405,169 @@ async fn long_rest_restores_owned_entities_short_rest_is_a_hook() {
         .set_json(serde_json::json!({"kind": "long"}))
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+}
+
+// --- Long-rest exhaustion semantics (SRD: one level shed per long rest) ------
+//
+// Pins the exhaustion wire-up on the live HTTP surface:
+//   - each long rest sheds exactly one Exhaustion level, persisted in the
+//     session snapshot and reported as "exhaustion_reduced" in both the
+//     LONG_REST_APPLIED ledger event and the HTTP response
+//   - HP is restored to the *effective* maximum for the POST-rest exhaustion
+//     level (level >= 4 halves max), so a 5->4 rest tops out at the halved cap
+//     while a 4->3 rest comes back to full
+//   - short rests never touch exhaustion (SRD: no short-rest recovery)
+
+#[actix_web::test]
+async fn long_rest_sheds_one_exhaustion_level_and_reports_it() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let tired_id = Uuid::new_v4();
+    let mut tired = entity_json(tired_id, "Tired Fighter", 30, 14, 5, "1d8");
+    tired["current_hp"] = serde_json::json!(9);
+    tired["conditions"] = serde_json::json!([{"exhaustion": 2}]);
+    let fresh_id = Uuid::new_v4();
+    let fresh = entity_json(fresh_id, "Fresh Rogue", 22, 14, 5, "1d6");
+    for payload in [tired, fresh] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"kind": "long"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let by_entity = |id: &Uuid| -> serde_json::Value {
+        body["entities"]
+            .as_array().unwrap()
+            .iter().find(|e| e["entity_id"] == json_str(id))
+            .unwrap_or_else(|| panic!("response missing entity {id}"))
+            .clone()
+    };
+    assert_eq!(by_entity(&tired_id)["exhaustion_reduced"], true);
+    assert_eq!(by_entity(&fresh_id)["exhaustion_reduced"], false,
+        "an unexhausted entity must report no reduction");
+
+    // Snapshot persistence: 2 -> 1, not straight to 0.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&tired_id.to_string()]["conditions"],
+        serde_json::json!([{"exhaustion": 1}]),
+        "long rest sheds exactly one exhaustion level"
+    );
+
+    let rest_events: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array().unwrap()
+        .iter().filter(|e| e["event_type"] == "LONG_REST_APPLIED").collect();
+    assert_eq!(rest_events.len(), 2);
+    let event_for = |id: &Uuid| -> &serde_json::Value {
+        rest_events.iter().copied()
+            .find(|e| e["payload"]["target_id"] == json_str(id))
+            .expect("ledger event per restored entity")
+    };
+    assert_eq!(event_for(&tired_id)["payload"]["exhaustion_reduced"], true);
+    assert_eq!(event_for(&fresh_id)["payload"]["exhaustion_reduced"], false);
+}
+
+#[actix_web::test]
+async fn long_rest_restores_hp_to_post_rest_effective_max() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // Still-capped case: exhaustion 5 sheds to 4, which keeps the halved-max
+    // penalty — so the rest may only refill to half of 30.
+    let deep_id = Uuid::new_v4();
+    let mut deep = entity_json(deep_id, "Deeply Worn", 30, 14, 5, "1d8");
+    deep["current_hp"] = serde_json::json!(4);
+    deep["conditions"] = serde_json::json!([{"exhaustion": 5}]);
+    // Penalty-lifted case: exhaustion 4 sheds to 3 — full max returns.
+    let lifting_id = Uuid::new_v4();
+    let mut lifting = entity_json(lifting_id, "Recovering Mage", 28, 12, 5, "1d8");
+    lifting["current_hp"] = serde_json::json!(2);
+    lifting["conditions"] = serde_json::json!([{"exhaustion": 4}]);
+    for payload in [deep, lifting] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"kind": "long"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&deep_id.to_string()]["current_hp"], 15,
+        "post-rest exhaustion 4 still halves max (30 / 2 == 15)"
+    );
+    assert_eq!(
+        snap["entities"][&deep_id.to_string()]["conditions"],
+        serde_json::json!([{"exhaustion": 4}])
+    );
+    assert_eq!(
+        snap["entities"][&lifting_id.to_string()]["current_hp"], 28,
+        "shedding to level 3 lifts the halved-max cap before refilling"
+    );
+}
+
+#[actix_web::test]
+async fn short_rest_does_not_touch_exhaustion_or_hp() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Weary Bard", 24, 13, 4, "1d8");
+    hero["current_hp"] = serde_json::json!(10);
+    hero["conditions"] = serde_json::json!([{"exhaustion": 2}]);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(hero)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"kind": "short"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!([{"exhaustion": 2}]),
+        "short rests never recover exhaustion"
+    );
+    assert_eq!(snap["entities"][&hero_id.to_string()]["current_hp"], 10);
+    assert!(
+        !snap["ledger"]["events"].as_array().unwrap().iter()
+            .any(|e| e["event_type"] == "LONG_REST_APPLIED"),
+        "a mechanical no-op short rest must not emit per-entity rest events"
+    );
+    assert!(
+        snap["ledger"]["events"].as_array().unwrap().iter()
+            .any(|e| e["event_type"] == "SHORT_REST_APPLIED"),
+        "the no-op rest itself stays ledgered for auditability"
+    );
 }
 
 // --- Fail-forward wire-up (audit remediation) -------------------------------
