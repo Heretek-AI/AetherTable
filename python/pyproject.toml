@@ -24,3 +24,6 @@ dependencies = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: requires the configured external LLM endpoint and network (opt-in via LLM_KEY + RUN_LIVE_LLM=1; never runs in CI)",
+]
