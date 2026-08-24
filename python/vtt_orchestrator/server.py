@@ -186,6 +186,14 @@ all_animals: List[Dict[str, Any]] = _load_json(ANIMALS_FILE)
 all_origins: List[Dict[str, Any]] = _load_json(ORIGINS_FILE)
 all_glossary_terms: List[Dict[str, Any]] = _load_json(GLOSSARY_FILE)
 
+# Compendium RAG backend selection (backlog 4.7): QDRANT_ENABLED=1 plus a
+# healthy Qdrant indexes the loaded compendium lists for semantic lore lookup;
+# anything else keeps the deterministic substring scan, logged once at startup.
+from .lore.compendium_rag import build_compendium_rag_index
+compendium_rag = build_compendium_rag_index(
+    all_spells, all_monsters, all_magic_items
+)
+
 
 class ClassifyRequest(BaseModel):
     utterance: str
@@ -2002,8 +2010,30 @@ _SENTENCE_END_RE = re.compile(r"[.!?…](\s|$)")
 @app.get("/api/v1/compendium/lore-lookup")
 def compendium_lore_lookup(
     q: str = Query(..., description="Text to scan for SRD monster/spell references"),
+    semantic: bool = Query(
+        False,
+        description="Rank via the Qdrant compendium RAG index when enabled",
+    ),
+    k: int = Query(5, ge=1, le=25, description="Top-K entries (semantic mode)"),
 ):
-    return {"query": q, "facts": extract_srd_context(q)}
+    # Response shape is identical across retrieval modes; the "retrieval"
+    # provenance field tells callers which path served the facts:
+    # "qdrant" | "substring" | "substring_fallback".
+    if semantic:
+        results = compendium_rag.search(q, k=k)
+        if results is not None:
+            return {"query": q, "facts": results, "retrieval": "qdrant"}
+        marker = (
+            "substring_fallback"
+            if compendium_rag.available  # healthy at startup, failed NOW
+            else "substring"             # never enabled/reachable
+        )
+        return {
+            "query": q,
+            "facts": extract_srd_context(q, limit=k),
+            "retrieval": marker,
+        }
+    return {"query": q, "facts": extract_srd_context(q), "retrieval": "substring"}
 
 
 @app.post("/api/v1/lore/assert")
