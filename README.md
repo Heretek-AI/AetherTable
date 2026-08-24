@@ -165,11 +165,12 @@ Gates enforced by `scripts/run_all_benchmarks.sh` and CI:
 | **Hallucination & Continuity Index (HCI)** | $\ge 0.95$ |
 | **Auditor False-Positive Rate (AFPR)** | $\le 1.5\%$ |
 | **Auditor Recall** (lethal-narrative probes) | $\ge 95\%$ |
-| **Rust Test Suite** (`cargo test --workspace`) | all pass (~163 tests) |
-| **Python Test Suite** (`PYTHONPATH=python pytest python/tests`) | all pass (~444 collected tests; live-LLM suite is opt-in) |
-| **Client Production Build** (`npm run build`) | zero TypeScript errors, typically well under 15s |
+| **Rust Test Suite** (`cargo test --workspace`) | all pass (235 tests) |
+| **Python Test Suite** (`PYTHONPATH=python pytest python/tests`) | all pass (~580 collected; engine-live and live-LLM suites gate/skip when unset) |
+| **Client Unit Tests** (`npx vitest run`) | all pass (69 tests) |
+| **Client Production Build** (`npm run build`) | zero TypeScript errors |
 
-Latest full local run: MCR 100%, HCI 1.00, AFPR 0.0%, recall 100% (16/16 probes). These are synthetic self-play results against a scripted playtester; they are not a claim about arbitrary homebrew content.
+Latest full local run (2026-08-24, `./scripts/run_all_benchmarks.sh`, 200 turns against a live engine): MCR 100%, HCI 1.00, AFPR 0.0%, auditor recall 100% (15/15 probes), trust-boundary probes 7/7 rejected; measured latency SLA: rules 0.39ms p50, spatial ~0.35ms, intent keyword 1.10ms. These are synthetic self-play results against a scripted playtester; they are not a claim about arbitrary homebrew content.
 
 ---
 
@@ -177,19 +178,27 @@ Latest full local run: MCR 100%, HCI 1.00, AFPR 0.0%, recall 100% (16/16 probes)
 
 **Real and exercised today:**
 - **Engine-authoritative rules**: server-side attack/cast/move/death-save resolution in `vtt-core` with ids-only payloads (`deny_unknown_fields`), action budgets, condition lifecycle timers, spell slot deduction, concentration checks, reaction stack, and safety rewind with full state replay.
-- **RBAC**: role claims in gateway tokens, entity ownership enforcement, spectator restrictions, fog-layer ownership, and owner-or-GM guards on privileged session routes.
-- **WFC dungeons**: real solver with reseed retries, wildcard sockets, flood-fill single-region guarantee, and deterministic dressing.
-- **AI orchestrator with live LLM support**: tool-calling agent (`agents/tool_agent.py`) plus streaming narrative against any OpenAI-compatible endpoint configured via `.env` (`LLM_API`/`LLM_KEY`/`LLM_MODEL`); audited-before-yield streaming with honest degradation when no key is present.
-- **CRDT sync**: Yjs is the default transport via an HMAC-authenticated relay upgrade, with automatic fallback to the engine LWW relay.
-- **WebRTC video & voice** via PeerJS (lobby-scoped mesh), Silero VAD capture, HRTF positional audio.
+- **Full SRD combat maneuver suite**: grapple/shove contested checks with reach and economy gates, two-weapon fighting, and the Help action — wired end-to-end through engine, gateway, and client (with rewind on contested-action failure).
+- **RBAC at every tier**: role claims in gateway tokens (legacy no-role tokens default to Player), entity ownership enforcement, spectator restrictions, fog-layer ownership, owner-or-GM guards on privileged session routes, GM-only monster spawns, and **wire-level relay RBAC** — hidden tokens, spectator ingress, private fog, and role-projected initial-state snapshots enforced inside the Rust WS relay.
+- **WFC dungeons**: real solver with reseed retries, wildcard sockets, flood-fill single-region guarantee, deterministic dressing — and a client studio that generates real maps through an engine proxy (no fabricated previews).
+- **AI orchestrator with live LLM support**: tool-calling agent (`agents/tool_agent.py`) plus streaming narrative against any OpenAI-compatible endpoint configured via `.env` (`LLM_API`/`LLM_KEY`/`LLM_MODEL`); audited-before-yield streaming with honest degradation when no key is present, plus an opt-in live-LLM test suite.
+- **Campaign simulation & Concordia NPC endpoint**: empirical playtester sim with a social-dialogue phase (norms enforcement, stance shifts), AI companion PCs, and a parametrized quest engine (theme tables, level scaling) exposed via `/api/v1/quest/*`.
+- **Dynasty engine**: multi-generation lineages, alliances, and prestige, served on real endpoints and rendered in a client dynasty view.
+- **Handouts & campaign autosave**: role-enforced handout persistence (create/read/update with owner + role checks) and GM campaign autosave from live engine state, both fail-closed on auth.
+- **CRDT sync**: Yjs is the default transport via an HMAC-authenticated relay upgrade, with automatic fallback to the engine LWW relay; atmosphere state syncs over the same relay with client-side LWW convergence.
+- **WebRTC video & voice** via PeerJS (lobby-scoped mesh with real `<video>` tiles and honest connection-failure states), Silero VAD capture, HRTF positional audio bound to board tokens.
+- **Client quality gates**: vitest unit suite over deterministic pure modules (69 tests: SRD character math tables, encounter XP budgets, viewport sync, atmospheres), plus real engine-state-driven boss health bar / initiative HUD, spellbook casts via the engine slot pipeline, encounter builder on live compendium data, Roll20 import, and compendium search.
 - **Spatial audio, fog-of-war rendering, initiative tracking, exhaustion conditions**, lobbies (create/join-by-code/host-only launch), character persistence with RBAC-owned deploy, and engine-side request rate limiting (60s sliding window buckets: script 10/min, action 120/min, read 600/min; `/health`, `/metrics` and `/ws` unmetered).
 
 **Known limitations (documented, not hidden):**
-- Per-seat WebSocket delivery has nuances documented inline in the relay code (`crates/vtt-server/src/server.rs`, `/ws/sessions/{id}/sync` broadcast filtering); clients must tolerate deltas that arrive without per-seat fan-out guarantees.
-- Atmosphere/soundscape sync is **local-only** — soundscape state is not shared between players through the server.
+- Quest routes (`POST /api/v1/quest/generate`, `GET /api/v1/quest/active`, `POST /api/v1/quest/concordia-negotiate`) have **no server-side auth dependency**, unlike handouts/autosave; generated quest graphs also live only in gateway process memory and do not survive a restart.
+- Relay fan-out is per-frame role-filtered (`broadcast_if`), not per-seat projected — hidden-token movement deltas go to GM peers as a class, not recomputed per recipient.
+- The relay applies **no role/ownership validation to atmosphere writes**; atmosphere converges by client-side LWW only.
+- The video mesh has **no TURN/STUN configured** (default PeerJS signaling/ICE); symmetric-NAT pairs may fail to connect — failures surface honestly but are not fixed.
+- Compendium spell-damage coverage is conservative: 73 of 352 spells enriched; the rest warn instead of guessing.
+- Rate-limit buckets are process-local (no distributed limiter).
 - The rule-version preference chosen in the campaign wizard is **not persisted server-side**; it is client-held metadata.
-- Legacy gateway tokens without role claims are treated as Player.
-- If every WFC synthesis attempt contradicts, generation falls back to a walled-box map.
+- If every WFC synthesis attempt contradicts, generation falls back to an open walled box.
 
 ---
 
@@ -226,7 +235,7 @@ Latest full local run: MCR 100%, HCI 1.00, AFPR 0.0%, recall 100% (16/16 probes)
 │   │   ├── routing/                    # Intent Router, Engine Client & LLM Client
 │   │   ├── simulation/                 # Dynasty Engine & Empirical Playtester
 │   │   └── server.py                   # FastAPI REST & SSE Streaming Gateway
-│   └── tests/                          # Pytest Unit & Integration Test Suites (~444 collected)
+│   └── tests/                          # Pytest Unit & Integration Test Suites (~580 collected)
 ├── client/                             # Presentation Layer (Vite + React 18 + Tailwind)
 │   ├── src/
 │   │   ├── components/                 # UI Modals, Radars, Studios & Tabletop View
