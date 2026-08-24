@@ -27,6 +27,7 @@ import {
   BookOpen
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
+import { getStoredToken } from '../api/auth_headers';
 import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
 import {
   EngineActionOutcome,
@@ -164,6 +165,8 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     setRecoveryFeedback(null);
     setConfirmLongRest(false);
     setHealAmount(activeToken ? Math.max(0, Math.floor(activeToken.maxHp) - Math.floor(activeToken.hp)) : 0);
+    setReadyFeedback(null);
+    setReadyInput('');
   }, [activeToken?.id]);
 
   /* --- Combat maneuvers (grapple/shove/dodge/dash/disengage/stabilize) -----
@@ -352,6 +355,121 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
       () => engineStabilize({ sessionId: maneuverSessionId!, healerId, targetId: dyingId }),
       (d: EngineStabilizeResult) => stabilizeFeedback(d),
     );
+
+  /* --- SRD Ready action ----------------------------------------------------
+   * Spend your Action to hold a triggered response ("I attack the goblin when
+   * it moves"). The engine stores/surfaces/clears the declaration; matching
+   * the trigger and resolving the held action stays GM adjudication — there is
+   * no automatic trigger matching. The active declaration is read from the
+   * PROJECTED session state (your own entity travels unredacted), never from a
+   * local guess.
+   */
+  const [readiedDescription, setReadiedDescription] = useState<string | null>(null);
+  const [readyInput, setReadyInput] = useState('');
+  const [readyBusy, setReadyBusy] = useState(false);
+  const [readyFeedback, setReadyFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(
+    null,
+  );
+
+  /** Reads the held declaration out of the projected session snapshot. */
+  const refreshReadiedAction = React.useCallback(async () => {
+    const token = getStoredToken();
+    if (!token || !maneuverSessionId || !activeToken?.id) {
+      setReadiedDescription(null);
+      return;
+    }
+    try {
+      const resp = await fetch(
+        `/api/v1/engine/session-state?token=${encodeURIComponent(token)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: maneuverSessionId }),
+        },
+      );
+      if (!resp.ok) {
+        setReadiedDescription(null);
+        return;
+      }
+      const data = (await resp.json()) as {
+        entities?: Record<string, { readied_action?: { description?: unknown } }>;
+      };
+      const desc = data.entities?.[activeToken.id]?.readied_action?.description;
+      setReadiedDescription(typeof desc === 'string' && desc.trim() ? desc : null);
+    } catch {
+      setReadiedDescription(null); // unreachable engine: show nothing, invent nothing
+    }
+  }, [maneuverSessionId, activeToken?.id]);
+
+  useEffect(() => {
+    void refreshReadiedAction();
+  }, [refreshReadiedAction]);
+
+  /** Quotes the engine's rejection verbatim, mirroring the maneuver helpers. */
+  const describeReadyRejection = (
+    status: number,
+    payload: unknown,
+  ): { tone: 'ok' | 'error'; text: string } => {
+    const raw = (payload as { detail?: unknown } | null)?.detail ??
+      (payload as { error?: unknown } | null)?.error ??
+      payload;
+    const label =
+      typeof raw === 'string'
+        ? raw
+        : raw && typeof raw === 'object'
+        ? String((raw as Record<string, unknown>).message ?? `HTTP ${status}`)
+        : `HTTP ${status}`;
+    return { tone: 'error', text: `Rejected by the engine — ${label}` };
+  };
+
+  const handleReady = async (): Promise<void> => {
+    if (!activeToken || readyBusy || maneuverBusy) return;
+    const description = readyInput.trim();
+    if (!description || !maneuverSessionId) return;
+    setReadyBusy(true);
+    try {
+      const token = getStoredToken();
+      if (!token) {
+        setReadyFeedback({
+          tone: 'error',
+          text: 'Rejected by the engine — NOT_AUTHENTICATED: sign in to act through the authoritative engine.',
+        });
+        return;
+      }
+      let resp: Response;
+      try {
+        resp = await fetch(`/api/v1/engine/ready?token=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: maneuverSessionId,
+            entity_id: activeToken.id,
+            description,
+          }),
+        });
+      } catch {
+        setReadyFeedback({
+          tone: 'error',
+          text: 'Rules engine unreachable — nothing was readied.',
+        });
+        return;
+      }
+      const payload: unknown = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        setReadyFeedback(describeReadyRejection(resp.status, payload));
+        return;
+      }
+      const body = payload as { readied_action?: { description?: string }; event_sequence?: number };
+      setReadyFeedback({
+        tone: 'ok',
+        text: `Engine confirms your readied action — “${body.readied_action?.description ?? description}” is held until your next turn · event_sequence ${body.event_sequence ?? '?'}.`,
+      });
+      setReadyInput('');
+      await refreshReadiedAction();
+    } finally {
+      setReadyBusy(false);
+    }
+  };
 
   const handleEngineHeal = async () => {
     if (!activeToken || recoveryBusy || missingHp <= 0 || healAmount <= 0) return;
@@ -858,6 +976,75 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                   </span>
                 </button>
               ))}
+            </div>
+
+            {/* SRD Ready — hold a triggered response until your next turn.
+                The engine stores/surfaces/clears the declaration; matching the
+                trigger and resolving the held action is GM adjudication. */}
+            <div className="pt-2 space-y-1.5 border-t" style={{ borderColor: LEATHER_HAIRLINE }}>
+              <span className="text-[10px] font-display uppercase tracking-widest" style={{ color: CRIMSON_TEXT }}>
+                Readied Action
+              </span>
+              {readiedDescription ? (
+                <p
+                  className="text-[11px] font-prose leading-snug break-words"
+                  style={{ color: 'var(--state-success)' }}
+                  title="Held until your next turn — the GM adjudicates when your trigger fires"
+                >
+                  Holding: “{readiedDescription}”
+                </p>
+              ) : (
+                <p
+                  className="text-[10px] font-prose leading-snug"
+                  style={{ color: 'color-mix(in srgb, var(--parchment-ink) 60%, transparent)' }}
+                >
+                  Nothing readied. Ready spends your Action; it clears at your next turn.
+                </p>
+              )}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={readyInput}
+                  maxLength={200}
+                  disabled={readyBusy || maneuverBusy !== null}
+                  onChange={(e) => setReadyInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && readyInput.trim()) void handleReady();
+                  }}
+                  aria-label="Readied action description"
+                  placeholder="I attack the goblin when it moves"
+                  className="vtt-input flex-1 px-1.5 py-1 text-xs font-prose"
+                  style={{ color: INK }}
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleReady()}
+                  disabled={readyBusy || maneuverBusy !== null || !readyInput.trim()}
+                  title="Spend your Action to hold a triggered response until your next turn (resolved by the GM)"
+                  className="vtt-btn vtt-btn-secondary shrink-0 text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                    <Hand className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                    {readyBusy ? 'Readying…' : 'Ready'}
+                  </span>
+                </button>
+              </div>
+              {/* Honest result / rejection readout — verbatim engine verdicts */}
+              <div aria-live="polite" className="min-h-[0.75rem]">
+                {readyFeedback && (
+                  <p
+                    className="text-[11px] font-prose leading-snug break-words"
+                    style={{
+                      color:
+                        readyFeedback.tone === 'ok'
+                          ? 'var(--state-success)'
+                          : 'var(--state-danger)',
+                    }}
+                  >
+                    {readyFeedback.text}
+                  </p>
+                )}
+              </div>
             </div>
 
             {/* Stabilize — offered only where the projected state shows a downed,

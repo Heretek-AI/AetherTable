@@ -4077,3 +4077,149 @@ async fn stabilize_attempt_tallies_successes_and_enforces_rbac_and_gates() {
         "STABILIZE_ATTEMPTED event expected"
     );
 }
+
+// --- Ready action (SRD: spend the Action to hold a triggered response) --------
+
+#[actix_web::test]
+async fn ready_action_stores_description_spends_action_and_clears_on_refresh() {
+    let app = test_app().await;
+    let token = sign_token("gm-ready", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+
+    // Ready: 200, stores the description engine-side, spends the Action.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": hero_id, "description": "I attack the goblin", "trigger_hint": "when it moves"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("READY_ACTION_SET"));
+    assert_eq!(body["entity_id"], serde_json::json!(hero_id.to_string()));
+    assert!(
+        body["readied_action"]["description"].as_str().unwrap_or_default().contains("attack the goblin"),
+        "description is echoed back: {}",
+        body
+    );
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+
+    // Authoritative state + ledger event visible in the snapshot.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let stored = &snap["entities"][hero_id.to_string()]["readied_action"];
+    assert_eq!(stored["set_on_round"], serde_json::json!(0), "no combat round yet");
+    assert!(stored["description"].as_str().unwrap_or_default().contains("attack the goblin"));
+    assert!(
+        !snap["entities"][hero_id.to_string()]["action_budget"]["action"].as_bool().unwrap(),
+        "Ready spent the entity's Action"
+    );
+    assert!(
+        snap["ledger"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("READY_ACTION_SET")),
+        "READY_ACTION_SET lands in the ledger"
+    );
+
+    // The Action is gone: a second Ready this turn is 409.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": hero_id, "description": "second try"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+
+    // The next-turn refresh clears the readied action.
+    advance_turn(&app, &token, session_id).await;
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][hero_id.to_string()]["readied_action"].is_null(),
+        "refresh clears the readied action"
+    );
+}
+
+#[actix_web::test]
+async fn ready_action_rejects_wrong_role_owner_and_payload_shape() {
+    let app = test_app().await;
+
+    // Spectators cannot ready actions (same gate as dodge/dash/disengage).
+    let gm = sign_token_with_role("gm-ready-rbac", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id, entity_owned_by(entity_json(hero_id, "Claimed Hero", 30, 14, 0, "1d4"), "player-ten")).await;
+
+    let spectator = sign_token_with_role("spec-ready", "spectator", TEST_SECRET);
+    let (status, _) = post_contest(
+        &app,
+        &spectator,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": hero_id, "description": "sneaky"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Players cannot ready an action AS someone else's entity.
+    let player = sign_token("player-twelve", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &player,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": hero_id, "description": "not mine"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // Unknown entity → 404.
+    let (status, _) = post_contest(
+        &app,
+        &gm,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": Uuid::new_v4(), "description": "ghost"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Empty / blank description → 422.
+    for desc in ["", "   "] {
+        let (status, _) = post_contest(
+            &app,
+            &gm,
+            session_id,
+            "ready",
+            serde_json::json!({"entity_id": hero_id, "description": desc}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "blank description {:?} must be rejected", desc);
+    }
+
+    // Smuggled extra fields are structurally rejected (deny_unknown_fields).
+    let (status, _) = post_contest(
+        &app,
+        &gm,
+        session_id,
+        "ready",
+        serde_json::json!({
+            "entity_id": hero_id,
+            "description": "fine",
+            "automatic_trigger_matching": true
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "unknown fields must be structurally rejected, got {}",
+        status
+    );
+}

@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import json
@@ -1080,6 +1081,17 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
     attack_bonus = proficiency + (str_mod if uses_str else dex_mod)
     damage_expression = f"{dmg_dice}{'+' + str(attack_bonus - proficiency) if (attack_bonus - proficiency) >= 0 else str(attack_bonus - proficiency)}"
 
+    # Roll20 imports persist speed as None when movement text cannot be
+    # reduced to feet (the import warns and refuses to fabricate a default).
+    # Deploy must tolerate that: fall back to the create-route default of 30
+    # rather than raising float(None) -> unhandled 500 on every deploy.
+    speed_raw = data.get("speed", 30)
+    if isinstance(speed_raw, bool) or not isinstance(speed_raw, (int, float)) \
+            or not math.isfinite(float(speed_raw)):
+        speed_feet = 30.0
+    else:
+        speed_feet = float(speed_raw)
+
     import uuid as _uuid
     entity_id = engine_client._coerce_uuid(f"{record['character_id']}")
     entity = {
@@ -1092,7 +1104,7 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
         "max_hp": int(data.get("hp", 12)),
         "temp_hp": 0,
         "ac": int(data.get("ac", 14)),
-        "speed_feet": float(data.get("speed", 30)),
+        "speed_feet": speed_feet,
         "position": [req.x, req.y, 0.0],
         "zone_id": "Zone_Default",
         "abilities": {
@@ -1105,7 +1117,7 @@ async def deploy_character(character_id: str, req: CharacterDeployRequest, token
         },
         "conditions": [],
         "action_budget": {"action": True, "bonus_action": True, "reaction": True,
-                          "movement_remaining_feet": float(data.get("speed", 30)),
+                          "movement_remaining_feet": speed_feet,
                           "free_object_interaction": True},
         "spell_slots_remaining": {},
         "attacks": [{
@@ -1504,6 +1516,25 @@ async def engine_stabilize(req: EngineStabilizeRequest, token: str = Query(...))
         },
         _caller_actor(token),
     )
+
+
+class EngineReadyActionRequest(BaseModel):
+    session_id: str
+    entity_id: str
+    description: str
+    trigger_hint: Optional[str] = None
+
+
+@app.post("/api/v1/engine/ready")
+async def engine_ready_action(req: EngineReadyActionRequest, token: str = Query(...)):
+    payload: Dict[str, Any] = {
+        "session_id": req.session_id,
+        "entity_id": engine_client._coerce_uuid(req.entity_id),
+        "description": req.description,
+    }
+    if req.trigger_hint:
+        payload["trigger_hint"] = req.trigger_hint
+    return await _maneuver_proxy("ready", payload, _caller_actor(token))
 
 
 class EngineSessionStateRequest(BaseModel):
@@ -2801,7 +2832,8 @@ def _projected_to_character_payload(
     "fighter"/"Human") and is reported in the returned substitution warnings,
     which the route merges into its response envelope. A missing level falls
     back to the storage floor of 1 — allowed because level must be a positive
-    int — but only WITH a warning naming it.
+    int — but only WITH a warning naming it, and a level outside 1..20 is
+    clamped into range with its own "level out of range" warning.
 
     Numeric combat stats keep that route's defaults when the importer found
     nothing (the importer already emits a per-field "missing core stat"
@@ -2833,6 +2865,12 @@ def _projected_to_character_payload(
     level_raw = projected.get("level")
     if isinstance(level_raw, bool) or not isinstance(level_raw, (int, float)):
         warnings.append(f"level not present in export; defaulted to 1 (got {level_raw!r})")
+    elif not 1 <= int(level_raw) <= 20:
+        # Storage caps level at 20; clamping is unavoidable, but it must be
+        # disclosed like every other substitution this projection makes.
+        warnings.append(
+            f"level out of range; clamped {int(level_raw)} into 1..20"
+        )
     level = min(20, max(1, _import_int(level_raw, 1)))
 
     abilities_raw = projected.get("abilities") or {}

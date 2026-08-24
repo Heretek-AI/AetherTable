@@ -989,3 +989,53 @@ class TestCombatProxy:
         assert captured["path"].startswith("/api/v1/sessions/")
         coerced = captured["path"].split("/")[4]
         assert coerced == str(uuid.uuid5(uuid.NAMESPACE_URL, "thorins-table"))
+
+
+class TestReadyActionProxy:
+    """The Ready action's gateway proxy: identity-forwarded, strict body,
+    description required — same trust contract as the other maneuvers."""
+
+    @staticmethod
+    def _token(user_id: str = "gm-9", role: str = "gm") -> str:
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    def test_ready_forwards_identity_path_and_payload(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["method"], captured["path"] = method, path
+            captured["payload"], captured["actor"] = payload, actor
+            return {"status": "READY_ACTION_SET"}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        resp = client.post(
+            "/api/v1/engine/ready",
+            params={"token": self._token()},
+            json={"session_id": "s", "entity_id": "e",
+                  "description": "I attack it", "trigger_hint": "when it moves"},
+        )
+        assert resp.status_code == 200
+        assert captured["path"].endswith("/action/ready")
+        assert captured["payload"]["description"] == "I attack it"
+        assert captured["payload"]["trigger_hint"] == "when it moves"
+        assert captured["actor"]["role"] == "gm"
+
+    def test_missing_description_is_422(self):
+        resp = client.post(
+            "/api/v1/engine/ready",
+            params={"token": self._token()},
+            json={"session_id": "s", "entity_id": "e"},
+        )
+        assert resp.status_code == 422
+
+    def test_invalid_token_is_401(self):
+        resp = client.post(
+            "/api/v1/engine/ready",
+            params={"token": "garbage.token"},
+            json={"session_id": "s", "entity_id": "e", "description": "x"},
+        )
+        assert resp.status_code == 401

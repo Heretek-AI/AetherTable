@@ -159,6 +159,76 @@ def test_character_persistence_and_deploy(host, guest):
     assert denied.status_code == 403
 
 
+def _store_character_with_speed(host: dict, speed, name: str) -> dict:
+    """Persist a character row directly through storage so ``speed`` can be
+    the None that Roll20 imports persist for unparsable movement text (the
+    POST /api/v1/characters route rejects None via its int schema)."""
+    import asyncio
+
+    from vtt_orchestrator import server as server_mod
+
+    return asyncio.run(server_mod.storage_backend.create_character(
+        host["user"]["id"],
+        {
+            "name": name, "character_class": "fighter", "level": 3,
+            "race": "", "background": "", "alignment": "",
+            "abilities": {"STR": 16, "DEX": 14, "CON": 14,
+                          "INT": 10, "WIS": 12, "CHA": 8},
+            "hp": 28, "ac": 16, "speed": speed,
+            "features": [], "spells": [],
+        },
+    ))
+
+
+@pytest.mark.parametrize("bad_speed", [None, "walk 30 ft.", float("nan")])
+def test_deploy_bad_speed_falls_back_to_30_not_500(host, monkeypatch, bad_speed):
+    """Roll20 imports persist speed: None (or pass unparsable movement text
+    through verbatim) when the export's speed cannot be reduced to feet.
+    Deploy must fall back to 30 — the value the import already warned about
+    failing to determine — instead of raising float(None) -> unhandled 500."""
+    record = _store_character_with_speed(host, bad_speed, "Nullspeed")
+
+    captured = {}
+
+    async def fake_engine_request(method, path, payload=None, *, actor=None):
+        captured["payload"] = payload
+        return {"entity_id": payload["id"]}
+
+    monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+    resp = client.post(
+        f"/api/v1/characters/{record['character_id']}/deploy",
+        params={"token": host["token"]},
+        json={"session_id": "sess-mock", "x": 2.0, "y": 3.0},
+    )
+    assert resp.status_code == 200, resp.text  # NOT a TypeError-driven 500
+    assert resp.json()["status"] == "DEPLOYED"
+    assert captured["payload"]["speed_feet"] == 30.0
+    assert captured["payload"]["action_budget"]["movement_remaining_feet"] == 30.0
+
+
+def test_deploy_valid_speed_is_preserved(host, monkeypatch):
+    """The fallback must not clobber speeds that ARE determinable."""
+    record = _store_character_with_speed(host, 25, "Fleetfoot")
+
+    captured = {}
+
+    async def fake_engine_request(method, path, payload=None, *, actor=None):
+        captured["payload"] = payload
+        return {"entity_id": payload["id"]}
+
+    monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+    resp = client.post(
+        f"/api/v1/characters/{record['character_id']}/deploy",
+        params={"token": host["token"]},
+        json={"session_id": "sess-mock"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured["payload"]["speed_feet"] == 25.0
+    assert captured["payload"]["action_budget"]["movement_remaining_feet"] == 25.0
+
+
 def test_character_get_is_owner_scoped(host, guest):
     """IDOR: GET /characters/{id} must not serve another user's sheet.
 

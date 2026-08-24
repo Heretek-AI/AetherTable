@@ -300,6 +300,48 @@ def test_roll20_unparsable_speed_warns_without_fabricating_30(player):
     assert record["data"]["speed"] != 30  # nothing fabricated as authoritative
 
 
+@pytest.mark.parametrize("raw_level,clamped", [("25", 20), ("0", 1), ("-3", 1)])
+def test_roll20_out_of_range_level_clamps_with_warning(player, raw_level, clamped):
+    """A level outside 1..20 is clamped into range — but never silently.
+    The response warnings must name the clamp (disclosure contract), the way
+    missing identity fields and unparsable speed already do."""
+    doc = _thorin()
+    doc["name"] = f"Clamped {raw_level}"
+    doc["attribs"] = [
+        _attr("level", raw_level) if a["name"] == "level" else a
+        for a in doc["attribs"]
+    ]
+    resp = client.post(
+        "/api/v1/import/roll20",
+        params={"token": player["token"]},
+        json={"character_json": doc},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["imported"] == 1
+    assert any(
+        "level out of range" in w.lower() and "clamp" in w.lower()
+        for w in body["warnings"]
+    ), body["warnings"]
+
+    record = client.get(
+        f"/api/v1/characters/{body['characters'][0]['character_id']}",
+        params={"token": player["token"]},
+    ).json()
+    assert record["level"] == clamped
+
+
+def test_roll20_in_range_level_emits_no_clamp_warning(player):
+    """The clamp warning only fires for genuinely out-of-range levels."""
+    resp = client.post(
+        "/api/v1/import/roll20",
+        params={"token": player["token"]},
+        json={"character_json": _thorin()},  # level 5
+    )
+    assert resp.status_code == 200, resp.text
+    assert not any("level out of range" in w.lower() for w in resp.json()["warnings"])
+
+
 # --- Foundry preview: deliberate 501 stub ---------------------------------------------
 
 def test_foundry_preview_is_deliberate_501_contract(player):

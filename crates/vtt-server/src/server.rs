@@ -1730,6 +1730,93 @@ standard_action_route!(resolve_dodge, StandardAction::Dodge);
 standard_action_route!(resolve_dash, StandardAction::Dash);
 standard_action_route!(resolve_disengage, StandardAction::Disengage);
 
+// --- Ready action --------------------------------------------------------------
+//
+// SRD "Ready": spend your Action to hold a triggered response ("I attack the
+// goblin when it moves"). Same contract as the standard actions above —
+// ids-plus-description payload with `deny_unknown_fields`, attack-identical
+// RBAC (`may_mutate_session` + `may_control_entity`), Action spent only after
+// every validation passes, one READY_ACTION_SET ledger event per arming.
+// The engine stores/surfaces/clears the declaration; matching the trigger and
+// resolving the held action stays GM adjudication (no automatic trigger
+// matching in this iteration).
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadyActionReq {
+    pub entity_id: Uuid,
+    /// What the entity is holding ("I attack the goblin").
+    pub description: String,
+    /// Optional declared trigger ("when it moves"), folded into the stored
+    /// description for display.
+    #[serde(default)]
+    pub trigger_hint: Option<String>,
+}
+
+async fn resolve_ready_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<ReadyActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    let req = req.into_inner();
+    if req.description.trim().is_empty() {
+        return reject(
+            &data,
+            422,
+            "EMPTY_DESCRIPTION",
+            "a readied action needs a non-empty description",
+        );
+    }
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Attack-identical RBAC: spectators already rejected above; a player
+        // may only ready an action FOR an entity they control.
+        let owner = session
+            .entities
+            .get(&req.entity_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in this session");
+        }
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+
+        // Core spends the Action and ledgers READY_ACTION_SET itself; a
+        // rejection (ENTITY_CANNOT_ACT / ACTION_ECONOMY_EXHAUSTED) changes
+        // nothing.
+        let readied = match session.ready_action(
+            req.entity_id,
+            &req.description,
+            req.trigger_hint.as_deref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return reject(&data, 409, &e, "action rejected by the action economy")
+            }
+        };
+        data.count_valid();
+        let event_sequence = session.ledger.current_sequence;
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "READY_ACTION_SET",
+            "entity_id": req.entity_id.to_string(),
+            "readied_action": readied,
+            "event_sequence": event_sequence,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StabilizeActionReq {
@@ -3739,6 +3826,7 @@ pub fn configure_app_with(
                         .route("/action/dodge", web::post().to(resolve_dodge))
                         .route("/action/dash", web::post().to(resolve_dash))
                         .route("/action/disengage", web::post().to(resolve_disengage))
+                        .route("/action/ready", web::post().to(resolve_ready_action))
                         .route("/action/stabilize", web::post().to(resolve_stabilize))
                         .route("/action/cast-spell", web::post().to(resolve_cast_spell))
                         .route("/move", web::post().to(move_entity))

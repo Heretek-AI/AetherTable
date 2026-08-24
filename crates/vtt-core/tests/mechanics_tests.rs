@@ -3,7 +3,7 @@
 
 use vtt_core::dice::DiceEngine;
 use vtt_core::rules::{RulesEvaluator, SpellDefinition};
-use vtt_core::state::{EndOfTurnSave, EntityState, GameSession, ReactionType};
+use vtt_core::state::{EndOfTurnSave, EntityState, GameSession, ReadiedAction, ReactionType};
 use vtt_core::{AbilityScores};
 use vtt_core::types::{Ability, Condition, DamageType, IngressEvent, IngressType};
 
@@ -1427,3 +1427,114 @@ impl IntoPosition for (i32, i32, i32) {
 
 #[allow(dead_code)]
 fn _unused(_: IngressEvent, _: IngressType) {}
+
+// --------------------------------------------------------------- Ready action
+//
+// SRD "Ready": spend your Action to hold a triggered response ("I attack the
+// goblin when it moves"). This iteration stores, surfaces and clears the
+// readied action; resolving the trigger stays a GM adjudication.
+
+#[test]
+fn test_ready_action_stores_description_spends_action_and_ledgers() {
+    let mut session = session_with_pair();
+    session.combat.round = 4; // set_on_round must record the round it was set
+    let actor = *session.entities.keys().next().unwrap();
+
+    let ready = session
+        .ready_action(actor, "I attack the goblin", Some("when it moves"))
+        .unwrap();
+    assert_eq!(ready.set_on_round, 4);
+    assert!(
+        ready.description.contains("attack the goblin") && ready.description.contains("when it moves"),
+        "trigger hint is kept with the description for GM adjudication: {}",
+        ready.description
+    );
+
+    // The readied action is authoritative session state on the entity.
+    let stored = session.entities[&actor]
+        .readied_action
+        .as_ref()
+        .expect("readied action stored on the entity");
+    assert_eq!(stored.description, ready.description);
+    assert_eq!(stored.set_on_round, 4);
+    assert!(
+        !session.entities[&actor].action_budget.action,
+        "Ready spends the entity's Action"
+    );
+
+    // One ledger event records the arming.
+    assert!(session.ledger.events.iter().any(|e| {
+        e.event_type == "READY_ACTION_SET" && e.actor_id == actor
+    }));
+
+    // The Action is gone: a second Ready this turn is rejected WITHOUT
+    // overwriting the stored description.
+    let err = session.ready_action(actor, "second try", None).unwrap_err();
+    assert_eq!(err, "ACTION_ECONOMY_EXHAUSTED");
+    assert_eq!(
+        session.entities[&actor].readied_action.as_ref().unwrap().description,
+        ready.description,
+        "a rejected Ready must not clobber the stored description"
+    );
+
+    // Unknown entity.
+    assert_eq!(
+        session.ready_action(uuid::Uuid::new_v4(), "ghost", None).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+}
+
+#[test]
+fn test_ready_action_clears_at_the_next_round_refresh() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+
+    session.ready_action(actor, "I hold my strike", None).unwrap();
+    assert!(session.entities[&actor].readied_action.is_some());
+
+    // A readied action lasts until the actor's next turn refresh — the round
+    // advance clears it even though the trigger never fired (GM adjudicated).
+    let mut dice = DiceEngine::with_seed(3);
+    session.advance_round(&mut dice);
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "the next-turn refresh must clear the readied action"
+    );
+}
+
+#[test]
+fn test_ready_action_rejects_incapacitated_actors() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+
+    session
+        .entities
+        .get_mut(&actor)
+        .unwrap()
+        .add_condition(Condition::Unconscious);
+    assert_eq!(
+        session.ready_action(actor, "while unconscious", None).unwrap_err(),
+        "ENTITY_CANNOT_ACT"
+    );
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "a rejected Ready stores nothing"
+    );
+}
+
+#[test]
+fn test_readied_action_round_trips_and_legacy_payloads_default_to_none() {
+    let mut e = hero("ready", 30, 15);
+    e.readied_action = Some(ReadiedAction {
+        description: "I attack when it moves".to_string(),
+        set_on_round: 2,
+    });
+    let serialized = serde_json::to_value(&e).unwrap();
+    let parsed: EntityState = serde_json::from_value(serialized).unwrap();
+    assert_eq!(parsed.readied_action, e.readied_action);
+
+    // Entities persisted before this field existed deserialize cleanly.
+    let legacy: EntityState = serde_json::from_value(serde_json::to_value(hero("legacy", 30, 15)).unwrap())
+        .expect("legacy payload without readied_action");
+    assert!(legacy.readied_action.is_none());
+}

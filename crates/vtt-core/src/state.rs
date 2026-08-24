@@ -207,6 +207,11 @@ pub struct EntityState {
     /// persisted session / event-log JSON (without this field) deserializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concentration: Option<ConcentrationState>,
+    /// SRD Ready action declaration held until the actor's next turn refresh.
+    /// Serde default keeps pre-existing persisted sessions deserializing; the
+    /// engine stores and displays it only — resolution is GM adjudication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readied_action: Option<ReadiedAction>,
 }
 
 impl EntityState {
@@ -536,6 +541,7 @@ impl EntityState {
             death_saves: DeathSaveState::default(),
             is_visible: true,
             concentration: None,
+            readied_action: None,
         }
     }
 }
@@ -604,6 +610,18 @@ pub enum ReactionType {
 pub struct ArmedReaction {
     pub entity_id: Uuid,
     pub reaction_type: ReactionType,
+}
+
+/// SRD Ready action: an Action spent to hold a triggered response ("I attack
+/// the goblin when it moves"). The engine stores and surfaces the declaration
+/// only — matching the trigger and resolving the held action stays a GM
+/// adjudication. The entry clears at the actor's next turn refresh (see
+/// [`GameSession::advance_round`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReadiedAction {
+    pub description: String,
+    /// Combat round the action was readied on (0 outside combat).
+    pub set_on_round: u32,
 }
 
 /// Outcome of a round tick for one entity's condition clocks.
@@ -739,6 +757,61 @@ impl GameSession {
             .any(|r| r.entity_id == entity_id && r.reaction_type == reaction_type)
     }
 
+    // ------------------------------------------------------------ ready action
+
+    /// SRD Ready: spends the entity's Action to hold a triggered response
+    /// ("I attack the goblin when it moves") until its next turn refresh.
+    ///
+    /// Deliberately MINIMAL: this only stores, surfaces and clears the
+    /// declaration. There is no automatic trigger matching — when the player
+    /// declares the trigger has fired, the GM resolves the held action
+    /// manually (e.g. through the normal attack endpoint as a Reaction).
+    ///
+    /// The optional `trigger_hint` is folded into the stored description so a
+    /// single string carries the whole declaration for display.
+    ///
+    /// Rejections: `ENTITY_NOT_FOUND`, `ENTITY_CANNOT_ACT`,
+    /// `ACTION_ECONOMY_EXHAUSTED`. A rejected Ready stores nothing and
+    /// overwrites nothing.
+    pub fn ready_action(
+        &mut self,
+        entity_id: Uuid,
+        description: &str,
+        trigger_hint: Option<&str>,
+    ) -> Result<ReadiedAction, String> {
+        let mut description = description.trim().to_string();
+        if let Some(hint) = trigger_hint.map(str::trim).filter(|h| !h.is_empty()) {
+            description = format!("{} (trigger: {})", description, hint);
+        }
+        let round = self.combat.round;
+
+        let entity = self
+            .entities
+            .get_mut(&entity_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        // Single action-economy enforcement point: rejects incapacitated or
+        // Action-less actors BEFORE anything is stored.
+        entity.spend_action()?;
+
+        let readied = ReadiedAction {
+            description,
+            set_on_round: round,
+        };
+        entity.readied_action = Some(readied.clone());
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "READY_ACTION_SET",
+            serde_json::json!({
+                "description": readied.description,
+                "set_on_round": readied.set_on_round,
+            }),
+        );
+        Ok(readied)
+    }
+
     // ---------------------------------------------------- condition lifecycle
 
     /// Applies a timed condition and registers its duration clock.
@@ -793,6 +866,9 @@ impl GameSession {
             entity.dodge_until_next_turn = false;
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
+            // SRD: a readied action lasts until the start of the actor's next
+            // turn. If the trigger never fired, the held Action is simply lost.
+            entity.readied_action = None;
             // Start-of-round action-economy refresh. Exhaustion modifies the
             // speed the budget seeds from (halved at level 2+, zero at 5+).
             entity.action_budget.reset(entity.effective_speed_feet());
@@ -1277,6 +1353,9 @@ impl GameSession {
             entity.dodge_until_next_turn = false;
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
+            // Turn-scoped declarations are cleared wholesale on a rewind: the
+            // Ready event backing them may just have been reverted.
+            entity.readied_action = None;
             entity.action_budget.reset(entity.effective_speed_feet());
         }
 
