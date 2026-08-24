@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, lazy } from 'react';
 // Eager: only what first paint needs — landing page (default route), navbar,
 // and the Cmd+K palette. Everything else is code-split below.
 import { Navbar, SaaSView } from './components/Navbar';
@@ -75,6 +75,14 @@ import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPan
 // --- Roll history persistence ---------------------------------------------
 const ROLL_HISTORY_KEY = 'vtt_roll_history_v1';
 const ROLL_HISTORY_CAP = 50;
+
+/**
+ * Legacy inline whisper marker emitted by MacroQuickbar's "Whisper GM" toggle.
+ * New whispered lines are tagged `channel: 'gm'` + `recipient` at creation
+ * (see handleMacroRoll); this marker is still matched so pre-existing history
+ * and any future caller that forgets to tag stays spectator-safe.
+ */
+const WHISPER_MARKER = '[WHISPER TO GM]';
 
 export function App() {
   const [currentView, setCurrentView] = useState<SaaSView>('landing');
@@ -402,8 +410,85 @@ export function App() {
     },
   ]);
 
-  const selectedToken = tokens.find((t) => t.id === selectedTokenId) || tokens[0];
+  // --- Pillar 9: spectator privacy filtering (data-flow layer) --------------
+  // GOALS.md Pillar 9 requires streamer/spectator modes that never leak secret
+  // DM notes, hidden tokens, or private channels. The filtering below happens
+  // HERE, on the props handed to presentation components (TacticalCanvas,
+  // InitiativeTracker, AudioMixerModal, NarrativeChat, …) — those components
+  // stay role-agnostic and cannot accidentally render what they never receive.
+  //
+  // HONEST LIMITS — what CANNOT be guaranteed client-side (backend follow-ups):
+  //  1. Hidden TOKENS: the engine entity schema carries `is_visible`
+  //     (crates/vtt-core/src/state.rs), but no read path delivers session
+  //     entities to a browser: the orchestrator /api/v1/engine/* proxies are
+  //     write-only and the engine's GET /sessions/{id} requires HMAC auth.
+  //     The local demo/snapshot tokens below never set isVisible today, so
+  //     this filter removes nothing YET — it becomes load-bearing the moment
+  //     a snapshot or CRDT payload carries the flag. A real deployment also
+  //     needs PER-SEAT reveal (player A sees the token, player B doesn't);
+  //     one shared filtered list can only express the spectator contract.
+  //  2. Private CHAT: messages are local React state with no server fan-out.
+  //     "Privacy" here means the sender tagged the line channel:'gm' /
+  //     recipient-scoped at creation. The orchestrator must enforce the same
+  //     exclusion server-side before relaying chat to spectator sockets;
+  //     client-side filtering only protects what is rendered, not the wire.
+  //  3. Handouts & quest-journal DM notes: both modals hold module-local demo
+  //     data with `revealedTo: 'gm_only'`-style fields but NO per-role API.
+  //     Gating their entry points below is UI policy, not a data guarantee —
+  //     a backend handout/notes service must filter by seat before serving.
+  //  4. Fog-of-war layers live in one shared Y.Doc without per-layer read
+  //     ACLs; see TacticalCanvas.spectatorMode for the relay-side gap.
+  const isSpectator = userRole === 'spectator';
 
+  // GM-hidden tokens (`isVisible === false`, mirroring the engine's
+  // `is_visible`) never reach any spectator-facing surface. Players still
+  // receive them on purpose: per-player reveal is a GM choice that needs
+  // per-seat delivery (backend gap #1 above).
+  const visibleTokens = useMemo(
+    () => (isSpectator ? tokens.filter((t) => t.isVisible !== false) : tokens),
+    [tokens, isSpectator]
+  );
+
+  // A selection whose token becomes hidden mid-session must not keep feeding
+  // the character sheet / audio-radar subject for a spectator.
+  const spectatorSelectedId =
+    isSpectator &&
+    selectedTokenId !== null &&
+    !visibleTokens.some((t) => t.id === selectedTokenId)
+      ? null
+      : selectedTokenId;
+
+  const selectedToken =
+    visibleTokens.find((t) => t.id === spectatorSelectedId) || visibleTokens[0];
+
+  // Private-channel chat is excluded from what NarrativeChat receives. The
+  // channel tab UI stays (NarrativeChat owns it) — it just renders nothing
+  // private. Every private-tagging path in the app is covered:
+  //   - channel === 'gm'  → GM whispers and whispered macro rolls
+  //   - recipient present → any future direct-message tagging
+  //   - WHISPER_MARKER    → legacy inline whisper text from old history
+  const spectatorMessages = useMemo(
+    () =>
+      isSpectator
+        ? messages.filter(
+            (m) =>
+              m.channel !== 'gm' && !m.recipient && !m.content.includes(WHISPER_MARKER)
+          )
+        : messages,
+    [messages, isSpectator]
+  );
+
+  /** GM-only modal surfaces refuse to open for spectators (Pillar 9). */
+  const guardGmSurface = useCallback(
+    (surface: string, open: () => void) => () => {
+      if (isSpectator) {
+        addSystemMessage(`🚫 Spectator view: ${surface} is GM-only content.`);
+        return;
+      }
+      open();
+    },
+    [isSpectator]
+  );
   const addSystemMessage = (text: string) => {
     setMessages((prev) => [
       ...prev,
@@ -1018,7 +1103,13 @@ export function App() {
         id: `macro_${Date.now()}`,
         sender: selectedToken?.name || 'Thorin',
         role: 'player',
-        content: `🎲 ${isWhisper ? '[WHISPER TO GM] ' : ''}Triggered Macro: ${macroName} (${formula}) [${advDis.toUpperCase()}] -> Result: ${macroTotal}`,
+        content: `🎲 ${isWhisper ? `${WHISPER_MARKER} ` : ''}Triggered Macro: ${macroName} (${formula}) [${advDis.toUpperCase()}] -> Result: ${macroTotal}`,
+        // A whispered roll result is private to the GM: tag it so the GM
+        // channel tab picks it up AND spectator filtering excludes it
+        // (Pillar 9). Previously the whisper was display-only and leaked to
+        // every seat via the "All Table" tab.
+        channel: isWhisper ? 'gm' : undefined,
+        recipient: isWhisper ? 'Game Master' : undefined,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
       {
@@ -1062,9 +1153,9 @@ export function App() {
         onOpenJukebox={() => setIsJukeboxOpen(true)}
                 onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
-        onOpenMapEditor={() => setIsMapEditorOpen(true)}
-        onOpenHandouts={() => setIsHandoutsOpen(true)}
-        onOpenQuestJournal={() => setIsQuestJournalOpen(true)}
+        onOpenMapEditor={guardGmSurface('the Map & Hidden-Info Layer editor', () => setIsMapEditorOpen(true))}
+        onOpenHandouts={guardGmSurface('the Handouts Vault', () => setIsHandoutsOpen(true))}
+        onOpenQuestJournal={guardGmSurface('the Quest Journal DM notes', () => setIsQuestJournalOpen(true))}
         onToggleVideoMesh={() => setIsVideoMeshVisible(!isVideoMeshVisible)}
         onOpenStreamerHUD={() => setIsStreamerHUDOpen(true)}
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
@@ -1090,11 +1181,12 @@ export function App() {
 
         {currentView === 'tabletop' && (
           <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0 relative">
-            {/* Top Epic Boss Health Bar */}
-            {tokens.find((t) => !t.isPlayer && t.maxHp >= 50) && (
+            {/* Top Epic Boss Health Bar — derived from the spectator-filtered
+                list so a hidden boss never broadcasts its HP on stream. */}
+            {visibleTokens.find((t) => !t.isPlayer && t.maxHp >= 50) && (
               <BossHealthBar
-                bossToken={tokens.find((t) => !t.isPlayer && t.maxHp >= 50) || null}
-                activeTurnName={tokens[currentTurnIndex]?.name || 'Active Turn'}
+                bossToken={visibleTokens.find((t) => !t.isPlayer && t.maxHp >= 50) || null}
+                activeTurnName={visibleTokens[currentTurnIndex]?.name || 'Active Turn'}
               />
             )}
 
@@ -1106,9 +1198,11 @@ export function App() {
 
             {/* Tabletop Center Workspace */}
             <div className="flex-1 flex overflow-hidden relative min-h-0">
-              {/* Left Dock: Initiative Tracker */}
+              {/* Left Dock: Initiative Tracker — receives the same
+                  spectator-filtered list as the canvas so hidden entities are
+                  absent from turn order too (not merely invisible on map). */}
               <InitiativeTracker
-                tokens={tokens}
+                tokens={visibleTokens}
                 currentTurnIndex={currentTurnIndex}
                 onNextTurn={handleNextTurn}
                 onSelectToken={(id) => setSelectedTokenId(id)}
@@ -1121,9 +1215,9 @@ export function App() {
               {/* Center Tactical Canvas */}
               <main className="flex-1 h-full relative min-h-0 overflow-hidden">
                 <TacticalCanvas
-                  tokens={tokens}
+                  tokens={visibleTokens}
                   onTokenMove={handleTokenMove}
-                  selectedTokenId={selectedTokenId}
+                  selectedTokenId={spectatorSelectedId}
                   onSelectToken={(id) => setSelectedTokenId(id)}
                   onUpdateTokenElevation={handleUpdateTokenElevation}
                   currentUser={currentUser}
@@ -1134,6 +1228,7 @@ export function App() {
                   walls={customWalls}
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
+                  spectatorMode={isSpectator}
                 />
 
                 {/* Session dice audit log — floats over the map's free corner */}
@@ -1158,9 +1253,10 @@ export function App() {
             {/* In-Canvas Roll20 Style Macro Quickbar */}
             <MacroQuickbar onExecuteRoll={handleMacroRoll} />
 
-            {/* Bottom Floating Console */}
+            {/* Bottom Floating Console — receives the private-channel-filtered
+                stream; channel tabs remain but render nothing secret. */}
             <NarrativeChat
-              messages={messages}
+              messages={spectatorMessages}
               onSendMessage={handleSendMessage}
               spotlightWeights={spotlightWeights}
               isStreamingResponse={isStreamingResponse}
@@ -1196,7 +1292,7 @@ export function App() {
 
         {currentView === 'bundles' && (
           <BundleManagerView
-            tokens={tokens}
+            tokens={visibleTokens}
             walls={customWalls}
             onDeployToken={handleDeployFromBundleManager}
           />
@@ -1273,10 +1369,13 @@ export function App() {
         onLoadSnapshot={applyCampaignSnapshot}
       />
 
-      {/* Streamer Broadcast HUD Modal */}
+      {/* Streamer Broadcast HUD Modal — userRole is passed (not duplicated)
+          so the modal REPORTS the live privacy posture instead of keeping its
+          own copy of the filter state. */}
       <StreamerHUDModal
         isOpen={isStreamerHUDOpen}
         onClose={() => setIsStreamerHUDOpen(false)}
+        userRole={userRole}
         onToggleCinematicMode={(enabled) => {
           setIsLeftDockCollapsed(enabled);
           setIsRightDockCollapsed(enabled);
@@ -1284,12 +1383,13 @@ export function App() {
         }}
       />
 
-      {/* 3D Spatial Audio & Radar Modal */}
+      {/* 3D Spatial Audio & Radar Modal — filtered list: a hidden token must
+          not be selectable as a listening subject for spectators. */}
       <AudioMixerModal
         isOpen={isAudioMixerOpen}
         onClose={() => setIsAudioMixerOpen(false)}
-        tokens={tokens}
-        selectedTokenId={selectedTokenId}
+        tokens={visibleTokens}
+        selectedTokenId={spectatorSelectedId}
       />
 
       {/* Hardware Safety X-Card Modal */}

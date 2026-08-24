@@ -7,6 +7,7 @@ import {
   Check,
   Tv,
   Send,
+  ShieldAlert,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 
@@ -14,13 +15,22 @@ interface StreamerHUDModalProps {
   isOpen: boolean;
   onClose: () => void;
   onToggleCinematicMode?: (enabled: boolean) => void;
+  /**
+   * Live session role from the App shell. Passed IN rather than mirrored in
+   * local state so this modal can only ever REPORT the actual Pillar 9
+   * spectator filtering — it cannot drift out of sync with what TacticalCanvas
+   * and NarrativeChat are really receiving.
+   */
+  userRole?: 'gm' | 'player' | 'spectator';
 }
 
 export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
   isOpen,
   onClose,
   onToggleCinematicMode,
+  userRole = 'gm',
 }) => {
+  const isSpectator = userRole === 'spectator';
   const [isCinematicActive, setIsCinematicActive] = useState(false);
   const [discordWebhookUrl, setDiscordWebhookUrl] = useState('https://discord.com/api/webhooks/1042/aether_stream');
   const [relayCrits, setRelayCrits] = useState(true);
@@ -108,6 +118,29 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
             >
               {isCinematicActive ? 'ACTIVE (OBS Clean)' : 'Enable Cinematic'}
             </button>
+          </div>
+
+          {/* Spectator Privacy Posture — a read-only status card, not a toggle.
+              The filtering itself lives in the App shell (visibleTokens /
+              spectatorMessages props); this only tells the streamer what their
+              capture is guaranteed to exclude right now. */}
+          <div className="p-4 vtt-surface rounded-2xl space-y-2 shadow-inner">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <ShieldAlert className="w-4 h-4 text-tavern-accent" />
+                <span className="text-sm font-bold text-[var(--rp-parchment-100)]">
+                  Spectator Privacy Filtering
+                </span>
+              </div>
+              <span className={isSpectator ? 'vtt-badge vtt-badge-success' : 'vtt-badge'}>
+                {isSpectator ? 'ACTIVE' : 'INACTIVE (GM/Player seat)'}
+              </span>
+            </div>
+            <p className="text-xs text-[var(--rp-parchment-300)] font-sans">
+              {isSpectator
+                ? 'Spectator seat: GM-hidden tokens, private GM-whisper channels, and DM-only surfaces (Handouts Vault, Quest Journal notes, Hidden-Info map layer) are excluded from this session view and from OBS capture.'
+                : 'Trusted seat: full table content including GM whispers is visible. Switch to the Spectator lobby seat before broadcasting to enable privacy filtering.'}
+            </p>
           </div>
 
           {/* Discord Webhook Relay Form */}

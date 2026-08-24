@@ -47,6 +47,18 @@ export interface Token {
   avatarIconType?: string;
   conditions?: string[];
   elevationFeet?: number;
+  /**
+   * Pillar 9 (streamer/spectator secrecy): mirrors the engine entity flag
+   * `is_visible` (crates/vtt-core/src/state.rs). `false` = GM-hidden entity.
+   *
+   * NOTE: this component does NOT enforce the flag — the App shell filters
+   * hidden tokens OUT of the `tokens` prop before spectators ever see them
+   * (filter-at-the-data-flow-layer, not inside the renderer). The field lives
+   * on the type so hidden tokens can round-trip through snapshots/CRDT payloads
+   * without being silently dropped for GMs, who must still see and re-reveal
+   * them. Defaults to `true` (undefined = visible).
+   */
+  isVisible?: boolean;
 }
 
 interface TacticalCanvasProps {
@@ -73,6 +85,23 @@ interface TacticalCanvasProps {
    * render/fog_overlay.ts.
    */
   syncClient?: YjsCrdtClient | null;
+  /**
+   * Pillar 9 spectator/streamer mode (set by the App shell when
+   * userRole === 'spectator'). Effects:
+   *  - fog-of-war is NEVER omniscient for spectators: they see the party's
+   *    shared exploration memory, not the GM's unmasked map;
+   *  - spectators observe only — their viewport does not WRITE fog reveals
+   *    into the shared CRDT layers;
+   *  - the "GM Sight" omniscient vision-perspective control is removed.
+   *
+   * Hidden-token exclusion itself happens upstream (see Token.isVisible):
+   * this component simply renders whatever filtered token list it receives.
+   *
+   * BACKEND GAP: fog layers live in a shared Y.Doc with no per-role read
+   * ACL — any connected peer can technically read another layer. True
+   * spectator isolation needs the relay to withhold non-party fog layers.
+   */
+  spectatorMode?: boolean;
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
@@ -97,6 +126,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   particleFXRef,
   diceBoxRef,
   syncClient = null,
+  spectatorMode = false,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -139,8 +169,18 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
 
   // GMs/admins (and anonymous solo sessions — same authority precedent as the
   // token click handler above) are omniscient: no fog is rendered or written.
+  // Spectators are never omniscient regardless of the signed-in account's role:
+  // a spectator seat must not inherit GM fog clearance (Pillar 9).
   const fogOmniscient =
-    !currentUser || currentUser.role === 'admin' || currentUser.role === 'gm';
+    !spectatorMode &&
+    (!currentUser || currentUser.role === 'admin' || currentUser.role === 'gm');
+
+  // Spectators are pinned to party-shared sight; the GM-omniscient perspective
+  // is unreachable for them (its button is also hidden below). Derived once so
+  // both the render loop and the write path agree.
+  const effectivePerspective: VisionPerspective = spectatorMode
+    ? 'party'
+    : visionPerspective;
 
   /**
    * Effective fog mask for the LOCAL perspective. Convention (full contract in
@@ -312,7 +352,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           ? 420
           : 130;
 
-      if (visionPerspective === 'party') {
+      if (effectivePerspective === 'party') {
         const playerSources: Point[] = tokens
           .filter((t) => t.isPlayer)
           .map((t) => ({
@@ -329,7 +369,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             lightRadius
           );
         }
-      } else if (visionPerspective === 'selected') {
+      } else if (effectivePerspective === 'selected') {
         const active = tokens.find((t) => t.id === selectedTokenId) || tokens[0];
         if (active) {
           const source: Point = {
@@ -363,7 +403,15 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       // polygons the lighting pass just drew, so explored area genuinely
       // accumulates per player through the Y.Doc and merges across the table.
       // Throttled to ~1 write/second; only fires when something new was seen.
-      if (syncClient && !fogOmniscient && currentUser && visionPerspective !== 'gm_omniscient') {
+      // Spectators never author exploration memory — they observe the party's,
+      // they don't expand it (Pillar 9: read-only seats).
+      if (
+        syncClient &&
+        !fogOmniscient &&
+        !spectatorMode &&
+        currentUser &&
+        effectivePerspective !== 'gm_omniscient'
+      ) {
         const nowMs = performance.now();
         if (nowMs - lastFogSeedAtRef.current >= FOG_SEED_INTERVAL_MS) {
           lastFogSeedAtRef.current = nowMs;
@@ -407,7 +455,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   }, [
     tokens,
     selectedTokenId,
-    visionPerspective,
+    effectivePerspective,
+    spectatorMode,
     tokenLightMode,
     gridWidth,
     gridHeight,
@@ -623,21 +672,26 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             <span>Token POV</span>
           </button>
 
-          <button
-            onClick={() => {
-              setVisionPerspective('gm_omniscient');
-              globalAudio.playTurnAdvance();
-            }}
-            className={`flex items-center gap-1 px-2 py-1 rounded transition ${
-              visionPerspective === 'gm_omniscient'
-                ? 'bg-rule-red text-parchment-aged font-bold'
-                : 'text-parchment-aged/70 hover:text-parchment-aged'
-            }`}
-            title="GM Master Sight (Unmasked Omniscient View)"
-          >
-            <Sparkles className="w-3 h-3" />
-            <span>GM Sight</span>
-          </button>
+          {/* GM omniscient sight is a GM-only control — removed entirely for
+              spectator/streamer seats (Pillar 9); spectatorMode also pins the
+              effective perspective to 'party' above. */}
+          {!spectatorMode && (
+            <button
+              onClick={() => {
+                setVisionPerspective('gm_omniscient');
+                globalAudio.playTurnAdvance();
+              }}
+              className={`flex items-center gap-1 px-2 py-1 rounded transition ${
+                visionPerspective === 'gm_omniscient'
+                  ? 'bg-rule-red text-parchment-aged font-bold'
+                  : 'text-parchment-aged/70 hover:text-parchment-aged'
+              }`}
+              title="GM Master Sight (Unmasked Omniscient View)"
+            >
+              <Sparkles className="w-3 h-3" />
+              <span>GM Sight</span>
+            </button>
+          )}
         </div>
 
         {/* Dynamic Light Source Preset (Roll20 Style) */}
