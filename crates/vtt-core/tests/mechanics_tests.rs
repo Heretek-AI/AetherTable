@@ -303,6 +303,133 @@ fn test_safety_rewind_restores_hp_positions_and_removes_late_spawns() {
     );
 }
 
+/// Drops the paired hero to 0 HP and unconsciousness so death saves apply.
+fn knock_down(session: &mut GameSession, id: uuid::Uuid) {
+    let e = session.entities.get_mut(&id).unwrap();
+    e.current_hp = 0;
+    e.is_conscious = false;
+}
+
+#[test]
+fn test_death_save_tallies_accumulate_on_entity() {
+    use vtt_core::actions::ActionResolver;
+
+    let mut session = session_with_pair();
+    let victim = *session.entities.keys().next().unwrap();
+    knock_down(&mut session, victim);
+
+    // First failed save persists onto the entity, not a throwaway struct.
+    let mut state = session.entities[&victim].death_saves;
+    assert_eq!(ActionResolver::resolve_death_save(&mut state, 9), "PENDING");
+    session.entities.get_mut(&victim).unwrap().death_saves = state;
+    assert_eq!(session.entities[&victim].death_saves.failures, 1);
+    assert!(!session.entities[&victim].death_saves.is_dead);
+
+    // A second failed save accumulates on the persisted tally.
+    let mut state = session.entities[&victim].death_saves;
+    ActionResolver::resolve_death_save(&mut state, 5);
+    session.entities.get_mut(&victim).unwrap().death_saves = state;
+    assert_eq!(session.entities[&victim].death_saves.failures, 2);
+    assert!(!session.entities[&victim].death_saves.is_dead);
+
+    // Nat 1 counts as two failures: 2 + 2 crosses the threshold → dead,
+    // and the entity's is_dead flag follows on the next handler write-back.
+    let mut state = session.entities[&victim].death_saves;
+    assert_eq!(ActionResolver::resolve_death_save(&mut state, 1), "DEAD");
+    let e = session.entities.get_mut(&victim).unwrap();
+    e.death_saves = state;
+    e.is_dead = true;
+    assert!(e.death_saves.is_dead);
+}
+
+#[test]
+fn test_healing_resets_death_save_tally() {
+    use vtt_core::actions::ActionResolver;
+
+    let mut session = session_with_pair();
+    let victim = *session.entities.keys().next().unwrap();
+    knock_down(&mut session, victim);
+
+    let mut state = session.entities[&victim].death_saves;
+    ActionResolver::resolve_death_save(&mut state, 9); // 1 failure
+    session.entities.get_mut(&victim).unwrap().death_saves = state;
+
+    // Regaining hit points clears accumulated tallies (SRD).
+    let healed = session.entities.get_mut(&victim).unwrap();
+    healed.current_hp = 5;
+    healed.is_conscious = true;
+    assert!(healed.reset_death_saves_if_healed(), "heal must clear the ledger");
+    assert_eq!(
+        healed.death_saves,
+        vtt_core::types::DeathSaveState::default(),
+        "regaining HP must reset the death-save ledger"
+    );
+
+    // Back down again: the fresh tally starts from zero, not from 1 failure.
+    knock_down(&mut session, victim);
+    assert_eq!(
+        session.entities[&victim].death_saves,
+        vtt_core::types::DeathSaveState::default()
+    );
+    let mut state = session.entities[&victim].death_saves;
+    ActionResolver::resolve_death_save(&mut state, 9);
+    assert_eq!(state.failures, 1, "stale pre-heal failure must not carry over");
+}
+
+#[test]
+fn test_safety_rewind_replays_death_save_tallies() {
+    let mut session = session_with_pair();
+    let victim = *session.entities.keys().next().unwrap();
+    knock_down(&mut session, victim);
+
+    // Simulate the engine's event trail: one surviving failed save, then a
+    // second one that the rewind will revert.
+    let seq_after_first = {
+        let event = session.ledger.append_event(
+            session.session_id,
+            session.campaign_id,
+            victim,
+            "DEATH_SAVE_RESOLVED",
+            serde_json::json!({
+                "outcome": "PENDING", "natural_roll": 9,
+                "successes": 0, "failures": 1,
+                "is_stabilized": false, "is_dead": false,
+            }),
+        );
+        event.sequence_id
+    };
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        victim,
+        "DEATH_SAVE_RESOLVED",
+        serde_json::json!({
+            "outcome": "PENDING", "natural_roll": 5,
+            "successes": 0, "failures": 2,
+            "is_stabilized": false, "is_dead": false,
+        }),
+    );
+
+    // Live state drifted to the post-rewind tally before the X-card.
+    let e = session.entities.get_mut(&victim).unwrap();
+    e.death_saves = vtt_core::types::DeathSaveState {
+        successes: 0,
+        failures: 2,
+        is_stabilized: false,
+        is_dead: false,
+    };
+
+    session.safety_rewind(seq_after_first);
+
+    let restored = &session.entities[&victim];
+    assert_eq!(
+        restored.death_saves.failures, 1,
+        "rewind must reconstruct tallies from surviving DEATH_SAVE_RESOLVED events"
+    );
+    assert!(!restored.death_saves.is_dead);
+    assert!(!restored.is_dead);
+}
+
 /// Helper so the tuple literal reads cleanly in assertions above.
 trait IntoPosition {
     fn into_position(self) -> (f32, f32, f32);

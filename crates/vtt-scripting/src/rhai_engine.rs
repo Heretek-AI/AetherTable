@@ -97,8 +97,16 @@ impl RhaiNarrativeEngine {
 }
 
 /// SplitMix64 — small, fast, fully deterministic integer mixer.
+///
+/// The golden-ratio addition advances the stream state; the xorshift-multiply
+/// avalanche below it is what turns consecutive counters into statistically
+/// independent outputs. Omitting it makes `roll_d6` emit a strictly cycling
+/// 1..=6 sequence (the seed would only set the phase).
 fn splitmix64(state: u64) -> u64 {
-    state.wrapping_add(0x9E37_79B9_7F4A_7C15)
+    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -158,5 +166,70 @@ mod tests {
         };
         assert!(engine.evaluate_spell_hook_seeded("roll_d6(-1)", &ctx, 1).is_err());
         assert!(engine.evaluate_spell_hook_seeded("roll_d6(5000)", &ctx, 1).is_err());
+    }
+
+    /// Guards against regression to the pre-fix bug where `splitmix64` was
+    /// only the golden-ratio addition: consecutive counters then mapped to a
+    /// strictly cycling 1,2,3,4,5,6 face sequence regardless of seed.
+    #[test]
+    fn test_roll_d6_sequence_is_statistically_mixed() {
+        let engine = RhaiNarrativeEngine::new();
+        let ctx = ScriptExecutionContext {
+            caster_level: 1,
+            target_ac: 10,
+            spell_dc: 10,
+            environment_tag: "clear".to_string(),
+        };
+        let script = "let faces = []; for i in 0..48 { faces.push(roll_d6(1)); } faces";
+        let result = engine
+            .evaluate_spell_hook_seeded(script, &ctx, 2024)
+            .expect("mixed-roll script must evaluate");
+        let faces: Vec<i64> = result
+            .into_array()
+            .expect("script returns an array")
+            .into_iter()
+            .map(|d| d.as_int().expect("face is an integer"))
+            .collect();
+        assert_eq!(faces.len(), 48);
+
+        // Every face is a legal d6 value and the full spread appears.
+        assert!(faces.iter().all(|f| (1..=6).contains(f)));
+        let distinct: std::collections::HashSet<i64> = faces.iter().copied().collect();
+        assert_eq!(distinct.len(), 6, "48 rolls must visit every face");
+
+        // In a strict 1..=6 cycle, consecutive faces NEVER repeat and every
+        // adjacent difference is +1 mod 6. Real mixing produces occasional
+        // adjacent repeats ((5/6)^48 ≈ 0.02% chance of none).
+        let has_adjacent_repeat = faces.windows(2).any(|w| w[0] == w[1]);
+        assert!(
+            has_adjacent_repeat,
+            "consecutive faces never repeat — output looks like a fixed cycle"
+        );
+        let total: i64 = faces.iter().sum();
+        assert!(
+            (100..=240).contains(&total),
+            "sum of 48d6 ({total}) outside plausible range for mixed dice"
+        );
+    }
+
+    /// The avalanche finalizer must be sensitive to its input: consecutive
+    /// counters must not map to consecutive faces (+1 mod 6) everywhere.
+    #[test]
+    fn test_splitmix64_output_avalanche() {
+        for seed in [0u64, 1, 7, 0xDEAD_BEEF] {
+            let mut plus_one_mod6 = true;
+            let mut prev = splitmix64(seed);
+            for n in 1..32u64 {
+                let next = splitmix64(seed.wrapping_add(n));
+                if prev.wrapping_add(1) != next {
+                    plus_one_mod6 = false;
+                }
+                prev = next;
+            }
+            assert!(
+                !plus_one_mod6,
+                "seed {seed}: outputs increment by 1 — finalizer missing"
+            );
+        }
     }
 }

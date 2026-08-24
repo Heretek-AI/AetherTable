@@ -96,11 +96,16 @@ pub async fn insert_event(
     sequence_id: u64,
     is_reverted: bool,
 ) -> Result<(), sqlx::Error> {
+    // ON CONFLICT DO NOTHING makes tailer replays idempotent: after a
+    // transient mid-batch failure the next tick re-drains from the old
+    // watermark, and already-inserted rows conflict on the unique
+    // (session_id, ledger_sequence) index instead of erroring forever.
     sqlx::query(
         r#"INSERT INTO narrative_state.event_sourcing_log
                (session_id, campaign_id, actor_id, event_type, payload,
                 state_hash, ledger_sequence, is_reverted)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (session_id, ledger_sequence) DO NOTHING"#,
     )
     .bind(session_id)
     .bind(campaign_id)

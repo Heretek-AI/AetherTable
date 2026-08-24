@@ -166,6 +166,11 @@ pub struct EntityState {
     pub inventory: InventoryManager,
     pub is_conscious: bool,
     pub is_dead: bool,
+    /// Cumulative death-save tallies, persisted on the entity so successive
+    /// saves progress toward stabilization or death. Serde default keeps
+    /// legacy serialized entities deserializing.
+    #[serde(default)]
+    pub death_saves: DeathSaveState,
     pub is_visible: bool,
     /// Active concentration spell, if any. Serde default keeps pre-existing
     /// persisted session / event-log JSON (without this field) deserializing.
@@ -187,6 +192,24 @@ impl EntityState {
     /// True when this entity can take actions at all.
     pub fn can_act(&self) -> bool {
         self.is_conscious && !self.is_dead && !self.conditions.iter().any(|c| c.is_incapacitated())
+    }
+
+    /// SRD: regaining any hit points clears accumulated death-save tallies.
+    /// Returns true when a stale tally was wiped. Callers that restore HP
+    /// (future heal endpoints) should invoke this alongside the HP write;
+    /// the death-save endpoint also calls it defensively so a healed entity's
+    /// leftover counters never leak into a later drop.
+    pub fn reset_death_saves_if_healed(&mut self) -> bool {
+        if self.current_hp <= 0 {
+            return false;
+        }
+        let had_tally = self.death_saves.successes > 0
+            || self.death_saves.failures > 0
+            || self.death_saves.is_stabilized;
+        if had_tally {
+            self.death_saves.reset();
+        }
+        had_tally
     }
 
     /// Spends the entity's Action. Rejects when the budget is exhausted or the
@@ -255,6 +278,7 @@ impl EntityState {
             inventory: InventoryManager::new(),
             is_conscious: true,
             is_dead: false,
+            death_saves: DeathSaveState::default(),
             is_visible: true,
             concentration: None,
         }
@@ -691,6 +715,7 @@ impl GameSession {
 
         // 2. Replay surviving events to rebuild mechanical state.
         let mut hp_state: HashMap<Uuid, (i32, bool, bool)> = HashMap::new();
+        let mut death_save_state: HashMap<Uuid, DeathSaveState> = HashMap::new();
         let mut pos_state: HashMap<Uuid, (f32, f32, f32)> = HashMap::new();
 
         for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
@@ -712,6 +737,15 @@ impl GameSession {
                             hp_state.insert(tid, (hp as i32, hp > 0, ev.payload.get("instant_death").and_then(|v| v.as_bool()).unwrap_or(false)));
                         }
                     }
+                }
+                "DEATH_SAVE_RESOLVED" => {
+                    let tally = DeathSaveState {
+                        successes: ev.payload.get("successes").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                        failures: ev.payload.get("failures").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                        is_stabilized: ev.payload.get("is_stabilized").and_then(|v| v.as_bool()).unwrap_or(false),
+                        is_dead: ev.payload.get("is_dead").and_then(|v| v.as_bool()).unwrap_or(false),
+                    };
+                    death_save_state.insert(ev.actor_id, tally);
                 }
                 "MOVE_ENTITY" => {
                     let aid_ok = ev.payload.get("to").is_some();
@@ -745,6 +779,19 @@ impl GameSession {
         for (id, pos) in pos_state {
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.position = pos;
+            }
+        }
+        // Death-save tallies replay after HP so the last surviving save event
+        // wins (its counters already reflect any heal-reset at save time).
+        for (id, tally) in death_save_state {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.death_saves = tally;
+                if tally.is_dead {
+                    entity.is_dead = true;
+                }
+                if tally.is_stabilized {
+                    entity.is_dead = false;
+                }
             }
         }
         // Concentration is cleared wholesale on a rewind: any spell granting
