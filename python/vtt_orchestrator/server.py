@@ -702,6 +702,405 @@ async def hydrate_engine_session(req: EngineHydrateRequest):
     return {"status": "HYDRATED", "engine_response": result}
 
 
+# --- Lobbies -------------------------------------------------------------------
+
+class LobbyCreateRequest(BaseModel):
+    name: str = "Untitled Table"
+
+
+class LobbyJoinRequest(BaseModel):
+    invite_code: str
+
+
+_INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _invite_code() -> str:
+    return "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(6))
+
+
+async def _profile_of(user_id: str) -> Dict[str, Any]:
+    record = await storage_backend.get_user_by_id(user_id)
+    return public_user(record) if record else {"id": user_id, "displayName": user_id, "role": "player"}
+
+
+@app.post("/api/v1/lobbies")
+async def create_lobby(req: LobbyCreateRequest, token: str = Query(...)):
+    user_id = _require_user_id(token)
+    profile = await _profile_of(user_id)
+    return await storage_backend.create_lobby(
+        user_id, profile.get("displayName", user_id), req.name.strip() or "Untitled Table",
+        _invite_code(),
+    )
+
+
+@app.get("/api/v1/lobbies/mine")
+async def my_lobbies(token: str = Query(...)):
+    user_id = _require_user_id(token)
+    return {"lobbies": await storage_backend.list_lobbies_for_user(user_id)}
+
+
+@app.post("/api/v1/lobbies/{lobby_id}/join")
+async def join_lobby(lobby_id: str, req: LobbyJoinRequest, token: str = Query(...)):
+    user_id = _require_user_id(token)
+    lobby = await storage_backend.get_lobby(lobby_id)
+    if lobby is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    if req.invite_code.strip().upper() != lobby["invite_code"].upper():
+        raise HTTPException(status_code=403, detail="Invalid invite code")
+    profile = await _profile_of(user_id)
+    await storage_backend.join_lobby(
+        lobby_id, user_id, profile.get("displayName", user_id), profile.get("role", "player")
+    )
+    return await storage_backend.get_lobby(lobby_id)
+
+
+@app.get("/api/v1/lobbies/{lobby_id}")
+async def get_lobby(lobby_id: str, token: str = Query(...)):
+    _require_user_id(token)
+    lobby = await storage_backend.get_lobby(lobby_id)
+    if lobby is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    return lobby
+
+
+@app.post("/api/v1/lobbies/{lobby_id}/launch")
+async def launch_lobby(lobby_id: str, token: str = Query(...)):
+    user_id = _require_user_id(token)
+    lobby = await storage_backend.get_lobby(lobby_id)
+    if lobby is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    if lobby["host_user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Only the host can launch")
+    created = await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            "/api/v1/sessions",
+            {"campaign_id": "00000000-0000-0000-0000-00000000000a",
+             "session_name": f"Lobby {lobby['name']}"},
+        )
+    )
+    session_id = created["session_id"]
+    await storage_backend.set_lobby_session(lobby_id, session_id)
+    refreshed = await storage_backend.get_lobby(lobby_id)
+    return {"status": "LAUNCHED", "session_id": session_id, "lobby": refreshed}
+
+
+# --- Characters ------------------------------------------------------------------
+
+class CharacterCreateRequest(BaseModel):
+    name: str
+    character_class: str = "fighter"
+    level: int = Field(1, ge=1, le=20)
+    race: str = "Human"
+    background: str = "Soldier"
+    alignment: str = "Neutral Good"
+    abilities: Dict[str, int] = Field(
+        default_factory=lambda: {"STR": 16, "DEX": 14, "CON": 14, "INT": 10, "WIS": 12, "CHA": 8}
+    )
+    hp: int = 12
+    ac: int = 16
+    speed: int = 30
+    features: List[str] = Field(default_factory=list)
+    spells: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/v1/characters")
+async def create_character(req: CharacterCreateRequest, token: str = Query(...)):
+    user_id = _require_user_id(token)
+    return await storage_backend.create_character(user_id, req.model_dump())
+
+
+@app.get("/api/v1/characters")
+async def list_characters(token: str = Query(...)):
+    user_id = _require_user_id(token)
+    return {"characters": await storage_backend.list_characters(user_id)}
+
+
+@app.get("/api/v1/characters/{character_id}")
+async def get_character(character_id: str, token: str = Query(...)):
+    _require_user_id(token)
+    record = await storage_backend.get_character(character_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    return record
+
+
+@app.delete("/api/v1/characters/{character_id}")
+async def delete_character(character_id: str, token: str = Query(...)):
+    user_id = _require_user_id(token)
+    ok = await storage_backend.delete_character(character_id, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Character not found for this owner")
+    return {"status": "DELETED"}
+
+
+_CLASS_DAMAGE = {
+    "fighter": ("1d8", True), "barbarian": ("1d12", True), "ranger": ("1d8", True),
+    "paladin": ("1d8", True), "rogue": ("1d6", False), "bard": ("1d6", False),
+    "wizard": ("1d10", False), "sorcerer": ("1d10", False), "warlock": ("1d10", False),
+    "druid": ("1d8", False), "cleric": ("1d8", True), "monk": ("1d6", True),
+}
+
+
+class CharacterDeployRequest(BaseModel):
+    session_id: str
+    x: float = 5.0
+    y: float = 5.0
+
+
+@app.post("/api/v1/characters/{character_id}/deploy")
+async def deploy_character(character_id: str, req: CharacterDeployRequest, token: str = Query(...)):
+    """Materializes a stored character as an OWNED engine entity — RBAC binds
+    it to the deploying player (owner_player_id), so only they may act with it."""
+    user_id = _require_user_id(token)
+    record = await storage_backend.get_character(character_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    if record["owner_user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this character")
+
+    data = record["data"]
+    abilities = data.get("abilities", {})
+    level = int(record.get("level", 1))
+    proficiency = 2 + (level - 1) // 4
+    str_mod = (int(abilities.get("STR", 10)) - 10) // 2
+    dex_mod = (int(abilities.get("DEX", 10)) - 10) // 2
+
+    klass = record.get("character_class", "fighter").lower()
+    dmg_dice, uses_str = _CLASS_DAMAGE.get(klass, ("1d6", True))
+    attack_bonus = proficiency + (str_mod if uses_str else dex_mod)
+    damage_expression = f"{dmg_dice}{'+' + str(attack_bonus - proficiency) if (attack_bonus - proficiency) >= 0 else str(attack_bonus - proficiency)}"
+
+    import uuid as _uuid
+    entity_id = engine_client._coerce_uuid(f"{record['character_id']}")
+    entity = {
+        "id": entity_id,
+        "compendium_id": f"player_{klass}",
+        "name": record["name"],
+        "is_player": True,
+        "owner_player_id": user_id,
+        "current_hp": int(data.get("hp", 12)),
+        "max_hp": int(data.get("hp", 12)),
+        "temp_hp": 0,
+        "ac": int(data.get("ac", 14)),
+        "speed_feet": float(data.get("speed", 30)),
+        "position": [req.x, req.y, 0.0],
+        "zone_id": "Zone_Default",
+        "abilities": {
+            "strength": int(abilities.get("STR", 10)),
+            "dexterity": int(abilities.get("DEX", 10)),
+            "constitution": int(abilities.get("CON", 10)),
+            "intelligence": int(abilities.get("INT", 10)),
+            "wisdom": int(abilities.get("WIS", 10)),
+            "charisma": int(abilities.get("CHA", 10)),
+        },
+        "conditions": [],
+        "action_budget": {"action": True, "bonus_action": True, "reaction": True,
+                          "movement_remaining_feet": float(data.get("speed", 30)),
+                          "free_object_interaction": True},
+        "spell_slots_remaining": {},
+        "attacks": [{
+            "name": f"{klass.title()} Strike",
+            "attack_bonus": attack_bonus,
+            "damage_expression": damage_expression,
+            "damage_type": "slashing" if uses_str else "fire",
+        }],
+        "resistances": [],
+        "vulnerabilities": [],
+        "immunities": [],
+        "inventory": {"items": {}},
+        "is_conscious": True,
+        "is_dead": False,
+        "is_visible": True,
+        "ingress": {
+            "entity_id": entity_id,
+            "ingress_type": "SPAWN_EVENT",
+            "source_point": [0.0, 0.0, 0.0],
+            "target_point": [req.x, req.y, 0.0],
+            "verified": False,
+        },
+    }
+    result = await _engine_call(
+        engine_client.engine_request(
+            "POST", f"/api/v1/sessions/{req.session_id}/entities", entity
+        )
+    )
+    return {"status": "DEPLOYED", "entity_id": result.get("entity_id"),
+            "owner_player_id": user_id}
+
+
+# --- Engine action proxies ---------------------------------------------------------
+
+class EngineSpawnRequest(BaseModel):
+    session_id: str
+    entity: Dict[str, Any]
+    ingress: Optional[Dict[str, Any]] = None
+
+
+class EngineCastSpellRequest(BaseModel):
+    session_id: str
+    caster_id: str
+    target_id: Optional[str] = None
+    spell: Dict[str, Any]
+    cast_level: int = Field(1, ge=0, le=9)
+
+
+class EngineMoveRequest(BaseModel):
+    session_id: str
+    entity_id: str
+    x: float
+    y: float
+    z: float = 0.0
+
+
+class EngineSessionActionRequest(BaseModel):
+    session_id: str
+
+
+class EngineDamageRequest(BaseModel):
+    session_id: str
+    target_id: str
+    source_event_sequence: int
+
+
+class EngineArmReactionRequest(BaseModel):
+    session_id: str
+    entity_id: str
+    reaction_type: str
+
+
+@app.post("/api/v1/engine/spawn")
+async def engine_spawn(req: EngineSpawnRequest):
+    payload = dict(req.entity)
+    if req.ingress is not None:
+        payload["ingress"] = req.ingress
+    return await _engine_call(
+        engine_client.engine_request("POST", f"/api/v1/sessions/{req.session_id}/entities", payload)
+    )
+
+
+@app.post("/api/v1/engine/cast-spell")
+async def engine_cast_spell(req: EngineCastSpellRequest):
+    payload: Dict[str, Any] = {
+        "caster_id": engine_client._coerce_uuid(req.caster_id),
+        "spell": req.spell,
+        "cast_level": req.cast_level,
+    }
+    if req.target_id:
+        payload["target_id"] = engine_client._coerce_uuid(req.target_id)
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST", f"/api/v1/sessions/{req.session_id}/action/cast-spell", payload
+        )
+    )
+
+
+@app.post("/api/v1/engine/move")
+async def engine_move(req: EngineMoveRequest):
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/move",
+            {
+                "entity_id": engine_client._coerce_uuid(req.entity_id),
+                "x": req.x, "y": req.y, "z": req.z,
+            },
+        )
+    )
+
+
+@app.post("/api/v1/engine/turn-next")
+async def engine_turn_next(req: EngineSessionActionRequest):
+    return await _engine_call(
+        engine_client.engine_request("POST", f"/api/v1/sessions/{req.session_id}/turn/next", {})
+    )
+
+
+@app.post("/api/v1/engine/damage")
+async def engine_damage(req: EngineDamageRequest):
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/damage",
+            {
+                "target_id": engine_client._coerce_uuid(req.target_id),
+                "source_event_sequence": req.source_event_sequence,
+            },
+        )
+    )
+
+
+@app.post("/api/v1/engine/reactions/arm")
+async def engine_arm_reaction(req: EngineArmReactionRequest):
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{req.session_id}/reactions/arm",
+            {
+                "entity_id": engine_client._coerce_uuid(req.entity_id),
+                "reaction_type": req.reaction_type,
+            },
+        )
+    )
+
+
+# --- Request observability & rate limiting ------------------------------------------
+
+import logging as _logging
+
+_logging.basicConfig(level=_logging.INFO)
+http_logger = _logging.getLogger("aethertable.http")
+
+_RATE_LIMITS = {  # bucket -> (max_events, window_seconds)
+    "auth": (30, 60),
+    "agent": (60, 60),
+    "default": (600, 60),
+}
+_rate_windows: Dict[tuple, List[float]] = {}
+
+
+def _bucket_for_path(path: str) -> str:
+    if path.startswith("/api/v1/auth"):
+        return "auth"
+    if path.startswith("/api/v1/agent"):
+        return "agent"
+    return "default"
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    bucket = _bucket_for_path(request.url.path)
+    limit, window = _RATE_LIMITS[bucket]
+    client_ip = request.client.host if request.client else "unknown"
+    key = (client_ip, bucket)
+    now = time.time()
+    hits = [t for t in _rate_windows.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        retry_after = max(1, int(window - (now - hits[0])) + 1)
+        return Response(
+            content=json.dumps({"error": "RATE_LIMITED", "retry_after_s": retry_after}),
+            status_code=429,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
+    hits.append(now)
+    _rate_windows[key] = hits
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def request_log_middleware(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    http_logger.info(
+        '%s %s -> %s (%.1f ms)',
+        request.method, request.url.path, response.status_code, duration_ms,
+    )
+    return response
+
+
 # --- Multi-agent tool-calling loop --------------------------------------------
 
 class AgentTurnRequest(BaseModel):

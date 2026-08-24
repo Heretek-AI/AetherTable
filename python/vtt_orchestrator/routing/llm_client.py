@@ -1,8 +1,28 @@
 import os
 import json
+import time
 import asyncio
 from typing import Dict, Any, AsyncGenerator, Optional, List
 import httpx
+
+
+LLM_LOG_PATH = os.environ.get("LLM_LOG_PATH", "logs/llm_calls.jsonl")
+
+
+def _log_llm_call(record: Dict[str, Any]) -> None:
+    """Appends one structured JSONL record per upstream LLM interaction.
+
+    Durable run artifact for the campaign harness; complements (does not
+    replace) mitmproxy-level capture of the wire traffic.
+    """
+    try:
+        directory = os.path.dirname(LLM_LOG_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(LLM_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass  # observability must never break inference
 
 
 class ToolCallRound:
@@ -80,11 +100,39 @@ class LLMStreamingGateway:
             "temperature": 0.4,
         }
         endpoint = f"{self.config.base_url.rstrip('/')}/chat/completions"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(endpoint, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(endpoint, headers=headers, json=payload)
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                resp.raise_for_status()
+                data = resp.json()
+            message = data["choices"][0]["message"]
+            _log_llm_call({
+                "ts": time.time(),
+                "kind": "tools",
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "latency_ms": round(latency_ms, 1),
+                "status": resp.status_code,
+                "tool_calls_emitted": len(message.get("tool_calls") or []),
+                "prompt_chars": len(json.dumps(messages)),
+                "response_chars": len(message.get("content") or ""),
+                "response_excerpt": (message.get("content") or "")[:2000],
+            })
+            return message
+        except Exception as exc:
+            _log_llm_call({
+                "ts": time.time(),
+                "kind": "tools",
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                "status": getattr(locals().get("resp"), "status_code", None),
+                "error": str(exc)[:2000],
+                "prompt_chars": len(json.dumps(messages)),
+            })
+            raise
 
     async def stream_narrative(
         self,
@@ -130,6 +178,8 @@ class LLMStreamingGateway:
                 }
 
                 endpoint = f"{self.config.base_url.rstrip('/')}/chat/completions"
+                stream_started = time.perf_counter()
+                streamed_chars = 0
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
                         if response.status_code == 200:
@@ -139,15 +189,41 @@ class LLMStreamingGateway:
                                         chunk_json = json.loads(line[6:])
                                         delta = chunk_json.get("choices", [{}])[0].get("delta", {})
                                         token = delta.get("content", "")
+                                        streamed_chars += len(token)
                                         if token:
                                             yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
                                     except Exception:
                                         continue
                             yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
+                            _log_llm_call({
+                                "ts": time.time(),
+                                "kind": "stream",
+                                "model": self.config.model,
+                                "base_url": self.config.base_url,
+                                "latency_ms": round((time.perf_counter() - stream_started) * 1000.0, 1),
+                                "status": 200,
+                                "prompt_chars": len(user_prompt),
+                                "response_chars": streamed_chars,
+                            })
                             return
+                        _log_llm_call({
+                            "ts": time.time(),
+                            "kind": "stream",
+                            "model": self.config.model,
+                            "base_url": self.config.base_url,
+                            "status": response.status_code,
+                            "error": "non-200 streaming response",
+                        })
             except Exception as e:
-                # Log error and smoothly failover to deterministic mock
-                print(f"[LLM Gateway] Upstream inference error: {e}. Falling back to deterministic generator.")
+                # Structured record + smooth failover to deterministic mock.
+                _log_llm_call({
+                    "ts": time.time(),
+                    "kind": "stream",
+                    "model": self.config.model,
+                    "base_url": self.config.base_url,
+                    "status": None,
+                    "error": str(e)[:2000],
+                })
 
         # High-Speed Deterministic Generator Fallback
         # Weave SRD compendium facts into the narration so even the offline

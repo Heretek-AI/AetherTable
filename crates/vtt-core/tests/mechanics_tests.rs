@@ -5,7 +5,7 @@ use vtt_core::dice::DiceEngine;
 use vtt_core::rules::{RulesEvaluator, SpellDefinition};
 use vtt_core::state::{EndOfTurnSave, EntityState, GameSession, ReactionType};
 use vtt_core::{AbilityScores};
-use vtt_core::types::{Ability, Condition, DamageType, EgressEvent, EgressEvent as _, IngressEvent, IngressType};
+use vtt_core::types::{Ability, Condition, DamageType, IngressEvent, IngressType};
 
 fn hero(id: &str, hp: i32, ac: i32) -> EntityState {
     let mut e = EntityState::new(

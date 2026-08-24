@@ -370,9 +370,15 @@ async fn add_entity(
 
     // Ownership claim validation: players may only claim entities for
     // themselves; claiming someone else's identity is a GM privilege.
-    let mut entity = req.entity.clone();
+    // The orchestrator service principal is trusted to bind ownership on
+    // behalf of authenticated players (e.g. character deploy).
+    const SERVICE_PRINCIPAL: &str = "orchestrator-service";
+    let entity = req.entity.clone();
     if let Some(claimed) = &entity.owner_player_id {
-        if claimed != &identity.user_id && !role.is_gm() {
+        if claimed != &identity.user_id
+            && !role.is_gm()
+            && identity.user_id != SERVICE_PRINCIPAL
+        {
             return reject(
                 &data,
                 403,
@@ -1499,7 +1505,7 @@ fn validate_token_move(
         None => return Ok(()), // Free rooms (e.g. lobby) carry no map constraints.
     };
 
-    let mut last_positions = data
+    let last_positions = data
         .movement
         .entry(room_id.to_string())
         .or_default();

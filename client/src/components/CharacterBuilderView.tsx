@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { Token } from './TacticalCanvas';
+import { saveCharacter } from '../api/lobby_store';
 
 interface CharacterBuilderViewProps {
   onDeployCharacter: (token: Omit<Token, 'id' | 'x' | 'y'>) => void;
@@ -215,8 +216,24 @@ export const CharacterBuilderView: React.FC<CharacterBuilderViewProps> = ({ onDe
     }
   };
 
-  const handleDeployToBattlefield = () => {
+  const handleDeployToBattlefield = async () => {
     globalAudio.playSpellCast();
+    // Persist to the server roster first (silently skipped when offline);
+    // the local deploy below remains the immediate in-session effect.
+    try {
+      await saveCharacter({
+        name,
+        character_class: selectedClass.toLowerCase(),
+        level,
+        race: selectedRace,
+        abilities: {
+          STR: getFinalScore('str'), DEX: getFinalScore('dex'),
+          CON: getFinalScore('con'), INT: getFinalScore('int'),
+          WIS: getFinalScore('wis'), CHA: getFinalScore('cha'),
+        },
+        hp: computedHP, ac: computedAC, speed: 30,
+      });
+    } catch { /* offline — local-only deploy */ }
     onDeployCharacter({
       name,
       hp: computedHP,

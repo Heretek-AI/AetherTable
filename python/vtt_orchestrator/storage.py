@@ -64,6 +64,37 @@ CREATE TABLE IF NOT EXISTS narrative_state.engine_session_snapshots (
     snapshot      JSONB NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS narrative_state.lobbies (
+    lobby_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    invite_code       VARCHAR(8) UNIQUE NOT NULL,
+    name              TEXT NOT NULL,
+    host_user_id      TEXT NOT NULL,
+    engine_session_id UUID,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS narrative_state.lobby_members (
+    lobby_id     UUID REFERENCES narrative_state.lobbies(lobby_id) ON DELETE CASCADE,
+    user_id      TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT 'player',
+    joined_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (lobby_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS narrative_state.player_characters (
+    character_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_user_id   TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    character_class TEXT NOT NULL DEFAULT 'fighter',
+    level           INT  NOT NULL DEFAULT 1,
+    data            JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_player_characters_owner
+    ON narrative_state.player_characters (owner_user_id);
 """
 
 
@@ -87,6 +118,8 @@ class MemoryStore:
         self.saves: Dict[str, Dict[str, Any]] = {}        # save_id -> record
         self.campaign_names: Dict[str, Dict[str, str]] = {}  # owner -> {name -> campaign_id}
         self.engine_snapshots: Dict[str, Dict[str, Any]] = {}  # session_id -> snapshot
+        self.lobbies: Dict[str, Dict[str, Any]] = {}           # lobby_id -> record
+        self.characters: Dict[str, Dict[str, Any]] = {}        # character_id -> record
         self._counter = 0
 
     @property
@@ -193,6 +226,101 @@ class MemoryStore:
     async def load_engine_snapshot(self, session_id: str) -> Optional[Dict[str, Any]]:
         record = self.engine_snapshots.get(session_id)
         return record["snapshot"] if record else None
+
+    async def create_lobby(self, host_user_id: str, host_display_name: str,
+                           name: str, invite_code: str) -> Dict[str, Any]:
+        lobby_id = f"lob_{secrets.token_hex(6)}"
+        record = {
+            "lobby_id": lobby_id,
+            "invite_code": invite_code,
+            "name": name,
+            "host_user_id": host_user_id,
+            "engine_session_id": None,
+            "created_at": time.time(),
+            "members": [{
+                "user_id": host_user_id,
+                "display_name": host_display_name,
+                "role": "gm",
+                "joined_at": time.time(),
+            }],
+        }
+        self.lobbies[lobby_id] = record
+        return self._lobby_public(record)
+
+    async def join_lobby(self, lobby_id: str, user_id: str,
+                         display_name: str, role: str) -> bool:
+        record = self.lobbies.get(lobby_id)
+        if record is None:
+            return False
+        for m in record["members"]:
+            if m["user_id"] == user_id:
+                return True  # idempotent rejoin
+        record["members"].append({
+            "user_id": user_id, "display_name": display_name,
+            "role": role, "joined_at": time.time(),
+        })
+        return True
+
+    async def get_lobby(self, lobby_id: str) -> Optional[Dict[str, Any]]:
+        record = self.lobbies.get(lobby_id)
+        return self._lobby_public(record) if record else None
+
+    async def list_lobbies_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+        out = []
+        for record in self.lobbies.values():
+            if any(m["user_id"] == user_id for m in record["members"]):
+                out.append(self._lobby_public(record))
+        out.sort(key=lambda l: l["created_at"], reverse=True)
+        return out
+
+    async def set_lobby_session(self, lobby_id: str, engine_session_id: str) -> None:
+        record = self.lobbies.get(lobby_id)
+        if record is not None:
+            record["engine_session_id"] = engine_session_id
+
+    @staticmethod
+    def _lobby_public(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "lobby_id": record["lobby_id"],
+            "invite_code": record["invite_code"],
+            "name": record["name"],
+            "host_user_id": record["host_user_id"],
+            "engine_session_id": record["engine_session_id"],
+            "created_at": record["created_at"],
+            "members": [
+                {"user_id": m["user_id"], "display_name": m["display_name"], "role": m["role"]}
+                for m in record["members"]
+            ],
+        }
+
+    async def create_character(self, owner_user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        character_id = f"chr_{secrets.token_hex(6)}"
+        record = {
+            "character_id": character_id,
+            "owner_user_id": owner_user_id,
+            "name": payload["name"],
+            "character_class": payload.get("character_class", "fighter"),
+            "level": int(payload.get("level", 1)),
+            "data": payload,
+            "created_at": time.time(),
+        }
+        self.characters[record["character_id"]] = record
+        return {k: v for k, v in record.items() if k != "data"}
+
+    async def list_characters(self, owner_user_id: str) -> List[Dict[str, Any]]:
+        rows = [c for c in self.characters.values() if c["owner_user_id"] == owner_user_id]
+        return [{k: v for k, v in c.items() if k != "data"} for c in
+                sorted(rows, key=lambda r: r["created_at"], reverse=True)]
+
+    async def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
+        return self.characters.get(character_id)
+
+    async def delete_character(self, character_id: str, owner_user_id: str) -> bool:
+        record = self.characters.get(character_id)
+        if record is None or record["owner_user_id"] != owner_user_id:
+            return False
+        del self.characters[character_id]
+        return True
 
 
 class PostgresStore:
@@ -346,6 +474,139 @@ class PostgresStore:
         if isinstance(snap, str):
             return json.loads(snap)
         return snap
+
+    async def create_lobby(self, host_user_id: str, host_display_name: str,
+                           name: str, invite_code: str) -> Dict[str, Any]:
+        row = await self.pool.fetchrow(
+            """INSERT INTO narrative_state.lobbies (invite_code, name, host_user_id)
+               VALUES ($1, $2, $3)
+               RETURNING lobby_id, invite_code, name, host_user_id,
+                         engine_session_id, created_at""",
+            invite_code, name, host_user_id,
+        )
+        await self.pool.execute(
+            """INSERT INTO narrative_state.lobby_members (lobby_id, user_id, display_name, role)
+               VALUES ($1, $2, $3, 'gm') ON CONFLICT DO NOTHING""",
+            row["lobby_id"], host_user_id, host_display_name,
+        )
+        members = await self.pool.fetch(
+            "SELECT user_id, display_name, role FROM narrative_state.lobby_members WHERE lobby_id = $1",
+            row["lobby_id"],
+        )
+        return {
+            "lobby_id": str(row["lobby_id"]),
+            "invite_code": row["invite_code"],
+            "name": row["name"],
+            "host_user_id": row["host_user_id"],
+            "engine_session_id": None,
+            "created_at": str(row["created_at"]),
+            "members": [dict(m) for m in members],
+        }
+
+    async def join_lobby(self, lobby_id: str, user_id: str,
+                         display_name: str, role: str) -> bool:
+        result = await self.pool.execute(
+            """INSERT INTO narrative_state.lobby_members (lobby_id, user_id, display_name, role)
+               VALUES ($1, $2, $3, $4) ON CONFLICT (lobby_id, user_id) DO NOTHING""",
+            lobby_id, user_id, display_name, role,
+        )
+        return True  # idempotent; unknown lobby surfaces via get_lobby
+
+    async def get_lobby(self, lobby_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            row = await self.pool.fetchrow(
+                """SELECT lobby_id, invite_code, name, host_user_id,
+                          engine_session_id, created_at
+                   FROM narrative_state.lobbies WHERE lobby_id = $1""",
+                lobby_id,
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        members = await self.pool.fetch(
+            "SELECT user_id, display_name, role FROM narrative_state.lobby_members WHERE lobby_id = $1",
+            lobby_id,
+        )
+        return {
+            "lobby_id": str(row["lobby_id"]),
+            "invite_code": row["invite_code"],
+            "name": row["name"],
+            "host_user_id": row["host_user_id"],
+            "engine_session_id": str(row["engine_session_id"]) if row["engine_session_id"] else None,
+            "created_at": str(row["created_at"]),
+            "members": [dict(m) for m in members],
+        }
+
+    async def list_lobbies_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """SELECT l.lobby_id FROM narrative_state.lobbies l
+               JOIN narrative_state.lobby_members m ON m.lobby_id = l.lobby_id
+               WHERE m.user_id = $1 ORDER BY l.created_at DESC""",
+            user_id,
+        )
+        out = []
+        for r in rows:
+            lobby = await self.get_lobby(str(r["lobby_id"]))
+            if lobby:
+                out.append(lobby)
+        return out
+
+    async def set_lobby_session(self, lobby_id: str, engine_session_id: str) -> None:
+        await self.pool.execute(
+            "UPDATE narrative_state.lobbies SET engine_session_id = $2 WHERE lobby_id = $1",
+            lobby_id, engine_session_id,
+        )
+
+    async def create_character(self, owner_user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        row = await self.pool.fetchrow(
+            """INSERT INTO narrative_state.player_characters
+                   (owner_user_id, name, character_class, level, data)
+               VALUES ($1, $2, $3, $4, $5::jsonb)
+               RETURNING character_id, owner_user_id, name, character_class,
+                         level, created_at""",
+            owner_user_id, payload["name"],
+            payload.get("character_class", "fighter"), int(payload.get("level", 1)),
+            json_dumps(payload),
+        )
+        meta = dict(row)
+        meta["character_id"] = str(meta["character_id"])
+        return meta
+
+    async def list_characters(self, owner_user_id: str) -> List[Dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """SELECT character_id, owner_user_id, name, character_class, level, created_at
+               FROM narrative_state.player_characters WHERE owner_user_id = $1
+               ORDER BY created_at DESC""",
+            owner_user_id,
+        )
+        out = []
+        for r in rows:
+            meta = dict(r)
+            meta["character_id"] = str(meta["character_id"])
+            out.append(meta)
+        return out
+
+    async def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
+        row = await self.pool.fetchrow(
+            """SELECT character_id, owner_user_id, name, character_class, level, data, created_at
+               FROM narrative_state.player_characters WHERE character_id = $1""",
+            character_id,
+        )
+        if row is None:
+            return None
+        record = dict(row)
+        record["character_id"] = str(record["character_id"])
+        data = record["data"]
+        record["data"] = json.loads(data) if isinstance(data, str) else data
+        return record
+
+    async def delete_character(self, character_id: str, owner_user_id: str) -> bool:
+        status = await self.pool.execute(
+            "DELETE FROM narrative_state.player_characters WHERE character_id = $1 AND owner_user_id = $2",
+            character_id, owner_user_id,
+        )
+        return status.endswith("1")
 
 
 def json_dumps(value: Any) -> str:

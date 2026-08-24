@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { createLobby, joinLobby, launchLobby, fetchLobby, listMyLobbies, type Lobby } from '../api/lobby_store';
 import {
   Users,
   Shield,
@@ -36,6 +37,9 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
   const [selectedSeat, setSelectedSeat] = useState<string>('seat_gm');
   // Live presence from the engine relay; null while unreachable (solo session).
   const [livePeers, setLivePeers] = useState<number | null>(null);
+  // REAL lobby state: created/joined via /api/v1/lobbies. Null = demo fallback.
+  const [lobby, setLobby] = useState<Lobby | null>(null);
+  const [joinCode, setJoinCode] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -51,9 +55,21 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     };
     pollPresence();
     const timer = setInterval(pollPresence, 5000);
+
+    // Restore the user's most recent lobby and refresh its roster.
+    listMyLobbies().then((mine) => {
+      if (!cancelled && mine && mine.length > 0) setLobby(mine[0]);
+    });
+    const rosterTimer = setInterval(() => {
+      setLobby((current) => {
+        if (current) fetchLobby(current.lobby_id).then((fresh) => { if (!cancelled && fresh) setLobby(fresh); });
+        return current;
+      });
+    }, 5000);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      clearInterval(rosterTimer);
     };
   }, []);
 
@@ -65,6 +81,8 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     difficulty: 'Heroic Challenge (CR 5-8)',
     passcode: 'VANE-1042',
   });
+
+  const displayCode = lobby?.invite_code ?? campaignMeta.passcode;
 
   const [seats, setSeats] = useState<PlayerSeat[]>([
     {
@@ -115,7 +133,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     },
   ]);
 
-  const inviteUrl = `http://localhost:3000?campaign=vane-1042&passcode=${campaignMeta.passcode}`;
+  const inviteUrl = `http://localhost:3000?campaign=vane-1042&passcode=${displayCode}`;
 
   const handleCopyLink = () => {
     navigator.clipboard.writeText(inviteUrl);
@@ -130,8 +148,31 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     // (launch campaign) rather than every seat pick.
   };
 
-  const handleLaunch = () => {
+  // Host: create a real lobby bound to this table name; players join by code.
+  const handleCreateLobby = async () => {
+    const created = await createLobby(campaignMeta.title);
+    if (created) setLobby(created);
+  };
+
+  const handleJoinLobby = async () => {
+    if (!joinCode.trim()) return;
+    // Join by code against the host's lobby id carried in the invite URL,
+    // or fall back to the most recent lobby we know of.
+    const target = lobby?.lobby_id ?? new URLSearchParams(window.location.search).get('lobby');
+    if (!target) return;
+    const joined = await joinLobby(target, joinCode.trim());
+    if (joined) setLobby(joined);
+  };
+
+  const handleLaunch = async () => {
     globalAudio.playSpellCast();
+    if (lobby && !lobby.engine_session_id) {
+      const launched = await launchLobby(lobby.lobby_id);
+      if (launched?.session_id) {
+        setLobby({ ...lobby, engine_session_id: launched.session_id });
+      }
+      // Offline/failed launch still proceeds into the demo tabletop.
+    }
     onLaunchCampaign(selectedSeat);
   };
 
@@ -271,7 +312,31 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
             <div className="p-3 rounded-lg border border-tavern-border text-xs font-mono space-y-1.5 text-[var(--rp-parchment-300)] bg-tavern-bg/60">
               <div className="flex justify-between">
                 <span>Room Passcode:</span>
-                <strong className="text-[var(--rp-parchment-100)]">{campaignMeta.passcode}</strong>
+<div className="flex items-center gap-2 mb-2">
+                  <button
+                    onClick={handleCreateLobby}
+                    className="px-2 py-1 text-xs vtt-surface hover:bg-black/20 rounded-lg transition"
+                    title="Create a real multiplayer lobby (requires login)"
+                  >
+                    Create Lobby
+                  </button>
+                  <input
+                    value={joinCode}
+                    onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                    placeholder="CODE"
+                    maxLength={6}
+                    className="w-16 px-1 py-1 text-xs bg-black/40 border border-tavern-border rounded-lg font-mono"
+                  />
+                  <button
+                    onClick={handleJoinLobby}
+                    className="px-2 py-1 text-xs vtt-surface hover:bg-black/20 rounded-lg transition"
+                    title="Join by invite code (requires lobby id in URL)"
+                  >
+                    Join
+                  </button>
+                </div>
+                
+                <strong className="text-[var(--rp-parchment-100)]">{displayCode}</strong>
               </div>
               <div className="flex justify-between">
                 <span>Ruleset:</span>

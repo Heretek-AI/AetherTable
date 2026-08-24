@@ -262,11 +262,7 @@ async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
     // seed that hits by scanning a few deterministic seeds.
     let mut event_sequence = None;
     let mut total_damage = 0i64;
-    let mut hit_found = false;
     for seed in 1..=50u64 {
-        if hit_found {
-            break;
-        }
         let req = test::TestRequest::post()
             .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
             .insert_header(auth.clone())
@@ -288,7 +284,6 @@ async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
                 if body["is_hit"].as_bool() == Some(true) {
                     event_sequence = body["event_sequence"].as_u64();
                     total_damage = body["total_damage"].as_i64().unwrap_or(0);
-                    hit_found = true;
                 }
                 // A miss still spends the Action, so stop scanning seeds.
                 break;
@@ -567,7 +562,7 @@ async fn rbac_enforcement_spectator_player_gm() {
     // GM spawns two entities: one owned by player-1, one by someone else.
     let hero_id = Uuid::new_v4();
     let other_id = Uuid::new_v4();
-    for (mut payload, id, name, owner) in [
+    for (mut payload, _id, _name, owner) in [
         (
             entity_json(hero_id, "Player Hero", 20, 14, 6, "1d8"),
             hero_id,
