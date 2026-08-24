@@ -15,6 +15,8 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Check,
+  Layers,
+  AlertTriangle,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { Token } from './TacticalCanvas';
@@ -26,44 +28,6 @@ import type { StatblockKind } from '../ui/Statblock';
 interface CompendiumViewProps {
   onSpawnToken: (tokenData: Omit<Token, 'id' | 'x' | 'y'>) => void;
 }
-
-const FALLBACK_MONSTERS = [
-  { id: 'm1', name: 'Adult Red Dragon', size: 'Huge', type: 'Dragon', challenge_rating: '17', ac: 19, hp: 256, speed: '40 ft, fly 80 ft', xp: 18000, description: 'Legendary apex predator breathing cone of destructive fire.' },
-  { id: 'm2', name: 'Orc Warlord', size: 'Medium', type: 'Humanoid (Orc)', challenge_rating: '3', ac: 16, hp: 58, speed: '30 ft', xp: 700, description: 'Battle-hardened vanguard commander wielding heavy greataxe.' },
-  { id: 'm3', name: 'Goblin Scout', size: 'Small', type: 'Humanoid (Goblinoid)', challenge_rating: '1/4', ac: 15, hp: 7, speed: '30 ft', xp: 50, description: 'Nimble skirmisher with shortbow and stealth tactics.' },
-  { id: 'm4', name: 'Iron Golem Titan', size: 'Large', type: 'Construct', challenge_rating: '16', ac: 20, hp: 210, speed: '30 ft', xp: 15000, description: 'Unstoppable forged titan immune to non-magical physical strikes.' },
-  { id: 'm5', name: 'Beholder', size: 'Large', type: 'Aberration', challenge_rating: '13', ac: 18, hp: 180, speed: '0 ft, fly 20 ft', xp: 10000, description: 'Central antimagic cone eye with 10 lethal eye stalks.' },
-  { id: 'm6', name: 'Lich', size: 'Medium', type: 'Undead', challenge_rating: '21', ac: 17, hp: 135, speed: '30 ft', xp: 33000, description: 'Ancient spellcaster bound to a phylactery commanding 9th-level spells.' },
-  { id: 'm7', name: 'Gelatinous Cube', size: 'Large', type: 'Ooze', challenge_rating: '2', ac: 6, hp: 84, speed: '15 ft', xp: 450, description: 'Transparent dungeon scavenger engulfing unwary adventurers.' },
-  { id: 'm8', name: 'Mind Flayer', size: 'Medium', type: 'Aberration', challenge_rating: '7', ac: 15, hp: 71, speed: '30 ft', xp: 2900, description: 'Psionic entity extracting brains with tentacle grappling.' },
-  { id: 'm9', name: 'Frost Giant', size: 'Huge', type: 'Giant', challenge_rating: '8', ac: 15, hp: 138, speed: '40 ft', xp: 3900, description: 'Immense warrior wielding greataxe and hurling glacial boulders.' },
-  { id: 'm10', name: 'Vampire Lord', size: 'Medium', type: 'Undead', challenge_rating: '13', ac: 16, hp: 144, speed: '30 ft', xp: 10000, description: 'Shapechanging aristocrat drinking blood and commanding bat swarms.' },
-  { id: 'm11', name: 'Dire Wolf', size: 'Large', type: 'Beast', challenge_rating: '1', ac: 14, hp: 37, speed: '50 ft', xp: 200, description: 'Pack tactics predator knocking targets prone on bite.' },
-  { id: 'm12', name: 'Hydra', size: 'Huge', type: 'Monstrosity', challenge_rating: '8', ac: 15, hp: 172, speed: '30 ft, swim 30 ft', xp: 3900, description: 'Multi-headed beast regrowing two heads for every severed head.' },
-  { id: 'm13', name: 'Shadow Assassin', size: 'Medium', type: 'Humanoid', challenge_rating: '5', ac: 15, hp: 78, speed: '30 ft', xp: 1800, description: 'Stealth striker executing sneak attacks with poisoned daggers.' },
-  { id: 'm14', name: 'Skeleton Archer', size: 'Medium', type: 'Undead', challenge_rating: '1/4', ac: 13, hp: 13, speed: '30 ft', xp: 50, description: 'Animated bones wielding shortbow and shortsword.' },
-  { id: 'm15', name: 'Zombie Vanguard', size: 'Medium', type: 'Undead', challenge_rating: '1/4', ac: 8, hp: 22, speed: '20 ft', xp: 50, description: 'Relentless undead with Undead Fortitude survival.' },
-  { id: 'm16', name: 'Ancient Blue Dragon', size: 'Gargantuan', type: 'Dragon', challenge_rating: '23', ac: 22, hp: 481, speed: '40 ft, fly 80 ft', xp: 50000, description: 'Desert titan unleashing 120-ft lightning breath.' },
-  { id: 'm17', name: 'Owlbear', size: 'Large', type: 'Monstrosity', challenge_rating: '3', ac: 13, hp: 59, speed: '40 ft', xp: 700, description: 'Ferocious hybrid with keen sight and smell.' },
-  { id: 'm18', name: 'Treant', size: 'Huge', type: 'Plant', challenge_rating: '9', ac: 16, hp: 138, speed: '30 ft', xp: 5000, description: 'Ancient woodland guardian animating trees to crush trespassers.' },
-];
-
-const FALLBACK_SPELLS = [
-  { id: 's1', name: 'Fireball', level: 3, school: 'Evocation', casting_time: '1 action', range: '150 feet', duration: 'Instantaneous', description: 'A bright streak flashes from your pointing finger to a point you choose within range and then blossoms with a low roar into an explosion of flame (8d6 Fire, 20ft sphere).' },
-  { id: 's2', name: 'Shield', level: 1, school: 'Abjuration', casting_time: '1 reaction', range: 'Self', duration: '1 round', description: 'An invisible barrier of magical force appears and protects you. Until the start of your next turn, you have a +5 bonus to AC, including against the triggering attack.' },
-  { id: 's3', name: 'Cure Wounds', level: 1, school: 'Evocation', casting_time: '1 action', range: 'Touch', duration: 'Instantaneous', description: 'A creature you touch regains a number of hit points equal to 1d8 + your spellcasting ability modifier.' },
-  { id: 's4', name: 'Counterspell', level: 3, school: 'Abjuration', casting_time: '1 reaction', range: '60 feet', duration: 'Instantaneous', description: 'You attempt to interrupt a creature in the process of casting a spell. If the creature is casting a spell of 3rd level or lower, its spell fails.' },
-  { id: 's5', name: 'Misty Step', level: 2, school: 'Conjuration', casting_time: '1 bonus action', range: 'Self', duration: 'Instantaneous', description: 'Briefly surrounded by silvery mist, you teleport up to 30 feet to an unoccupied space that you can see.' },
-  { id: 's6', name: 'Magic Missile', level: 1, school: 'Evocation', casting_time: '1 action', range: '120 feet', duration: 'Instantaneous', description: 'You create three glowing darts of magical force. Each dart hits a creature of your choice that you can see within range dealing 1d4 + 1 force damage.' },
-  { id: 's7', name: 'Haste', level: 3, school: 'Transmutation', casting_time: '1 action', range: '30 feet', duration: 'Concentration, up to 1 minute', description: 'Choose a willing creature. Its speed is doubled, it gains a +2 bonus to AC, advantage on Dexterity saving throws, and an additional action each turn.' },
-  { id: 's8', name: 'Polymorph', level: 4, school: 'Transmutation', casting_time: '1 action', range: '60 feet', duration: 'Concentration, up to 1 hour', description: 'This spell transforms a creature with at least 1 hit point that you can see within range into a beast form (e.g. Giant Ape or Tyrannosaurus Rex).' },
-  { id: 's9', name: 'Invisibility', level: 2, school: 'Illusion', casting_time: '1 action', range: 'Touch', duration: 'Concentration, up to 1 hour', description: 'A creature you touch becomes invisible until the spell ends. Anything the target is wearing or carrying is invisible.' },
-  { id: 's10', name: 'Spiritual Weapon', level: 2, school: 'Evocation', casting_time: '1 bonus action', range: '60 feet', duration: '1 minute', description: 'You create a floating, spectral weapon within range that lasts for the duration. On your turn, you can bonus action attack for 1d8 + MOD force.' },
-  { id: 's11', name: 'Eldritch Blast', level: 0, school: 'Evocation', casting_time: '1 action', range: '120 feet', duration: 'Instantaneous', description: 'A beam of crackling energy streaks toward a creature within range dealing 1d10 force damage.' },
-  { id: 's12', name: 'Revivify', level: 3, school: 'Necromancy', casting_time: '1 action', range: 'Touch', duration: 'Instantaneous', description: 'You touch a creature that has died within the last minute. That creature returns to life with 1 hit point.' },
-  { id: 's13', name: 'Hold Person', level: 2, school: 'Enchantment', casting_time: '1 action', range: '60 feet', duration: 'Concentration, up to 1 minute', description: 'Choose a humanoid that you can see within range. The target must succeed on a Wisdom saving throw or be paralyzed for the duration.' },
-  { id: 's14', name: 'Fly', level: 3, school: 'Transmutation', casting_time: '1 action', range: 'Touch', duration: 'Concentration, up to 10 minutes', description: 'You touch a willing creature. The target gains a flying speed of 60 feet for the duration.' },
-];
 
 export type CompendiumTab = 'monsters' | 'spells' | 'magic-items' | 'feats' | 'animals' | 'glossary';
 
@@ -81,6 +45,42 @@ const CARD_ICONS: Record<CompendiumTab, LucideIcon> = Object.fromEntries(
   TABS.map((t) => [t.id, t.icon]),
 ) as Record<CompendiumTab, LucideIcon>;
 
+/**
+ * One real endpoint per section (python/vtt_orchestrator/server.py serves
+ * each from the SRD 5.2 fixtures under /compendium). `pick` extracts the
+ * payload key so loading/failure/empty can be tracked per section honestly —
+ * there is deliberately NO client-side fallback dataset: if the service is
+ * unreachable the section says so instead of showing invented entries.
+ */
+const SECTION_SOURCES: Record<CompendiumTab, { url: string; pick: (json: any) => unknown }> = {
+  monsters: { url: '/api/v1/compendium/monsters?limit=400', pick: (j) => j?.monsters },
+  spells: { url: '/api/v1/compendium/spells?limit=400', pick: (j) => j?.spells },
+  'magic-items': { url: '/api/v1/compendium/magic-items?limit=300', pick: (j) => j?.magic_items },
+  feats: { url: '/api/v1/compendium/feats?limit=100', pick: (j) => j?.feats },
+  animals: { url: '/api/v1/compendium/animals?limit=150', pick: (j) => j?.animals },
+  glossary: { url: '/api/v1/compendium/glossary?limit=200', pick: (j) => j?.glossary },
+};
+
+type SectionStatus = 'loading' | 'ready' | 'empty' | 'failed';
+
+const initialSections = (): Record<CompendiumTab, any[]> => ({
+  monsters: [],
+  spells: [],
+  'magic-items': [],
+  feats: [],
+  animals: [],
+  glossary: [],
+});
+
+const initialSectionStatus = (): Record<CompendiumTab, SectionStatus> => ({
+  monsters: 'loading',
+  spells: 'loading',
+  'magic-items': 'loading',
+  feats: 'loading',
+  animals: 'loading',
+  glossary: 'loading',
+});
+
 const SPELL_SCHOOLS = [
   'Abjuration',
   'Conjuration',
@@ -94,6 +94,9 @@ const SPELL_SCHOOLS = [
 
 const CR_FILTERS = ['All', '0', '1/4', '1/2', '1', '2', '3', '5', '7', '10', '13', '17', '21'];
 
+/** How many hits per section the cross-section search shows before "more". */
+const CROSS_SECTION_LIMIT = 6;
+
 /** Tab → shared Statblock renderer kind. Feats print like items. */
 function statblockKindForTab(tab: CompendiumTab): StatblockKind {
   if (tab === 'spells') return 'spell';
@@ -104,17 +107,18 @@ function statblockKindForTab(tab: CompendiumTab): StatblockKind {
 export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) => {
   const [activeTab, setActiveTab] = useState<CompendiumTab>('monsters');
   const [searchQuery, setSearchQuery] = useState('');
+  // Cross-section mode: one query box filters every fetched set at once.
+  const [searchAllSections, setSearchAllSections] = useState(false);
   const [selectedSchool, setSelectedSchool] = useState<string>('All');
   const [selectedCR, setSelectedCR] = useState<string>('All');
 
-  const [monsters, setMonsters] = useState<any[]>(FALLBACK_MONSTERS);
-  const [spells, setSpells] = useState<any[]>(FALLBACK_SPELLS);
-  const [magicItems, setMagicItems] = useState<any[]>([]);
-  const [feats, setFeats] = useState<any[]>([]);
-  const [animals, setAnimals] = useState<any[]>([]);
-  const [glossaryTerms, setGlossaryTerms] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [sections, setSections] = useState<Record<CompendiumTab, any[]>>(initialSections);
+  const [sectionStatus, setSectionStatus] = useState<Record<CompendiumTab, SectionStatus>>(
+    initialSectionStatus,
+  );
   const [selectedItem, setSelectedItem] = useState<Record<string, any> | null>(null);
+  /** Which section the open detail entry came from (drives the Statblock kind). */
+  const [selectedKind, setSelectedKind] = useState<CompendiumTab>('monsters');
   const [spawnSuccess, setSpawnSuccess] = useState<string | null>(null);
 
   // Pagination State
@@ -122,61 +126,36 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
   const ITEMS_PER_PAGE = 12;
 
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      try {
-        const [
-          monstersRes,
-          spellsRes,
-          magicItemsRes,
-          featsRes,
-          animalsRes,
-          glossaryRes,
-        ] = await Promise.all([
-          fetch('/api/v1/compendium/monsters?limit=350').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/spells?limit=400').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/magic-items?limit=300').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/feats?limit=100').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/animals?limit=150').then((r) => (r.ok ? r.json() : null)),
-          fetch('/api/v1/compendium/glossary?limit=200').then((r) => (r.ok ? r.json() : null)),
-        ]);
-        if (monstersRes?.monsters?.length) setMonsters(monstersRes.monsters);
-        if (spellsRes?.spells?.length) setSpells(spellsRes.spells);
-        if (magicItemsRes?.magic_items?.length) setMagicItems(magicItemsRes.magic_items);
-        if (featsRes?.feats?.length) setFeats(featsRes.feats);
-        if (animalsRes?.animals?.length) setAnimals(animalsRes.animals);
-        if (glossaryRes?.glossary?.length) setGlossaryTerms(glossaryRes.glossary);
-      } catch (e) {
-        console.warn('Compendium API unavailable, using rich built-in SRD dataset.');
-      } finally {
-        setLoading(false);
-      }
+    let cancelled = false;
+    const load = async () => {
+      await Promise.all(
+        TABS.map(async ({ id }) => {
+          const { url, pick } = SECTION_SOURCES[id];
+          try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const items = pick(await res.json());
+            if (cancelled) return;
+            const list = Array.isArray(items) ? items : [];
+            setSections((prev) => ({ ...prev, [id]: list }));
+            setSectionStatus((prev) => ({ ...prev, [id]: list.length > 0 ? 'ready' : 'empty' }));
+          } catch {
+            if (cancelled) return;
+            setSectionStatus((prev) => ({ ...prev, [id]: 'failed' }));
+          }
+        }),
+      );
     };
-    fetchData();
+    load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Reset pagination on search or tab change
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery, selectedSchool, selectedCR, activeTab]);
-
-  const filteredMonsters = monsters.filter((m) => {
-    const matchesSearch =
-      m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (m.type && m.type.toLowerCase().includes(searchQuery.toLowerCase()));
-    const crValue = String(m.challenge_rating || m.cr || '');
-    const matchesCR = selectedCR === 'All' || crValue.toLowerCase().includes(selectedCR.toLowerCase());
-    return matchesSearch && matchesCR;
-  });
-
-  const filteredSpells = spells.filter((s) => {
-    const matchesSearch =
-      s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (s.description && s.description.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesSchool =
-      selectedSchool === 'All' || (s.school && s.school.toLowerCase() === selectedSchool.toLowerCase());
-    return matchesSearch && matchesSchool;
-  });
+  }, [searchQuery, selectedSchool, selectedCR, activeTab, searchAllSections]);
 
   const q = searchQuery.toLowerCase();
   const matchesText = (entry: any) =>
@@ -186,26 +165,57 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     entry.description?.toLowerCase().includes(q) ||
     entry.definition?.toLowerCase().includes(q);
 
-  const filteredMagicItems = magicItems.filter(matchesText);
-  const filteredFeats = feats.filter(matchesText);
-  const filteredAnimals = animals.filter(
-    (a) => matchesText(a) && (selectedCR === 'All' || String(a.challenge_rating || '').includes(selectedCR.toLowerCase()))
-  );
-  const filteredGlossary = glossaryTerms.filter(matchesText);
+  const filteredMonsters = sections.monsters.filter((m) => {
+    const matchesSearch =
+      m.name.toLowerCase().includes(q) || (m.type || m.creature_type || '').toLowerCase().includes(q);
+    const crValue = String(m.challenge_rating || m.cr || '');
+    const matchesCR = selectedCR === 'All' || crValue.toLowerCase().includes(selectedCR.toLowerCase());
+    return matchesSearch && matchesCR;
+  });
 
-  // Active items and pagination calculations
-  const activeItems =
-    activeTab === 'monsters'
-      ? filteredMonsters
-      : activeTab === 'spells'
-        ? filteredSpells
-        : activeTab === 'magic-items'
-          ? filteredMagicItems
-          : activeTab === 'feats'
-            ? filteredFeats
-            : activeTab === 'animals'
-              ? filteredAnimals
-              : filteredGlossary;
+  const filteredSpells = sections.spells.filter((s) => {
+    const matchesSearch =
+      s.name.toLowerCase().includes(q) ||
+      (s.description && s.description.toLowerCase().includes(q));
+    const matchesSchool =
+      selectedSchool === 'All' || (s.school && s.school.toLowerCase() === selectedSchool.toLowerCase());
+    return matchesSearch && matchesSchool;
+  });
+
+  const filteredMagicItems = sections['magic-items'].filter(matchesText);
+  const filteredFeats = sections.feats.filter(matchesText);
+  const filteredAnimals = sections.animals.filter(
+    (a) =>
+      matchesText(a) &&
+      (q ? a.name.toLowerCase().includes(q) || (a.type || a.creature_type || '').toLowerCase().includes(q) : true) &&
+      (selectedCR === 'All' ||
+        String(a.challenge_rating || '').includes(selectedCR.toLowerCase()))
+  );
+  const filteredGlossary = sections.glossary.filter(matchesText);
+
+  const filteredByTab: Record<CompendiumTab, any[]> = {
+    monsters: filteredMonsters,
+    spells: filteredSpells,
+    'magic-items': filteredMagicItems,
+    feats: filteredFeats,
+    animals: filteredAnimals,
+    glossary: filteredGlossary,
+  };
+
+  /** True when the query box is driving the cross-section result view. */
+  const crossSearchActive = searchAllSections && q.trim().length > 0;
+
+  // Cross-section groups: up to CROSS_SECTION_LIMIT hits per fetched set.
+  const crossGroups = TABS.map(({ id, label, icon }) => ({
+    tab: id,
+    label,
+    icon,
+    total: filteredByTab[id].length,
+    items: filteredByTab[id].slice(0, CROSS_SECTION_LIMIT),
+  })).filter((g) => g.items.length > 0);
+  const crossTotalMatches = crossGroups.reduce((sum, g) => sum + g.total, 0);
+
+  const activeItems = filteredByTab[activeTab];
   const totalPages = Math.max(1, Math.ceil(activeItems.length / ITEMS_PER_PAGE));
   const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
   const paginatedItems = activeItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
@@ -258,20 +268,34 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
     return pages;
   };
 
-  const openEntry = (entry: Record<string, any>) => {
+  const openEntry = (entry: Record<string, any>, tab: CompendiumTab) => {
     // Glossary entries key on term/definition; normalize so the Statblock
     // renderer (which prints item.name/item.description) sees both.
-    if (activeTab === 'glossary') {
-      setSelectedItem({ ...entry, name: entry.term, description: entry.definition });
-    } else {
-      setSelectedItem(entry);
-    }
+    setSelectedKind(tab);
+    setSelectedItem(
+      tab === 'glossary' ? { ...entry, name: entry.term, description: entry.definition } : entry,
+    );
   };
 
-  const selectedCanSpawn = activeTab === 'monsters' || activeTab === 'animals';
+  const selectedCanSpawn = selectedKind === 'monsters' || selectedKind === 'animals';
 
   const pageNavBtn =
     'vtt-btn vtt-btn-secondary disabled:opacity-30 disabled:pointer-events-none';
+
+  /** Shared banner panel for loading / failure / empty states. */
+  const noticePanel = (icon: React.ReactNode, text: string, tone: 'muted' | 'danger' = 'muted') => (
+    <div
+      role="status"
+      className={`p-12 text-center font-mono text-xs bg-tavern-bg border rounded-xl flex flex-col items-center gap-3 ${
+        tone === 'danger'
+          ? 'border-[var(--state-danger)] text-[var(--state-danger)]'
+          : 'border-tavern-border text-[var(--rp-parchment-300)]'
+      }`}
+    >
+      {icon}
+      <span>{text}</span>
+    </div>
+  );
 
   return (
     <div className="w-full h-full flex flex-col overflow-hidden p-6 max-w-7xl mx-auto space-y-4 select-none">
@@ -302,7 +326,9 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-[var(--rp-parchment-300)] pointer-events-none" />
               <input
                 type="text"
-                placeholder="Search monsters, spells, rules..."
+                placeholder={
+                  searchAllSections ? 'Search every section...' : 'Search monsters, spells, rules...'
+                }
                 aria-label="Search the compendium"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -310,7 +336,20 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
               />
             </div>
 
-            {activeTab === 'spells' && (
+            <button
+              type="button"
+              onClick={() => setSearchAllSections((v) => !v)}
+              aria-pressed={searchAllSections}
+              title="Filter every compendium section with one query"
+              className={`vtt-btn text-[11px] whitespace-nowrap ${
+                searchAllSections ? 'vtt-btn-primary' : 'vtt-btn-secondary'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>All Sections</span>
+            </button>
+
+            {activeTab === 'spells' && !crossSearchActive && (
               <select
                 aria-label="Filter by school of magic"
                 value={selectedSchool}
@@ -326,7 +365,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
               </select>
             )}
 
-            {(activeTab === 'monsters' || activeTab === 'animals') && (
+            {(activeTab === 'monsters' || activeTab === 'animals') && !crossSearchActive && (
               <select
                 aria-label="Filter by challenge rating"
                 value={selectedCR}
@@ -364,10 +403,60 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
 
       {/* Main Content Grid (Scrollable) */}
       <div className="flex-1 overflow-y-auto vtt-scrollbar pr-1 min-h-0">
-        {paginatedItems.length === 0 ? (
-          <div className="p-12 text-center text-[var(--rp-parchment-300)] font-mono text-xs bg-tavern-bg border border-tavern-border rounded-xl">
-            No entries found matching "{searchQuery}".
-          </div>
+        {/* Loading: nothing is shown as data until the real fetch resolves. */}
+        {TABS.every((t) => sectionStatus[t.id] === 'loading') ? (
+          noticePanel(<Wand2 className="w-6 h-6 animate-pulse" aria-hidden="true" />, 'Consulting the archives...')
+        ) : crossSearchActive ? (
+          crossGroups.length === 0 ? (
+            noticePanel(<Search className="w-6 h-6 opacity-60" aria-hidden="true" />, `No entries found matching "${searchQuery}" in any section.`)
+          ) : (
+            <div className="space-y-6">
+              {crossGroups.map(({ tab, label, icon: Icon, total, items }) => (
+                <section key={tab} aria-label={`${label} results`}>
+                  <h3 className="flex items-center gap-2 mb-3 font-mono text-xs uppercase tracking-wide text-[var(--rp-parchment-300)]">
+                    <Icon className="w-4 h-4 text-tavern-accent" aria-hidden="true" />
+                    {label}
+                    <span className="vtt-badge">{total}</span>
+                  </h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {items.map((entry: Record<string, any>, index: number) => (
+                      <CompendiumCard
+                        key={entry.id || index}
+                        entry={entry}
+                        kind={tab}
+                        spawned={spawnSuccess === (entry.name ?? entry.term)}
+                        onOpen={() => openEntry(entry, tab)}
+                        onSpawn={
+                          tab === 'monsters' || tab === 'animals'
+                            ? () => handleSpawnMonster(entry)
+                            : undefined
+                        }
+                      />
+                    ))}
+                  </div>
+                  {total > items.length && (
+                    <p className="mt-2 font-mono text-[10px] text-[var(--rp-parchment-300)] opacity-70">
+                      Showing first {items.length} of {total} — switch to the {label} tab to page through the rest.
+                    </p>
+                  )}
+                </section>
+              ))}
+            </div>
+          )
+        ) : paginatedItems.length === 0 ? (
+          sectionStatus[activeTab] === 'loading' ? (
+            noticePanel(<Wand2 className="w-6 h-6 animate-pulse" aria-hidden="true" />, 'Consulting the archives...')
+          ) : sectionStatus[activeTab] === 'failed' ? (
+            noticePanel(
+              <AlertTriangle className="w-6 h-6" aria-hidden="true" />,
+              `The compendium service could not be reached for this section, so no entries are shown.`,
+              'danger',
+            )
+          ) : sectionStatus[activeTab] === 'empty' && !q ? (
+            noticePanel(<BookOpen className="w-6 h-6 opacity-60" aria-hidden="true" />, 'This section has no entries.')
+          ) : (
+            noticePanel(<Search className="w-6 h-6 opacity-60" aria-hidden="true" />, `No entries found matching "${searchQuery}".`)
+          )
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {paginatedItems.map((entry: Record<string, any>, index: number) => (
@@ -376,7 +465,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
                 entry={entry}
                 kind={activeTab}
                 spawned={spawnSuccess === (entry.name ?? entry.term)}
-                onOpen={() => openEntry(entry)}
+                onOpen={() => openEntry(entry, activeTab)}
                 onSpawn={
                   activeTab === 'monsters' || activeTab === 'animals'
                     ? () => handleSpawnMonster(entry)
@@ -390,19 +479,26 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
 
       {/* Bottom Responsive Pagination Bar */}
       <footer className="bg-tavern-bg border border-tavern-border rounded-2xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0 font-mono text-xs text-[var(--rp-parchment-300)]">
-        <div className="text-xs">
-          Showing{' '}
-          <strong className="text-parchment-paper">
-            {activeItems.length > 0 ? startIndex + 1 : 0}
-          </strong>
-          –
-          <strong className="text-parchment-paper">
-            {Math.min(startIndex + ITEMS_PER_PAGE, activeItems.length)}
-          </strong>{' '}
-          of <strong className="text-tavern-accent">{activeItems.length}</strong> {activeTab} (Page{' '}
-          <strong className="text-parchment-paper">{currentPage}</strong> of{' '}
-          <strong className="text-parchment-paper">{totalPages}</strong>)
-        </div>
+        {crossSearchActive ? (
+          <div className="text-xs">
+            <strong className="text-tavern-accent">{crossTotalMatches}</strong> matches across{' '}
+            <strong className="text-parchment-paper">{crossGroups.length}</strong> sections for "{searchQuery}"
+          </div>
+        ) : (
+          <div className="text-xs">
+            Showing{' '}
+            <strong className="text-parchment-paper">
+              {activeItems.length > 0 ? startIndex + 1 : 0}
+            </strong>
+            –
+            <strong className="text-parchment-paper">
+              {Math.min(startIndex + ITEMS_PER_PAGE, activeItems.length)}
+            </strong>{' '}
+            of <strong className="text-tavern-accent">{activeItems.length}</strong> {activeTab} (Page{' '}
+            <strong className="text-parchment-paper">{currentPage}</strong> of{' '}
+            <strong className="text-parchment-paper">{totalPages}</strong>)
+          </div>
+        )}
 
         <div className="hidden lg:block text-[9px] text-[var(--rp-parchment-300)] opacity-70">
           Rules content from the D&amp;D System Reference Document 5.2 © Wizards of the Coast (
@@ -418,55 +514,57 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
         </div>
 
         {/* Pagination Nav Buttons */}
-        <div className="flex items-center space-x-1.5">
-          <button
-            onClick={() => handlePageChange(1)}
-            disabled={currentPage === 1}
-            className={pageNavBtn}
-            title="First Page"
-          >
-            <ChevronsLeft className="w-4 h-4" aria-hidden="true" />
-          </button>
-          <button
-            onClick={() => handlePageChange(currentPage - 1)}
-            disabled={currentPage === 1}
-            className={pageNavBtn}
-            title="Previous Page"
-          >
-            <ChevronLeft className="w-4 h-4" aria-hidden="true" />
-          </button>
-
-          {/* Page Number Pills */}
-          {getPageNumbers().map((num) => (
+        {!crossSearchActive && (
+          <div className="flex items-center space-x-1.5">
             <button
-              key={num}
-              onClick={() => handlePageChange(num)}
-              aria-current={num === currentPage ? 'page' : undefined}
-              className={`vtt-btn w-7 h-7 text-xs ${
-                num === currentPage ? 'vtt-btn-primary' : 'vtt-btn-secondary'
-              }`}
+              onClick={() => handlePageChange(1)}
+              disabled={currentPage === 1}
+              className={pageNavBtn}
+              title="First Page"
             >
-              {num}
+              <ChevronsLeft className="w-4 h-4" aria-hidden="true" />
             </button>
-          ))}
+            <button
+              onClick={() => handlePageChange(currentPage - 1)}
+              disabled={currentPage === 1}
+              className={pageNavBtn}
+              title="Previous Page"
+            >
+              <ChevronLeft className="w-4 h-4" aria-hidden="true" />
+            </button>
 
-          <button
-            onClick={() => handlePageChange(currentPage + 1)}
-            disabled={currentPage === totalPages}
-            className={pageNavBtn}
-            title="Next Page"
-          >
-            <ChevronRight className="w-4 h-4" aria-hidden="true" />
-          </button>
-          <button
-            onClick={() => handlePageChange(totalPages)}
-            disabled={currentPage === totalPages}
-            className={pageNavBtn}
-            title="Last Page"
-          >
-            <ChevronsRight className="w-4 h-4" aria-hidden="true" />
-          </button>
-        </div>
+            {/* Page Number Pills */}
+            {getPageNumbers().map((num) => (
+              <button
+                key={num}
+                onClick={() => handlePageChange(num)}
+                aria-current={num === currentPage ? 'page' : undefined}
+                className={`vtt-btn w-7 h-7 text-xs ${
+                  num === currentPage ? 'vtt-btn-primary' : 'vtt-btn-secondary'
+                }`}
+              >
+                {num}
+              </button>
+            ))}
+
+            <button
+              onClick={() => handlePageChange(currentPage + 1)}
+              disabled={currentPage === totalPages}
+              className={pageNavBtn}
+              title="Next Page"
+            >
+              <ChevronRight className="w-4 h-4" aria-hidden="true" />
+            </button>
+            <button
+              onClick={() => handlePageChange(totalPages)}
+              disabled={currentPage === totalPages}
+              className={pageNavBtn}
+              title="Last Page"
+            >
+              <ChevronsRight className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
+        )}
       </footer>
 
       {/* Rich Statblock Detail Sheet — ModalShell owns the dialog pattern
@@ -498,7 +596,7 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
           ) : undefined
         }
       >
-        <Statblock item={selectedItem ?? {}} kind={statblockKindForTab(activeTab)} />
+        <Statblock item={selectedItem ?? {}} kind={statblockKindForTab(selectedKind)} />
       </ModalShell>
     </div>
   );
@@ -513,6 +611,8 @@ export const CompendiumView: React.FC<CompendiumViewProps> = ({ onSpawnToken }) 
  *   magic-items      → rarity badge + attunement flag
  *   feats            → category + prerequisite footer
  *   glossary         → [tag] + definition prose
+ * Absent SRD fields render as em-dashes (or drop their badge) — the card never
+ * invents placeholder stats for what the server did not send.
  */
 interface CompendiumCardProps {
   /** Loosely typed SRD compendium entry (shapes vary per endpoint). */
@@ -543,41 +643,54 @@ function CompendiumCard({ entry, kind, spawned, onOpen, onSpawn }: CompendiumCar
   const Icon = CARD_ICONS[kind];
   const isCreature = kind === 'monsters' || kind === 'animals';
 
+  const creatureType = entry.type || entry.creature_type;
+
   let title = entry.name ?? entry.term ?? 'Untitled';
   let tagline = '';
   switch (kind) {
     case 'monsters':
-      tagline = `${entry.size || 'Medium'} ${entry.type || 'Monstrosity'}`;
+      tagline = [entry.size, creatureType].filter(Boolean).join(' ') || '—';
       break;
     case 'animals':
-      tagline = `${entry.size || 'Medium'} Beast`;
+      tagline = [entry.size, creatureType || 'Beast'].filter(Boolean).join(' ');
       break;
     case 'spells':
-      tagline = `${entry.level === 0 ? 'Cantrip' : `Level ${entry.level}`} · ${entry.school ?? ''}`;
+      tagline =
+        [
+          entry.level == null ? null : entry.level === 0 ? 'Cantrip' : `Level ${entry.level}`,
+          entry.school,
+        ]
+          .filter(Boolean)
+          .join(' · ') || '—';
       break;
     case 'magic-items':
-      tagline = entry.item_type || entry.category || '';
+      tagline = entry.item_type || entry.category || '—';
       break;
     case 'feats':
-      tagline = `${entry.category ?? ''} Feat`;
+      tagline = entry.category ? `${entry.category} Feat` : '—';
       break;
     case 'glossary':
       tagline = entry.tag ? `[${entry.tag}]` : 'Rules Term';
       break;
   }
 
+  // Badges only appear when the server actually sent the field — an unknown
+  // rarity or school stays blank rather than masquerading as "Common".
+  const crValue = entry.challenge_rating ?? entry.cr;
   const badge =
     isCreature
-      ? `CR ${entry.challenge_rating || entry.cr || '1'}`
+      ? crValue != null && crValue !== ''
+        ? `CR ${crValue}`
+        : null
       : kind === 'spells'
-        ? entry.school
+        ? entry.school || null
         : kind === 'magic-items'
-          ? entry.rarity || 'Common'
+          ? entry.rarity || null
           : null;
 
   const body =
     kind === 'spells' || kind === 'magic-items' || kind === 'feats' || kind === 'glossary'
-      ? entry.description ?? entry.definition
+      ? (entry.description ?? entry.definition) || null
       : null;
 
   return (
@@ -611,12 +724,13 @@ function CompendiumCard({ entry, kind, spawned, onOpen, onSpawn }: CompendiumCar
         </div>
 
         {/* Creature cards carry the printed-book attribute strip; the paper
-            background needs ink-dark values, hence text-parchment-ink here. */}
+            background needs ink-dark values, hence text-parchment-ink here.
+            Nullish coalescing keeps legitimate zeros (e.g. AC 6 oozes). */}
         {isCreature && (
           <dl className="vtt-statblock-attr grid grid-cols-3 gap-2 px-2.5 py-1.5 mt-3 rounded-sm text-parchment-ink">
-            <MiniAttr label="AC" value={entry.armor_class || entry.ac || 14} />
-            <MiniAttr label="HP" value={entry.hit_points || entry.hp || 30} />
-            <MiniAttr label="Speed" value={entry.speed || '30 ft'} />
+            <MiniAttr label="AC" value={entry.armor_class ?? entry.ac ?? null} />
+            <MiniAttr label="HP" value={entry.hit_points ?? entry.hp ?? null} />
+            <MiniAttr label="Speed" value={entry.speed ?? null} />
           </dl>
         )}
 
@@ -633,18 +747,20 @@ function CompendiumCard({ entry, kind, spawned, onOpen, onSpawn }: CompendiumCar
             <span />
           </div>
           <div className="flex items-center justify-between font-mono text-xs text-[var(--rp-parchment-300)]">
-            {kind === 'monsters' && <span className="text-[10px]">XP: {entry.xp || 100}</span>}
+            {kind === 'monsters' && (
+              <span className="text-[10px]">XP: {entry.xp != null && entry.xp !== '' ? entry.xp : '—'}</span>
+            )}
 
             {kind === 'spells' && (
               <>
-                <span>{entry.casting_time || '1 action'}</span>
-                <span>{entry.range || '60 ft'}</span>
+                <span>{entry.casting_time || '—'}</span>
+                <span>{entry.range || '—'}</span>
               </>
             )}
 
             {kind === 'magic-items' && (
               <>
-                <span className="capitalize">{entry.category}</span>
+                <span className="capitalize">{entry.category || '—'}</span>
                 {entry.requires_attunement && <span className="vtt-badge">Attunement</span>}
               </>
             )}
