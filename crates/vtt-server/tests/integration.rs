@@ -861,3 +861,392 @@ async fn x_card_open_to_players_blocked_for_spectators() {
     let body: serde_json::Value = test::read_body_json(res).await;
     assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
 }
+
+// --- Healing & rests (backlog 4.3 / 5.8) --------------------------------------
+
+/// Creates a session as GM and returns its id.
+async fn create_session_as(app: &impl Service<
+    actix_http::Request,
+    Response = ServiceResponse<EitherBody<BoxBody>>,
+    Error = actix_web::Error,
+>, token: &str) -> Uuid {
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Heal"}))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    body["session_id"].as_str().unwrap().parse().unwrap()
+}
+
+#[actix_web::test]
+async fn heal_happy_path_restores_hp_consciousness_and_death_saves() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // A dying hero: 0 HP, unconscious, two failed death saves banked.
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Dying Hero", 20, 14, 5, "1d8");
+    hero["current_hp"] = serde_json::json!(0);
+    hero["is_conscious"] = serde_json::json!(false);
+    hero["death_saves"] = serde_json::json!({"successes": 1, "failures": 2, "is_stabilized": false, "is_dead": false});
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(hero)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Heal for 6 → back up, conscious, death-save tally wiped (SRD).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "amount": 6}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "heal must resolve");
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["amount_applied"], 6);
+    assert_eq!(body["hp_remaining"], 6);
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    let snap: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let hero = &snap["entities"][&hero_id.to_string()];
+    assert_eq!(hero["current_hp"], 6);
+    assert_eq!(hero["is_conscious"], true);
+    assert_eq!(hero["death_saves"]["failures"], 0, "healing wipes the death-save tally");
+    assert_eq!(hero["death_saves"]["successes"], 0);
+
+    // HEALED is ledgered so rewind can replay it.
+    let healed_events: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array().unwrap()
+        .iter().filter(|e| e["event_type"] == "HEALED").collect();
+    assert_eq!(healed_events.len(), 1);
+    assert_eq!(healed_events[0]["payload"]["amount"], 6);
+    assert_eq!(healed_events[0]["payload"]["hp_remaining"], 6);
+}
+
+#[actix_web::test]
+async fn over_heal_clamps_to_max_hp() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Bruised", 25, 14, 5, "1d8");
+    hero["current_hp"] = serde_json::json!(20);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(hero)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Ask for 500 HP on a 5-HP deficit — server clamps, no overheal stacking.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "amount": 500}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    let snap: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    assert_eq!(snap["entities"][&hero_id.to_string()]["current_hp"], 25);
+}
+
+#[actix_web::test]
+async fn heal_rejects_dead_targets_unknown_entities_and_negative_amounts() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let corpse_id = Uuid::new_v4();
+    let mut corpse = entity_json(corpse_id, "Corpse", 20, 14, 5, "1d8");
+    corpse["current_hp"] = serde_json::json!(-22);
+    corpse["is_conscious"] = serde_json::json!(false);
+    corpse["is_dead"] = serde_json::json!(true);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(corpse)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Dead target → 409 CANNOT_HEAL_DEAD.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": corpse_id, "amount": 10}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "CANNOT_HEAL_DEAD");
+
+    // Unknown entity → 404.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": Uuid::new_v4(), "amount": 10}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::NOT_FOUND);
+
+    // Negative amount → 422 (that would be damage smuggled through heal).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": corpse_id, "amount": -5}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Client-supplied extra fields are structurally rejected (ids-only contract).
+    // actix surfaces serde `deny_unknown_fields` errors as 400; either way the
+    // payload never reaches the handler.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": corpse_id, "amount": 5, "bonus": 999}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert!(
+        res.status() == StatusCode::BAD_REQUEST
+            || res.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown fields must be structurally rejected, got {}",
+        res.status()
+    );
+}
+
+#[actix_web::test]
+async fn heal_enforces_spectator_and_ownership_rbac() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-1", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let mine_id = Uuid::new_v4();
+    let mut mine = entity_json(mine_id, "My Hero", 20, 14, 5, "1d8");
+    mine["owner_player_id"] = serde_json::json!("player-1");
+    let other_id = Uuid::new_v4();
+    let mut other = entity_json(other_id, "Rival", 20, 14, 5, "1d8");
+    other["owner_player_id"] = serde_json::json!("someone-else");
+    for payload in [mine, other] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Spectators cannot heal.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&spectator))
+        .set_json(serde_json::json!({"entity_id": mine_id, "amount": 5}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::FORBIDDEN);
+
+    // Players cannot heal someone else's entity.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"entity_id": other_id, "amount": 5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "ENTITY_NOT_OWNED");
+
+    // …but their own entity heals fine.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"entity_id": mine_id, "amount": 5}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn rewind_past_heal_restores_prior_hp() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    for (id, name, hp, ac, ab) in [
+        (hero_id, "Healee", 30, 14, 8),
+        (orc_id, "Striker", 20, 11, 8),
+    ] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(entity_json(id, name, hp, ac, ab, "2d6"))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Damage the hero via a seeded attack + engine-provenance damage commit.
+    let mut post_damage_hp = None;
+    for seed in 1..=50u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "attacker_id": orc_id, "target_id": hero_id,
+                "action_index": 0, "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let attack: serde_json::Value = test::read_body_json(res).await;
+        if attack["is_hit"].as_bool() != Some(true) {
+            break;
+        }
+        let seq = attack["event_sequence"].as_u64().unwrap();
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({"target_id": hero_id, "source_event_sequence": seq}))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let dmg: serde_json::Value = test::read_body_json(res).await;
+        post_damage_hp = Some(dmg["hp_remaining"].as_i64().unwrap());
+        break;
+    }
+    let post_damage_hp = post_damage_hp.expect("seeded hit must land and apply damage");
+    assert!(post_damage_hp < 30);
+
+    // The ledger tail right now IS the DAMAGE_APPLIED event — rewind target.
+    let seq_after_damage: u64 = {
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{}", session_id))
+            .insert_header(auth.clone())
+            .to_request();
+        let snap: serde_json::Value =
+            test::read_body_json(test::call_service(&app, req).await).await;
+        snap["ledger"]["current_sequence"].as_u64().unwrap()
+    };
+
+    // Heal the hero back up.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": hero_id, "amount": 30}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // X-card rewind to just after the damage event undoes ONLY the heal.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "player_id": "gm-1",
+            "topic": "rewind",
+            "target_sequence_id": seq_after_damage
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let snap: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let hero = &snap["entities"][&hero_id.to_string()];
+    assert_eq!(
+        hero["current_hp"].as_i64().unwrap(),
+        post_damage_hp,
+        "rewinding past the heal must replay the surviving DAMAGE event"
+    );
+    assert_eq!(hero["is_conscious"], post_damage_hp > 0);
+}
+
+#[actix_web::test]
+async fn long_rest_restores_owned_entities_short_rest_is_a_hook() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-1", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Wounded Hero", 28, 14, 5, "1d8");
+    hero["current_hp"] = serde_json::json!(7);
+    hero["owner_player_id"] = serde_json::json!("player-1");
+    let rival_id = Uuid::new_v4();
+    let mut rival = entity_json(rival_id, "Wounded Rival", 24, 14, 5, "1d8");
+    rival["current_hp"] = serde_json::json!(3);
+    rival["owner_player_id"] = serde_json::json!("someone-else");
+    for payload in [hero, rival] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Spectators cannot call rests.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&spectator))
+        .set_json(serde_json::json!({"kind": "long"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::FORBIDDEN);
+
+    // Short rest is a mechanical no-op hook point: HP unchanged.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"kind": "short"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SHORT_REST_APPLIED");
+
+    // Long rest restores the caller's controlled entities to max HP.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"kind": "long"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "LONG_REST_APPLIED");
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    let snap: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    assert_eq!(snap["entities"][&hero_id.to_string()]["current_hp"], 28);
+    assert_eq!(snap["entities"][&rival_id.to_string()]["current_hp"], 24);
+    let rest_events: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array().unwrap()
+        .iter().filter(|e| e["event_type"] == "LONG_REST_APPLIED").collect();
+    assert_eq!(rest_events.len(), 2, "one ledger event per restored entity");
+
+    // A player's long rest touches only entities they control.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"kind": "long"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+}

@@ -1065,6 +1065,212 @@ async fn apply_damage(
     }
 }
 
+// --- Healing & rests ---------------------------------------------------------
+
+/// Ids-only heal request: the client names WHO gets how much — never how the
+/// math works. Unknown fields are structurally rejected (HTTP 422), so no
+/// client can smuggle an HP override or a bonus multiplier.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealEntityReq {
+    pub entity_id: Uuid,
+    /// Requested hit points to restore. Clamped server-side to
+    /// `max_hp - current_hp`; negative values are rejected outright.
+    pub amount: i32,
+}
+
+async fn heal_entity(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<HealEntityReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // A negative "heal" is damage smuggled through the wrong endpoint.
+        if req.amount < 0 {
+            return reject(
+                &data,
+                422,
+                "NEGATIVE_HEAL_AMOUNT",
+                "heal amounts must be zero or positive",
+            );
+        }
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(
+                &data,
+                404,
+                "ENTITY_NOT_FOUND",
+                "entity does not exist in session",
+            );
+        }
+        let owner = session.entities[&req.entity_id].owner_player_id.clone();
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+        if session.entities[&req.entity_id].is_dead {
+            return reject(
+                &data,
+                409,
+                "CANNOT_HEAL_DEAD",
+                "dead entities cannot be healed (resurrection is out of scope)",
+            );
+        }
+
+        // Server-authoritative math: clamp to the missing deficit, restore
+        // consciousness above 0 HP, and wipe any stale death-save tally.
+        let (applied, hp_remaining, death_saves_reset) = {
+            let entity = session
+                .entities
+                .get_mut(&req.entity_id)
+                .expect("existence checked above");
+            let applied = req.amount.min(entity.max_hp - entity.current_hp).max(0);
+            entity.current_hp += applied;
+            if entity.current_hp > 0 && !entity.is_dead {
+                entity.is_conscious = true;
+            }
+            let wiped = entity.reset_death_saves_if_healed();
+            (applied, entity.current_hp, wiped)
+        };
+
+        data.count_valid();
+        let campaign_id = session.campaign_id;
+        session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.entity_id,
+            "HEALED",
+            serde_json::json!({
+                "target_id": req.entity_id.to_string(),
+                "amount": applied,
+                "hp_remaining": hp_remaining,
+            }),
+        );
+
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "HEALED",
+            "entity_id": req.entity_id,
+            "amount_applied": applied,
+            "hp_remaining": hp_remaining,
+            "death_saves_reset": death_saves_reset,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestKind {
+    Short,
+    Long,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestReq {
+    pub kind: RestKind,
+}
+
+async fn take_rest(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<RestReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        data.count_valid();
+        let campaign_id = session.campaign_id;
+
+        match req.kind {
+            // Short rest: no mechanical effect yet (SRD hit-dice spending is a
+            // future hook). Ledgered so the intent is auditable and rewirable.
+            RestKind::Short => {
+                session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    Uuid::nil(),
+                    "SHORT_REST_APPLIED",
+                    serde_json::json!({"triggered_by": identity.user_id}),
+                );
+                HttpResponse::Ok().json(serde_json::json!({
+                    "status": "SHORT_REST_APPLIED",
+                    "restored_entities": 0,
+                    "hook": "short-rest mechanics (hit dice) not yet implemented",
+                }))
+            }
+            // Long rest: SRD restores hit points (and clears exhaustion —
+            // exhaustion tracking is engine-side TODO). Spell slots are NOT
+            // refilled because slot MAXIMA are not tracked engine-side yet;
+            // only remaining counts live on EntityState.
+            RestKind::Long => {
+                // Only player characters / owned creatures rest here, and only
+                // those the caller controls (a player long-rests their own
+                // party members; a GM rests everyone at the table).
+                let candidates: Vec<Uuid> = session
+                    .entities
+                    .values()
+                    .filter(|e| (e.is_player || e.owner_player_id.is_some()) && !e.is_dead)
+                    .filter(|e| may_control_entity(e.owner_player_id.as_ref(), role, &identity.user_id))
+                    .map(|e| e.id)
+                    .collect();
+
+                let mut restored: Vec<serde_json::Value> = Vec::new();
+                for id in candidates {
+                    let (max_hp, hp_remaining) = {
+                        let entity = session.entities.get_mut(&id).expect("checked above");
+                        entity.current_hp = entity.max_hp;
+                        entity.temp_hp = 0;
+                        entity.is_conscious = true;
+                        entity.reset_death_saves_if_healed();
+                        (entity.max_hp, entity.current_hp)
+                    };
+                    session.ledger.append_event(
+                        session_id,
+                        campaign_id,
+                        id,
+                        "LONG_REST_APPLIED",
+                        serde_json::json!({
+                            "target_id": id.to_string(),
+                            "hp_restored_to_max": max_hp,
+                            "hp_remaining": hp_remaining,
+                        }),
+                    );
+                    restored.push(serde_json::json!({
+                        "entity_id": id,
+                        "hp_remaining": hp_remaining,
+                    }));
+                }
+
+                HttpResponse::Ok().json(serde_json::json!({
+                    "status": "LONG_REST_APPLIED",
+                    "restored_entities": restored.len(),
+                    "entities": restored,
+                    "note": "spell slots are not refilled (slot maxima untracked engine-side); exhaustion not modeled",
+                }))
+            }
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
 // --- Stateless rule calculators (dice utilities; still authenticated) -------
 
 #[derive(Debug, Deserialize)]
@@ -1785,6 +1991,8 @@ pub fn configure_app(cfg: &mut web::ServiceConfig) {
             .route("/sessions/{id}/turn/next", web::post().to(next_turn))
             .route("/sessions/{id}/action/death-save", web::post().to(resolve_death_save))
             .route("/sessions/{id}/damage", web::post().to(apply_damage))
+            .route("/sessions/{id}/heal", web::post().to(heal_entity))
+            .route("/sessions/{id}/rest", web::post().to(take_rest))
             .route("/sessions/{id}/safety/x-card", web::post().to(trigger_safety_rewind))
             .route("/ws/sessions/{id}/sync", web::get().to(ws_sync))
             .route("/rooms/{id}/presence", web::get().to(room_presence))

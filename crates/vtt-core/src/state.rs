@@ -738,6 +738,18 @@ impl GameSession {
                         }
                     }
                 }
+                // HEALED carries absolute hp_remaining like DAMAGE_APPLIED, so
+                // replays landing between a heal and a later wound keep the
+                // post-heal total instead of regressing to the last damage.
+                "HEALED" => {
+                    let tid = ev.payload.get("target_id").and_then(|v| v.as_str());
+                    let hp = ev.payload.get("hp_remaining").and_then(|v| v.as_i64());
+                    if let (Some(tid), Some(hp)) = (tid, hp) {
+                        if let Ok(tid) = Uuid::parse_str(tid) {
+                            hp_state.insert(tid, (hp as i32, hp > 0, false));
+                        }
+                    }
+                }
                 "DEATH_SAVE_RESOLVED" => {
                     let tally = DeathSaveState {
                         successes: ev.payload.get("successes").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
