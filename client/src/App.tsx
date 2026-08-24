@@ -71,6 +71,7 @@ import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
+import { getStoredToken } from './api/auth_headers';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
@@ -446,6 +447,10 @@ export function App() {
   // fabricated combatants until a GM rolls initiative for real.
   const [combat, setCombat] = useState<EngineCombatSnapshot>(IDLE_COMBAT_SNAPSHOT);
   const [isCombatBusy, setIsCombatBusy] = useState(false);
+  // RAW body of the most recent engine turn-advance response. Handed to
+  // InitiativeTracker verbatim; it parses the additive disclosure fields (OA
+  // provocations, concentration saves) itself and displays only what arrived.
+  const [lastTurnResponse, setLastTurnResponse] = useState<unknown>(null);
   // Engine session this browser talks to through the orchestrator proxies;
   // null while the engine is unreachable (tracker then shows its empty state).
   const [combatSessionId, setCombatSessionId] = useState<string | null>(null);
@@ -697,7 +702,12 @@ export function App() {
         if (!sessionId) return;
         setCombatSessionId(sessionId);
       }
-      const resp = await fetch('/api/v1/engine/session-state', {
+      // The gateway's read proxy is authenticated (token: str = Query(...));
+      // the stored session token rides in the query string like every other
+      // /api/v1/engine/* browser call (see api/rules_engine.ts).
+      const token = getStoredToken();
+      const authSuffix = token ? `?token=${encodeURIComponent(token)}` : '';
+      const resp = await fetch(`/api/v1/engine/session-state${authSuffix}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
@@ -741,7 +751,12 @@ export function App() {
         }
         setCombatSessionId(sessionId);
       }
-      const resp = await fetch('/api/v1/engine/combat/begin', {
+      const beginToken = getStoredToken();
+      if (!beginToken) {
+        addSystemMessage('🔒 Sign in to roll initiative — the engine proxies require a session token.');
+        return;
+      }
+      const resp = await fetch(`/api/v1/engine/combat/begin?token=${encodeURIComponent(beginToken)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
@@ -778,7 +793,12 @@ export function App() {
     setIsCombatBusy(true);
     try {
       if (combatSessionId) {
-        const resp = await fetch('/api/v1/engine/combat/end', {
+        const endToken = getStoredToken();
+        if (!endToken) {
+          addSystemMessage('🔒 Sign in to end combat — the engine proxies require a session token.');
+          return;
+        }
+        const resp = await fetch(`/api/v1/engine/combat/end?token=${encodeURIComponent(endToken)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: combatSessionId }),
@@ -817,14 +837,40 @@ export function App() {
     const name =
       combat.order[nextIndex]?.name ?? tokens[nextIndex]?.name ?? 'the next combatant';
     addSystemMessage(`Turn passed to ${name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
-    // Keep the engine's turn cursor converging (fire-and-forget; the poll
-    // reconciles authoritative round/turn when we are not the actor).
+    // Keep the engine's turn cursor converging (the poll reconciles
+    // authoritative round/turn when we are not the actor). The response body —
+    // core contract plus any ADDITIVE disclosure fields the engine chose to
+    // include (opportunity-attack provocations, concentration saves) — is
+    // captured raw and handed to InitiativeTracker, which displays only what
+    // is actually present. The previous fire-and-forget version also sent NO
+    // session token, so the gateway's `token: str = Query(...)` route 401'd
+    // every call and nothing ever converged.
     if (combat.in_combat && combatSessionId) {
-      void fetch('/api/v1/engine/turn-next', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: combatSessionId }),
-      }).then(() => refreshCombatState());
+      const nextToken = getStoredToken();
+      if (!nextToken) {
+        addSystemMessage('🔒 Sign in so turn advances reach the authoritative engine.');
+      } else {
+        void fetch(`/api/v1/engine/turn-next?token=${encodeURIComponent(nextToken)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: combatSessionId }),
+        })
+          .then(async (resp) => {
+            // A non-OK advance discloses nothing: clear the stale report.
+            if (!resp.ok) {
+              setLastTurnResponse(null);
+              return;
+            }
+            const body = await resp.json().catch(() => null);
+            setLastTurnResponse(body);
+          })
+          .then(() => refreshCombatState())
+          .catch(() => {
+            setLastTurnResponse(null);
+          });
+      }
+    } else {
+      setLastTurnResponse(null);
     }
   };
 
@@ -1517,14 +1563,15 @@ export function App() {
 
         {currentView === 'tabletop' && (
           <div className="flex-1 flex flex-col h-full overflow-hidden min-h-0 relative">
-            {/* Top Epic Boss Health Bar — derived from the spectator-filtered
-                list so a hidden boss never broadcasts its HP on stream. */}
-            {visibleTokens.find((t) => !t.isPlayer && t.maxHp >= 50) && (
-              <BossHealthBar
-                bossToken={visibleTokens.find((t) => !t.isPlayer && t.maxHp >= 50) || null}
-                activeTurnName={visibleTokens[currentTurnIndex]?.name || 'Active Turn'}
-              />
-            )}
+            {/* Top Epic Boss Health Bar — self-sourced from the role-projected
+                engine session state (highest-max-HP visible hostile with both
+                HP figures disclosed). Renders NOTHING for roles the projection
+                gives no hostile sheets to (players/spectators), and nothing at
+                all when no qualifying hostile exists — never a fake boss. */}
+            <BossHealthBar
+              sessionId={combatSessionId}
+              activeTurnName={combat.order[combat.turn_index]?.name ?? ''}
+            />
 
             {/* Floating WebRTC Video Mesh Tiles */}
             <VideoMeshTiles
@@ -1553,6 +1600,7 @@ export function App() {
                 isCombatBusy={isCombatBusy}
                 onBeginCombat={() => void handleBeginCombat()}
                 onEndCombat={() => void handleEndCombat()}
+                lastTurnResponse={lastTurnResponse}
               />
 
               {/* Center Tactical Canvas */}

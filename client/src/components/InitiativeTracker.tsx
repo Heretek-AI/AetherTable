@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   Swords,
   ChevronRight,
@@ -10,6 +10,7 @@ import {
   Crosshair,
   Play,
   Square,
+  Zap,
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
 
@@ -24,6 +25,143 @@ export interface CombatantEntry {
   name: string;
   dexterity: number;
   initiative_total: number;
+}
+
+/* --- Additive turn-report consumption ------------------------------------
+ *
+ * The engine's POST /api/v1/sessions/{id}/turn/next response carries its core
+ * contract ({status, round, report:{round, ticks}}) PLUS additive disclosure
+ * fields that appear only when the underlying rules actually fired:
+ *   - `opportunity_attack` / `opportunity_attacks_detail` — OA provocations
+ *     ({provoked_by, reaction_type, available}), omitted entirely when nothing
+ *     could be provoked;
+ *   - `concentration_check` / `concentration_checks` — damage-triggered
+ *     concentration saves, omitted when no caster took damage.
+ *
+ * This component consumes those fields ONLY as display. It never resolves an
+ * OA itself, never rolls a save, and renders nothing for a field the response
+ * did not contain — absence stays silent instead of becoming an invention.
+ */
+
+/** One disclosed opportunity-attack provocation from the last advance. */
+export interface TurnOpportunityAttack {
+  provokedBy?: string;
+  moverId?: string;
+}
+
+/** One disclosed concentration save from the last advance. */
+export interface TurnConcentrationCheck {
+  entityId?: string;
+  naturalRoll?: number;
+  total?: number;
+  dc?: number;
+  /** undefined = the response did not say; rendered as "reported", not guessed. */
+  maintained?: boolean;
+}
+
+/** Parsed view of whatever additive fields the last turn-next response carried. */
+export interface TurnAdvancementNotice {
+  round?: number;
+  opportunityAttacks: TurnOpportunityAttack[];
+  concentrationChecks: TurnConcentrationCheck[];
+}
+
+const asRecord = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+
+const numField = (o: Record<string, unknown>, ...keys: string[]): number | undefined => {
+  for (const k of keys) {
+    if (typeof o[k] === 'number') return o[k] as number;
+  }
+  return undefined;
+};
+
+const strField = (o: Record<string, unknown>, ...keys: string[]): string | undefined => {
+  for (const k of keys) {
+    if (typeof o[k] === 'string' && (o[k] as string).length > 0) return o[k] as string;
+  }
+  return undefined;
+};
+
+const parseOaEntry = (raw: unknown): TurnOpportunityAttack | null => {
+  const o = asRecord(raw);
+  if (!o) return null;
+  const provokedBy = strField(o, 'provoked_by', 'attacker_id', 'provokedBy');
+  // Without a provoking entity the entry says nothing usable — drop it rather
+  // than render "something provoked something".
+  if (!provokedBy) return null;
+  const moverId = strField(o, 'mover_id', 'mover', 'target_id');
+  return { provokedBy, moverId };
+};
+
+const parseConcEntry = (raw: unknown): TurnConcentrationCheck | null => {
+  const o = asRecord(raw);
+  if (!o) return null;
+  const entityId = strField(o, 'entity_id', 'target_id', 'caster_id');
+  const naturalRoll = numField(o, 'natural_roll', 'natural', 'roll');
+  const total = numField(o, 'total');
+  const dc = numField(o, 'dc');
+  // An entry with no subject AND no numbers discloses nothing.
+  if (!entityId && naturalRoll === undefined && total === undefined && dc === undefined) {
+    return null;
+  }
+  let maintained: boolean | undefined;
+  for (const k of ['maintained', 'passed', 'success', 'concentration_maintained']) {
+    if (typeof o[k] === 'boolean') {
+      maintained = o[k] as boolean;
+      break;
+    }
+  }
+  return { entityId, naturalRoll, total, dc, maintained };
+};
+
+const parseOaList = (raw: unknown): TurnOpportunityAttack[] => {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map(parseOaEntry)
+    .filter((e): e is TurnOpportunityAttack => e !== null);
+};
+
+const parseConcList = (raw: unknown): TurnConcentrationCheck[] => {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map(parseConcEntry)
+    .filter((e): e is TurnConcentrationCheck => e !== null);
+};
+
+/**
+ * Extract the additive disclosure fields from a raw turn-next (or any action)
+ * response body. Returns null when the body carried none of them.
+ */
+export function parseTurnAdvancement(raw: unknown): TurnAdvancementNotice | null {
+  const top = asRecord(raw);
+  if (!top) return null;
+
+  const opportunityAttacks = [
+    ...parseOaList(top.opportunity_attacks_detail),
+    ...parseOaList(top.opportunity_attacks),
+    // Back-compat singular field mirrors the first detail entry.
+    ...(Array.isArray(top.opportunity_attacks_detail) || Array.isArray(top.opportunity_attacks)
+      ? []
+      : (() => {
+          const single = parseOaEntry(top.opportunity_attack);
+          return single ? [single] : [];
+        })()),
+  ];
+
+  const concentrationChecks = [
+    ...parseConcList(top.concentration_checks),
+    ...(Array.isArray(top.concentration_checks)
+      ? []
+      : (() => {
+          const single = parseConcEntry(top.concentration_check);
+          return single ? [single] : [];
+        })()),
+  ];
+
+  const round = typeof top.round === 'number' ? top.round : undefined;
+  if (opportunityAttacks.length === 0 && concentrationChecks.length === 0) return null;
+  return { round, opportunityAttacks, concentrationChecks };
 }
 
 interface InitiativeTrackerProps {
@@ -46,6 +184,12 @@ interface InitiativeTrackerProps {
   isCombatBusy?: boolean;
   onBeginCombat: () => void;
   onEndCombat: () => void;
+  /**
+   * RAW JSON body of the most recent engine turn-advance response, handed over
+   * verbatim by the caller. Parsed defensively here; only additive disclosure
+   * fields it actually contains are displayed. Null/undefined renders nothing.
+   */
+  lastTurnResponse?: unknown;
 }
 
 export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
@@ -63,7 +207,22 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   isCombatBusy = false,
   onBeginCombat,
   onEndCombat,
+  lastTurnResponse,
 }) => {
+  // Additive turn report: whatever the engine's last advance actually
+  // disclosed (OA provocations, concentration saves). Nothing here is derived
+  // or remembered across advances beyond what the caller hands us.
+  const turnNotice = useMemo(() => parseTurnAdvancement(lastTurnResponse), [lastTurnResponse]);
+
+  /** Best-effort id → display name using ONLY data we already have. */
+  const displayNameFor = (entityId?: string): string => {
+    if (!entityId) return 'unknown combatant';
+    const fromOrder = combatOrder.find((c) => c.entity_id === entityId);
+    if (fromOrder) return fromOrder.name;
+    const fromToken = tokens.find((t) => t.id === entityId);
+    return fromToken ? fromToken.name : entityId;
+  };
+
   const renderTokenIcon = (token: Token) => {
     const iconType = token.avatarIconType || (token.isPlayer ? 'fighter' : 'boss');
     switch (iconType) {
@@ -287,6 +446,49 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
           </div>
         )}
       </div>
+
+      {/* Additive engine disclosures from the most recent turn advance.
+          Renders ONLY fields the response actually carried — an advance that
+          provoked nothing and triggered no concentration save shows no strip
+          at all. Display-only: this component never resolves a reaction. */}
+      {inCombat && turnNotice && (
+        <div className="mx-3 mb-2 rounded-xl border border-[var(--rp-amber-600)]/40 bg-black/30 p-2.5 space-y-1.5">
+          <div className="flex items-center gap-1.5 text-[9px] uppercase tracking-widest text-[var(--rp-parchment-300)]">
+            <Zap className="w-3 h-3 text-tavern-accent" />
+            <span>
+              Turn report{typeof turnNotice.round === 'number' ? ` · Round ${turnNotice.round}` : ''}
+            </span>
+          </div>
+          {turnNotice.opportunityAttacks.map((oa, i) => (
+            <div key={`oa_${i}`} className="text-[10px] text-[var(--rp-parchment-200)] font-mono">
+              ⚔ Opportunity attack provoked by{' '}
+              <strong className="text-[var(--rp-parchment-100)]">{displayNameFor(oa.provokedBy)}</strong>
+              {oa.moverId ? ` against ${displayNameFor(oa.moverId)}` : ''} — reaction available
+            </div>
+          ))}
+          {turnNotice.concentrationChecks.map((cc, i) => (
+            <div key={`cc_${i}`} className="text-[10px] text-[var(--rp-parchment-200)] font-mono">
+              ✦ Concentration save
+              {cc.entityId ? (
+                <>
+                  {' '}— <strong className="text-[var(--rp-parchment-100)]">{displayNameFor(cc.entityId)}</strong>
+                </>
+              ) : null}
+              {typeof cc.naturalRoll === 'number' ? ` · d20 ${cc.naturalRoll}` : ''}
+              {typeof cc.total === 'number' ? ` → ${cc.total}` : ''}
+              {typeof cc.dc === 'number' ? ` vs DC ${cc.dc}` : ''}
+              {' '}—{' '}
+              {cc.maintained === undefined ? (
+                <span className="text-[var(--rp-parchment-300)]">reported</span>
+              ) : cc.maintained ? (
+                <span className="text-emerald-400">maintained</span>
+              ) : (
+                <span className="text-rose-400">BROKEN</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Footer Controls */}
       <div className="p-3 border-t border-[var(--tavern-border)] bg-black/30 space-y-2">

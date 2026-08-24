@@ -1,34 +1,167 @@
-import React, { useState, useEffect } from 'react';
-import {
-  Skull,
-  Clock,
-} from 'lucide-react';
-import { Token } from './TacticalCanvas';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Skull } from 'lucide-react';
+import { getStoredToken } from '../api/auth_headers';
 
-interface BossHealthBarProps {
-  bossToken: Token | null;
-  activeTurnName: string;
+/**
+ * One entity exactly as POST /api/v1/engine/session-state projects it for THE
+ * CALLING ROLE (see _project_entities in python/vtt_orchestrator/server.py):
+ *
+ *   - gm/admin        full authoritative stat block (max_hp/current_hp/ac present)
+ *   - player          own sheet unredacted; every OTHER visible hostile reduced
+ *                     to board-token facts ONLY (no hp, no ac)
+ *   - spectator       board-token facts only, nothing more
+ *
+ * Every field except `id` is therefore OPTIONAL, and absence means "the
+ * projection did not disclose it", never zero. This component refuses to draw
+ * a bar it cannot source from live values.
+ */
+export interface ProjectedEntity {
+  id: string;
+  name?: string;
+  is_player?: boolean;
+  is_visible?: boolean;
+  is_dead?: boolean;
+  current_hp?: number;
+  max_hp?: number;
+  ac?: number;
 }
 
+interface BossHealthBarProps {
+  /**
+   * Engine session whose projected state feeds the bar. Null/undefined while
+   * no engine session exists — the component then renders nothing at all.
+   */
+  sessionId?: string | null;
+  /**
+   * Whose turn it is per the engine's rolled initiative order (already
+   * resolved by the caller from `combat.order[turn_index].name`). Empty string
+   * hides the strip instead of printing a placeholder actor.
+   */
+  activeTurnName?: string;
+}
+
+/**
+ * Defensively coerce the session-state `entities` map into ProjectedEntity[]
+ * values. A malformed entry is skipped, never guessed into shape.
+ */
+function parseProjectedEntities(raw: unknown): ProjectedEntity[] {
+  if (!raw || typeof raw !== 'object') return [];
+  const out: ProjectedEntity[] = [];
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const e = value as Record<string, unknown>;
+    out.push({
+      id: typeof e.id === 'string' && e.id.length > 0 ? e.id : key,
+      name: typeof e.name === 'string' ? e.name : undefined,
+      is_player: e.is_player === true,
+      is_visible: e.is_visible !== false,
+      is_dead: e.is_dead === true,
+      current_hp: typeof e.current_hp === 'number' ? e.current_hp : undefined,
+      max_hp: typeof e.max_hp === 'number' ? e.max_hp : undefined,
+      ac: typeof e.ac === 'number' ? e.ac : undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * Top HUD threat bar. Sources EVERYTHING from the role-projected engine state
+ * polled live through the gateway's session-state read proxy:
+ *
+ *   - candidate = visible (is_visible !== false), non-player, non-dead entity
+ *   - the projection must expose BOTH max_hp and current_hp, i.e. this caller
+ *     is privileged enough to see the sheet (GM/admin, or owns the entity).
+ *     A player-facing projection carries neither, so players correctly see
+ *     NO bar rather than a fabricated one.
+ *   - among candidates the highest max_hp wins.
+ *
+ * When no candidate qualifies the component renders NOTHING — no placeholder
+ * boss, no invented HP, no hardcoded legendary resistances, no decorative
+ * countdown timer (all three existed in the previous demo-data version and
+ * were removed as fabrications).
+ */
 export const BossHealthBar: React.FC<BossHealthBarProps> = ({
-  bossToken,
+  sessionId,
   activeTurnName,
 }) => {
-  const [turnTimerSeconds, setTurnTimerSeconds] = useState(60);
-  const [legendaryResistances, setLegendaryResistances] = useState(3);
+  // Last known projected roster. Kept on transient transport failure so a
+  // single dropped poll doesn't blank a live fight; cleared whenever there is
+  // no session to read from.
+  const [roster, setRoster] = useState<ProjectedEntity[] | null>(null);
 
-  // Turn timer countdown tick
   useEffect(() => {
-    setTurnTimerSeconds(60);
-    const interval = setInterval(() => {
-      setTurnTimerSeconds((prev) => (prev > 0 ? prev - 1 : 60));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [activeTurnName]);
+    if (!sessionId) {
+      setRoster(null);
+      return;
+    }
+    let cancelled = false;
 
-  if (!bossToken) return null;
+    const pull = async () => {
+      const token = getStoredToken();
+      if (!token) {
+        // Not signed in: the gateway's session-state route is authenticated,
+        // so there is genuinely nothing readable — show nothing.
+        if (!cancelled) setRoster(null);
+        return;
+      }
+      try {
+        const resp = await fetch(
+          `/api/v1/engine/session-state?token=${encodeURIComponent(token)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId }),
+          }
+        );
+        if (!resp.ok) return; // keep last known snapshot (matches App's poll policy)
+        const snap = (await resp.json()) as { entities?: unknown };
+        if (!cancelled) setRoster(parseProjectedEntities(snap?.entities));
+      } catch {
+        /* engine unreachable — keep showing the last known projection */
+      }
+    };
 
-  const hpPercent = Math.max(0, Math.min(100, Math.round((bossToken.hp / bossToken.maxHp) * 100)));
+    void pull();
+    const timer = window.setInterval(() => void pull(), 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId]);
+
+  /**
+   * The qualifying hostile: visible, hostile, alive, with BOTH HP figures
+   * disclosed by the projection. Highest max_hp wins; ties keep the first.
+   */
+  const boss = useMemo<ProjectedEntity | null>(() => {
+    if (!roster) return null;
+    let best: ProjectedEntity | null = null;
+    for (const e of roster) {
+      if (
+        !e ||
+        e.is_player === true ||
+        e.is_visible === false ||
+        e.is_dead === true ||
+        typeof e.max_hp !== 'number' ||
+        e.max_hp <= 0 ||
+        typeof e.current_hp !== 'number'
+      ) {
+        continue;
+      }
+      if (best === null || (e.max_hp as number) > (best.max_hp as number)) best = e;
+    }
+    return best;
+  }, [roster]);
+
+  // Explicit empty state: no qualifying hostile in the projected state means
+  // this HUD element does not exist for this viewer right now.
+  if (!boss) return null;
+
+  const clampedHp = Math.max(0, Math.min(boss.max_hp as number, boss.current_hp as number));
+  const hpPercent = Math.max(0, Math.min(100, Math.round((clampedHp / (boss.max_hp as number)) * 100)));
+  // AC is a stat-block fact the player/spectator projection strips; render it
+  // only when this role was actually told.
+  const knownAc = typeof boss.ac === 'number';
 
   return (
     <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 w-full max-w-xl px-4 animate-fadeIn pointer-events-none font-mono select-none">
@@ -55,41 +188,14 @@ export const BossHealthBar: React.FC<BossHealthBarProps> = ({
                     color: 'var(--rp-parchment-100)',
                   }}
                 >
-                  {bossToken.name}
+                  {boss.name || boss.id}
                 </span>
-                <span className="vtt-badge vtt-badge-danger text-[9px] uppercase">BOSS</span>
+                <span className="vtt-badge vtt-badge-danger text-[9px] uppercase">Hostile</span>
               </div>
               <div className="text-[10px] text-[var(--rp-parchment-300)]">
-                Phase {hpPercent > 50 ? 'I' : hpPercent > 25 ? 'II' : 'III'} · {bossToken.ac} AC
+                {knownAc ? `${boss.ac} AC · ` : ''}
+                Highest-HP visible enemy on the board
               </div>
-            </div>
-          </div>
-
-          {/* Turn Timer & Legendary Resistances */}
-          <div className="flex items-center space-x-3 text-xs">
-            {/* Legendary Resistances */}
-            <div className="flex items-center space-x-1" title="Legendary Resistances Remaining">
-              {[1, 2, 3].map((gem) => (
-                <span
-                  key={gem}
-                  className={`text-sm ${
-                    gem <= legendaryResistances ? 'text-tavern-accent drop-shadow' : 'text-[var(--rp-leather-700)] opacity-40'
-                  }`}
-                >
-                  💎
-                </span>
-              ))}
-            </div>
-
-            {/* Turn Timer */}
-            <div className="flex items-center space-x-1 px-2 py-0.5 bg-tavern-bg border border-tavern-border rounded-lg text-[var(--rp-parchment-200)]">
-              <Clock className="w-3 h-3 text-tavern-accent" />
-              <span
-                className={`font-bold ${turnTimerSeconds <= 15 ? 'animate-pulse' : ''}`}
-                style={turnTimerSeconds <= 15 ? { color: 'var(--rp-crimson-400)' } : undefined}
-              >
-                {turnTimerSeconds}s
-              </span>
             </div>
           </div>
         </div>
@@ -98,11 +204,7 @@ export const BossHealthBar: React.FC<BossHealthBarProps> = ({
         <div className="relative w-full h-3.5 bg-tavern-bg rounded-full border border-tavern-border overflow-hidden shadow-inner">
           <div
             className={`h-full transition-all duration-300 rounded-full ${
-              hpPercent > 50
-                ? ''
-                : hpPercent > 25
-                ? 'animate-pulse'
-                : 'animate-ping'
+              hpPercent > 50 ? '' : hpPercent > 25 ? 'animate-pulse' : ''
             }`}
             /* Crimson-to-dark-red blood ramp; parchment numeral rides on top */
             style={{
@@ -117,11 +219,11 @@ export const BossHealthBar: React.FC<BossHealthBarProps> = ({
               className="text-[10px] font-bold tracking-widest"
               style={{ fontFamily: 'var(--font-display)', color: 'var(--rp-parchment-100)', textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}
             >
-              {bossToken.hp} / {bossToken.maxHp}
+              {clampedHp} / {boss.max_hp}
             </span>
           </div>
 
-          {/* Phase Markers */}
+          {/* Half/quarter thresholds — visual reference marks only */}
           <div className="absolute top-0 bottom-0 left-1/4 w-0.5 bg-black/50 z-10" />
           <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-black/50 z-10" />
           <div className="absolute top-0 bottom-0 left-3/4 w-0.5 bg-black/50 z-10" />
@@ -129,9 +231,15 @@ export const BossHealthBar: React.FC<BossHealthBarProps> = ({
 
         {/* HP Numeric Text */}
         <div className="flex justify-between text-[10px] text-[var(--rp-parchment-300)] pt-0.5">
-          <span>Current Turn: <strong className="text-tavern-accent">{activeTurnName}</strong></span>
+          {(activeTurnName ?? '').length > 0 ? (
+            <span>
+              Current Turn: <strong className="text-tavern-accent">{activeTurnName}</strong>
+            </span>
+          ) : (
+            <span />
+          )}
           <span>
-            Current HP: <strong className="font-bold" style={{ color: 'var(--rp-crimson-400)' }}>{hpPercent}%</strong> ({bossToken.hp}/{bossToken.maxHp})
+            Current HP: <strong className="font-bold" style={{ color: 'var(--rp-crimson-400)' }}>{hpPercent}%</strong> ({clampedHp}/{boss.max_hp})
           </span>
         </div>
       </div>
