@@ -893,6 +893,192 @@ fn test_cost_suggestion_only_applies_inside_success_at_cost_band() {
     assert_eq!(RulesEvaluator::suggest_cost(-99), None);
 }
 
+// ---------------------------------------------------------------------------
+// SRD 5e Exhaustion as a leveled condition.
+//
+// DESIGN NOTE: exhaustion lives as the existing `Condition::Exhaustion(u8)`
+// enum variant inside `EntityState::conditions` — NOT as a parallel
+// `exhaustion: u8` field. The variant already exists, already serializes
+// round-trip through the condition list, and is already wired into
+// `Condition::inflicts_disadvantage_on_attacks()` (level >= 3), so a second
+// source of truth would let the two drift (e.g. an `Exhaustion(4)` condition
+// alongside `exhaustion: 1`). All effects are derived from the single
+// condition entry via helpers on `EntityState`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_exhaustion_level_1_imposes_disadvantage_on_ability_checks() {
+    // The check pipeline (`RulesEvaluator::resolve_check_margin`) takes a
+    // pre-rolled d20 and has no adv/dis parameter, so level 1's penalty is
+    // exposed as a query helper callers fold into their roll strategy.
+    let mut e = hero("scout", 30, 15);
+    assert!(!e.has_disadvantage_on_checks(), "fresh entity is unencumbered");
+
+    e.set_exhaustion(1);
+    assert_eq!(e.exhaustion_level(), 1);
+    assert!(e.has_disadvantage_on_checks());
+
+    e.set_exhaustion(5);
+    assert!(e.has_disadvantage_on_checks(), "levels 2..=5 keep the check penalty");
+}
+
+#[test]
+fn test_exhaustion_level_2_halves_speed_in_the_action_budget() {
+    let mut session = session_with_pair();
+    let id = *session.entities.keys().next().unwrap();
+    session.entities.get_mut(&id).unwrap().set_exhaustion(2);
+    assert_eq!(
+        session.entities[&id].effective_speed_feet(),
+        15.0,
+        "level 2 halves the 30 ft base speed"
+    );
+
+    // The next round refresh seeds the movement budget from the halved speed.
+    let mut dice = DiceEngine::with_seed(11);
+    session.advance_round(&mut dice);
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 15.0,
+        "round refresh must use effective (halved) speed"
+    );
+
+    // And movement beyond the halved budget is rejected by move_entity.
+    let err = session.move_entity(id, (20.0, 20.0, 0.0)).unwrap_err();
+    // A ~24.7 ft straight-line hop from (2.5, 2.5) exceeds the 15 ft budget.
+    assert!(
+        err.starts_with("MOVE_BUDGET_EXCEEDED"),
+        "expected budget rejection at half speed, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_exhaustion_level_3_imposes_disadvantage_on_attacks_and_saves() {
+    let mut e = hero("worn_duelist", 30, 15);
+    e.set_exhaustion(3);
+    assert!(e.has_disadvantage_on_attacks());
+    assert!(e.has_disadvantage_on_saves());
+    // Level 2 does not yet carry either penalty.
+    e.set_exhaustion(2);
+    assert!(!e.has_disadvantage_on_attacks());
+    assert!(!e.has_disadvantage_on_saves());
+
+    // The attack edge pipeline picks the level up automatically.
+    let target = hero("orc", 30, 15);
+    let (_, dis) = RulesEvaluator::edge_from_conditions(&e, &target, 30.0, 0.0, 0.0);
+    e.set_exhaustion(3);
+    let (_, dis3) = RulesEvaluator::edge_from_conditions(&e, &target, 30.0, 0.0, 0.0);
+    assert!(!dis, "level 2 grants no attack edge");
+    assert!(dis3, "level 3 imposes attack disadvantage via edge_from_conditions");
+}
+
+#[test]
+fn test_exhaustion_level_4_halves_max_and_current_hp_floor_division() {
+    let mut e = hero("gaunt_survivor", 27, 15);
+    e.current_hp = 27;
+    e.set_exhaustion(4);
+
+    assert_eq!(e.effective_max_hp(), 13, "27 / 2 floors to 13");
+    assert_eq!(e.current_hp, 13, "current HP clamped down to the halved max");
+
+    // Odd values above the cap always clamp; even values halve exactly.
+    let mut even = hero("even_case", 24, 15);
+    even.set_exhaustion(4);
+    assert_eq!(even.effective_max_hp(), 12);
+    assert_eq!(even.current_hp, 12);
+
+    // Dropping back below level 4 restores the full maximum.
+    e.set_exhaustion(3);
+    assert_eq!(e.effective_max_hp(), 27);
+}
+
+#[test]
+fn test_exhaustion_level_4_cap_is_reenforced_each_round_after_healing() {
+    let mut session = session_with_pair();
+    let id = *session.entities.keys().next().unwrap();
+    session.entities.get_mut(&id).unwrap().set_exhaustion(4);
+    assert_eq!(
+        session.entities[&id].current_hp, 15,
+        "set_exhaustion itself clamps to the halved max of 15 (30/2)"
+    );
+
+    // Someone tops the exhausted creature off past its reduced maximum.
+    session.entities.get_mut(&id).unwrap().current_hp = 30;
+
+    let mut dice = DiceEngine::with_seed(5);
+    session.advance_round(&mut dice);
+    assert_eq!(
+        session.entities[&id].current_hp, 15,
+        "round pass must clamp HP back to the halved max of 15 (30/2)"
+    );
+}
+
+#[test]
+fn test_exhaustion_level_5_reduces_speed_to_zero() {
+    let mut session = session_with_pair();
+    let id = *session.entities.keys().next().unwrap();
+    session.entities.get_mut(&id).unwrap().set_exhaustion(5);
+
+    assert_eq!(session.entities[&id].effective_speed_feet(), 0.0);
+
+    let mut dice = DiceEngine::with_seed(6);
+    session.advance_round(&mut dice);
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 0.0,
+        "round refresh must grant no movement at level 5"
+    );
+
+    // Even a one-step shuffle is rejected.
+    let err = session.move_entity(id, (2.6, 2.5, 0.0)).unwrap_err();
+    assert!(err.starts_with("MOVE_BUDGET_EXCEEDED"), "got: {}", err);
+}
+
+#[test]
+fn test_exhaustion_level_6_kills_the_entity() {
+    let mut e = hero("collapsed", 12, 15);
+    e.set_exhaustion(6);
+    assert!(e.is_dead, "SRD: the seventh exhaustion level is death");
+    assert!(!e.is_conscious);
+    assert_eq!(e.exhaustion_level(), 6);
+}
+
+#[test]
+fn test_take_long_rest_effects_reduces_exhaustion_by_one() {
+    let mut e = hero("weary", 30, 15);
+    e.set_exhaustion(3);
+    assert!(e.take_long_rest_effects(), "a rest with exhaustion must report change");
+    assert_eq!(e.exhaustion_level(), 2);
+
+    assert!(e.take_long_rest_effects());
+    assert!(e.take_long_rest_effects());
+    assert_eq!(e.exhaustion_level(), 0, "resting at level 1 clears exhaustion fully");
+    assert!(e.conditions.is_empty(), "no Exhaustion(0) stub condition may linger");
+
+    // Resting while unexhausted is a no-op and reports it.
+    assert!(!e.take_long_rest_effects());
+    assert_eq!(e.exhaustion_level(), 0);
+}
+
+#[test]
+fn test_exhaustion_serialization_round_trip_and_legacy_payload_back_compat() {
+    let mut e = hero("legacy", 30, 15);
+    e.set_exhaustion(3);
+
+    // Round trip preserves the leveled condition.
+    let json = serde_json::to_value(&e).unwrap();
+    let parsed: EntityState = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.exhaustion_level(), 3);
+
+    // Old payloads predate any dedicated exhaustion representation: a
+    // serialized entity whose condition list carries no Exhaustion entry
+    // deserializes cleanly at level 0 (nothing new was added to the schema).
+    let legacy_json = serde_json::to_value(&hero("legacy", 30, 15)).unwrap();
+    let legacy: EntityState = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.exhaustion_level(), 0);
+    assert!(!legacy.has_disadvantage_on_checks());
+    assert_eq!(legacy.effective_speed_feet(), 30.0);
+    assert_eq!(legacy.effective_max_hp(), 30);
+}
+
 /// Helper so the tuple literal reads cleanly in assertions above.
 trait IntoPosition {
     fn into_position(self) -> (f32, f32, f32);

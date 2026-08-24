@@ -235,6 +235,115 @@ impl EntityState {
     }
 }
 
+// ------------------------------------------------------------- exhaustion
+//
+// SRD 5e Exhaustion is modeled as the existing `Condition::Exhaustion(u8)`
+// variant inside `conditions` — NOT as a parallel numeric field on this
+// struct. The variant already round-trips through serde via the condition
+// list and is already consulted by `Condition::inflicts_disadvantage_on_
+// attacks()` (level >= 3); a second source of truth would let the two drift.
+// Every mechanical effect below derives from that single condition entry.
+
+impl EntityState {
+    /// Current exhaustion level: 0 (none) through 6 (death). Derived from the
+    /// strongest `Condition::Exhaustion` entry in `conditions`.
+    pub fn exhaustion_level(&self) -> u8 {
+        self.conditions
+            .iter()
+            .map(|c| match c {
+                Condition::Exhaustion(level) => *level,
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+        .min(6)
+    }
+
+    /// Sets the exhaustion level, replacing any prior `Exhaustion` condition.
+    /// Level 0 clears the condition entirely; levels above 6 clamp to 6.
+    ///
+    /// This is the enforcement point for level 4's HP cap and level 6's death:
+    /// callers mutate exhaustion only through here so the derived penalties can
+    /// never be stale relative to stored HP / liveness.
+    pub fn set_exhaustion(&mut self, level: u8) {
+        let level = level.min(6);
+        self.conditions.retain(|c| !matches!(c, Condition::Exhaustion(_)));
+        if level > 0 {
+            self.conditions.push(Condition::Exhaustion(level));
+        }
+        if level >= 6 {
+            // SRD: reaching the seventh exhaustion level kills the creature.
+            self.is_dead = true;
+            self.is_conscious = false;
+        }
+        self.enforce_exhaustion_hp_cap();
+    }
+
+    /// Level >= 4 halves the hit-point maximum (floor division, min 1).
+    pub fn effective_max_hp(&self) -> i32 {
+        if self.exhaustion_level() >= 4 {
+            (self.max_hp / 2).max(1)
+        } else {
+            self.max_hp
+        }
+    }
+
+    /// Speed as modified by exhaustion: halved at level >= 2, zero at
+    /// level >= 5. All movement-budget seeding must use THIS value instead of
+    /// the raw `speed_feet`.
+    pub fn effective_speed_feet(&self) -> f32 {
+        match self.exhaustion_level() {
+            5..=6 => 0.0,
+            2..=4 => self.speed_feet / 2.0,
+            _ => self.speed_feet,
+        }
+    }
+
+    /// Level >= 1: disadvantage on ability checks. The check pipeline
+    /// (`RulesEvaluator::resolve_check_margin`) consumes a pre-rolled d20 and
+    /// has no adv/dis parameter, so callers fold this flag into their roll
+    /// strategy (roll twice keep lower) before invoking it.
+    pub fn has_disadvantage_on_checks(&self) -> bool {
+        self.exhaustion_level() >= 1
+    }
+
+    /// Level >= 3: disadvantage on attack rolls. Also surfaced automatically
+    /// by `RulesEvaluator::edge_from_conditions` through
+    /// `Condition::inflicts_disadvantage_on_attacks`.
+    pub fn has_disadvantage_on_attacks(&self) -> bool {
+        self.exhaustion_level() >= 3
+    }
+
+    /// Level >= 3: disadvantage on saving throws. `resolve_saving_throw`
+    /// likewise takes a raw d20, so callers roll twice/keep lower when true.
+    pub fn has_disadvantage_on_saves(&self) -> bool {
+        self.exhaustion_level() >= 3
+    }
+
+    /// Clamps current HP down to the level-4+ halved maximum. Idempotent and a
+    /// no-op below level 4; called by [`Self::set_exhaustion`] and by the
+    /// round-advance pass so healing above the reduced maximum is undone.
+    pub fn enforce_exhaustion_hp_cap(&mut self) {
+        let cap = self.effective_max_hp();
+        if self.current_hp > cap {
+            self.current_hp = cap;
+        }
+    }
+
+    /// Long-rest hook (SRD 5e): one long rest reduces exhaustion by one level.
+    /// Returns true when a level was shed. Exported for the server's rest
+    /// endpoint to adopt. Death at level 6 is final — resting does not
+    /// resurrect, so this is never called for a dead creature by the engine.
+    pub fn take_long_rest_effects(&mut self) -> bool {
+        let level = self.exhaustion_level();
+        if level == 0 {
+            return false;
+        }
+        self.set_exhaustion(level - 1);
+        true
+    }
+}
+
 impl EntityState {
     pub fn new(
         id: Uuid,
@@ -533,8 +642,12 @@ impl GameSession {
 
         for (id, entity) in self.entities.iter_mut() {
             entity.shield_ac_bonus_active = false; // Shield lasts until the start of the caster's next turn
-            // Start-of-round action-economy refresh.
-            entity.action_budget.reset(entity.speed_feet);
+            // Start-of-round action-economy refresh. Exhaustion modifies the
+            // speed the budget seeds from (halved at level 2+, zero at 5+).
+            entity.action_budget.reset(entity.effective_speed_feet());
+            // Re-clamp HP to the halved maximum at exhaustion 4+ so healing
+            // past the reduced cap between rounds cannot stick.
+            entity.enforce_exhaustion_hp_cap();
             if entity.condition_timers.is_empty() {
                 continue;
             }
@@ -866,7 +979,7 @@ impl GameSession {
         // it may have been undone, so conservatively end all concentration.
         for entity in self.entities.values_mut() {
             entity.concentration = None;
-            entity.action_budget.reset(entity.speed_feet);
+            entity.action_budget.reset(entity.effective_speed_feet());
         }
 
         RewindReport {
