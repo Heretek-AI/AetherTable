@@ -42,11 +42,17 @@ fn sign_token(user_id: &str, secret: &str) -> String {
     )
 }
 
-async fn test_app() -> impl Service<
-    actix_http::Request,
-    Response = ServiceResponse<EitherBody<BoxBody>>,
-    Error = actix_web::Error,
-> {
+/// Builds the production-config test app AND hands back the shared AppState so
+/// tests can assert on server-side caches (e.g. the WS movement baseline that
+/// engine-side shove displacement must keep consistent).
+async fn test_app_with_state() -> (
+    impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    actix_web::web::Data<vtt_server::AppState>,
+) {
     let verifier = Arc::new(AuthVerifier {
         secret: Arc::new(TEST_SECRET.to_string()),
     });
@@ -56,13 +62,22 @@ async fn test_app() -> impl Service<
     // scans of 200+ attacks), so they run against the exact same route set but
     // with quotas raised out of the way.
     let limits = vtt_server::RateLimits::explicit(1_000_000, 1_000_000, 1_000_000);
-    test::init_service(
+    let app = test::init_service(
         App::new()
             .wrap(AuthMiddleware { verifier })
-            .app_data(state)
+            .app_data(state.clone())
             .configure(move |cfg| vtt_server::configure_app_with(cfg, &limits)),
     )
-    .await
+    .await;
+    (app, state)
+}
+
+async fn test_app() -> impl Service<
+    actix_http::Request,
+    Response = ServiceResponse<EitherBody<BoxBody>>,
+    Error = actix_web::Error,
+> {
+    test_app_with_state().await.0
 }
 
 fn sign_token_with_role(user_id: &str, role: &str, secret: &str) -> String {
@@ -3232,6 +3247,228 @@ async fn shove_prone_knocks_target_down_and_push_5ft_moves_it() {
     );
 }
 
+/// Puts an authored map on a session (GM-only endpoint).
+async fn put_map(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    width: usize,
+    height: usize,
+    cell_size_feet: f64,
+    solid_cells: Vec<(usize, usize)>,
+) {
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/map", session_id))
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({
+            "width": width, "height": height,
+            "cell_size_feet": cell_size_feet,
+            "solid_cells": solid_cells, "difficult_terrain": []
+        }))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "map upload failed");
+}
+
+#[actix_web::test]
+async fn shove_push_payload_records_pre_and_post_push_position() {
+    let app = test_app().await;
+    let token = sign_token("gm-push-ledger", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 3.5, 2.5)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    let pushed_to = body["pushed_to"].clone();
+    assert!(
+        pushed_to.is_array(),
+        "successful push must carry post-push position in the event payload; got {}",
+        body
+    );
+    let from = body["pushed_from"].clone();
+    assert_eq!(from, serde_json::json!([3.5, 2.5, 0.0]), "pre-push position recorded");
+
+    // The ledger payload — not just the HTTP response — carries both points so
+    // a safety rewind can undo unledgered displacement.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let event = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == serde_json::json!("SHOVE_ATTEMPTED"))
+        .cloned()
+        .expect("SHOVE_ATTEMPTED in ledger");
+    assert_eq!(event["payload"]["pushed_from"], from);
+    assert_eq!(event["payload"]["pushed_to"], pushed_to);
+
+    // The recorded destination matches authoritative live state.
+    assert_eq!(
+        snap["entities"][orc_id.to_string()]["position"],
+        pushed_to,
+        "payload position and live position must agree"
+    );
+}
+
+#[actix_web::test]
+async fn shove_push_into_wall_clamps_at_wall_but_still_wins_the_contest() {
+    let app = test_app().await;
+    let token = sign_token("gm-push-wall", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    // Wall column at cell x=1 → world x in [5, 10).
+    put_map(&app, &token, session_id, 32, 32, 5.0, vec![(1, 0), (1, 1), (1, 2)]).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 3.6, 2.5)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // SRD shove is EITHER/OR: with the push effect chosen and fully blocked,
+    // the contest is still won (Action spent) but displacement is zero.
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["push_distance_feet"], serde_json::json!(0.0));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let pos = &snap["entities"][orc_id.to_string()]["position"];
+    assert_eq!(pos[0], serde_json::json!(3.6), "no wall clipping");
+    assert_eq!(pos[1], serde_json::json!(2.5));
+}
+
+#[actix_web::test]
+async fn shove_push_off_map_edge_clamps_at_bounds() {
+    let app = test_app().await;
+    let token = sign_token("gm-push-edge", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    put_map(&app, &token, session_id, 32, 32, 5.0, vec![]).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    // Hero near the east edge (map spans 0..160 ft); orc between hero and
+    // edge — a full 5 ft push would land at 161 ft, past cell x=31.
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10), 152.4, 2.5)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 156.0, 2.5)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["push_distance_feet"], serde_json::json!(0.0), "full push would exit the map");
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][orc_id.to_string()]["position"],
+        serde_json::json!([156.0, 2.5, 0.0]),
+        "target never leaves map bounds"
+    );
+}
+
+#[actix_web::test]
+async fn shove_push_refreshes_ws_movement_baseline_cache() {
+    // FNV-1a 64 over the token display name — the same keying
+    // validate_token_move uses for its per-token baseline cache.
+    fn fnv1a(input: &str) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in input.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    let (app, state) = test_app_with_state().await;
+    let token = sign_token("gm-push-cache", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    put_map(&app, &token, session_id, 32, 32, 5.0, vec![]).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 3.5, 2.5)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    let new_x = body["pushed_to"][0].as_f64().unwrap() as f32;
+    let new_y = body["pushed_to"][1].as_f64().unwrap() as f32;
+
+    // The WS movement baseline for the Orc token must now be the POST-push
+    // point: otherwise the next relay move is speed-checked against a stale
+    // pre-shove origin and can spuriously fail (or clip) validation.
+    let baselines = state
+        .movement
+        .get(&session_id.to_string())
+        .expect("movement baseline map exists for the session room");
+    let baseline = baselines
+        .get(&fnv1a("Orc"))
+        .map(|entry| *entry)
+        .expect("Orc token has a movement baseline");
+    assert_eq!(
+        baseline,
+        (new_x, new_y),
+        "WS move validation measures from the post-push point"
+    );
+}
+
 #[actix_web::test]
 async fn lost_contest_spends_the_action_but_changes_nothing() {
     let app = test_app().await;
@@ -3437,5 +3674,406 @@ async fn contests_enforce_reach_rbac_and_payload_shape() {
         status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
         "invalid shove effect must be rejected, got {}",
         status
+    );
+}
+
+// --- Dodge / Dash / Disengage / Stabilize (standard action options) ------------
+
+#[actix_web::test]
+async fn dodge_grants_attack_disadvantage_until_next_turn_refresh() {
+    let app = test_app().await;
+    let token = sign_token("gm-dodge", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+    spawn(&app, &token, session_id, entity_at(entity_json(orc_id, "Orc", 20, 11, 3, "1d6+1"), 7.5, 2.5)).await;
+
+    // Dodge: 200, flags the entity, spends the Action, lands in the ledger.
+    let (status, body) = post_contest(&app, &token, session_id, "dodge", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["dodge_until_next_turn"], serde_json::json!(true));
+    assert!(body["event_sequence"].is_u64());
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["dodge_until_next_turn"],
+        serde_json::json!(true),
+        "dodge is authoritative session state"
+    );
+    assert!(snap["ledger"]["events"].as_array().unwrap().iter().any(|e| e["event_type"] == serde_json::json!("DODGE")));
+
+    // Second dodge this turn: Action already gone.
+    let (status, body) = post_contest(&app, &token, session_id, "dodge", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+
+    // Attacks against the dodger are rolled at disadvantage...
+    let (status, body) = attack(&app, &token, session_id, orc_id, hero_id, 42).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["disadvantage"], serde_json::json!(true), "dodge must disadvantage attackers: {}", body);
+
+    // ...until the dodger's next-turn refresh clears the flag.
+    advance_turn(&app, &token, session_id).await;
+    let (status, body) = attack(&app, &token, session_id, orc_id, hero_id, 42).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["disadvantage"], serde_json::json!(false), "dodge expires on refresh: {}", body);
+
+    // Spectators cannot dodge.
+    let spectator = sign_token_with_role("spec-dodge", "spectator", TEST_SECRET);
+    let (status, _) = post_contest(&app, &spectator, session_id, "dodge", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[actix_web::test]
+async fn dash_adds_one_speed_once_per_turn_then_resets() {
+    let app = test_app().await;
+    let token = sign_token("gm-dash", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Runner", 30, 14, 0, "1d4")).await;
+
+    // Dash: budget 30 -> 60, exactly once per turn.
+    let (status, body) = post_contest(&app, &token, session_id, "dash", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["movement_remaining_feet"], serde_json::json!(60.0));
+    assert_eq!(body["dashed_this_turn"], serde_json::json!(true));
+
+    let (status, body) = post_contest(&app, &token, session_id, "dash", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("DASH_ALREADY_TAKEN"));
+
+    // The doubled budget really buys a >30 ft move (32.5 ft here).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 35.0, "y": 2.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(st, StatusCode::OK, "dashed move failed: {:?}", String::from_utf8_lossy(&raw));
+
+    // Next turn the bonus movement and the latch are both gone.
+    advance_turn(&app, &token, session_id).await;
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["action_budget"]["movement_remaining_feet"],
+        serde_json::json!(30.0)
+    );
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 70.0, "y": 2.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "35 ft must exceed a plain 30 ft budget");
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("MOVE_BUDGET_EXCEEDED"), "{}", body);
+
+    // Ledger records the dash.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(snap["ledger"]["events"].as_array().unwrap().iter().any(|e| e["event_type"] == serde_json::json!("DASH")));
+}
+
+#[actix_web::test]
+async fn disengage_suppresses_opportunity_attack_provocation_until_refresh() {
+    let app = test_app().await;
+    let token = sign_token("gm-disengage", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+
+    // Arm the adjacent orc's opportunity attack.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": orc_id, "reaction_type": "opportunity_attack"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Disengage, then walk away: NO provocation reported.
+    let (status, body) = post_contest(&app, &token, session_id, "disengage", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["disengaged_until_next_turn"], serde_json::json!(true));
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(st, StatusCode::OK, "disengaged move failed: {:?}", String::from_utf8_lossy(&raw));
+    let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(body.get("opportunity_attack").is_none(), "disengage must suppress OAs: {}", body);
+    assert_eq!(body["outcome"]["opportunity_attacks"].as_array().unwrap().len(), 0);
+
+    // The disengage spent the Action.
+    let (status, err_body) = post_contest(&app, &token, session_id, "disengage", serde_json::json!({"entity_id": hero_id})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err_body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+
+    // Refresh: the same leave-adjacency provokes again.
+    advance_turn(&app, &token, session_id).await;
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 15.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "step back into adjacency");
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 30.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["opportunity_attack"]["provoked_by"],
+        orc_id.to_string(),
+        "protection must expire at the next turn: {}",
+        body
+    );
+
+    // Ledger records the disengage.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(snap["ledger"]["events"].as_array().unwrap().iter().any(|e| e["event_type"] == serde_json::json!("DISENGAGE_TAKEN")));
+}
+
+/// DC 10 Medicine check on a dying ally with EXISTING tallies: success adds
+/// exactly +1 success (never overwriting), failures untouched; three successes
+/// stabilize. Failures of the check change nothing; RBAC/budget gates reject.
+#[actix_web::test]
+async fn stabilize_attempt_tallies_successes_and_enforces_rbac_and_gates() {
+    let app = test_app().await;
+    let token = sign_token("gm-stabilize", TEST_SECRET);
+
+    // --- Happy path: existing tally 1S/1F -> successful check -> 2S/1F --------
+    let session_id = create_session_as(&app, &token).await;
+    let healer_id = Uuid::new_v4();
+    let dying_id = Uuid::new_v4();
+    let mut healer = entity_json(healer_id, "Medic", 20, 12, 0, "1d4"); // Wis 12 => +1
+    healer["position"] = serde_json::json!([2.5, 2.5, 0.0]);
+    let mut dying = entity_at(entity_json(dying_id, "Dying Ally", 20, 12, 0, "1d4"), 2.6, 2.5);
+    dying["current_hp"] = serde_json::json!(0);
+    dying["is_conscious"] = serde_json::json!(false);
+    dying["death_saves"] = serde_json::json!({
+        "successes": 1, "failures": 1, "is_stabilized": false, "is_dead": false
+    });
+    spawn(&app, &token, session_id, healer).await;
+    spawn(&app, &token, session_id, dying).await;
+
+    // Natural 15 + Wis +1 = 16 >= DC 10.
+    let seed = seed_producing_roll(15);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_id, "target_id": dying_id, "seed": seed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    assert_eq!(body["dc"], serde_json::json!(10));
+    assert_eq!(body["successes"], serde_json::json!(2), "+1 success on top of the existing tally");
+    assert_eq!(body["failures"], serde_json::json!(1));
+    assert_eq!(body["is_stabilized"], serde_json::json!(false));
+    assert!(body["event_sequence"].is_u64());
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let saves = &snap["entities"][dying_id.to_string()]["death_saves"];
+    assert_eq!(saves["successes"], serde_json::json!(2));
+    assert_eq!(saves["failures"], serde_json::json!(1));
+
+    // The check burned the healer's Action.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_id, "target_id": dying_id, "seed": seed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+
+    // --- Failed check changes nothing ----------------------------------------
+    let session_id = create_session_as(&app, &token).await;
+    let healer_id = Uuid::new_v4();
+    let dying_id = Uuid::new_v4();
+    let mut dying = entity_at(entity_json(dying_id, "Dying Ally", 20, 12, 0, "1d4"), 2.6, 2.5);
+    dying["current_hp"] = serde_json::json!(0);
+    dying["is_conscious"] = serde_json::json!(false);
+    dying["death_saves"] = serde_json::json!({
+        "successes": 0, "failures": 2, "is_stabilized": false, "is_dead": false
+    });
+    spawn(&app, &token, session_id, entity_json(healer_id, "Medic", 20, 12, 0, "1d4")).await;
+    spawn(&app, &token, session_id, dying).await;
+
+    // Natural 3 + 1 = 4 < DC 10: no tally change, but the attempt still resolves.
+    let seed = seed_producing_roll(3);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_id, "target_id": dying_id, "seed": seed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a FAILED Medicine check is still a resolved action");
+    assert_eq!(body["success"], serde_json::json!(false));
+    assert_eq!(body["successes"], serde_json::json!(0));
+    assert_eq!(body["failures"], serde_json::json!(2), "failures are never moved by Medicine");
+
+    // --- Gates -----------------------------------------------------------------
+    // Healthy target: not dying. Uses a FRESH healer so the gate order is
+    // exercised independently of the previous healer's spent Action.
+    let healer_b = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_at(entity_json(healer_b, "Medic B", 20, 12, 0, "1d4"), 2.5, 2.5)).await;
+    let healthy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(healthy_id, "Healthy", 20, 12, 0, "1d4")).await;
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_b, "target_id": healthy_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("TARGET_NOT_DYING"));
+    // That rejected attempt must NOT have burned Medic B's Action: a legal
+    // attempt right after resolves normally.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_b, "target_id": dying_id, "seed": seed_producing_roll(15)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "state rejections must not burn the Action: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+
+    // Out of reach (> 5 ft).
+    let session_far = create_session_as(&app, &token).await;
+    let healer_id = Uuid::new_v4();
+    let dying_id = Uuid::new_v4();
+    let mut dying = entity_at(entity_json(dying_id, "Far Dying", 20, 12, 0, "1d4"), 40.0, 40.0);
+    dying["current_hp"] = serde_json::json!(0);
+    dying["is_conscious"] = serde_json::json!(false);
+    spawn(&app, &token, session_far, entity_json(healer_id, "Medic", 20, 12, 0, "1d4")).await;
+    spawn(&app, &token, session_far, dying).await;
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_far,
+        "stabilize",
+        serde_json::json!({"healer_id": healer_id, "target_id": dying_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("OUT_OF_REACH"));
+
+    // Dead target cannot be saved.
+    let dead_id = Uuid::new_v4();
+    let mut dead = entity_at(entity_json(dead_id, "Corpse", 20, 12, 0, "1d4"), 2.6, 2.5);
+    dead["current_hp"] = serde_json::json!(0);
+    dead["is_conscious"] = serde_json::json!(false);
+    dead["is_dead"] = serde_json::json!(true);
+    spawn(&app, &token, session_far, entity_at(entity_json(Uuid::new_v4(), "Medic2", 20, 12, 0, "1d4"), 2.5, 2.5)).await;
+    spawn(&app, &token, session_far, dead).await;
+    // (medic above spawned at default spot; reuse it)
+    let medic2_id = {
+        let snap = snapshot_as(&app, &token, session_far).await;
+        snap["entities"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, e)| e["name"] == serde_json::json!("Medic2"))
+            .map(|(id, _)| id.clone())
+            .unwrap()
+    };
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_far,
+        "stabilize",
+        serde_json::json!({"healer_id": medic2_id, "target_id": dead_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("TARGET_ALREADY_DEAD"));
+
+    // --- RBAC: ownership + spectators + payload shape --------------------------
+    let (p_session, owned_healer, other_dying) = {
+        let gm = sign_token_with_role("gm-owned-stab", "gm", TEST_SECRET);
+        let sid = create_session_as(&app, &gm).await;
+        let mut owned = entity_owned_by(entity_json(Uuid::new_v4(), "Claimed Medic", 20, 12, 0, "1d4"), "player-nine");
+        owned["position"] = serde_json::json!([2.5, 2.5, 0.0]);
+        let mut dying = entity_at(entity_json(Uuid::new_v4(), "Dying Ally", 20, 12, 0, "1d4"), 2.6, 2.5);
+        dying["current_hp"] = serde_json::json!(0);
+        dying["is_conscious"] = serde_json::json!(false);
+        let healer_id = Uuid::new_v4();
+        let dying_id = Uuid::new_v4();
+        owned["id"] = serde_json::json!(healer_id.to_string());
+        dying["id"] = serde_json::json!(dying_id.to_string());
+        spawn(&app, &gm, sid, owned).await;
+        spawn(&app, &gm, sid, dying).await;
+        (sid, healer_id, dying_id)
+    };
+    let player = sign_token("player-one", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "stabilize",
+        serde_json::json!({"healer_id": owned_healer, "target_id": other_dying}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    let spectator = sign_token_with_role("spec-stab", "spectator", TEST_SECRET);
+    let (status, _) = post_contest(
+        &app,
+        &spectator,
+        p_session,
+        "stabilize",
+        serde_json::json!({"healer_id": owned_healer, "target_id": other_dying}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Smuggled client math is structurally rejected.
+    let (status, _) = post_contest(
+        &app,
+        &player,
+        p_session,
+        "stabilize",
+        serde_json::json!({"healer_id": owned_healer, "target_id": other_dying, "medicine_bonus": 9}),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "smuggled medicine modifier must be rejected, got {}",
+        status
+    );
+
+    // Ledger events exist for every resolution.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["ledger"]["events"].as_array().unwrap().iter().any(|e| e["event_type"] == serde_json::json!("STABILIZE_ATTEMPTED")),
+        "STABILIZE_ATTEMPTED event expected"
     );
 }

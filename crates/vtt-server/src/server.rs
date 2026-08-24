@@ -1482,27 +1482,40 @@ async fn resolve_shove_action(
         );
 
         let campaign_id = session.campaign_id;
+        // Positional provenance for a successful push: recorded in the ledger
+        // event below so `safety_rewind` can undo the displacement, and used
+        // to refresh the WS movement baseline (see resolve_clamped_push docs
+        // for the blocked-push design decision).
+        let mut pushed_from: Option<(f32, f32, f32)> = None;
+        let mut pushed_to: Option<(f32, f32, f32)> = None;
+        let mut push_distance_feet = 0.0f32;
+
         if let Some(condition) = resolution.applied_condition {
             if let Some(t) = session.entities.get_mut(&req.defender_id) {
                 t.add_condition(condition);
             }
         } else if resolution.success && effect == vtt_core::actions::ShoveEffect::Push5Feet {
             // Push 5 ft directly away from the shover along their connecting
-            // line (degenerate same-point case pushes along +x).
+            // line, clamped cell-by-cell against solid cells and map bounds.
+            let (from, to, moved) =
+                resolve_clamped_push(&session.map, attacker.position, defender.position);
             if let Some(t) = session.entities.get_mut(&req.defender_id) {
-                let dx = t.position.0 - attacker.position.0;
-                let dy = t.position.1 - attacker.position.1;
-                let len = (dx * dx + dy * dy).sqrt();
-                let (ux, uy) = if len > f32::EPSILON { (dx / len, dy / len) } else { (1.0, 0.0) };
-                t.position = (
-                    t.position.0 + ux * 5.0,
-                    t.position.1 + uy * 5.0,
-                    t.position.2,
-                );
+                t.position = to;
             }
+            // Keep the WS relay's movement baseline consistent: the token was
+            // displaced engine-side, so the next TokenTransform update must be
+            // speed-checked from where the shove LEFT it, not from a stale
+            // pre-shove origin.
+            data.movement
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(fnv1a_hash(&defender.name), (to.0, to.1));
+            pushed_from = Some(from);
+            pushed_to = Some(to);
+            push_distance_feet = moved;
         }
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "attacker_id": req.attacker_id.to_string(),
             "defender_id": req.defender_id.to_string(),
             "attacker_natural_roll": attacker_roll,
@@ -1514,6 +1527,12 @@ async fn resolve_shove_action(
             "success": resolution.success,
             "applied_condition": resolution.applied_condition,
         });
+        if let (Some(from), Some(to)) = (pushed_from, pushed_to) {
+            payload["pushed_from"] =
+                serde_json::json!([from.0, from.1, from.2]);
+            payload["pushed_to"] = serde_json::json!([to.0, to.1, to.2]);
+        }
+        payload["push_distance_feet"] = serde_json::json!(push_distance_feet);
         let event = session.ledger.append_event(
             session_id,
             campaign_id,
@@ -1529,6 +1548,333 @@ async fn resolve_shove_action(
         body["margin"] = serde_json::json!(resolution.contest.margin);
         body["effect"] = serde_json::json!(req.shove_effect);
         body["distance_feet"] = serde_json::json!(attacker.distance_to_feet(&defender));
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+
+// --- Dodge / Dash / Disengage / Stabilize (standard action options) -----------
+//
+// SRD 5e standard action alternatives, following the grapple/shove contract
+// wholesale: ids-only payloads (`deny_unknown_fields` makes smuggled client
+// math structurally impossible), server-side stats only, attack-identical RBAC
+// (`may_mutate_session` + `may_control_entity`), Action-budget spend AFTER all
+// validation passes (a rejected action must never consume the turn), and one
+// ledger event per resolution.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimpleActionReq {
+    pub entity_id: Uuid,
+}
+
+/// Which standard action a shared handler should perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardAction {
+    Dodge,
+    Dash,
+    Disengage,
+}
+
+impl StandardAction {
+    fn ledger_event(self) -> &'static str {
+        match self {
+            StandardAction::Dodge => "DODGE",
+            StandardAction::Dash => "DASH",
+            StandardAction::Disengage => "DISENGAGE_TAKEN",
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            StandardAction::Dodge => "DODGE_TAKEN",
+            StandardAction::Dash => "DASH_TAKEN",
+            StandardAction::Disengage => "DISENGAGE_TAKEN",
+        }
+    }
+}
+
+/// Rejection from the standard-action path: same shape as [`ContestRejection`]
+/// but the code comes from core's dynamic error strings.
+struct StandardActionRejection {
+    status: u16,
+    code: String,
+    detail: &'static str,
+}
+
+impl StandardActionRejection {
+    fn render(self, data: &AppState) -> HttpResponse {
+        reject(data, self.status, &self.code, self.detail)
+    }
+}
+
+/// Shared plumbing for Dodge / Dash / Disengage: RBAC, entity lookup and the
+/// core action-economy enforcement point ([`EntityState`] spends its own
+/// Action). Returns the post-action entity snapshot for the response body.
+fn perform_standard_action(
+    session: &mut GameSession,
+    role: Role,
+    user_id: &str,
+    entity_id: Uuid,
+    action: StandardAction,
+) -> Result<serde_json::Value, StandardActionRejection> {
+    let owner = session.entities.get(&entity_id).and_then(|e| e.owner_player_id.clone());
+    if !may_control_entity(owner.as_ref(), role, user_id) {
+        return Err(StandardActionRejection {
+            status: 403,
+            code: "ENTITY_NOT_OWNED".to_string(),
+            detail: "you do not control this entity",
+        });
+    }
+
+    // Core rejects with ENTITY_CANNOT_ACT / ACTION_ECONOMY_EXHAUSTED /
+    // DASH_ALREADY_TAKEN — surfaced verbatim as 409 codes.
+    let result = match session.entities.get_mut(&entity_id) {
+        None => {
+            return Err(StandardActionRejection {
+                status: 404,
+                code: "ENTITY_NOT_FOUND".to_string(),
+                detail: "entity does not exist in this session",
+            })
+        }
+        Some(entity) => match action {
+            StandardAction::Dodge => entity.take_dodge(),
+            StandardAction::Dash => entity.take_dash(),
+            StandardAction::Disengage => entity.take_disengage(),
+        },
+    };
+    let entity = match result {
+        Ok(()) => &session.entities[&entity_id],
+        Err(e) => {
+            return Err(StandardActionRejection {
+                status: 409,
+                code: e,
+                detail: "action rejected by the action economy",
+            })
+        }
+    };
+
+    Ok(match action {
+        StandardAction::Dodge => serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "dodge_until_next_turn": entity.dodge_until_next_turn,
+        }),
+        StandardAction::Dash => serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "dashed_this_turn": entity.dashed_this_turn,
+            "movement_remaining_feet": entity.action_budget.movement_remaining_feet,
+        }),
+        StandardAction::Disengage => serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "disengaged_until_next_turn": entity.disengaged_until_next_turn,
+        }),
+    })
+}
+
+macro_rules! standard_action_route {
+    ($name:ident, $action:expr) => {
+        async fn $name(
+            data: web::Data<AppState>,
+            path: web::Path<Uuid>,
+            req: web::Json<SimpleActionReq>,
+            identity: AuthIdentity,
+        ) -> impl Responder {
+            data.count_request();
+            let session_id = path.into_inner();
+            let role = Role::from_identity(&identity);
+            if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+                return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+            }
+            let req = req.into_inner();
+            if let Some(session_lock) = data.sessions.get(&session_id) {
+                let mut session = session_lock.write();
+                if !session.entities.contains_key(&req.entity_id) {
+                    return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in session");
+                }
+                let payload = match perform_standard_action(
+                    &mut session,
+                    role,
+                    &identity.user_id,
+                    req.entity_id,
+                    $action,
+                ) {
+                    Ok(p) => p,
+                    Err(rejection) => return rejection.render(&data),
+                };
+                data.count_valid();
+                let campaign_id = session.campaign_id;
+                let event = session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    req.entity_id,
+                    $action.ledger_event(),
+                    payload.clone(),
+                );
+                let mut body = serde_json::json!({ "status": $action.status() });
+                for (k, v) in payload.as_object().into_iter().flatten() {
+                    body[k.clone()] = v.clone();
+                }
+                body["event_sequence"] = serde_json::json!(event.sequence_id);
+                HttpResponse::Ok().json(body)
+            } else {
+                HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+            }
+        }
+    };
+}
+
+standard_action_route!(resolve_dodge, StandardAction::Dodge);
+standard_action_route!(resolve_dash, StandardAction::Dash);
+standard_action_route!(resolve_disengage, StandardAction::Disengage);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StabilizeActionReq {
+    pub healer_id: Uuid,
+    pub target_id: Uuid,
+    /// Optional deterministic seed pinning the Medicine roll.
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+/// Melee reach for stabilize (a Medicine check requires touching the patient).
+const STABILIZE_REACH_FEET: f32 = 5.0;
+
+async fn resolve_stabilize(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<StabilizeActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Healer must exist, be controllable, and be able to act.
+        let healer_owner = session
+            .entities
+            .get(&req.healer_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !session.entities.contains_key(&req.healer_id) {
+            return reject(&data, 404, "HEALER_NOT_FOUND", "healer_id does not exist in this session");
+        }
+        if !may_control_entity(healer_owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control the healer");
+        }
+        let target_exists = session.entities.contains_key(&req.target_id);
+        if !target_exists {
+            return reject(&data, 404, "TARGET_NOT_FOUND", "target_id does not exist in this session");
+        }
+        if req.healer_id == req.target_id {
+            return reject(&data, 422, "SELF_TARGET_INVALID", "the healer cannot treat themself");
+        }
+
+        // Read-only gates BEFORE any state changes or budget spends.
+        let (healer_can_act, healer_has_action, distance) = {
+            let healer = &session.entities[&req.healer_id];
+            let target = &session.entities[&req.target_id];
+            (
+                healer.can_act() && healer.action_budget.action,
+                healer.action_budget.action,
+                healer.distance_to_feet(target),
+            )
+        };
+        if !healer_can_act {
+            return reject(
+                &data,
+                409,
+                if healer_has_action { "ENTITY_CANNOT_ACT" } else { "ACTION_ECONOMY_EXHAUSTED" },
+                "healer is unconscious, dead, incapacitated, or out of Actions",
+            );
+        }
+        if distance > STABILIZE_REACH_FEET {
+            return reject(
+                &data,
+                409,
+                "OUT_OF_REACH",
+                "stabilizing requires the dying ally within 5 ft",
+            );
+        }
+
+        // Dying-state gates on the TARGET (a rejected attempt must not burn
+        // the healer's Action).
+        let dying_gate = {
+            let target = &session.entities[&req.target_id];
+            if target.is_dead {
+                Err("TARGET_ALREADY_DEAD")
+            } else if target.current_hp > 0 {
+                Err("TARGET_NOT_DYING")
+            } else if target.death_saves.is_stabilized {
+                Err("ALREADY_STABILIZED")
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(code) = dying_gate {
+            return reject(&data, 409, code, "target is not a saveable dying creature");
+        }
+
+        // All validations passed — spend the healer's Action now.
+        if let Err(e) = session
+            .entities
+            .get_mut(&req.healer_id)
+            .expect("checked above")
+            .spend_action()
+        {
+            return reject(&data, 409, &e, "action budget exhausted or entity incapable");
+        }
+
+        // Server-side roll + Wisdom modifier (stat blocks carry no per-skill
+        // proficiency bonuses; Medicine is keyed off Wisdom in this engine).
+        let medicine_mod = session.entities[&req.healer_id]
+            .abilities
+            .modifier(Ability::Wisdom);
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+        let natural_roll = dice.roll_d20();
+
+        let outcome = session
+            .entities
+            .get_mut(&req.target_id)
+            .expect("checked above")
+            .stabilize_attempt(natural_roll, medicine_mod)
+            .expect("gates re-verified above");
+
+        let payload = serde_json::json!({
+            "healer_id": req.healer_id.to_string(),
+            "target_id": req.target_id.to_string(),
+            "natural_roll": outcome.natural_roll,
+            "medicine_modifier": outcome.modifier,
+            "total": outcome.total,
+            "dc": outcome.dc,
+            "success": outcome.success,
+            "successes": outcome.successes_after,
+            "failures": outcome.failures_after,
+            "is_stabilized": outcome.is_stabilized_after,
+        });
+        let campaign_id = session.campaign_id;
+        let event = session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.healer_id,
+            "STABILIZE_ATTEMPTED",
+            payload.clone(),
+        );
+
+        data.count_valid();
+        let mut body = payload;
         body["event_sequence"] = serde_json::json!(event.sequence_id);
         HttpResponse::Ok().json(body)
     } else {
@@ -2311,6 +2657,76 @@ fn build_collision_grid(map: &SessionMap) -> GridCollisionMap {
         grid.set_solid(x, y, 0, true);
     }
     grid
+}
+
+/// Whether a world-space point lands in a solid cell or outside the authored
+/// map rectangle. Bounds are checked in RAW grid space (not via
+/// `world_to_grid`, which clamps out-of-bounds coordinates back onto the edge
+/// of the map and would silently allow pushing a token off-world).
+fn world_point_blocked(grid: &GridCollisionMap, p: (f32, f32, f32)) -> bool {
+    let gx = (p.0 / grid.cell_size_feet).floor();
+    let gy = (p.1 / grid.cell_size_feet).floor();
+    if gx < 0.0 || gy < 0.0 || gx >= grid.width as f32 || gy >= grid.height as f32 {
+        return true;
+    }
+    grid.is_solid(gx as usize, gy as usize, 0)
+}
+
+/// Resolves a 5 ft shove push of the defender directly away from the shover,
+/// stepping cell-by-cell (cell-size increments) along the push direction.
+///
+/// SRD 5e shove is EITHER/OR: knock prone OR push 5 feet. DESIGN DECISION
+/// (audit F4): when the chosen effect was push but the path is obstructed,
+/// the contest itself still resolves — the roll stands, the Action is spent
+/// and the winner is declared — but displacement is reduced to whatever
+/// fits before the first solid cell or map bound, and to ZERO if not even
+/// one step is possible. Forced movement never drags a creature through an
+/// obstruction, and the shover does not get a free fallback to the prone
+/// effect they did not choose. The applied displacement is returned so the
+/// caller can record it in the ledger event (rewind provenance) and refresh
+/// the WS movement baseline.
+///
+/// Degenerate same-point attackers/defenders push along +x (matching the
+/// pre-clamping behaviour).
+fn resolve_clamped_push(
+    map: &SessionMap,
+    attacker_pos: (f32, f32, f32),
+    defender_pos: (f32, f32, f32),
+) -> ((f32, f32, f32), (f32, f32, f32), f32) {
+    const PUSH_FEET: f32 = 5.0;
+    let grid = build_collision_grid(map);
+    let cell = if map.cell_size_feet > 0.0 {
+        map.cell_size_feet
+    } else {
+        5.0
+    };
+
+    let dx = defender_pos.0 - attacker_pos.0;
+    let dy = defender_pos.1 - attacker_pos.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    let (ux, uy) = if len > f32::EPSILON {
+        (dx / len, dy / len)
+    } else {
+        (1.0, 0.0)
+    };
+
+    // Whole-cell steps fit into the 5 ft budget.
+    let steps = (PUSH_FEET / cell + 1e-4).floor().max(0.0) as usize;
+    let mut landed = defender_pos;
+    let mut moved = 0.0f32;
+    for step in 1..=steps {
+        let candidate = (
+            defender_pos.0 + ux * (step as f32 * cell),
+            defender_pos.1 + uy * (step as f32 * cell),
+            defender_pos.2,
+        );
+        if world_point_blocked(&grid, candidate) {
+            break; // stop BEFORE the blocking cell — never clip into it
+        }
+        landed = candidate;
+        moved += cell;
+    }
+    (defender_pos, landed, moved)
 }
 
 fn build_terrain_overlay(map: &SessionMap) -> TerrainOverlay {
@@ -3320,6 +3736,10 @@ pub fn configure_app_with(
                         .route("/action/attack", web::post().to(resolve_attack))
                         .route("/action/grapple", web::post().to(resolve_grapple_action))
                         .route("/action/shove", web::post().to(resolve_shove_action))
+                        .route("/action/dodge", web::post().to(resolve_dodge))
+                        .route("/action/dash", web::post().to(resolve_dash))
+                        .route("/action/disengage", web::post().to(resolve_disengage))
+                        .route("/action/stabilize", web::post().to(resolve_stabilize))
                         .route("/action/cast-spell", web::post().to(resolve_cast_spell))
                         .route("/move", web::post().to(move_entity))
                         .route("/reactions/arm", web::post().to(arm_reaction))

@@ -745,6 +745,244 @@ fn test_safety_rewind_restores_exhaustion_from_surviving_long_rest_event() {
     );
 }
 
+// ------------------------------------------------- contest rewind (audit F4)
+//
+// GRAPPLE_ATTEMPTED / SHOVE_ATTEMPTED mutate live state (conditions, position)
+// outside the classic HP/position replay set. A rewind past them must undo
+// that state too, or the X-card rollback leaves a grapple or a 5 ft push in
+// place after the events that caused it are gone.
+
+fn grapple_event(defender: uuid::Uuid, success: bool) -> serde_json::Value {
+    serde_json::json!({
+        "attacker_id": uuid::Uuid::new_v4().to_string(),
+        "defender_id": defender.to_string(),
+        "success": success,
+        "applied_condition": if success { serde_json::json!("grappled") } else { serde_json::Value::Null },
+        "escape_dc": 13,
+    })
+}
+
+#[test]
+fn test_safety_rewind_past_grapple_removes_grappled_condition() {
+    let mut session = session_with_pair();
+    let (grappler, victim): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+    let _ = grappler;
+
+    let baseline_seq = append_and_seq(
+        &mut session,
+        grappler,
+        "MOVE_ENTITY",
+        serde_json::json!({"from": [2.5, 2.5, 0.0], "to": [2.5, 2.5, 0.0]}),
+    );
+
+    // Successful grapple: ledger event + the live condition it applied.
+    let seq_after_grapple = append_and_seq(
+        &mut session,
+        grappler,
+        "GRAPPLE_ATTEMPTED",
+        grapple_event(victim, true),
+    );
+    session
+        .entities
+        .get_mut(&victim)
+        .unwrap()
+        .add_condition(Condition::Grappled);
+    assert!(session.entities[&victim].has_condition(&Condition::Grappled));
+
+    // Rewind to BEFORE the grapple.
+    let report = session.safety_rewind(baseline_seq);
+    assert_eq!(report.reverted_event_count, 1);
+
+    assert!(
+        !session.entities[&victim].has_condition(&Condition::Grappled),
+        "rewinding past a successful grapple must strip Grappled from the defender"
+    );
+    // The surviving baseline event still replays its own effect (position).
+    assert_eq!(session.entities[&victim].position, (2.5, 2.5, 0.0));
+    let _ = seq_after_grapple;
+}
+
+#[test]
+fn test_safety_rewind_keeps_grapple_when_its_event_survives() {
+    let mut session = session_with_pair();
+    let (grappler, victim): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let seq_after_grapple = append_and_seq(
+        &mut session,
+        grappler,
+        "GRAPPLE_ATTEMPTED",
+        grapple_event(victim, true),
+    );
+    session
+        .entities
+        .get_mut(&victim)
+        .unwrap()
+        .add_condition(Condition::Grappled);
+
+    session.safety_rewind(seq_after_grapple);
+
+    assert!(
+        session.entities[&victim].has_condition(&Condition::Grappled),
+        "a surviving GRAPPLE_ATTEMPTED must re-grant Grappled during replay"
+    );
+}
+
+#[test]
+fn test_safety_rewind_past_failed_grapple_leaves_no_condition() {
+    let mut session = session_with_pair();
+    let (grappler, victim): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+    let _ = grappler;
+
+    let baseline_seq = append_and_seq(
+        &mut session,
+        grappler,
+        "MOVE_ENTITY",
+        serde_json::json!({"from": [2.5, 2.5, 0.0], "to": [2.5, 2.5, 0.0]}),
+    );
+
+    // Lost contest: event recorded, NO condition was ever applied.
+    append_and_seq(&mut session, grappler, "GRAPPLE_ATTEMPTED", grapple_event(victim, false));
+
+    session.safety_rewind(baseline_seq);
+
+    assert!(
+        !session.entities[&victim].has_condition(&Condition::Grappled),
+        "a lost contest grants nothing and rewinding past it must grant nothing"
+    );
+}
+
+#[test]
+fn test_safety_rewind_past_shove_push_restores_pre_push_position() {
+    let mut session = session_with_pair();
+    let (shover, pushed): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let pre_push = session.entities[&pushed].position;
+
+    let baseline_seq = append_and_seq(
+        &mut session,
+        shover,
+        "MOVE_ENTITY",
+        serde_json::json!({"from": [2.5, 2.5, 0.0], "to": [2.5, 2.5, 0.0]}),
+    );
+
+    // Successful 5 ft push: displacement is carried IN the event payload so a
+    // rewind can undo it even though no MOVE_ENTITY ever recorded the trip.
+    let seq_after_push = append_and_seq(
+        &mut session,
+        shover,
+        "SHOVE_ATTEMPTED",
+        serde_json::json!({
+            "attacker_id": shover.to_string(),
+            "defender_id": pushed.to_string(),
+            "success": true,
+            "shove_effect": "push_5ft",
+            "applied_condition": null,
+            "pushed_from": [pre_push.0, pre_push.1, pre_push.2],
+            "pushed_to": [pre_push.0 + 5.0, pre_push.1, pre_push.2],
+            "push_distance_feet": 5.0,
+        }),
+    );
+    session.entities.get_mut(&pushed).unwrap().position =
+        (pre_push.0 + 5.0, pre_push.1, pre_push.2);
+
+    session.safety_rewind(baseline_seq);
+
+    assert_eq!(
+        session.entities[&pushed].position, pre_push,
+        "rewind past a shove-push must restore the pre-push position"
+    );
+    let _ = seq_after_push;
+}
+
+#[test]
+fn test_safety_rewind_past_shove_prone_removes_prone_condition() {
+    let mut session = session_with_pair();
+    let (shover, victim): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let baseline_seq = append_and_seq(
+        &mut session,
+        shover,
+        "MOVE_ENTITY",
+        serde_json::json!({"from": [2.5, 2.5, 0.0], "to": [2.5, 2.5, 0.0]}),
+    );
+
+    append_and_seq(
+        &mut session,
+        shover,
+        "SHOVE_ATTEMPTED",
+        serde_json::json!({
+            "attacker_id": shover.to_string(),
+            "defender_id": victim.to_string(),
+            "success": true,
+            "shove_effect": "prone",
+            "applied_condition": "prone",
+        }),
+    );
+    session
+        .entities
+        .get_mut(&victim)
+        .unwrap()
+        .add_condition(Condition::Prone);
+
+    session.safety_rewind(baseline_seq);
+
+    assert!(
+        !session.entities[&victim].has_condition(&Condition::Prone),
+        "rewind past a prone-shove must stand the defender back up"
+    );
+}
+
+#[test]
+fn test_safety_rewind_shove_position_yields_to_later_surviving_move() {
+    let mut session = session_with_pair();
+    let (shover, pushed): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+    let pre_push = session.entities[&pushed].position;
+
+    // Shove happens BEFORE the rewind point and SURVIVES it; a later
+    // MOVE_ENTITY also survives — last-event-wins means the move wins.
+    append_and_seq(
+        &mut session,
+        shover,
+        "SHOVE_ATTEMPTED",
+        serde_json::json!({
+            "attacker_id": shover.to_string(),
+            "defender_id": pushed.to_string(),
+            "success": true,
+            "shove_effect": "push_5ft",
+            "applied_condition": null,
+            "pushed_from": [pre_push.0, pre_push.1, pre_push.2],
+            "pushed_to": [pre_push.0 + 5.0, pre_push.1, pre_push.2],
+        }),
+    );
+    session.move_entity(pushed, (20.0, 20.0, 0.0)).unwrap();
+
+    session.safety_rewind(session.ledger.current_sequence);
+
+    assert_eq!(
+        session.entities[&pushed].position,
+        (20.0, 20.0, 0.0),
+        "a surviving MOVE_ENTITY after a surviving shove wins position replay"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fail-forward resolution engine (GOALS.md Pillar 8): non-binary skill-check
 // success margins M = Roll − DC.

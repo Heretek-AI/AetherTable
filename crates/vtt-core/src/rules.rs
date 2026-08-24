@@ -211,6 +211,9 @@ impl RulesEvaluator {
     ///   unconscious; prone only within 5 ft).
     /// - Target conditions that impose disadvantage on the attacker (invisible;
     ///   prone beyond 5 ft).
+    /// - A target that took the Dodge action imposes disadvantage until its
+    ///   next-turn refresh clears the flag (see
+    ///   [`crate::state::EntityState::take_dodge`]).
     /// - High ground grants advantage when the existing high-ground attack bonus is > 0.
     ///
     /// NOTE: when both flags are true the pair CANCELS per SRD 5.1 and resolves as a
@@ -235,7 +238,8 @@ impl RulesEvaluator {
             || target
                 .conditions
                 .iter()
-                .any(|c| c.inflicts_disadvantage_on_attacker(distance_feet));
+                .any(|c| c.inflicts_disadvantage_on_attacker(distance_feet))
+            || target.dodge_until_next_turn;
 
         // High ground: only treat as advantage when the bonus is actually applied.
         if Self::calculate_high_ground_attack_bonus(attacker_z, target_z) > 0 {

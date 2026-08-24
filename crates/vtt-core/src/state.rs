@@ -13,6 +13,25 @@ pub struct ConcentrationState {
     pub started_round: u32,
 }
 
+/// SRD Medicine DC to stabilize a dying creature (see
+/// [`EntityState::stabilize_attempt`]).
+pub const STABILIZE_MEDICINE_DC: i32 = 10;
+
+/// Result of one stabilize attempt on a dying creature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StabilizeAttemptOutcome {
+    pub dc: i32,
+    pub natural_roll: i32,
+    pub modifier: i32,
+    pub total: i32,
+    pub success: bool,
+    /// Death-save success tally AFTER the attempt (3 => stabilized).
+    pub successes_after: u8,
+    /// Death-save failure tally AFTER the attempt (unchanged by this check).
+    pub failures_after: u8,
+    pub is_stabilized_after: bool,
+}
+
 /// One weapon / natural attack from an entity's stat block. Attack bonuses
 /// and damage dice live HERE — on the server-side authoritative stat block —
 /// never in client requests.
@@ -150,6 +169,18 @@ pub struct EntityState {
     /// the entity's next turn refresh.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shield_ac_bonus_active: bool,
+    /// SRD Dodge action taken this turn: attackers roll against this entity at
+    /// disadvantage until its next turn refresh clears the flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dodge_until_next_turn: bool,
+    /// SRD Disengage action taken this turn: leaving an adjacent hostile's
+    /// reach provokes NO opportunity attacks until the next turn refresh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disengaged_until_next_turn: bool,
+    /// SRD Dash latch: the movement-budget top-up is granted once per turn;
+    /// the next turn refresh re-arms it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dashed_this_turn: bool,
     pub action_budget: ActionBudget,
     #[serde(with = "slots_serde", default)]
     pub spell_slots_remaining: HashMap<u8, u32>,
@@ -232,6 +263,87 @@ impl EntityState {
             .get(action_index)
             .cloned()
             .unwrap_or_default()
+    }
+
+    // ------------------------------------------------- standard action options
+
+    /// SRD Dodge: until this entity's next turn refresh, every attack against
+    /// it is made at disadvantage (consumed by
+    /// [`crate::rules::RulesEvaluator::edge_from_conditions`]). Spends the
+    /// Action; idempotence is naturally prevented by the action economy.
+    pub fn take_dodge(&mut self) -> Result<(), String> {
+        self.spend_action()?;
+        self.dodge_until_next_turn = true;
+        Ok(())
+    }
+
+    /// SRD Dash: adds exactly one speed's worth of movement to the remaining
+    /// budget (exhaustion-modified speed — a level-5 creature dashes for 0 ft).
+    /// Once per turn: a second Dash within the same turn is rejected with
+    /// `DASH_ALREADY_TAKEN` WITHOUT spending anything. The latch and the bonus
+    /// movement both clear at the next turn refresh.
+    pub fn take_dash(&mut self) -> Result<(), String> {
+        if self.dashed_this_turn {
+            return Err("DASH_ALREADY_TAKEN".to_string());
+        }
+        self.spend_action()?;
+        self.dashed_this_turn = true;
+        self.action_budget.movement_remaining_feet += self.effective_speed_feet();
+        Ok(())
+    }
+
+    /// SRD Disengage: [`GameSession::move_entity`] reports no opportunity-
+    /// attack triggers for this entity's movement until its next turn refresh.
+    /// Spends the Action.
+    pub fn take_disengage(&mut self) -> Result<(), String> {
+        self.spend_action()?;
+        self.disengaged_until_next_turn = true;
+        Ok(())
+    }
+
+    /// SRD Stabilize: a DC 10 Medicine check on a dying creature. On a pass,
+    /// the creature's death-save SUCCESS tally gains +1 (existing tallies are
+    /// preserved — see [`DeathSaveState`]); reaching three successes marks it
+    /// stabilized. A failed check changes nothing (the Action is still spent by
+    /// the caller). Rolls are supplied by the caller so seeded server dice stay
+    /// authoritative — same contract as [`ActionResolver::resolve_death_save`].
+    ///
+    /// Rejections: `ENTITY_DEAD`, `TARGET_NOT_DYING` (has hit points),
+    /// `ALREADY_STABILIZED`.
+    pub fn stabilize_attempt(
+        &mut self,
+        medicine_natural_roll: i32,
+        medicine_modifier: i32,
+    ) -> Result<StabilizeAttemptOutcome, String> {
+        if self.is_dead {
+            return Err("ENTITY_DEAD".to_string());
+        }
+        if self.current_hp > 0 {
+            return Err("TARGET_NOT_DYING".to_string());
+        }
+        if self.death_saves.is_stabilized {
+            return Err("ALREADY_STABILIZED".to_string());
+        }
+
+        let total = medicine_natural_roll + medicine_modifier;
+        let success = total >= STABILIZE_MEDICINE_DC;
+        if success {
+            self.death_saves.successes = self.death_saves.successes.saturating_add(1);
+            if self.death_saves.successes >= 3 {
+                self.death_saves.is_stabilized = true;
+            }
+        }
+
+        Ok(StabilizeAttemptOutcome {
+            dc: STABILIZE_MEDICINE_DC,
+            natural_roll: medicine_natural_roll,
+            modifier: medicine_modifier,
+            total,
+            success,
+            successes_after: self.death_saves.successes,
+            failures_after: self.death_saves.failures,
+            is_stabilized_after: self.death_saves.is_stabilized,
+        })
     }
 
     /// Adds a condition if not already present. Matching is by variant
@@ -403,6 +515,9 @@ impl EntityState {
             conditions: Vec::new(),
             condition_timers: Vec::new(),
             shield_ac_bonus_active: false,
+            dodge_until_next_turn: false,
+            disengaged_until_next_turn: false,
+            dashed_this_turn: false,
             action_budget: ActionBudget {
                 action: true,
                 bonus_action: true,
@@ -673,6 +788,11 @@ impl GameSession {
 
         for (id, entity) in self.entities.iter_mut() {
             entity.shield_ac_bonus_active = false; // Shield lasts until the start of the caster's next turn
+            // Dodge / Disengage last until the actor's next turn; the Dash
+            // once-per-turn latch re-arms here too.
+            entity.dodge_until_next_turn = false;
+            entity.disengaged_until_next_turn = false;
+            entity.dashed_this_turn = false;
             // Start-of-round action-economy refresh. Exhaustion modifies the
             // speed the budget seeds from (halved at level 2+, zero at 5+).
             entity.action_budget.reset(entity.effective_speed_feet());
@@ -796,10 +916,13 @@ impl GameSession {
         }
 
         // Opportunity attacks: enemies who WERE adjacent and no longer are.
+        // A mover who took the Disengage action provokes nothing this turn —
+        // and a provoked-but-suppressed enemy keeps its readied reaction,
+        // because no trigger actually fired.
         let mut opportunity_attacks = Vec::new();
         {
-            let (mover_pos, _) = match self.entities.get(&entity_id) {
-                Some(m) => (m.position, ()),
+            let (mover_pos, disengaged) = match self.entities.get(&entity_id) {
+                Some(m) => (m.position, m.disengaged_until_next_turn),
                 None => return Err("ENTITY_NOT_FOUND".to_string()),
             };
             for enemy_id in adjacent_enemies_before {
@@ -813,6 +936,7 @@ impl GameSession {
                     })
                     .unwrap_or(false);
                 if !still_adjacent
+                    && !disengaged
                     && self.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack)
                 {
                     opportunity_attacks.push(OpportunityAttackTrigger {
@@ -886,6 +1010,36 @@ impl GameSession {
         let mut hp_state: HashMap<Uuid, (i32, bool, bool)> = HashMap::new();
         let mut death_save_state: HashMap<Uuid, DeathSaveState> = HashMap::new();
         let mut pos_state: HashMap<Uuid, (f32, f32, f32)> = HashMap::new();
+        // Contest-derived conditions (Grappled from a won grapple, Prone from
+        // a prone-shove): last surviving grant per entity wins. Anything not
+        // backed by a surviving event is stripped below — these two
+        // conditions are only ever granted by GRAPPLE_ATTEMPTED /
+        // SHOVE_ATTEMPTED flows, so a rewind past those events must un-grant
+        // them even though they live outside the HP/position replay set
+        // (audit F4: the rewind-blind-spot class).
+        let mut condition_state: HashMap<Uuid, Condition> = HashMap::new();
+
+        // Seed positions from REVERTED shove pushes first (`or_insert`, so any
+        // surviving event below overrides): a push displaces its target
+        // WITHOUT a MOVE_ENTITY, so when the SHOVE_ATTEMPTED is reverted the
+        // only record of where the target stood before is that event's own
+        // "pushed_from" payload. Without this seeding, rewinding past a push
+        // would strand the target at the pushed-to point whenever no earlier
+        // move event exists to fall back on.
+        for ev in reverted.iter().filter(|e| e.event_type == "SHOVE_ATTEMPTED") {
+            if ev.payload.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            if let (Some(id), Some(from)) = (
+                ev.payload
+                    .get("defender_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                parse_payload_position(ev.payload.get("pushed_from")),
+            ) {
+                pos_state.entry(id).or_insert(from);
+            }
+        }
         // Last-seen post-rest exhaustion level per entity, from surviving
         // LONG_REST_APPLIED events carrying "exhaustion_level".
         let mut exhaustion_state: HashMap<Uuid, u8> = HashMap::new();
@@ -985,16 +1139,55 @@ impl GameSession {
                 "MOVE_ENTITY" => {
                     let aid_ok = ev.payload.get("to").is_some();
                     if aid_ok {
-                        if let (Some(to), true) = (
-                            ev.payload.get("to").and_then(|v| v.as_array()).map(|a| (
-                                a.first().and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
-                                a.get(1).and_then(|y| y.as_f64()).unwrap_or(0.0) as f32,
-                                a.get(2).and_then(|z| z.as_f64()).unwrap_or(0.0) as f32,
-                            )),
-                            true,
-                        ) {
+                        if let Some(to) = parse_payload_position(ev.payload.get("to")) {
                             pos_state.insert(ev.actor_id, to);
                         }
+                    }
+                }
+                // Contest outcomes replay their mechanical side effects so a
+                // rewind past them cannot leave a grapple or a push behind
+                // (audit F4). A WON grapple re-grants Grappled to the
+                // defender; a lost contest grants nothing. For shoves the
+                // effect decides: Prone rides `condition_state`, Push5Feet
+                // rides `pos_state` via the payload's post-push position —
+                // both last-surviving-event-wins.
+                "GRAPPLE_ATTEMPTED"
+                    if ev.payload.get("success").and_then(|v| v.as_bool()) == Some(true) =>
+                {
+                    if let (Some(id), Some(condition)) = (
+                        ev.payload
+                            .get("defender_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Uuid::parse_str(s).ok()),
+                        parse_contest_condition(ev.payload.get("applied_condition")),
+                    ) {
+                        condition_state.insert(id, condition);
+                    }
+                }
+                "SHOVE_ATTEMPTED" => {
+                    if ev.payload.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                        continue;
+                    }
+                    let defender = ev
+                        .payload
+                        .get("defender_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok());
+                    let condition =
+                        parse_contest_condition(ev.payload.get("applied_condition"));
+                    match (defender, condition) {
+                        (Some(id), Some(condition)) => {
+                            condition_state.insert(id, condition);
+                        }
+                        // No condition granted: a successful shove is either
+                        // prone OR a 5 ft push. Only a push carries position
+                        // data ("pushed_to"), and only it moves the board.
+                        (Some(id), None) => {
+                            if let Some(to) = parse_payload_position(ev.payload.get("pushed_to")) {
+                                pos_state.insert(id, to);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -1040,6 +1233,22 @@ impl GameSession {
             }
         }
 
+        // Contest-condition replay: strip Grappled/Prone everywhere first (the
+        // live grants came from events that may just have been reverted), then
+        // re-apply exactly what the surviving ledger still vouches for. Both
+        // conditions are granted ONLY by the grapple/shove contest endpoints,
+        // so nothing else can be lost by the sweep.
+        for entity in self.entities.values_mut() {
+            entity.remove_condition(&Condition::Grappled);
+            entity.remove_condition(&Condition::Prone);
+        }
+        for (id, condition) in condition_state {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.add_condition(condition);
+                restored += 1;
+            }
+        }
+
         // Combat-state replay: the ledger is authoritative at the rewind
         // point. A surviving end (or no surviving begin at all) means no
         // engagement is active — clear any drifted tracker. A surviving
@@ -1065,6 +1274,9 @@ impl GameSession {
         // it may have been undone, so conservatively end all concentration.
         for entity in self.entities.values_mut() {
             entity.concentration = None;
+            entity.dodge_until_next_turn = false;
+            entity.disengaged_until_next_turn = false;
+            entity.dashed_this_turn = false;
             entity.action_budget.reset(entity.effective_speed_feet());
         }
 
@@ -1217,10 +1429,32 @@ impl GameSession {
     }
 }
 
+/// Parses a `[x, y, z]` payload coordinate array into a position tuple.
+fn parse_payload_position(value: Option<&serde_json::Value>) -> Option<(f32, f32, f32)> {
+    let a = value?.as_array()?;
+    Some((
+        a.first()?.as_f64()? as f32,
+        a.get(1)?.as_f64()? as f32,
+        a.get(2).and_then(|z| z.as_f64()).unwrap_or(0.0) as f32,
+    ))
+}
+
+/// Maps a contest event's `applied_condition` payload string to the condition
+/// the rewind replay can re-grant. Only Grappled and Prone are ever written by
+/// the grapple/shove endpoints; anything else replays as nothing.
+fn parse_contest_condition(value: Option<&serde_json::Value>) -> Option<Condition> {
+    match value.and_then(|v| v.as_str()) {
+        Some("grappled") => Some(Condition::Grappled),
+        Some("prone") => Some(Condition::Prone),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dice::DiceEngine;
+    use crate::RulesEvaluator;
 
     fn entity(id: Uuid, name: &str, dex: i32) -> EntityState {
         EntityState::new(
@@ -1365,6 +1599,234 @@ mod tests {
         let mut state = InitiativeCombatState::default();
         let (idx, round, actor) = state.next_turn();
         assert_eq!((idx, round, actor), (0, 0, None));
+    }
+
+    // ------------------------------------------------ standard action options
+
+    fn enemy(id: Uuid, name: &str) -> EntityState {
+        let mut e = entity(id, name, 10);
+        e.is_player = false;
+        e
+    }
+
+    #[test]
+    fn test_take_dodge_sets_flag_and_edge_from_conditions_applies_it_until_refresh() {
+        let attacker_id = Uuid::new_v4();
+        let dodger_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(attacker_id, "Attacker", 10), None).unwrap();
+        session.add_entity(entity(dodger_id, "Dodger", 10), None).unwrap();
+
+        // Baseline: nobody dodging -> no condition-derived disadvantage.
+        let attacker = session.entities[&attacker_id].clone();
+        let target = session.entities[&dodger_id].clone();
+        let (adv, dis) = RulesEvaluator::edge_from_conditions(&attacker, &target, 5.0, 0.0, 0.0);
+        assert!(!adv && !dis, "clean board must be straight d20");
+
+        // Dodge spends the Action and flags the entity.
+        session.entities.get_mut(&dodger_id).unwrap().take_dodge().unwrap();
+        assert!(session.entities[&dodger_id].dodge_until_next_turn);
+        assert!(!session.entities[&dodger_id].action_budget.action, "dodge spends the Action");
+
+        // Attacks against the dodger are made at disadvantage.
+        let attacker = session.entities[&attacker_id].clone();
+        let target = session.entities[&dodger_id].clone();
+        let (adv, dis) = RulesEvaluator::edge_from_conditions(&attacker, &target, 5.0, 0.0, 0.0);
+        assert!(!adv);
+        assert!(dis, "attackers gain disadvantage against a dodging target");
+
+        // The dodger's next-turn refresh clears the flag and the edge with it.
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice);
+        assert!(!session.entities[&dodger_id].dodge_until_next_turn);
+        let attacker = session.entities[&attacker_id].clone();
+        let target = session.entities[&dodger_id].clone();
+        let (_, dis) = RulesEvaluator::edge_from_conditions(&attacker, &target, 5.0, 0.0, 0.0);
+        assert!(!dis, "dodge must expire at the start of the dodger's next turn");
+    }
+
+    #[test]
+    fn test_take_dash_adds_speed_to_budget_once_then_resets() {
+        let id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(id, "Runner", 10), None).unwrap(); // speed 30
+
+        // Spend some movement first — Dash adds on top of whatever remains.
+        session.move_entity(id, (10.0, 0.0, 0.0)).unwrap();
+        assert_eq!(session.entities[&id].action_budget.movement_remaining_feet, 20.0);
+
+        session.entities.get_mut(&id).unwrap().take_dash().unwrap();
+        assert_eq!(
+            session.entities[&id].action_budget.movement_remaining_feet, 50.0,
+            "dash adds exactly one speed worth of movement"
+        );
+        assert!(session.entities[&id].dashed_this_turn);
+
+        // Once per turn: a second Dash is rejected WITHOUT double-spending.
+        let err = session.entities.get_mut(&id).unwrap().take_dash().unwrap_err();
+        assert_eq!(err, "DASH_ALREADY_TAKEN");
+        assert_eq!(
+            session.entities[&id].action_budget.movement_remaining_feet, 50.0,
+            "rejected dash must not add movement again"
+        );
+
+        // Next-turn refresh resets both the budget and the once-per-turn latch.
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice);
+        assert_eq!(session.entities[&id].action_budget.movement_remaining_feet, 30.0);
+        assert!(!session.entities[&id].dashed_this_turn);
+        session.entities.get_mut(&id).unwrap().take_dash().unwrap();
+        assert_eq!(session.entities[&id].action_budget.movement_remaining_feet, 60.0);
+    }
+
+    #[test]
+    fn test_take_disengage_suppresses_opportunity_attacks_until_refresh() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        // Adjacent (5 ft) hostile with an ARMED opportunity reaction.
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+
+        // Baseline: leaving adjacency provokes.
+        let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert_eq!(outcome.opportunity_attacks.len(), 1);
+        assert_eq!(outcome.opportunity_attacks[0].attacker_id, enemy_id);
+
+        // Re-arm (the baseline provoke consumed it), step back in, disengage.
+        session.entities.get_mut(&enemy_id).unwrap().action_budget.reaction = true;
+        session.entities.get_mut(&mover_id).unwrap().action_budget.movement_remaining_feet = 30.0;
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (5.0, 0.0, 0.0)).unwrap();
+        session.entities.get_mut(&mover_id).unwrap().action_budget.movement_remaining_feet = 30.0;
+        session.entities.get_mut(&mover_id).unwrap().take_disengage().unwrap();
+
+        // Walking away produces NO triggers and does NOT consume the enemy's
+        // readied reaction.
+        let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert!(outcome.opportunity_attacks.is_empty(), "disengage suppresses OAs");
+        assert!(session.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack));
+
+        // Refresh clears the protection: the same walk provokes again.
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (5.0, 0.0, 0.0)).unwrap();
+        session.entities.get_mut(&mover_id).unwrap().action_budget.movement_remaining_feet = 30.0;
+        let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert_eq!(outcome.opportunity_attacks.len(), 1, "protection expires");
+    }
+
+    #[test]
+    fn test_standard_actions_reject_incapacitated_or_spent_actors() {
+        let id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(id, "Actor", 10), None).unwrap();
+
+        // Exhaustion 5 = speed 0; dash still works (adds zero) but the point is
+        // incapacity gating, so use an unconscious actor instead.
+        session.entities.get_mut(&id).unwrap().add_condition(Condition::Unconscious);
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_dodge().unwrap_err(), "ENTITY_CANNOT_ACT");
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_dash().unwrap_err(), "ENTITY_CANNOT_ACT");
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_disengage().unwrap_err(), "ENTITY_CANNOT_ACT");
+
+        // Conscious again, but the Action is already gone.
+        let actor = session.entities.get_mut(&id).unwrap();
+        actor.remove_condition(&Condition::Unconscious);
+        actor.action_budget.action = false;
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_dodge().unwrap_err(), "ACTION_ECONOMY_EXHAUSTED");
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_dash().unwrap_err(), "ACTION_ECONOMY_EXHAUSTED");
+        assert_eq!(session.entities.get_mut(&id).unwrap().take_disengage().unwrap_err(), "ACTION_ECONOMY_EXHAUSTED");
+        assert!(!session.entities[&id].dodge_until_next_turn);
+        assert!(!session.entities[&id].disengaged_until_next_turn);
+        assert!(!session.entities[&id].dashed_this_turn, "a rejected dash must not latch");
+    }
+
+    #[test]
+    fn test_stabilize_attempt_success_tallies_and_stabilizes_at_three() {
+        let dying_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        let mut dying = entity(dying_id, "Dying", 10);
+        dying.current_hp = 0;
+        dying.is_conscious = false;
+        // Existing tallies: the new success must ADD, never overwrite.
+        dying.death_saves.successes = 1;
+        dying.death_saves.failures = 2;
+        session.add_entity(dying, None).unwrap();
+
+        // DC 10 Medicine check passed (natural 14 + 2).
+        let out = session
+            .entities
+            .get_mut(&dying_id)
+            .unwrap()
+            .stabilize_attempt(14, 2)
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(out.dc, 10);
+        assert_eq!(out.total, 16);
+        let state = &session.entities[&dying_id].death_saves;
+        assert_eq!(state.successes, 2, "+1 success on top of the existing tally");
+        assert_eq!(state.failures, 2, "failures untouched by a Medicine check");
+        assert!(!state.is_stabilized);
+
+        // Second success reaches three -> stabilized.
+        let out = session
+            .entities
+            .get_mut(&dying_id)
+            .unwrap()
+            .stabilize_attempt(10, 0)
+            .unwrap();
+        assert!(out.success);
+        let state = &session.entities[&dying_id].death_saves;
+        assert_eq!(state.successes, 3);
+        assert!(state.is_stabilized);
+        assert!(out.is_stabilized_after);
+
+        // A stabilized creature is past saving.
+        let err = session.entities.get_mut(&dying_id).unwrap().stabilize_attempt(20, 5).unwrap_err();
+        assert_eq!(err, "ALREADY_STABILIZED");
+    }
+
+    #[test]
+    fn test_stabilize_attempt_failed_check_and_invalid_targets_change_nothing() {
+        let dying_id = Uuid::new_v4();
+        let healthy_id = Uuid::new_v4();
+        let dead_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        let mut dying = entity(dying_id, "Dying", 10);
+        dying.current_hp = 0;
+        dying.is_conscious = false;
+        dying.death_saves.failures = 1;
+        session.add_entity(dying, None).unwrap();
+        session.add_entity(entity(healthy_id, "Healthy", 10), None).unwrap();
+        let mut dead = entity(dead_id, "Dead", 10);
+        dead.current_hp = 0;
+        dead.is_dead = true;
+        session.add_entity(dead, None).unwrap();
+
+        // Failed check (total 9 < DC 10): tallies unchanged.
+        let out = session
+            .entities
+            .get_mut(&dying_id)
+            .unwrap()
+            .stabilize_attempt(7, 2)
+            .unwrap();
+        assert!(!out.success);
+        let state = &session.entities[&dying_id].death_saves;
+        assert_eq!((state.successes, state.failures), (0, 1));
+        assert!(!state.is_stabilized && !state.is_dead);
+
+        // Healthy targets are not dying; corpses cannot be saved.
+        assert_eq!(
+            session.entities.get_mut(&healthy_id).unwrap().stabilize_attempt(20, 5).unwrap_err(),
+            "TARGET_NOT_DYING"
+        );
+        assert_eq!(
+            session.entities.get_mut(&dead_id).unwrap().stabilize_attempt(20, 5).unwrap_err(),
+            "ENTITY_DEAD"
+        );
     }
 
     #[test]
