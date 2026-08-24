@@ -18,6 +18,7 @@ import {
   Users
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { LorePanel } from './LorePanel';
 
 export interface DynastyMember {
   id: string;
@@ -243,6 +244,9 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
               </div>
             </div>
           </div>
+
+          {/* Live canon-assertion surface (real /api/v1/lore/assert + /api/v1/npc/) */}
+          <LorePanel />
         </div>
 
         {/* Center & Right 3 Columns: Generational Family Tree & Faction Tension Matrix */}
