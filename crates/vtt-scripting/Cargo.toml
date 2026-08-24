@@ -8,7 +8,7 @@ description = "Dual Scripting Architecture: Sandboxed Wasmtime Fuel-Metered & Rh
 [dependencies]
 vtt-core = { path = "../vtt-core" }
 rhai = { version = "1.19", features = ["sync", "serde"] }
-wasmtime = "29.0"
+wasmtime = "48.0"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

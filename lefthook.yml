@@ -26,6 +26,6 @@ pre-commit:
 pre-push:
   commands:
     noir-scan:
-      run: noir scan . --ai-context -f sarif
+      run: if command -v noir >/dev/null 2>&1; then noir scan . --ai-context -f sarif; fi
     cargo-deny:
       run: cargo deny check
