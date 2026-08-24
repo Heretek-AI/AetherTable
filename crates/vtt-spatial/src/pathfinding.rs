@@ -6,13 +6,15 @@ use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone, Eq, PartialEq)]
 struct Node {
-    cost: usize,
+    /// Priority = g + h: cost so far plus the admissible heuristic.
+    priority: usize,
+    g_cost: usize,
     pos: (usize, usize, usize),
 }
 
 impl Ord for Node {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.cmp(&self.cost)
+        other.priority.cmp(&self.priority)
     }
 }
 
@@ -22,10 +24,22 @@ impl PartialOrd for Node {
     }
 }
 
+/// Admissible Manhattan heuristic in grid steps. Every step costs at least 1
+/// movement point regardless of terrain, so this never overestimates the
+/// remaining weighted cost and A* stays optimal.
+fn manhattan_heuristic(a: (usize, usize, usize), b: (usize, usize, usize)) -> usize {
+    a.0.abs_diff(b.0) + a.1.abs_diff(b.1) + a.2.abs_diff(b.2)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathResult {
     pub path: Vec<Vector3>,
+    /// Geometric path length (hops × cell size), ignoring terrain.
     pub total_distance_feet: f32,
+    /// Terrain-weighted movement expenditure (Σ step costs × cell size) —
+    /// this is what the speed budget actually consumes on difficult terrain.
+    #[serde(default)]
+    pub movement_cost_feet: f32,
     pub is_reachable: bool,
     pub speed_budget_exceeded: bool,
 }
@@ -80,6 +94,7 @@ impl AStarPathfinder {
             return PathResult {
                 path: Vec::new(),
                 total_distance_feet: 0.0,
+                movement_cost_feet: 0.0,
                 is_reachable: false,
                 speed_budget_exceeded: false,
             };
@@ -90,7 +105,11 @@ impl AStarPathfinder {
         let mut heap = BinaryHeap::new();
 
         dist.insert(start, 0);
-        heap.push(Node { cost: 0, pos: start });
+        heap.push(Node {
+            priority: manhattan_heuristic(start, goal),
+            g_cost: 0,
+            pos: start,
+        });
 
         let neighbors_offset: [(i32, i32, i32); 6] = [
             (1, 0, 0), (-1, 0, 0),
@@ -100,14 +119,14 @@ impl AStarPathfinder {
 
         let mut found = false;
 
-        while let Some(Node { cost, pos }) = heap.pop() {
+        while let Some(Node { g_cost, pos, .. }) = heap.pop() {
             if pos == goal {
                 found = true;
                 break;
             }
 
             if let Some(&d) = dist.get(&pos) {
-                if cost > d {
+                if g_cost > d {
                     continue;
                 }
             }
@@ -122,11 +141,15 @@ impl AStarPathfinder {
                    nz >= 0 && nz < grid.depth as i32 {
                     let npos = (nx as usize, ny as usize, nz as usize);
                     if !grid.is_solid(npos.0, npos.1, npos.2) {
-                        let next_cost = cost + terrain.step_cost(npos);
-                        if next_cost < *dist.get(&npos).unwrap_or(&usize::MAX) {
-                            dist.insert(npos, next_cost);
+                        let next_g = g_cost + terrain.step_cost(npos);
+                        if next_g < *dist.get(&npos).unwrap_or(&usize::MAX) {
+                            dist.insert(npos, next_g);
                             came_from.insert(npos, pos);
-                            heap.push(Node { cost: next_cost, pos: npos });
+                            heap.push(Node {
+                                priority: next_g + manhattan_heuristic(npos, goal),
+                                g_cost: next_g,
+                                pos: npos,
+                            });
                         }
                     }
                 }
@@ -137,6 +160,7 @@ impl AStarPathfinder {
             return PathResult {
                 path: Vec::new(),
                 total_distance_feet: 0.0,
+                movement_cost_feet: 0.0,
                 is_reachable: false,
                 speed_budget_exceeded: false,
             };
@@ -161,11 +185,14 @@ impl AStarPathfinder {
             .collect();
 
         let total_distance = (world_path.len().saturating_sub(1) as f32) * grid.cell_size_feet;
-        let budget_exceeded = total_distance > speed_budget_feet;
+        // The speed budget consumes TERRAIN-WEIGHTED cost, never raw hops.
+        let weighted_cost = dist.get(&goal).copied().unwrap_or(0) as f32 * grid.cell_size_feet;
+        let budget_exceeded = weighted_cost > speed_budget_feet;
 
         PathResult {
             path: world_path,
             total_distance_feet: total_distance,
+            movement_cost_feet: weighted_cost,
             is_reachable: true,
             speed_budget_exceeded: budget_exceeded,
         }

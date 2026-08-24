@@ -57,6 +57,56 @@ mod tests {
     }
 
     #[test]
+    fn test_difficult_terrain_weights_movement_budget() {
+        let grid = GridCollisionMap::new(10, 10, 1, 5.0);
+        let mut terrain = TerrainOverlay::new();
+        // A difficult-terrain BELT spanning every row: any path must cross
+        // its 3 doubled cells, so detouring cannot dodge the surcharge.
+        for y in 0..10 {
+            for x in 2..=4 {
+                terrain.set_cost(x, y, 0, 2);
+            }
+        }
+
+        let start = Vector3::new(0.5, 0.5, 0.0);
+        let goal = Vector3::new(45.5, 0.5, 0.0);
+
+        let res = AStarPathfinder::find_path_with_terrain(&grid, &terrain, &start, &goal, 50.0);
+        assert!(res.is_reachable);
+
+        // 9 hops = 45 ft geometric; the 3 doubled cells push weighted cost
+        // to 12 steps = 60 ft.
+        assert_eq!(res.total_distance_feet, 45.0);
+        assert_eq!(res.movement_cost_feet, 60.0);
+        assert!(res.speed_budget_exceeded, "60 ft weighted > 50 ft budget");
+
+        // The same trip on clear ground fits comfortably in the budget.
+        let clear = AStarPathfinder::find_path(&grid, &start, &goal, 50.0);
+        assert!(!clear.speed_budget_exceeded);
+        assert_eq!(clear.movement_cost_feet, 45.0);
+    }
+
+    #[test]
+    fn test_astar_heuristic_preserves_optimal_paths() {
+        let mut grid = GridCollisionMap::new(10, 10, 1, 5.0);
+        for y in 0..9 {
+            grid.set_solid(5, y, 0, true);
+        }
+
+        let start = Vector3::new(0.5, 0.5, 0.0);
+        let goal = Vector3::new(45.5, 0.5, 0.0);
+        let res = AStarPathfinder::find_path(&grid, &start, &goal, 500.0);
+        assert!(res.is_reachable);
+
+        // Only crossing point is (5,9): optimal = manhattan(start→cross) +
+        // manhattan(cross→goal) = (5+9) + (4+9) = 27 hops = 135 ft.
+        // The heuristic must not cost any optimality.
+        let hops = res.path.len() - 1;
+        assert_eq!(hops, 27, "A* must return a shortest path");
+        assert_eq!(res.movement_cost_feet, 135.0);
+    }
+
+    #[test]
     fn test_zone_graph() {
         let mut graph = TopologicalZoneGraph::new();
         graph.add_zone(ZoneNode {
