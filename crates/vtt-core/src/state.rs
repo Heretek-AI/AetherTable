@@ -99,6 +99,11 @@ pub struct SessionMap {
     /// these cells consumes double movement (SRD difficult terrain).
     #[serde(default)]
     pub difficult_terrain: Vec<(usize, usize)>,
+    /// Per-cell lighting zones ([`LightingZoneCell`]). Cells absent from this
+    /// list are Bright by convention. Serde default keeps older maps
+    /// (lighting-less) deserializing.
+    #[serde(default)]
+    pub lighting_zones: Vec<LightingZoneCell>,
     /// Feet per grid cell.
     pub cell_size_feet: f32,
 }
@@ -110,6 +115,7 @@ impl Default for SessionMap {
             height: 32,
             solid_cells: Vec::new(),
             difficult_terrain: Vec::new(),
+            lighting_zones: Vec::new(),
             cell_size_feet: 5.0,
         }
     }
@@ -123,6 +129,14 @@ impl SessionMap {
                 return Err(format!(
                     "solid cell ({}, {}) out of {}x{} bounds",
                     x, y, self.width, self.height
+                ));
+            }
+        }
+        for cell in &self.lighting_zones {
+            if cell.x >= self.width || cell.y >= self.height {
+                return Err(format!(
+                    "lighting cell ({}, {}) out of {}x{} bounds",
+                    cell.x, cell.y, self.width, self.height
                 ));
             }
         }
@@ -236,6 +250,29 @@ pub struct EntityState {
     /// refresh. Serde default keeps legacy payloads deserializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_attacker_has_advantage_against: Option<String>,
+    /// Active SRD vision/sense mode ([`VisionMode`]). None = ordinary sight.
+    /// Feeds lighting-aware line-of-sight in `vtt_spatial::lighting`; serde
+    /// default keeps pre-existing persisted entities deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_mode: Option<VisionMode>,
+    /// Range in feet of the active special sense (darkvision 60/120,
+    /// blindsight 10-30, truesight 60+ — see
+    /// [`VisionMode::typical_range_feet`]). None = normal sight, unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sense_range_feet: Option<f32>,
+}
+
+impl EntityState {
+    /// The vision this entity effectively sees with: unset => Normal sight.
+    pub fn effective_vision_mode(&self) -> VisionMode {
+        self.vision_mode.unwrap_or(VisionMode::Normal)
+    }
+
+    /// How far the active sense reaches. Unset/Normal => unlimited (the
+    /// spatial layer treats infinity as "no range gate").
+    pub fn effective_sense_range_feet(&self) -> f32 {
+        self.sense_range_feet.unwrap_or(f32::INFINITY)
+    }
 }
 
 impl EntityState {
@@ -582,6 +619,8 @@ impl EntityState {
             concentration: None,
             readied_action: None,
             next_attacker_has_advantage_against: None,
+            vision_mode: None,
+            sense_range_feet: None,
         }
     }
 }
@@ -2090,6 +2129,77 @@ mod tests {
         let state: InitiativeCombatState = serde_json::from_value(raw).expect("legacy payload");
         assert!(state.order.is_empty());
         assert_eq!(state.round, 2);
+    }
+
+    #[test]
+    fn test_entity_defaults_to_normal_vision_and_serializes_backward_compatible() {
+        // New entities default to Normal, unlimited-range vision (stored as
+        // Option so legacy payloads stay backward compatible).
+        let e = entity(Uuid::new_v4(), "Seer", 10);
+        assert_eq!(e.vision_mode, None);
+        assert_eq!(e.effective_vision_mode(), VisionMode::Normal);
+        assert_eq!(e.sense_range_feet, None);
+        assert_eq!(e.effective_sense_range_feet(), f32::INFINITY);
+
+        // A legacy payload WITHOUT the new fields still deserializes.
+        let legacy = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "compendium_id": "legacy",
+            "name": "Legacy",
+            "is_player": true,
+            "current_hp": 10,
+            "max_hp": 10,
+            "temp_hp": 0,
+            "ac": 12,
+            "speed_feet": 30.0,
+            "position": [0.0, 0.0, 0.0],
+            "zone_id": "Zone_Default",
+            "abilities": {
+                "strength": 10, "dexterity": 10, "constitution": 10,
+                "intelligence": 10, "wisdom": 10, "charisma": 10
+            },
+            "conditions": [],
+            "action_budget": {
+                "action": true, "bonus_action": true, "reaction": true,
+                "movement_remaining_feet": 30.0, "free_object_interaction": true
+            },
+            "spell_slots_remaining": {},
+            "inventory": {"items": {}},
+            "is_conscious": true,
+            "is_dead": false,
+            "is_visible": true
+        });
+        let parsed: EntityState = serde_json::from_value(legacy).expect("legacy payload");
+        assert_eq!(parsed.vision_mode, None);
+        assert_eq!(parsed.effective_vision_mode(), VisionMode::Normal);
+
+        // A modern payload round-trips its senses.
+        let mut seer = entity(Uuid::new_v4(), "Drow", 12);
+        seer.vision_mode = Some(VisionMode::Darkvision);
+        seer.sense_range_feet = Some(120.0);
+        let json = serde_json::to_string(&seer).unwrap();
+        assert!(json.contains("darkvision"), "vision mode must serialize: {}", json);
+        let back: EntityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vision_mode, Some(VisionMode::Darkvision));
+        assert_eq!(back.sense_range_feet, Some(120.0));
+    }
+
+    #[test]
+    fn test_session_map_validates_lighting_zone_bounds() {
+        let mut map = SessionMap::default();
+        map.lighting_zones.push(LightingZoneCell {
+            x: 3,
+            y: 4,
+            zone: LightingZone::MagicalDarkness,
+        });
+        assert!(map.validate().is_ok());
+
+        map.lighting_zones.push(LightingZoneCell {
+            x: 99,
+            y: 0,
+            zone: LightingZone::Dim,
+        });
+        assert!(map.validate().is_err());
     }
 
     #[test]

@@ -754,6 +754,153 @@ async fn map_geometry_blocks_line_of_sight_attacks() {
     }
 }
 
+// --- Lighting zones & vision modes ---------------------------------------------
+
+#[actix_web::test]
+async fn los_route_evaluates_lighting_zones_and_viewer_vision() {
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+
+    // los_payload puts the viewer at world (0,0) and the target at (10,0):
+    // grid cells (0,0) and (2,0), 10 ft apart on a 5 ft grid.
+    let mut payload = los_payload();
+    payload["lighting_zones"] =
+        serde_json::json!([{ "x": 2, "y": 0, "zone": "darkness" }]);
+
+    // Normal sight cannot see into darkness.
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["has_line_of_sight"], serde_json::json!(false), "{body}");
+
+    // In-range darkvision sees it, and the response names the target zone.
+    payload["viewer_vision_mode"] = serde_json::json!("darkvision");
+    payload["viewer_vision_range_feet"] = serde_json::json!(60.0);
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", payload.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["has_line_of_sight"], serde_json::json!(true), "{body}");
+    assert_eq!(body["target_cell_zone"], serde_json::json!("darkness"));
+
+    // Beyond the sense range, darkness is invisible again.
+    payload["viewer_vision_range_feet"] = serde_json::json!(5.0);
+    let (_, body) = post_raw(&app, &player, "/api/v1/spatial/los", payload.clone()).await;
+    assert_eq!(body["has_line_of_sight"], serde_json::json!(false), "{body}");
+
+    // Magical darkness defeats darkvision…
+    payload["viewer_vision_range_feet"] = serde_json::json!(60.0);
+    payload["lighting_zones"] =
+        serde_json::json!([{ "x": 2, "y": 0, "zone": "magical_darkness" }]);
+    let (_, body) = post_raw(&app, &player, "/api/v1/spatial/los", payload.clone()).await;
+    assert_eq!(body["has_line_of_sight"], serde_json::json!(false), "{body}");
+
+    // …but Truesight penetrates it.
+    payload["viewer_vision_mode"] = serde_json::json!("truesight");
+    let (_, body) = post_raw(&app, &player, "/api/v1/spatial/los", payload.clone()).await;
+    assert_eq!(body["has_line_of_sight"], serde_json::json!(true), "{body}");
+
+    // Omitting lighting entirely keeps the legacy behavior (Bright everywhere).
+    let plain = los_payload();
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["has_line_of_sight"],
+        serde_json::json!(true),
+        "absent lighting must not change legacy LoS results"
+    );
+}
+
+#[actix_web::test]
+async fn darkvision_attacker_strikes_into_darkness_while_normal_cannot() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Dark Vision"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    // Non-magical darkness over the goblin's cell (28, 0): darkvision
+    // penetrates it, normal sight does not. (Magical-darkness semantics are
+    // covered by the /spatial/los route test above.)
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/map", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "width": 32, "height": 32, "cell_size_feet": 5.0,
+            "solid_cells": [], "difficult_terrain": [],
+            "lighting_zones": [{ "x": 28, "y": 0, "zone": "darkness" }]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "map with lighting accepted");
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    for (id, name, x) in [(hero_id, "Human", 2), (orc_id, "Goblin", 28)] {
+        let mut e = entity_json(id, name, 20, 12, 8, "1d6");
+        e["position"] = serde_json::json!([(x as f32) * 5.0, 2.5, 0.0]);
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(e)
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "{} spawned", name);
+    }
+
+    let attack_body = |attacker_id: Uuid| {
+        serde_json::json!({
+            "attacker_id": attacker_id,
+            "target_id": orc_id,
+            "seed": 7u64
+        })
+    };
+
+    // The sighted human cannot target into magical darkness.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(auth.clone())
+        .set_json(attack_body(hero_id))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "normal sight blocked by magical darkness");
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "NO_LINE_OF_SIGHT");
+
+    // Spawn a dedicated darkvision attacker within sense range of the target
+    // (goblin at x=140 ft; drow at x=95 ft => 45 ft <= 120 ft darkvision).
+    let drow_id = Uuid::new_v4();
+    let mut e = entity_json(drow_id, "Drow", 20, 14, 8, "1d6");
+    e["position"] = serde_json::json!([95.0, 2.5, 0.0]);
+    e["vision_mode"] = serde_json::json!("darkvision");
+    e["sense_range_feet"] = serde_json::json!(120.0);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(auth.clone())
+        .set_json(e)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "drow spawned");
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(auth.clone())
+        .set_json(attack_body(drow_id))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "in-range darkvision must penetrate magical darkness: {body}"
+    );
+}
+
 // --- Privileged-route RBAC ----------------------------------------------------
 
 #[actix_web::test]

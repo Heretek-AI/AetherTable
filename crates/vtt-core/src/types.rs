@@ -275,3 +275,104 @@ pub struct EgressEvent {
     pub reason: String, // "DEAD", "DESPAWN", "PLANAR_SHIFT"
     pub position: (f32, f32, f32),
 }
+
+// ------------------------------------------------------------------- senses
+
+/// SRD vision/sense modes (PHB ch. 9 "Vision and Light"). Consumed by the
+/// spatial crate's lighting-aware line-of-sight evaluation
+/// (`vtt_spatial::lighting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionMode {
+    /// Ordinary sight: needs light; darkness is heavily obscured.
+    Normal,
+    /// Sees in non-magical darkness within its range as if dim light.
+    Darkvision,
+    /// Special sense that does not rely on sight: perceives within range even
+    /// in darkness AND magical darkness (and while blinded).
+    Blindsight,
+    /// Sees in normal and magical darkness within range, and pierces illusions.
+    Truesight,
+}
+
+impl VisionMode {
+    /// Typical SRD range for this sense in feet, where one applies. Normal
+    /// sight is unlimited (no modeled horizon), hence None.
+    pub fn typical_range_feet(self) -> Option<f32> {
+        match self {
+            VisionMode::Normal => None,
+            // PHB examples: darkvision 60 ft is standard, 120 ft for drow et al.
+            VisionMode::Darkvision => Some(60.0),
+            // Blindsight spans roughly 10-30 ft for most stat blocks.
+            VisionMode::Blindsight => Some(30.0),
+            VisionMode::Truesight => Some(60.0),
+        }
+    }
+}
+
+/// Per-cell ambient lighting on a battle map (PHB "Lighting" table: bright
+/// light, dim light, darkness; plus magically conjured darkness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightingZone {
+    Bright,
+    Dim,
+    Darkness,
+    /// Magically conjured darkness (e.g. Darkness spell): impenetrable to
+    /// darkvision — only truesight and blindsight see through it.
+    MagicalDarkness,
+}
+
+/// One lit cell on a [`SessionMap`], mirroring how `difficult_terrain` cells
+/// are declared. Cells absent from the map are Bright by convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightingZoneCell {
+    pub x: usize,
+    pub y: usize,
+    pub zone: LightingZone,
+}
+
+// ------------------------------------------------------------------ senses
+
+#[cfg(test)]
+mod senses_tests {
+    use super::*;
+
+    #[test]
+    fn test_vision_mode_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&VisionMode::Normal).unwrap(), "\"normal\"");
+        assert_eq!(serde_json::to_string(&VisionMode::Darkvision).unwrap(), "\"darkvision\"");
+        assert_eq!(serde_json::to_string(&VisionMode::Blindsight).unwrap(), "\"blindsight\"");
+        assert_eq!(serde_json::to_string(&VisionMode::Truesight).unwrap(), "\"truesight\"");
+
+        let mode: VisionMode = serde_json::from_str("\"truesight\"").unwrap();
+        assert_eq!(mode, VisionMode::Truesight);
+        // Unknown modes are refused, never silently downgraded.
+        assert!(serde_json::from_str::<VisionMode>("\"echolocation\"").is_err());
+    }
+
+    #[test]
+    fn test_lighting_zone_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&LightingZone::Bright).unwrap(), "\"bright\"");
+        assert_eq!(serde_json::to_string(&LightingZone::Dim).unwrap(), "\"dim\"");
+        assert_eq!(serde_json::to_string(&LightingZone::Darkness).unwrap(), "\"darkness\"");
+        assert_eq!(
+            serde_json::to_string(&LightingZone::MagicalDarkness).unwrap(),
+            "\"magical_darkness\""
+        );
+
+        let zone: LightingZone = serde_json::from_str("\"magical_darkness\"").unwrap();
+        assert_eq!(zone, LightingZone::MagicalDarkness);
+    }
+
+    #[test]
+    fn test_vision_mode_typical_ranges() {
+        // Normal sight has no modeled range limit.
+        assert_eq!(VisionMode::Normal.typical_range_feet(), None);
+        // Common SRD values: darkvision 60 ft (120 for some races), blindsight
+        // 10-30 ft, truesight 60+ ft.
+        assert_eq!(VisionMode::Darkvision.typical_range_feet(), Some(60.0));
+        assert_eq!(VisionMode::Blindsight.typical_range_feet(), Some(30.0));
+        assert_eq!(VisionMode::Truesight.typical_range_feet(), Some(60.0));
+    }
+}

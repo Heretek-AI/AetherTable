@@ -9,12 +9,17 @@
 
 pub mod cover;
 pub mod geometry;
+pub mod lighting;
 pub mod pathfinding;
 pub mod raycast;
 pub mod zone_graph;
 
 pub use cover::{CoverCalculator, CoverType};
 pub use geometry::{AreaOfEffect, Vector3};
+pub use lighting::{cell_visible, LightingOverlay};
+// One definition shared with session maps (vtt-core), re-exported for
+// spatial callers.
+pub use vtt_core::types::{LightingZone, LightingZoneCell, VisionMode};
 pub use pathfinding::{AStarPathfinder, PathResult, TerrainOverlay};
 pub use raycast::GridCollisionMap;
 pub use zone_graph::{RangeBand, TopologicalZoneGraph, ZoneEdge, ZoneNode};
@@ -138,5 +143,176 @@ mod tests {
 
         assert_eq!(graph.get_range_between_zones("Tavern_Main", "Tavern_Balcony"), Some(RangeBand::Near));
         assert_eq!(graph.get_range_between_zones("Tavern_Main", "Tavern_Main"), Some(RangeBand::Engaged));
+    }
+
+    // ------------------------------------------------------- lighting + vision
+
+    const UNLIMITED: f32 = f32::INFINITY;
+
+    /// Viewer at cell (0,0), target at cell (2,0) — 10 ft apart on a 5 ft grid.
+    fn lit_grid() -> GridCollisionMap {
+        GridCollisionMap::new(10, 10, 1, 5.0)
+    }
+
+    fn viewer() -> Vector3 {
+        Vector3::new(2.5, 2.5, 0.0)
+    }
+
+    fn dark_target() -> Vector3 {
+        Vector3::new(12.5, 2.5, 0.0)
+    }
+
+    #[test]
+    fn test_lighting_overlay_absent_cells_are_bright() {
+        let mut overlay = LightingOverlay::new();
+        assert_eq!(overlay.zone_at(3, 4, 0), LightingZone::Bright);
+        overlay.set_zone(3, 4, 0, LightingZone::MagicalDarkness);
+        assert_eq!(overlay.zone_at(3, 4, 0), LightingZone::MagicalDarkness);
+        // Neighbors stay Bright — the overlay is per-cell.
+        assert_eq!(overlay.zone_at(3, 5, 0), LightingZone::Bright);
+    }
+
+    #[test]
+    fn test_cell_visible_matrix_across_modes_zones_and_ranges() {
+        use VisionMode::*;
+        // Bright and Dim are visible to every mode at any distance.
+        for zone in [LightingZone::Bright, LightingZone::Dim] {
+            for mode in [Normal, Darkvision, Blindsight, Truesight] {
+                assert!(
+                    cell_visible(zone, mode, 30.0, 500.0),
+                    "{:?} must see {:?} at any distance",
+                    mode,
+                    zone
+                );
+            }
+        }
+
+        // Darkness: invisible to Normal; visible to the special senses WITHIN
+        // their range; beyond range every sense reverts to normal sight.
+        for (mode, range) in [(Normal, UNLIMITED), (Darkvision, 60.0), (Blindsight, 30.0), (Truesight, 60.0)] {
+            let expect = mode != Normal;
+            assert_eq!(
+                cell_visible(LightingZone::Darkness, mode, range, 10.0),
+                expect,
+                "darkness @10ft for {:?}",
+                mode
+            );
+            if mode != Normal {
+                assert!(!cell_visible(LightingZone::Darkness, mode, range, range + 0.1));
+            }
+        }
+
+        // Magical darkness: only Truesight (and Blindsight, which does not
+        // rely on sight) penetrates — Darkvision does NOT.
+        assert!(!cell_visible(LightingZone::MagicalDarkness, Darkvision, 120.0, 10.0));
+        assert!(!cell_visible(LightingZone::MagicalDarkness, Normal, UNLIMITED, 10.0));
+        assert!(cell_visible(LightingZone::MagicalDarkness, Truesight, 60.0, 10.0));
+        assert!(cell_visible(LightingZone::MagicalDarkness, Blindsight, 30.0, 10.0));
+        // ...but even Truesight/Blindsight fail beyond their range.
+        assert!(!cell_visible(LightingZone::MagicalDarkness, Truesight, 60.0, 60.1));
+        assert!(!cell_visible(LightingZone::MagicalDarkness, Blindsight, 30.0, 30.1));
+    }
+
+    #[test]
+    fn test_darkvision_sees_into_darkness_while_normal_sight_cannot() {
+        let grid = lit_grid();
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(2, 0, 0, LightingZone::Darkness);
+
+        assert!(
+            !grid.has_line_of_sight_with_lighting(&lighting, VisionMode::Normal, UNLIMITED, &viewer(), &dark_target()),
+            "normal sight must not reach into a darkness cell"
+        );
+        assert!(
+            grid.has_line_of_sight_with_lighting(&lighting, VisionMode::Darkvision, 60.0, &viewer(), &dark_target()),
+            "in-range darkvision must see into darkness"
+        );
+        assert!(
+            !grid.has_line_of_sight_with_lighting(&lighting, VisionMode::Darkvision, 5.0, &viewer(), &dark_target()),
+            "darkvision beyond its range reverts to normal sight"
+        );
+    }
+
+    #[test]
+    fn test_magical_darkness_blocks_darkvision_but_not_truesight_or_blindsight() {
+        let grid = lit_grid();
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(2, 0, 0, LightingZone::MagicalDarkness);
+
+        assert!(!grid.has_line_of_sight_with_lighting(
+            &lighting, VisionMode::Darkvision, 120.0, &viewer(), &dark_target()
+        ));
+        assert!(grid.has_line_of_sight_with_lighting(
+            &lighting, VisionMode::Truesight, 60.0, &viewer(), &dark_target()
+        ));
+        assert!(grid.has_line_of_sight_with_lighting(
+            &lighting, VisionMode::Blindsight, 30.0, &viewer(), &dark_target()
+        ));
+    }
+
+    #[test]
+    fn test_darkness_wall_mid_path_blocks_normal_sight() {
+        // A belt of darkness BETWEEN viewer and a lit target: normal sight
+        // cannot see through heavily obscured cells either.
+        let grid = lit_grid();
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(1, 0, 0, LightingZone::Darkness);
+        // The target cell itself is lit.
+        assert!(!grid.has_line_of_sight_with_lighting(
+            &lighting, VisionMode::Normal, UNLIMITED, &viewer(), &dark_target()
+        ));
+
+        // A dim belt is mere obscurement — sight still reaches through it.
+        let mut dim = LightingOverlay::new();
+        dim.set_zone(1, 0, 0, LightingZone::Dim);
+        assert!(grid.has_line_of_sight_with_lighting(
+            &dim, VisionMode::Normal, UNLIMITED, &viewer(), &dark_target()
+        ));
+    }
+
+    #[test]
+    fn test_walls_still_block_every_vision_mode() {
+        let mut grid = lit_grid();
+        grid.set_solid(1, 0, 0, true); // wall between viewer and target
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(2, 0, 0, LightingZone::MagicalDarkness);
+
+        for mode in [VisionMode::Truesight, VisionMode::Blindsight] {
+            assert!(
+                !grid.has_line_of_sight_with_lighting(&lighting, mode, 120.0, &viewer(), &dark_target()),
+                "{:?} must still be stopped by a physical wall",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_lighting_overlay_matches_plain_los_backcompat() {
+        let empty = GridCollisionMap::new(10, 10, 1, 5.0);
+        let mut walled = GridCollisionMap::new(10, 10, 1, 5.0);
+        walled.set_solid(5, 5, 0, true);
+
+        let no_overlay = LightingOverlay::new();
+        for (grid, from, to) in [
+            (
+                &empty as &GridCollisionMap,
+                viewer(),
+                dark_target(),
+            ),
+            (
+                &walled as &GridCollisionMap,
+                viewer(),
+                Vector3::new(27.5, 27.5, 0.0),
+            ),
+        ] {
+            for mode in [VisionMode::Normal, VisionMode::Darkvision, VisionMode::Blindsight, VisionMode::Truesight] {
+                assert_eq!(
+                    grid.has_line_of_sight(&from, &to),
+                    grid.has_line_of_sight_with_lighting(&no_overlay, mode, UNLIMITED, &from, &to),
+                    "absent lighting must behave exactly like plain LoS ({:?})",
+                    mode
+                );
+            }
+        }
     }
 }

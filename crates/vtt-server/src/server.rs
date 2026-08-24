@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use vtt_core::{
     Ability, ActionResolver, CheckOutcomeTier, Condition, CostSuggestion, DiceEngine,
-    EntityState, GameSession, RulesEvaluator, SessionMap,
+    EntityState, GameSession, LightingZoneCell, RulesEvaluator, SessionMap, VisionMode,
 };
 use vtt_crdt_sync::{
     CrdtRelayHub, CrdtSyncMessage, FogOfWarMask, SnapshotToken, SyncSnapshot, TokenTransform,
@@ -35,7 +35,8 @@ use vtt_crdt_sync::{
 };
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
 use vtt_spatial::{
-    AStarPathfinder, CoverCalculator, CoverType, GridCollisionMap, TerrainOverlay, Vector3,
+    AStarPathfinder, CoverCalculator, CoverType, GridCollisionMap, LightingOverlay, TerrainOverlay,
+    Vector3,
 };
 use vtt_wfc::{DungeonGenerator, RoomDescriptor};
 
@@ -1207,12 +1208,34 @@ async fn resolve_attack(
         // LOS / total-cover rejections happen BEFORE the Help promise is
         // touched: a refused attack must not permanently burn an ally's
         // standing Advantage (mirrors the off-hand route's ordering).
-        if !grid.has_line_of_sight(&attacker_pos, &target_pos) {
+        //
+        // Lighting-aware: the attacker's SRD vision mode (darkvision,
+        // blindsight, truesight) is evaluated against the session map's
+        // per-cell lighting zones. Maps without declared zones are Bright
+        // everywhere, so this reproduces the old wall-only behavior exactly.
+        let (attacker_vision_mode, attacker_sense_range) = {
+            let a = session
+                .entities
+                .get(&req.attacker_id)
+                .expect("checked above");
+            (
+                a.effective_vision_mode(),
+                a.effective_sense_range_feet(),
+            )
+        };
+        let lighting = build_lighting_overlay(&session.map);
+        if !grid.has_line_of_sight_with_lighting(
+            &lighting,
+            attacker_vision_mode,
+            attacker_sense_range,
+            &attacker_pos,
+            &target_pos,
+        ) {
             return reject(
                 &data,
                 409,
                 "NO_LINE_OF_SIGHT",
-                "walls fully occlude the attack line",
+                "walls fully occlude the attack line or the target lies in lighting the attacker cannot see through",
             );
         }
         let cover = CoverCalculator::calculate_cover(&grid, &attacker_pos, &target_pos, half_cell);
@@ -3381,6 +3404,12 @@ fn build_terrain_overlay(map: &SessionMap) -> TerrainOverlay {
     overlay
 }
 
+/// Builds the per-cell lighting overlay from a session map's declared
+/// `lighting_zones` (cells absent from the map are Bright by convention).
+fn build_lighting_overlay(map: &SessionMap) -> LightingOverlay {
+    LightingOverlay::from_cells(&map.lighting_zones)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LosReq {
     pub attacker_pos: Vector3,
@@ -3389,6 +3418,17 @@ pub struct LosReq {
     pub grid_width: usize,
     pub grid_height: usize,
     pub solid_cells: Vec<(usize, usize)>,
+    /// Per-cell lighting zones to evaluate against (PHB bright/dim/darkness/
+    /// magical darkness). Serde default keeps legacy payloads (no lighting)
+    /// working — absent zones are Bright.
+    #[serde(default)]
+    pub lighting_zones: Vec<LightingZoneCell>,
+    /// Viewer's SRD vision mode. Absent = Normal sight.
+    #[serde(default)]
+    pub viewer_vision_mode: Option<VisionMode>,
+    /// Range in feet of the viewer's special sense; absent = unlimited.
+    #[serde(default)]
+    pub viewer_vision_range_feet: Option<f32>,
 }
 
 async fn compute_los(
@@ -3407,19 +3447,35 @@ async fn compute_los(
         grid.set_solid(x, y, 0, true);
     }
 
-    let has_los = grid.has_line_of_sight(&req.attacker_pos, &req.target_pos);
+    let lighting = LightingOverlay::from_cells(&req.lighting_zones);
+    // Vision defaults keep the route backward compatible: no mode/range given
+    // means Normal sight with unlimited range.
+    let vision_mode = req.viewer_vision_mode.unwrap_or(VisionMode::Normal);
+    let vision_range_feet = req.viewer_vision_range_feet.unwrap_or(f32::INFINITY);
+
+    let has_los = grid.has_line_of_sight_with_lighting(
+        &lighting,
+        vision_mode,
+        vision_range_feet,
+        &req.attacker_pos,
+        &req.target_pos,
+    );
     let cover = CoverCalculator::calculate_cover(
         &grid,
         &req.attacker_pos,
         &req.target_pos,
         req.target_radius,
     );
+    let (tx, ty, _) = grid.world_to_grid(&req.target_pos);
+    let target_cell_zone = lighting.zone_at(tx, ty, 0);
 
     HttpResponse::Ok().json(serde_json::json!({
         "has_line_of_sight": has_los,
         "cover_type": cover,
         "ac_bonus": cover.ac_bonus(),
-        "dex_save_bonus": cover.dex_save_bonus()
+        "dex_save_bonus": cover.dex_save_bonus(),
+        "viewer_vision_mode": vision_mode,
+        "target_cell_zone": target_cell_zone
     }))
 }
 
@@ -3455,6 +3511,7 @@ async fn compute_path(
         height: req.grid_height,
         solid_cells: vec![],
         difficult_terrain: req.difficult_terrain.clone(),
+        lighting_zones: vec![],
         cell_size_feet: 5.0,
     });
 
