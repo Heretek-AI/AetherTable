@@ -41,7 +41,12 @@ const ENSURE_DDL: &[&str] = &[
         committed_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )"#,
     // The migration's `sequence_id` is a BIGSERIAL row id; the ENGINE's
-    // logical ledger sequence gets its own column + index.
+    // logical ledger sequence gets its own column + index (now also declared
+    // in database/postgres/02_event_sourcing_and_session_schema.sql). These
+    // idempotent statements remain so databases provisioned by OLDER
+    // migrations are upgraded in place — without them a fresh-migration DB
+    // served by an old binary would silently lose tailer idempotency, and an
+    // old-migration DB served by this binary would fail every insert.
     "ALTER TABLE narrative_state.event_sourcing_log \
          ADD COLUMN IF NOT EXISTS ledger_sequence BIGINT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_log_ledger_seq \

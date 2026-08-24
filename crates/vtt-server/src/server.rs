@@ -198,6 +198,50 @@ fn may_control_entity(entity_owner: Option<&String>, role: Role, user_id: &str) 
     }
 }
 
+/// Canonical orchestrator service principal id minted by the Python gateway
+/// (`routing/engine_client.py` signs tokens with this user_id and no role
+/// claim). Treated as privileged alongside GMs wherever privilege exists.
+const SERVICE_PRINCIPAL_ID: &str = "orchestrator-service";
+
+/// True when this caller may invoke the stateless compute utilities
+/// (`/actions/*` rolls, `/spatial/*` solvers, `/maps/generate`): players and
+/// GMs yes, spectators no. Spectators watch the board — they have no combat
+/// math to resolve, and every one of these routes leaks tactical information
+/// (cover bands, path costs, tile grids) that the spectator projection of
+/// `/sessions/{id}` deliberately withholds.
+fn may_compute(role: Role) -> bool {
+    !matches!(role, Role::Spectator)
+}
+
+/// True when this caller may EXECUTE attacker-controlled script programs
+/// (`/scripts/wasm`, `/scripts/rhai`) or PIN DETERMINISTIC DICE SEEDS on the
+/// stateless roll routes: GMs and the orchestrator service principal only.
+///
+/// Scripts: homebrew mechanics are authored by the table's GM (GOALS.md P10);
+/// players reach homebrew effects through session-scoped actions resolved by
+/// the GM, never by running programs directly, so direct script execution is a
+/// GM/service tool. Seeds: a pinned seed lets its caller pre-compute favorable
+/// outcomes offline before sending the request — acceptable for the trusted
+/// principals running determinism harnesses, unacceptable for clients.
+fn is_privileged_principal(identity: &AuthIdentity) -> bool {
+    Role::from_identity(identity).is_gm() || identity.user_id == SERVICE_PRINCIPAL_ID
+}
+
+/// Shared spectator gate for the stateless routes: returns the 403 response
+/// when this caller may not use them at all.
+fn refuse_non_compute_role(data: &AppState, what: &str, role: Role) -> Option<HttpResponse> {
+    if may_compute(role) {
+        None
+    } else {
+        Some(reject(
+            data,
+            403,
+            "FORBIDDEN_ROLE",
+            &format!("spectators cannot {what}"),
+        ))
+    }
+}
+
 /// One live WebSocket peer plus the verified role of its connection.
 /// Role travels WITH the registration so fan-out can be filtered per frame —
 /// client-side spectator filtering protects rendering, not the wire.
@@ -492,7 +536,7 @@ async fn restore_session(
     // recorded owner, or the gateway's server-mediated durability principal
     // (post-restart hydration) may do that.
     let role = Role::from_identity(&identity);
-    let is_service_principal = identity.user_id == "orchestrator-service";
+    let is_service_principal = identity.user_id == SERVICE_PRINCIPAL_ID;
     if !role.is_gm() && !is_service_principal {
         let is_owner = data
             .session_owners
@@ -2945,15 +2989,50 @@ pub struct CheckActionReq {
     pub cost_margin: i32,
     pub advantage: Option<bool>,
     pub disadvantage: Option<bool>,
-    /// Optional deterministic seed pinning the d20 (any value is equally
-    /// valid — the engine decides what the seed means). Omitted → server
-    /// entropy. Mirrors the seed field on the other roll endpoints.
+    /// Determinism opt-in: pins the d20 (any value is equally valid — the
+    /// engine decides what the seed means). Honored ONLY for privileged
+    /// principals (GM role / orchestrator service identity) running
+    /// determinism harnesses; any other caller supplying it gets 422
+    /// SEED_NOT_PERMITTED rather than a silently-ignored seed. Omitted →
+    /// server entropy, always.
     pub seed: Option<u64>,
 }
 
-async fn resolve_check(data: web::Data<AppState>, req: web::Json<CheckActionReq>) -> impl Responder {
+/// Shared seed policy for the stateless roll routes (see [`CheckActionReq`]):
+/// returns the 422 rejection when a non-privileged caller tried to pin one.
+/// Policy (refuse) and mechanics (build the engine) stay separate so the hot
+/// path never wraps a large response in a Result.
+fn refuse_client_seed(
+    data: &AppState,
+    identity: &AuthIdentity,
+    seed: Option<u64>,
+) -> Option<HttpResponse> {
+    if seed.is_some() && !is_privileged_principal(identity) {
+        Some(reject(
+            data,
+            422,
+            "SEED_NOT_PERMITTED",
+            "deterministic seeds are reserved for GM/service principals; omit `seed` for a server-rolled d20",
+        ))
+    } else {
+        None
+    }
+}
+
+async fn resolve_check(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<CheckActionReq>,
+) -> impl Responder {
     data.count_request();
+    if let Some(resp) = refuse_non_compute_role(&data, "resolve checks", Role::from_identity(&identity)) {
+        return resp;
+    }
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
     let mut dice = match req.seed {
+        // Privilege already verified above.
         Some(seed) => DiceEngine::with_seed(seed),
         None => DiceEngine::new(),
     };
@@ -3010,14 +3089,26 @@ pub struct SaveActionReq {
     pub disadvantage: Option<bool>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
-    /// Optional deterministic seed pinning the d20 (see `CheckActionReq`).
+    /// Determinism opt-in (see `CheckActionReq`): honored only for
+    /// GM/service principals; other callers get 422 SEED_NOT_PERMITTED.
     #[serde(default)]
     pub seed: Option<u64>,
 }
 
-async fn resolve_save(data: web::Data<AppState>, req: web::Json<SaveActionReq>) -> impl Responder {
+async fn resolve_save(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<SaveActionReq>,
+) -> impl Responder {
     data.count_request();
+    if let Some(resp) = refuse_non_compute_role(&data, "resolve saves", Role::from_identity(&identity)) {
+        return resp;
+    }
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
     let mut dice = match req.seed {
+        // Privilege already verified above.
         Some(seed) => DiceEngine::with_seed(seed),
         None => DiceEngine::new(),
     };
@@ -3080,9 +3171,16 @@ pub struct ConcentrationActionReq {
 
 async fn resolve_concentration(
     data: web::Data<AppState>,
+    identity: AuthIdentity,
     req: web::Json<ConcentrationActionReq>,
 ) -> impl Responder {
     data.count_request();
+    if let Some(resp) =
+        refuse_non_compute_role(&data, "resolve concentration checks", Role::from_identity(&identity))
+    {
+        return resp;
+    }
+    // No seed field by design: this route is always server-entropy.
     let mut dice = DiceEngine::new();
     let natural_roll = dice.roll_d20();
     let (passed, total, dc) =
@@ -3293,7 +3391,17 @@ pub struct LosReq {
     pub solid_cells: Vec<(usize, usize)>,
 }
 
-async fn compute_los(req: web::Json<LosReq>) -> impl Responder {
+async fn compute_los(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<LosReq>,
+) -> impl Responder {
+    data.count_request();
+    if let Some(resp) =
+        refuse_non_compute_role(&data, "query line-of-sight", Role::from_identity(&identity))
+    {
+        return resp;
+    }
     let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
     for &(x, y) in &req.solid_cells {
         grid.set_solid(x, y, 0, true);
@@ -3327,7 +3435,17 @@ pub struct PathReq {
     pub difficult_terrain: Vec<(usize, usize)>,
 }
 
-async fn compute_path(req: web::Json<PathReq>) -> impl Responder {
+async fn compute_path(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<PathReq>,
+) -> impl Responder {
+    data.count_request();
+    if let Some(resp) =
+        refuse_non_compute_role(&data, "query pathfinding", Role::from_identity(&identity))
+    {
+        return resp;
+    }
     let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
     for &(x, y) in &req.solid_cells {
         grid.set_solid(x, y, 0, true);
@@ -3353,7 +3471,21 @@ pub struct WfcReq {
     pub seed: Option<u64>,
 }
 
-async fn generate_wfc_map(req: web::Json<WfcReq>) -> impl Responder {
+/// Map generation keeps its caller-supplied `seed`: unlike the roll routes,
+/// WFC determinism is a design feature (same seed ⇒ identical tile grid for
+/// collaborative map editing) and a pre-computed dungeon reveals nothing an
+/// attacker can exploit. The ROUTE itself is still spectator-gated.
+async fn generate_wfc_map(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<WfcReq>,
+) -> impl Responder {
+    data.count_request();
+    if let Some(resp) =
+        refuse_non_compute_role(&data, "generate maps", Role::from_identity(&identity))
+    {
+        return resp;
+    }
     match DungeonGenerator::generate_room(&req.room_desc, req.seed) {
         Ok(tiles) => HttpResponse::Ok().json(serde_json::json!({
             "width": req.room_desc.width,
@@ -3378,8 +3510,19 @@ pub struct WasmScriptReq {
 
 async fn execute_wasm_script(
     data: web::Data<AppState>,
+    identity: AuthIdentity,
     req: web::Json<WasmScriptReq>,
 ) -> impl Responder {
+    data.count_request();
+    // Attacker-controlled programs: GM/service only (see `is_privileged_principal`).
+    if !is_privileged_principal(&identity) {
+        return reject(
+            &data,
+            403,
+            "FORBIDDEN_ROLE",
+            "script execution is reserved for GM and service principals",
+        );
+    }
     match data.wasm_engine.execute_wat(
         &req.wat_source,
         &req.function_name,
@@ -3401,8 +3544,19 @@ pub struct RhaiScriptReq {
 
 async fn execute_rhai_script(
     data: web::Data<AppState>,
+    identity: AuthIdentity,
     req: web::Json<RhaiScriptReq>,
 ) -> impl Responder {
+    data.count_request();
+    // Attacker-controlled programs: GM/service only (see `is_privileged_principal`).
+    if !is_privileged_principal(&identity) {
+        return reject(
+            &data,
+            403,
+            "FORBIDDEN_ROLE",
+            "script execution is reserved for GM and service principals",
+        );
+    }
     // Deterministic default seed derived from script content hash position.
     let seed = req
         .seed

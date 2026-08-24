@@ -40,7 +40,9 @@ fn sign_token(user_id: &str) -> String {
         .unwrap()
         .as_secs_f64()
         + 3600.0;
-    let payload = serde_json::json!({"user_id": user_id, "exp": exp});
+    // These tests meter rate-limiting, not RBAC: every token is a GM so the
+    // GM-only `/scripts/*` gate never masks the 429s under test.
+    let payload = serde_json::json!({"user_id": user_id, "role": "gm", "exp": exp});
     let raw = serde_json::to_vec(&payload).unwrap();
     let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
     mac.update(&raw);

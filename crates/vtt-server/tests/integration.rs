@@ -5308,3 +5308,261 @@ async fn offhand_index_zero_is_refused_as_matching_the_main_hand() {
         "the rejected off-hand attempt keeps the Bonus Action"
     );
 }
+
+// --- Stateless-route RBAC + server-seeded dice (audit remediation) ----------
+//
+// The stateless compute routes (`/actions/check|save|concentration`,
+// `/spatial/*`, `/maps/generate`) previously accepted ANY authenticated caller
+// — including spectators — and `/actions/check` and `/actions/save` honored a
+// CALLER-SUPPLIED `seed`. A spectator (or any client) could pre-compute
+// favorable outcomes offline and replay them. Contract pinned here:
+//   - spectators are refused on all stateless roll/spatial/map-generation
+//     routes (403 FORBIDDEN_ROLE); players and GMs may use them;
+//   - `/scripts/*` executes attacker-controlled programs, so it is GM /
+//     orchestrator-service ONLY;
+//   - a caller-supplied `seed` is an explicit determinism opt-in honored ONLY
+//     for privileged principals (GM role or the orchestrator service identity);
+//     everyone else gets 422 SEED_NOT_PERMITTED rather than silently-ignored
+//     seeds (silent ignoring hides the policy from integrators);
+//   - omitting `seed` always uses server entropy.
+
+/// POST with an arbitrary bearer token, returning status + decoded body
+/// (never asserting success) for RBAC assertions.
+async fn post_raw(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    path: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(path)
+        .insert_header(bearer(token))
+        .set_json(payload)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+fn wfc_payload() -> serde_json::Value {
+    serde_json::json!({
+        "room_desc": {
+            "room_id": 1, "x": 0, "y": 0,
+            "width": 8, "height": 8, "theme": "dungeon"
+        },
+        "seed": null
+    })
+}
+
+fn los_payload() -> serde_json::Value {
+    serde_json::json!({
+        "attacker_pos": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "target_pos": {"x": 10.0, "y": 0.0, "z": 0.0},
+        "target_radius": 2.5,
+        "grid_width": 16,
+        "grid_height": 16,
+        "solid_cells": []
+    })
+}
+
+fn check_payload(seed: Option<u64>) -> serde_json::Value {
+    let mut body = serde_json::json!({"modifier": 0, "dc": 10, "cost_margin": 0});
+    if let Some(s) = seed {
+        body["seed"] = serde_json::json!(s);
+    }
+    body
+}
+
+#[actix_web::test]
+async fn spectators_are_refused_on_stateless_roll_routes() {
+    let app = test_app().await;
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+
+    let (status, body) =
+        post_raw(&app, &spec, "/api/v1/actions/check", check_payload(None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+
+    // Spectator refusal must not depend on the payload shape: same verdict on
+    // the save route.
+    let (status, body) = post_raw(
+        &app,
+        &spec,
+        "/api/v1/actions/save",
+        serde_json::json!({"save_modifier": 0, "dc": 10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+
+    // Players remain legitimate callers of the same route…
+    let (status, _) =
+        post_raw(&app, &player, "/api/v1/actions/check", check_payload(None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // …and so are GMs.
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let (status, _) = post_raw(&app, &gm, "/api/v1/actions/check", check_payload(None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Role-less tokens default to Player (gateway service identities), so the
+    // orchestrator proxy keeps working without a role claim.
+    let plain = sign_token("orchestrator-service", TEST_SECRET);
+    let (status, _) =
+        post_raw(&app, &plain, "/api/v1/actions/check", check_payload(None)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn spectators_cannot_generate_maps_or_query_spatial_solvers() {
+    let app = test_app().await;
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+
+    for (path, payload) in [
+        ("/api/v1/maps/generate", wfc_payload()),
+        ("/api/v1/spatial/los", los_payload()),
+        (
+            "/api/v1/spatial/path",
+            serde_json::json!({
+                "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "end": {"x": 10.0, "y": 0.0, "z": 0.0},
+                "speed_budget": 30.0,
+                "grid_width": 16,
+                "grid_height": 16,
+                "solid_cells": []
+            }),
+        ),
+    ] {
+        let (status, body) = post_raw(&app, &spec, path, payload).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+    }
+
+    // A player still gets full solver access.
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", los_payload()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_raw(&app, &player, "/api/v1/maps/generate", wfc_payload()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[actix_web::test]
+async fn client_supplied_seeds_are_rejected_for_non_privileged_roles() {
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+    let lucky = seed_producing_roll(20);
+
+    // A player pinning a nat-20 seed must be REJECTED, not silently re-seeded:
+    // silent ignoring would leave integrators believing they got their roll.
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/actions/check",
+        check_payload(Some(lucky)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["error"], serde_json::json!("SEED_NOT_PERMITTED"));
+    assert!(
+        body["roll"].is_null(),
+        "a rejected request must not leak any roll result"
+    );
+
+    // Same verdict on the save route.
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/actions/save",
+        serde_json::json!({"save_modifier": 0, "dc": 10, "seed": lucky}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert_eq!(body["error"], serde_json::json!("SEED_NOT_PERMITTED"));
+
+    // Spectators hit the role gate first; either way no seeded roll happens.
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let (status, _) = post_raw(
+        &app,
+        &spec,
+        "/api/v1/actions/check",
+        check_payload(Some(lucky)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[actix_web::test]
+async fn privileged_principals_still_pin_deterministic_rolls() {
+    let app = test_app().await;
+    let seed = seed_producing_roll(3);
+
+    // Determinism tests remain possible through the sanctioned path: the SAME
+    // seed twice MUST produce byte-identical outcomes.
+    let first = post_actions(&app, "/api/v1/actions/check", check_payload(Some(seed))).await;
+    let second = post_actions(&app, "/api/v1/actions/check", check_payload(Some(seed))).await;
+    assert_eq!(first["roll"], serde_json::json!(3), "seeded check: {first}");
+    assert_eq!(first, second, "same seed must reproduce the same check");
+
+    // The service principal (no role claim, canonical orchestrator id) keeps
+    // its deterministic-harness privilege too.
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+    let (status, body) = post_raw(
+        &app,
+        &service,
+        "/api/v1/actions/check",
+        check_payload(Some(seed)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roll"], serde_json::json!(3));
+
+    // Seeded saves stay deterministic as well.
+    let body = post_actions(
+        &app,
+        "/api/v1/actions/save",
+        serde_json::json!({
+            "save_modifier": 0, "dc": 10,
+            "seed": seed_producing_roll(20),
+        }),
+    )
+    .await;
+    assert_eq!(body["natural_roll"], serde_json::json!(20), "{body}");
+    assert_eq!(body["passed"], serde_json::json!(true));
+}
+
+#[actix_web::test]
+async fn script_execution_is_gm_and_service_only() {
+    let app = test_app().await;
+    let rhai = serde_json::json!({
+        "script": "1 + 1",
+        "context": {
+            "caster_level": 5, "target_ac": 12, "spell_dc": 13,
+            "environment_tag": "dungeon"
+        }
+    });
+
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+    let (status, body) = post_raw(&app, &player, "/api/v1/scripts/rhai", rhai.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let (status, _) = post_raw(&app, &spec, "/api/v1/scripts/rhai", rhai.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // GMs run homebrew hooks…
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let (status, body) = post_raw(&app, &gm, "/api/v1/scripts/rhai", rhai.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // …and so does the orchestrator service principal.
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+    let (status, _) = post_raw(&app, &service, "/api/v1/scripts/rhai", rhai).await;
+    assert_eq!(status, StatusCode::OK);
+}

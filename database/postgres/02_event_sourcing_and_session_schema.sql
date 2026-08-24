@@ -40,6 +40,24 @@ CREATE TABLE IF NOT EXISTS narrative_state.sessions (
 );
 
 -- Append-Only Event Sourcing Log
+--
+-- TWO sequence id spaces live on this table; they are deliberately distinct
+-- and must not be conflated:
+--   * `sequence_id`      — BIGSERIAL physical row id (insertion order across
+--                          ALL sessions). Used by safety_audit_log's
+--                          `target_sequence_id_rewind` FK below, which records
+--                          WHICH ROW a rewind pointed at for audit purposes.
+--                          It is NOT the engine's logical ledger position.
+--   * `ledger_sequence`  — the engine-side logical ledger sequence
+--                          (vtt-core `EventLog::current_sequence`): per-session,
+--                          gap-free, and rewind-aware. The write-through tailer
+--                          (crates/vtt-server/src/persistence.rs) inserts with
+--                          ON CONFLICT (session_id, ledger_sequence) DO NOTHING
+--                          so replays after a transient failure are idempotent.
+-- A fresh database provisioned from these migrations gets BOTH columns; the
+-- engine additionally runs idempotent ADD COLUMN IF NOT EXISTS DDL at startup
+-- so databases provisioned before `ledger_sequence` existed are upgraded in
+-- place rather than silently losing tailer idempotency.
 CREATE TABLE IF NOT EXISTS narrative_state.event_sourcing_log (
     sequence_id BIGSERIAL PRIMARY KEY,
     session_id UUID NOT NULL REFERENCES narrative_state.sessions(session_id) ON DELETE CASCADE,
@@ -48,10 +66,18 @@ CREATE TABLE IF NOT EXISTS narrative_state.event_sourcing_log (
     event_type VARCHAR(64) NOT NULL,
     payload JSONB NOT NULL,
     state_hash VARCHAR(64) NOT NULL,
+    -- Engine logical ledger sequence (per-session; see block comment above).
+    ledger_sequence BIGINT,
     is_reverted BOOLEAN NOT NULL DEFAULT FALSE,
     revert_reason TEXT,
     committed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+
+-- Tailer replay idempotency: exactly one persisted row per (session, ledger
+-- sequence). Matches runtime DDL idx_event_log_ledger_seq in persistence.rs.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_log_ledger_seq
+    ON narrative_state.event_sourcing_log (session_id, ledger_sequence);
+
 
 -- Character & Entity Dynamic State
 CREATE TABLE IF NOT EXISTS narrative_state.characters (
@@ -114,6 +140,11 @@ CREATE TABLE IF NOT EXISTS narrative_state.safety_audit_log (
     trigger_type VARCHAR(32) NOT NULL, -- 'X_CARD', 'FAST_FORWARD', 'REWIND', 'VEIL'
     triggered_by_player VARCHAR(64) NOT NULL,
     topic_tag VARCHAR(64),
+    -- References the physical `sequence_id` (BIGSERIAL row id) of the
+    -- event-sourcing row the rewind rewound TO — audit provenance only. The
+    -- engine's LOGICAL rewind position is the event payload's ledger_sequence;
+    -- the two id spaces are distinct (see the block comment on
+    -- narrative_state.event_sourcing_log above).
     target_sequence_id_rewind BIGINT REFERENCES narrative_state.event_sourcing_log(sequence_id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
