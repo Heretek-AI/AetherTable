@@ -561,6 +561,66 @@ async def campaign_delete(save_id: str, token: str = Depends(_require_auth)):
     return {"status": "deleted"}
 
 
+class CampaignAutosaveRequest(BaseModel):
+    session_id: str
+    # Empty name falls back to a per-session rolling autosave slot so repeated
+    # calls UPSERT over the previous checkpoint instead of growing unbounded
+    # rows (upsert is keyed on owner_user_id + save_name).
+    name: str = ""
+
+
+@app.post("/api/v1/campaign/autosave")
+async def campaign_autosave(
+    req: CampaignAutosaveRequest, token: str = Depends(_require_auth)
+):
+    """Server-side GM autosave: capture LIVE engine state as a campaign save.
+
+    Unlike POST /campaign/save (a manual, client-supplied snapshot), this
+    route never trusts client numbers for state: it fetches the authoritative
+    session from the engine with the caller's identity forwarded (so the
+    engine's RBAC layer authorizes the real actor) and wraps that verbatim
+    payload as a snapshot through the existing create-save storage path.
+
+    Fails honestly and atomically: a non-GM caller gets 403 before any engine
+    or store touch; an unreachable engine maps to 502 with nothing half-saved.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="AUTOSAVE_GM_ONLY")
+
+    raw = await _engine_call(
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}",
+            actor=actor,
+        )
+    )
+    entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
+    ledger = raw.get("ledger") if isinstance(raw, dict) else None
+    events = ledger.get("events", []) if isinstance(ledger, dict) else []
+    combat = raw.get("combat") if isinstance(raw, dict) else None
+    round_number = combat.get("round") if isinstance(combat, dict) else None
+    if not isinstance(round_number, int) or round_number < 1:
+        round_number = 1
+
+    name = req.name.strip() or f"Autosave · {req.session_id[:8]}"
+    snapshot = {
+        "round": round_number,
+        "entities_count": len(entities),
+        "events_count": len(events),
+        # Verbatim engine state: the hydrate/restore bridge consumes this shape.
+        "snapshot": raw,
+    }
+    meta = await storage_backend.upsert_campaign_save(
+        _owner_or_401(token), name, snapshot, round_number
+    )
+    return {
+        "save_id": meta["save_id"],
+        "round": round_number,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
 def classify_intent(req: ClassifyRequest):
     return router.classify_utterance(req.utterance, req.speaker_id)

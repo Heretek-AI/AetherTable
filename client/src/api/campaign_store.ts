@@ -72,6 +72,32 @@ export async function listSaves(): Promise<CampaignSaveMeta[]> {
   return data?.saves ?? [];
 }
 
+/** Result of a server-side GM autosave: the snapshot was captured from the
+ * live engine (never client state) and stored as an ordinary campaign save. */
+export interface CampaignAutosaveResult {
+  save_id: string;
+  round: number;
+  captured_at: string;
+}
+
+/**
+ * GM-only autosave: asks the orchestrator to snapshot LIVE engine state for
+ * `sessionId` through its existing save path. Unlike saveCampaign, no client
+ * snapshot is sent — the server fetches authoritative state itself, so this
+ * is safe to fire on a timer or at turn boundaries.
+ *
+ * Resolves null when unauthenticated, the caller is not a GM (403), or the
+ * engine is unreachable (502) — callers surface those states, not throw.
+ */
+export async function gmAutosave(
+  sessionId: string,
+  name?: string
+): Promise<CampaignAutosaveResult | null> {
+  if (!getToken()) return null;
+  const body = { session_id: sessionId, ...(name ? { name } : {}) };
+  return post<CampaignAutosaveResult>('/api/v1/campaign/autosave', body);
+}
+
 export async function loadCampaign(
   saveId: string
 ): Promise<CampaignSnapshot | null> {
