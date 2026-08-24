@@ -2162,3 +2162,213 @@ async fn apply_damage_endpoint_triggers_auto_concentration_check() {
         "no additional break event for the passed save"
     );
 }
+
+// --- Opportunity attack reporting (backlog 5.9) -------------------------------
+
+/// Spawns an entity with explicit position/side and returns nothing (id is
+/// caller-chosen). Mirrors `entity_json` but allows non-player stat blocks.
+async fn spawn_at(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    auth: &(actix_web::http::header::HeaderName, String),
+    session_id: Uuid,
+    id: Uuid,
+    name: &str,
+    is_player: bool,
+    pos: [f64; 3],
+) {
+    let mut payload = entity_json(id, name, 20, 12, 3, "1d6+1");
+    payload["is_player"] = serde_json::json!(is_player);
+    payload["position"] = serde_json::json!(pos);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(payload)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "spawn of {} failed: {:?}",
+        name,
+        String::from_utf8_lossy(&raw)
+    );
+}
+
+async fn create_opportunity_session(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    auth: &(actix_web::http::header::HeaderName, String),
+) -> Uuid {
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({
+            "campaign_id": Uuid::new_v4(),
+            "session_name": "Opportunity Attacks"
+        }))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    body["session_id"].as_str().unwrap().parse().unwrap()
+}
+
+/// A move that leaves an adjacent enemy WITH an armed opportunity reaction
+/// must SAY so in the move response — without auto-executing the attack
+/// (polling/prompting is the Pillar-3 reaction stack's job).
+#[actix_web::test]
+async fn move_provoke_reports_opportunity_attack() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    // Hero starts 5 ft from the orc (adjacent); both on opposite sides.
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+
+    // Arm the orc's opportunity attack.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({
+            "entity_id": orc_id,
+            "reaction_type": "opportunity_attack"
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Move straight away past the engine's 5 ft adjacency band (the post-move
+    // check allows up to 5.5 ft of slack) — leaving adjacency provokes.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(st, StatusCode::OK, "move failed: {:?}", String::from_utf8_lossy(&raw));
+    let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+    // Additive report field describing WHO could take the OA.
+    assert_eq!(body["opportunity_attack"]["provoked_by"], orc_id.to_string());
+    assert_eq!(body["opportunity_attack"]["reaction_type"], "opportunity_attack");
+    assert_eq!(body["opportunity_attack"]["available"], true);
+
+    // The engine-level detection is still present in the outcome payload.
+    let triggers = body["outcome"]["opportunity_attacks"].as_array().unwrap();
+    assert_eq!(triggers.len(), 1, "exactly one provoked OA");
+    assert_eq!(triggers[0]["attacker_id"], orc_id.to_string());
+    assert_eq!(triggers[0]["mover_id"], hero_id.to_string());
+
+    // The reaction was CONSUMED by detection: step back in and away again —
+    // this second provocation cannot fire, so the field must be omitted.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 12.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "step-back move failed: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 18.5, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert!(
+        body.get("opportunity_attack").is_none(),
+        "consumed reaction must not re-report an OA: {}",
+        body
+    );
+}
+
+/// A mover who cannot be provoked — no adjacent enemy has a readied
+/// opportunity reaction (the engine's Disengage-equivalent semantics:
+/// provocation requires an ARMED reaction) — gets NO opportunity field.
+#[actix_web::test]
+async fn disengaged_mover_move_response_omits_opportunity_attack() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    // Adjacent enemy, but its reaction is NOT armed (mover effectively
+    // disengaged: nothing can be provoked).
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 15.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert!(body.get("opportunity_attack").is_none(), "{}", body);
+    assert_eq!(
+        body["outcome"]["opportunity_attacks"].as_array().unwrap().len(),
+        0,
+        "unarmed adjacent enemy cannot provoke"
+    );
+}
+
+/// No adjacent enemies at all → the field must be absent entirely.
+#[actix_web::test]
+async fn move_without_adjacent_armed_enemies_omits_opportunity_attack() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [2.5, 2.5, 0.0]).await;
+    // Armed orc, but far outside adjacency.
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [40.0, 40.0, 0.0]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({
+            "entity_id": orc_id,
+            "reaction_type": "opportunity_attack"
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 2.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert!(body.get("opportunity_attack").is_none(), "{}", body);
+}

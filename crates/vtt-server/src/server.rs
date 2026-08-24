@@ -697,8 +697,24 @@ async fn move_entity(
         match session.move_entity(req.entity_id, (req.x, req.y, req.z)) {
             Ok(outcome) => {
                 data.count_valid();
-                HttpResponse::Ok()
-                    .json(serde_json::json!({ "status": "MOVED", "outcome": outcome }))
+                // Additive Pillar-3 report: when leaving adjacency provoked an
+                // opportunity attack from an enemy with an ARMED reaction, say
+                // so in the response instead of resolving silently. The OA is
+                // NOT auto-executed here — polling/prompting the reacting
+                // entity is the reaction stack's behavior. The field is
+                // omitted entirely when nothing could be provoked (mover
+                // disengaged / no adjacent armed enemy / reaction already
+                // spent) — matching `GameSession::move_entity` semantics,
+                // which consumes the readied reaction at detection time.
+                let mut body = serde_json::json!({ "status": "MOVED", "outcome": outcome });
+                if let Some(trigger) = outcome.opportunity_attacks.first() {
+                    body["opportunity_attack"] = serde_json::json!({
+                        "provoked_by": trigger.attacker_id,
+                        "reaction_type": "opportunity_attack",
+                        "available": true,
+                    });
+                }
+                HttpResponse::Ok().json(body)
             }
             Err(e) => reject(&data, 409, "MOVE_REJECTED", &e),
         }
