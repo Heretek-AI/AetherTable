@@ -35,11 +35,13 @@ from types import SimpleNamespace
 from vtt_orchestrator.routing import engine_client, llm_client as llm_client_module
 from vtt_orchestrator.routing.engine_client import EngineRejectedError
 from vtt_orchestrator.routing.llm_client import LLMConfig, LLMStreamingGateway
+from vtt_orchestrator.agents.npc_sub_agent import ConcordiaNPC, SocialNorm, SocialNormsComponent
 from vtt_orchestrator.server import app
 from vtt_orchestrator.simulation.campaign_sim import (
     CampaignSimulation,
     CampaignSimPlayer,
     scripted_decision,
+    scripted_social_decision,
 )
 
 
@@ -48,6 +50,7 @@ from vtt_orchestrator.simulation.campaign_sim import (
 # ---------------------------------------------------------------------------
 
 DUMMY_ID = engine_client._coerce_uuid("sim-training-dummy")
+SOCIAL_NPC_ID = str(DUMMY_ID)
 
 
 class FakeEngine:
@@ -619,3 +622,265 @@ class TestSocialStateTelemetry:
                        for t in _all_turns(rep_a)
                        if t["action"] == "attack" and t["accepted"]}
         assert {rec.timestamp for rec in sim_a.disposition.history()} == expected_ts
+
+
+# ---------------------------------------------------------------------------
+# Social dialogue phase (campaign_sim x ConcordiaNPC sub-agents)
+# ---------------------------------------------------------------------------
+
+class _StubReplyGateway:
+    """Canned NPC-side LLM: returns one fixed {"reply": ...} JSON body."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+
+    async def complete_json(self, system_prompt, user_prompt):
+        self.calls.append((system_prompt, user_prompt))
+        return {"reply": self.reply}
+
+
+def _make_npc(npc_id=SOCIAL_NPC_ID, name="Marrow", gateway=None, norms=None):
+    return ConcordiaNPC(
+        npc_id=npc_id, name=name, role="Keeper of the Sunken Shrine",
+        norms=norms if norms is not None else SocialNormsComponent(),
+        llm_gateway=gateway,
+    )
+
+
+def _all_social(report):
+    return [e for r in report["rounds"] for e in r["social"]]
+
+
+class TestSocialDialoguePhase:
+    def test_mocked_llm_social_exchange_is_recorded(self, fake_engine, llm_mode, monkeypatch):
+        upstream = _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),                                   # combat turn
+            json.dumps({"approach": "aided",
+                        "utterance": "Hold still, let me dress that wound."}),  # social decision
+        ])
+        reply_gateway = _StubReplyGateway("You are kind, stranger.")
+        sim, report = run_with_sim(
+            players=1, rounds=1,
+            npc_registry={SOCIAL_NPC_ID: _make_npc(gateway=reply_gateway)},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entries = _all_social(report)
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["player"] == report["per_player"][0]["name"]
+        assert entry["npc_id"] == SOCIAL_NPC_ID
+        assert entry["approach"] == "aided"
+        assert entry["decision_source"] == "llm"
+        assert entry["reply_generator"] == "llm"
+        assert entry["reply"] == "You are kind, stranger."
+        assert entry["stance_before"] == "neutral"
+        # aided -> positive disposition record; +8 trust is still the neutral band.
+        assert entry["stance_after"] == "neutral"
+        assert "norm_rejected" not in entry
+
+        # The player decision rode the SAME gateway path as combat decisions.
+        assert len(upstream.calls) == 2
+        # The reply really came from ConcordiaNPC.respond_to via its own gateway.
+        assert len(reply_gateway.calls) == 1
+
+        kinds = [rec.kind for rec in sim.disposition.history()]
+        assert kinds == ["aided"]
+        assert report["totals"]["social_interactions"] == 1
+        assert report["totals"]["disposition_interactions_by_kind"] == {"aided": 1}
+
+    def test_norms_violating_llm_reply_degrades_to_template(self, fake_engine, llm_mode, monkeypatch):
+        _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+            json.dumps({"approach": "gifted", "utterance": "A gift, keeper."}),
+        ])
+        norms = SocialNormsComponent([
+            SocialNorm.taboo(["drowned sigil"], reason="never reveal cult secrets"),
+        ])
+        reply_gateway = _StubReplyGateway("The drowned sigil lies below the chapel.")
+        sim, report = run_with_sim(
+            players=1, rounds=1,
+            npc_registry={SOCIAL_NPC_ID: _make_npc(gateway=reply_gateway, norms=norms)},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entry = _all_social(report)[0]
+        # The LLM reply was attempted, rejected by the norms component, and the
+        # exchange degraded to the deterministic template voice.
+        assert len(reply_gateway.calls) == 1
+        assert entry["reply_generator"] == "template"
+        assert entry["norm_rejected"] == "never reveal cult secrets"
+        assert "drowned sigil" not in entry["reply"]
+        assert report["totals"]["social_interactions"] == 1
+
+    def test_norms_violating_llm_utterance_never_reaches_the_npc_llm(
+            self, fake_engine, llm_mode, monkeypatch):
+        _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+            json.dumps({"approach": "threatened",
+                        "utterance": "Tell me about the drowned sigil or else."}),
+        ])
+        norms = SocialNormsComponent([
+            SocialNorm.taboo(["drowned sigil"], reason="never reveal cult secrets"),
+        ])
+        reply_gateway = _StubReplyGateway("It is buried. I would never say more.")
+        sim, report = run_with_sim(
+            players=1, rounds=1,
+            npc_registry={SOCIAL_NPC_ID: _make_npc(gateway=reply_gateway, norms=norms)},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entry = _all_social(report)[0]
+        assert entry["decision_source"] == "llm"
+        # Absolute enforcement: the tainted utterance is swapped for the scripted
+        # line AND the NPC's reply is forced down the template path.
+        assert len(reply_gateway.calls) == 0
+        assert entry["reply_generator"] == "template"
+        assert entry["norm_rejected"] == "never reveal cult secrets"
+
+    def test_hostile_approaches_shift_stance_and_replies_across_rounds(
+            self, fake_engine, llm_mode, monkeypatch):
+        upstream = _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+            json.dumps({"approach": "threatened", "utterance": "Talk, or else."}),
+        ] * 3)
+        sim, report = run_with_sim(
+            players=1, rounds=3,
+            npc_registry={SOCIAL_NPC_ID: _make_npc()},   # no gateway -> template voice
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entries = _all_social(report)
+        assert len(entries) == 3
+        assert all(e["decision_source"] == "llm" for e in entries)
+        assert all(e["approach"] == "threatened" for e in entries)
+        stances = [e["stance_after"] for e in entries]
+        assert stances == ["unfriendly", "unfriendly", "hostile"]
+        assert entries[0]["stance_before"] == "neutral"
+        # Replies must reflect the shifted stance (template cores are per-stance).
+        assert "I owe you nothing." in entries[-1]["reply"]
+        assert [rec.kind for rec in sim.disposition.history()] == \
+            ["threatened", "threatened", "threatened"]
+
+    def test_registry_none_skips_social_phase_entirely(self, fake_engine, llm_mode, monkeypatch):
+        upstream = _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+        ] * 2)
+
+        sim, report = run_with_sim(players=1, rounds=2)
+
+        assert all(r["social"] == [] for r in report["rounds"])
+        assert report["totals"]["social_interactions"] == 0
+        assert sim.disposition.history() == []
+        # No extra LLM calls were burned on dialogue that cannot happen.
+        assert len(upstream.calls) == 2
+        assert all("chat/completions" in c["url"] for c in upstream.calls)
+
+    def test_designated_npc_absent_from_session_records_nothing(self, fake_engine):
+        sim, report = run_with_sim(
+            players=1, rounds=2,
+            npc_registry={"ghost-npc-id": _make_npc(npc_id="ghost-npc-id")},
+            social_npc_id="ghost-npc-id",
+        )
+
+        assert all(r["social"] == [] for r in report["rounds"])
+        assert report["totals"]["social_interactions"] == 0
+        # Combat telemetry on the training dummy may exist, but the designated
+        # (absent) social NPC was never touched.
+        assert all(rec.npc_id != "ghost-npc-id" for rec in sim.disposition.history())
+
+    def test_invalid_llm_approach_falls_back_but_interaction_still_recorded(
+            self, fake_engine, llm_mode, monkeypatch):
+        _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+            json.dumps({"approach": "summon_dragon", "utterance": "hi"}),
+        ])
+        sim, report = run_with_sim(
+            players=1, rounds=1,
+            npc_registry={SOCIAL_NPC_ID: _make_npc()},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entry = _all_social(report)[0]
+        assert entry["decision_source"] == "llm_fallback"
+        assert "unknown_approach" in entry["fallback_reason"]
+        # Deterministic scripted fallback for a neutral stance is "gifted".
+        assert entry["approach"] == "gifted"
+        assert report["totals"]["social_interactions"] == 1
+        assert [rec.kind for rec in sim.disposition.history()] == ["gifted"]
+
+    def test_scripted_mode_records_social_exchanges_without_the_network(
+            self, fake_engine, monkeypatch):
+        class _NeverClient(httpx.AsyncClient):
+            async def post(self, url, *args, **kwargs):
+                if "chat/completions" in str(url):
+                    raise AssertionError("network LLM call attempted in scripted mode")
+                return await super().post(url, *args, **kwargs)
+
+        monkeypatch.setattr(llm_client_module.httpx, "AsyncClient", _NeverClient)
+
+        sim, report = run_with_sim(
+            players=1, rounds=2,
+            npc_registry={SOCIAL_NPC_ID: _make_npc()},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+
+        entries = _all_social(report)
+        assert len(entries) == 2
+        assert all(e["decision_source"] == "scripted" for e in entries)
+        assert all(e["reply_generator"] == "template" for e in entries)
+        # The scripted approach must follow the CURRENT stance it was handed
+        # (the dummy is attacked during combat rounds, so it is not neutral).
+        assert all(e["stance_before"] != "allied" for e in entries)
+        assert all(e["approach"] ==
+                   scripted_social_decision(e["stance_before"])["approach"]
+                   for e in entries)
+        assert report["totals"]["social_interactions"] == 2
+
+    def test_social_timestamps_are_deterministic_sim_clock_values(self, fake_engine):
+        kwargs = dict(
+            players=1, rounds=3,
+            npc_registry={SOCIAL_NPC_ID: _make_npc()},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
+        sim_a, rep_a = run_with_sim(**kwargs)
+        sim_b, rep_b = run_with_sim(**kwargs)
+
+        def projected(sim, rep):
+            slot = {p["entity_id"]: i for i, p in enumerate(rep["per_player"])}
+            return [(slot.get(r.player_id, r.player_id), r.npc_id, r.kind,
+                     r.magnitude, r.timestamp) for r in sim.disposition.history()]
+
+        ts_a = projected(sim_a, rep_a)
+        ts_b = projected(sim_b, rep_b)
+        assert ts_a and ts_a == ts_b
+        # Social slots are round * 10 + player index + 0.5 — pure sim clock,
+        # offset from the combat-turn slots so the two never collide.
+        assert {r.timestamp for r in sim_a.disposition.history()
+                if r.kind == "threatened"} == {10.5, 20.5, 30.5}
+
+        proj_a = [{k: v for k, v in e.items() if k != "player"}
+                  for e in _all_social(rep_a)]
+        proj_b = [{k: v for k, v in e.items() if k != "player"}
+                  for e in _all_social(rep_b)]
+        assert proj_a == proj_b
+
+    def test_misconfigured_registry_is_rejected_at_construction(self):
+        # A registry without a designated NPC id cannot run the phase
+        # unambiguously -> fail fast instead of guessing.
+        with pytest.raises(ValueError):
+            CampaignSimulation(players=1, rounds=1,
+                               npc_registry={SOCIAL_NPC_ID: _make_npc()})
+        with pytest.raises(ValueError):
+            CampaignSimulation(players=1, rounds=1,
+                               npc_registry={SOCIAL_NPC_ID: _make_npc()},
+                               social_npc_id="not-in-registry")
+
+    def test_scripted_social_policy_branches_on_stance(self):
+        assert scripted_social_decision("friendly")["approach"] == "aided"
+        assert scripted_social_decision("allied")["approach"] == "aided"
+        assert scripted_social_decision("neutral")["approach"] == "gifted"
+        assert scripted_social_decision("unfriendly")["approach"] == "threatened"
+        assert scripted_social_decision("hostile")["approach"] == "threatened"
+        assert scripted_social_decision(None)["approach"] == "gifted"

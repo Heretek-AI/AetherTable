@@ -31,6 +31,23 @@ heal-like action reachable through the proxies, so cooperative interactions
 cannot be observed here; when a heal/protection action exists it should call
 ``_record_social`` with kind ``"aided"``.
 
+Social dialogue phase (integration with ``agents.npc_sub_agent``): between
+combat rounds, each player may attempt ONE dialogue interaction with a
+designated "social NPC". The player's decision ({approach, utterance}) comes
+from the SAME gateway path as combat decisions — strict JSON, validated
+defensively, with a deterministic scripted fallback per current stance — and
+the reply comes from that NPC's ``ConcordiaNPC.respond_to`` via the injectable
+``npc_registry`` constructor parameter. With no registry supplied the phase is
+skipped ENTIRELY (empty ``rounds[].social``, zero social totals) rather than
+simulated with invented chatter. Every exchange records its approach on the
+disposition engine (``"aided"``/``"gifted"`` positive,
+``"threatened"``/``"ignored"`` negative) so repeated hostile approaches shift
+the NPC's stance across rounds — and the NPC's replies reflect it, because
+``respond_to`` reads the stance it is handed. Norms enforcement stays absolute:
+an LLM utterance or reply that trips the NPC's social norms degrades the whole
+exchange to the template voice with the ``norm_rejected`` reason surfaced in
+the round report.
+
 Importable API only — no HTTP routes are added this iteration. To run live:
 
     # 1. authoritative engine:      cargo run -p vtt-server
@@ -475,6 +492,84 @@ def _coerce_coord(value: Any) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Social dialogue phase (player decision + ConcordiaNPC reply)
+# ---------------------------------------------------------------------------
+
+#: Social approaches a player may take toward the designated social NPC. Each
+#: maps 1:1 onto a disposition-engine interaction kind, so approaches carry
+#: their own valence ("aided"/"gifted" positive, "threatened"/"ignored"
+#: negative).
+SOCIAL_APPROACHES = ("aided", "gifted", "threatened", "ignored")
+SOCIAL_APPROACH_KINDS = {approach: approach for approach in SOCIAL_APPROACHES}
+
+SOCIAL_SYSTEM_PROMPT = (
+    "You are one player at a D&D-style virtual tabletop, speaking to an NPC "
+    "between combat rounds. Reply ONLY with a single JSON object, no prose, "
+    'of the form: {"approach": "aided" | "gifted" | "threatened" | "ignored", '
+    '"utterance": "<one short spoken line>", '
+    '"reason": "<one short sentence>"}'
+)
+
+
+def build_social_prompts(npc_name: str, stance: str) -> tuple:
+    """(system, user) prompts for the player's social decision. The NPC's
+    CURRENT stance toward the player is injected so the model reasons over live
+    social state, exactly like combat decisions."""
+    user_prompt = (
+        f"You are addressing the NPC {npc_name!r}, whose current attitude "
+        f"toward you is {stance!r}. Choose ONE social approach and write the "
+        "exact line you say aloud, as JSON per the schema."
+    )
+    return SOCIAL_SYSTEM_PROMPT, user_prompt
+
+
+def validate_social_decision(parsed: Any) -> tuple:
+    """Returns (decision_dict_or_None, fallback_reason_or_None). Defensive:
+    model output is untrusted input."""
+    if not isinstance(parsed, dict):
+        return None, "malformed_llm_output"
+    approach = parsed.get("approach")
+    if not isinstance(approach, str) or approach.lower() not in SOCIAL_APPROACHES:
+        return None, f"unknown_approach:{approach!r}"
+    utterance = parsed.get("utterance")
+    if not isinstance(utterance, str) or not utterance.strip():
+        return None, "missing_utterance"
+    return {
+        "approach": approach.lower(),
+        "utterance": utterance.strip()[:500],
+        "reason": str(parsed.get("reason", ""))[:200],
+    }, None
+
+
+#: Deterministic scripted fallback per CURRENT stance of the social NPC toward
+#: the acting player — no RNG anywhere.
+_SCRIPTED_SOCIAL_APPROACH = {
+    "allied": "aided",
+    "friendly": "aided",
+    "neutral": "gifted",
+    "unfriendly": "threatened",
+    "hostile": "threatened",
+}
+
+_SOCIAL_UTTERANCES = {
+    "aided": "Hold still — let me dress that wound.",
+    "gifted": "Take this coin pouch; a token of goodwill.",
+    "threatened": "Answer plainly, or answer to my blade.",
+    "ignored": "...",
+}
+
+
+def scripted_social_decision(stance: Optional[str]) -> Dict[str, Any]:
+    """Deterministic dialogue fallback for one stance reading."""
+    approach = _SCRIPTED_SOCIAL_APPROACH.get(stance or "neutral", "gifted")
+    return {
+        "approach": approach,
+        "utterance": _SOCIAL_UTTERANCES[approach],
+        "reason": f"scripted social approach ({approach}) for stance {stance}",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -493,11 +588,26 @@ class CampaignSimulation:
         transport=None,
         table_name: str = "Campaign Sim Table",
         disposition_engine: Optional[NpcDispositionEngine] = None,
+        npc_registry: Optional[Dict[str, Any]] = None,
+        social_npc_id: Optional[str] = None,
     ):
         if players < 1:
             raise ValueError("players must be >= 1")
         if rounds < 1:
             raise ValueError("rounds must be >= 1")
+        # Social dialogue layer. ``npc_registry`` maps entity id -> an object
+        # exposing ``ConcordiaNPC.respond_to``. Default (None) means the social
+        # phase is skipped entirely — the sim never invents dialogue it cannot
+        # actually produce.
+        self.npc_registry = dict(npc_registry) if npc_registry else None
+        self.social_npc_id = social_npc_id
+        if self.npc_registry is not None:
+            if not self.social_npc_id:
+                raise ValueError(
+                    "npc_registry supplied but no social_npc_id designated")
+            if self.social_npc_id not in self.npc_registry:
+                raise ValueError(
+                    f"social_npc_id {self.social_npc_id!r} is not in npc_registry")
         self.players_n = players
         self.rounds_n = rounds
         self.table_name = table_name
@@ -518,13 +628,16 @@ class CampaignSimulation:
         """Deterministic end-of-run sim-clock reading for stance snapshots."""
         return self.rounds_n * 10.0 + self.players_n
 
-    def _stance_toward(self, npc_id: str, player_id: Optional[str]) -> str:
+    def _stance_toward(self, npc_id: str, player_id: Optional[str],
+                       timestamp: Optional[float] = None) -> str:
         """Current stance of ``npc_id`` toward ``player_id`` — defensive:
-        unknown targets (or missing ids) read as neutral."""
+        unknown targets (or missing ids) read as neutral. Defaults to the
+        end-of-run sim clock; social exchanges read at their own timestamp."""
         if not player_id or not npc_id:
             return "neutral"
+        ts = self._end_ts if timestamp is None else timestamp
         try:
-            return self.disposition.stance(npc_id, player_id, timestamp=self._end_ts)
+            return self.disposition.stance(npc_id, player_id, timestamp=ts)
         except Exception:  # never let telemetry break the run
             return "neutral"
 
@@ -598,6 +711,7 @@ class CampaignSimulation:
                 "degraded_flags_seen": 0,
                 "disposition_interactions": 0,
                 "disposition_interactions_by_kind": {},
+                "social_interactions": 0,
             },
             "per_player": [],
             "rounds": [],
@@ -622,11 +736,20 @@ class CampaignSimulation:
 
         try:
             for round_no in range(1, self.rounds_n + 1):
-                round_entry = {"round": round_no, "turns": []}
+                round_entry = {"round": round_no, "turns": [], "social": []}
                 for player in players:
                     turn = await self._take_turn(player, round_no)
                     round_entry["turns"].append(turn)
                     self._account(turn, report)
+                # Social phase: BETWEEN combat rounds, each player may attempt
+                # ONE dialogue interaction with the designated social NPC.
+                # No registry -> the phase does not exist (empty, not faked).
+                if self.npc_registry is not None:
+                    for player in players:
+                        entry = await self._social_exchange(player, round_no, report)
+                        if entry is not None:
+                            round_entry["social"].append(entry)
+                            report["totals"]["social_interactions"] += 1
                 report["rounds"].append(round_entry)
         except CampaignSimError as exc:
             report["errors"].append(f"aborted mid-run: {exc}")
@@ -709,6 +832,107 @@ class CampaignSimulation:
             fallback["reason"] = f"scripted fallback ({reason})"
             return fallback, "llm_fallback", reason, True
         return decision, "llm", None, True
+
+    # -- social dialogue phase ------------------------------------------------
+
+    async def _decide_social(self, npc_name: str, stance: str) -> tuple:
+        """Player dialogue decision ({approach, utterance}) via the SAME
+        gateway path as combat decisions, with a deterministic per-stance
+        scripted fallback. Returns (decision, source, fallback_reason|None,
+        llm_was_called)."""
+        if self.mode != "llm":
+            return scripted_social_decision(stance), "scripted", None, False
+        system_prompt, user_prompt = build_social_prompts(npc_name, stance)
+        parsed = await self.gateway.complete_json(system_prompt, user_prompt)
+        decision, problem = validate_social_decision(parsed)
+        if decision is None:
+            reason = problem if parsed is not None else "llm_unavailable_or_unparseable"
+            fallback = scripted_social_decision(stance)
+            fallback["reason"] = f"scripted fallback ({reason})"
+            return fallback, "llm_fallback", reason, True
+        return decision, "llm", None, True
+
+    async def _social_exchange(self, player: CampaignSimPlayer, round_no: int,
+                               report: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """One player's single dialogue attempt against the designated social
+        NPC this round. Returns a report entry, or None when the interaction
+        genuinely could not happen (NPC absent/dead/hidden, or the exchange
+        failed) — nothing is fabricated."""
+        npc = self.npc_registry[self.social_npc_id]
+        snapshot = await player.observe_session()
+        entity = next(
+            (e for e in snapshot.get("entities", [])
+             if str(e["id"]) == str(self.social_npc_id)),
+            None,
+        )
+        if entity is None or entity.get("is_dead") or not entity.get("is_visible", True):
+            return None
+
+        actor_id = player.entity_id or player.name
+        ts = round_no * 10.0 + player.index + 0.5  # deterministic sim clock
+        stance_before = self._stance_toward(self.social_npc_id, actor_id, timestamp=ts)
+        npc_name = entity.get("name") or str(self.social_npc_id)
+
+        decision, source, fallback_reason, _called = await self._decide_social(
+            npc_name, stance_before)
+        approach = decision["approach"]
+        utterance = decision["utterance"]
+
+        # Absolute norms enforcement on BOTH halves of the LLM pair: a tainted
+        # utterance never reaches the NPC's LLM at all, and ConcordiaNPC itself
+        # norm-checks its own LLM reply before using it.
+        norm_rejected: Optional[str] = None
+        force_template = False
+        if source == "llm":
+            try:
+                norm_rejected = npc.norms.violates(utterance, {"player_id": actor_id})
+            except Exception:  # a broken norms component must not abort the run
+                norm_rejected = None
+            if norm_rejected is not None:
+                utterance = scripted_social_decision(stance_before)["utterance"]
+                force_template = True
+
+        try:
+            self.disposition.record_interaction(
+                npc_id=self.social_npc_id, player_id=actor_id,
+                kind=SOCIAL_APPROACH_KINDS[approach], magnitude=1.0, timestamp=ts)
+        except ValueError:  # defensive: never fabricate telemetry
+            return None
+        self._npc_names.setdefault(str(self.social_npc_id), npc_name)
+        # Post-exchange stance at this interaction's own sim-clock instant; the
+        # NPC replies through THIS stance so a hostile approach is answered
+        # coldly in the same breath it lands.
+        stance_after = self._stance_toward(self.social_npc_id, actor_id, timestamp=ts)
+
+        try:
+            result = await npc.respond_to(
+                actor_id, utterance, disposition_stance=stance_after, timestamp=ts,
+                **({"llm_gateway": None} if force_template else {}))
+        except Exception as exc:  # dialogue failure must never abort the run
+            report["errors"].append(f"{player.name}: social exchange failed: {exc}")
+            return None
+
+        if norm_rejected is None and isinstance(result.get("norm_rejected"), str):
+            norm_rejected = result["norm_rejected"]
+
+        entry: Dict[str, Any] = {
+            "round": round_no,
+            "player": player.name,
+            "npc_id": str(self.social_npc_id),
+            "approach": approach,
+            "decision_source": source,
+            "fallback_reason": fallback_reason,
+            "utterance": utterance[:300],
+            "reply_generator": result.get("generator"),
+            "reply": result.get("reply"),
+            "stance_before": stance_before,
+            # Read at THIS interaction's sim-clock instant: the post-exchange
+            # stance, before any later round's events decay or overwrite it.
+            "stance_after": stance_after,
+        }
+        if norm_rejected is not None:
+            entry["norm_rejected"] = norm_rejected
+        return entry
 
     # -- accounting -----------------------------------------------------------
 
