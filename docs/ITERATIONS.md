@@ -57,5 +57,5 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 
 | # | Item | Summary | Commit | Gates |
 |---|------|---------|--------|-------|
-| 1 | 3.6 + 3.7 | Dead code sweep (App.tsx unreachable dup block, audio_vad_pipeline.ts, ui/safety_xcard.ts); y-indexeddb wired as IndexedDB persistence for Y.Doc rooms | tbd | tsc+vite ✓ |
+| 1 | 3.6 + 3.7 | Dead code sweep (App.tsx unreachable dup block, audio_vad_pipeline.ts, ui/safety_xcard.ts); y-indexeddb wired as IndexedDB persistence for Y.Doc rooms | 3d6ba67 | tsc+vite ✓ |
 
