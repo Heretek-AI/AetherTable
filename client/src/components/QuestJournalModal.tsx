@@ -4,193 +4,118 @@ import {
   Share2,
   Sparkles,
   Check,
+  RefreshCw,
+  AlertTriangle,
+  Info,
+  Lock,
+  GitBranch,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { ModalShell } from './ui/ModalShell';
-
-export interface QuestItem {
-  id: string;
-  title: string;
-  giver: string;
-  location: string;
-  status: 'active' | 'completed' | 'failed';
-  xpReward: number;
-  goldReward: number;
-  description: string;
-  steps: { text: string; done: boolean }[];
-}
-
-export interface NPCDossier {
-  id: string;
-  name: string;
-  role: string;
-  faction: string;
-  disposition: 'friendly' | 'neutral' | 'hostile';
-  notes: string;
-  avatarIcon: string;
-}
+import {
+  generateQuest,
+  orderQuestNodes,
+  type QuestGraph,
+  type QuestNode as EngineQuestNode,
+} from '../api/quest_store';
 
 interface QuestJournalModalProps {
   isOpen: boolean;
   onClose: () => void;
   onShareToChat?: (text: string) => void;
+  /**
+   * Live session role from the App shell (same convention as StreamerHUDModal:
+   * passed IN rather than mirrored). Defaults to the App shell's own default
+   * seat. Quest generation and GM notes are gated on this; the gateway route
+   * itself is not role-enforced, so this is an entry-point gate only.
+   */
+  userRole?: 'gm' | 'player' | 'spectator';
 }
 
-/** Status → printed-book badge variant (failed kept for the type contract). */
-const STATUS_BADGE: Record<QuestItem['status'], string> = {
-  active: 'vtt-badge',
-  completed: 'vtt-badge vtt-badge-success',
-  failed: 'vtt-badge vtt-badge-danger',
+const NODE_BADGE: Record<string, string> = {
+  HOOK: 'vtt-badge vtt-badge-success',
+  CLIMAX: 'vtt-badge vtt-badge-danger',
+  RESOLUTION: 'vtt-badge vtt-badge-success',
 };
 
-const DISPOSITION_BADGE: Record<NPCDossier['disposition'], string> = {
-  friendly: 'vtt-badge vtt-badge-success',
-  neutral: 'vtt-badge',
-  hostile: 'vtt-badge vtt-badge-danger',
+function nodeBadge(nodeType: string): string {
+  return NODE_BADGE[nodeType] ?? 'vtt-badge';
+}
+
+/** Iteration 79's generator parameters — the exact body /api/v1/quest/generate accepts. */
+const GENERATE_DEFAULTS = {
+  campaign_theme: 'The Iron Succession',
+  primary_house: 'house_vane',
+  rival_house: 'house_silverpeak',
 };
 
 export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
   isOpen,
   onClose,
   onShareToChat,
+  userRole = 'gm',
 }) => {
-  const [activeTab, setActiveTab] = useState<'quests' | 'npcs' | 'chronicles' | 'loot'>('quests');
-  const [selectedQuestId, setSelectedQuestId] = useState<string>('q1');
+  const isGM = userRole === 'gm';
+  const [activeTab, setActiveTab] = useState<'quests' | 'notes'>('quests');
+  const [selectedQuestId, setSelectedQuestId] = useState<string | null>(null);
   const [shareAlert, setShareAlert] = useState<string | null>(null);
 
-  const [quests, setQuests] = useState<QuestItem[]>([
-    {
-      id: 'q1',
-      title: "Infiltrate Baron Vane's Corrupted Crypt",
-      giver: 'Captain Roderick',
-      location: 'The Sunken Catacombs',
-      status: 'active',
-      xpReward: 2400,
-      goldReward: 500,
-      description:
-        'Venture beneath the manor to stop the necrotic ritual. Destroy the Orc Vanguard and recover the blood-sealed treason parchment.',
-      steps: [
-        { text: 'Breach the outer iron portcullis', done: true },
-        { text: 'Defeat the Orc Warlord & Vanguard', done: false },
-        { text: 'Disarm the spiked pit trap at [D4]', done: false },
-        { text: 'Recover the Blood-Sealed Decree', done: false },
-      ],
-    },
-    {
-      id: 'q2',
-      title: 'The Stolen Relic of the Silver Dawn',
-      giver: 'High Priestess Althea',
-      location: 'Cathedral of Light',
-      status: 'completed',
-      xpReward: 1200,
-      goldReward: 250,
-      description: 'Recovered the consecrated chalice from goblin looters in the weeping woods.',
-      steps: [
-        { text: 'Track goblin tracks to cave', done: true },
-        { text: 'Retrieve the Consecrated Chalice', done: true },
-        { text: 'Return chalice to Althea', done: true },
-      ],
-    },
-    {
-      id: 'q3',
-      title: 'The Beast of Blackwood Fen',
-      giver: 'Townmaster Klaus',
-      location: 'Blackwood Marshes',
-      status: 'active',
-      xpReward: 1800,
-      goldReward: 350,
-      description: 'Hunt down the hydra terrorizing trading caravans along the marsh road.',
-      steps: [
-        { text: 'Investigate damaged merchant wagon', done: true },
-        { text: 'Craft fire arrows for hydra heads', done: true },
-        { text: 'Slay the 5-headed marsh hydra', done: false },
-      ],
-    },
-  ]);
+  // Graphs generated THIS SESSION via POST /api/v1/quest/generate. Held in
+  // memory only — neither this client nor the modal persists them.
+  const [quests, setQuests] = useState<QuestGraph[]>([]);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [form, setForm] = useState({ ...GENERATE_DEFAULTS });
 
-  const [npcs] = useState<NPCDossier[]>([
-    {
-      id: 'npc1',
-      name: 'Baron Vane',
-      role: 'Corrupted Noble',
-      faction: 'House Vane',
-      disposition: 'hostile',
-      notes: 'Pacted with shadow entities to usurp the Crown. Highly dangerous sorcerer.',
-      avatarIcon: '👑',
-    },
-    {
-      id: 'npc2',
-      name: 'Captain Roderick',
-      role: 'Town Guard Captain',
-      faction: 'Silver Vanguard',
-      disposition: 'friendly',
-      notes: 'Loyal ally of the party. Promised 500 gold reward for proof of treason.',
-      avatarIcon: '🛡️',
-    },
-    {
-      id: 'npc3',
-      name: 'Gorthak the Skullsplitter',
-      role: 'Orc Warlord',
-      faction: 'Iron Vanguard',
-      disposition: 'hostile',
-      notes: 'Wields an enchanted greataxe. Commands vanguard in the lower crypts.',
-      avatarIcon: '⚔️',
-    },
-  ]);
+  // GM session notes. Deliberately component-local state ONLY — never sent to
+  // any server, never written to storage; erased when the tab closes or the
+  // modal unmounts. The UI labels this LOCAL-ONLY in three places below.
+  const [sessionNotes, setSessionNotes] = useState('');
 
-  const [chronicles] = useState([
-    { date: 'Session #1042', entry: 'Entered the Baron Crypt. Encountered Orc Warlord at the portcullis.' },
-    { date: 'Session #1041', entry: 'Discovered the Ancient Cipher of the Iron Lich at the Altar of Torment.' },
-    { date: 'Session #1040', entry: 'Interrogated Goblin Scout, learned of hidden passage near brazier.' },
-  ]);
+  const activeQuest =
+    quests.find((q) => q.quest_id === selectedQuestId) ?? quests[0] ?? null;
 
-  const [loot] = useState({
-    gold: 1450,
-    platinum: 25,
-    electrum: 80,
-    items: [
-      'Potion of Greater Healing (x2)',
-      'Spell Scroll of Fireball (3rd level)',
-      'Ring of Protection (+1 AC / Saves)',
-      'Boots of Elvenkind',
-    ],
-  });
-
-  const activeQuest = quests.find((q) => q.id === selectedQuestId) || quests[0];
-
-  const handleToggleStep = (stepIdx: number) => {
-    const updated = quests.map((q) => {
-      if (q.id === activeQuest.id) {
-        const nextSteps = [...q.steps];
-        nextSteps[stepIdx].done = !nextSteps[stepIdx].done;
-        return { ...q, steps: nextSteps };
-      }
-      return q;
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setGenError(null);
+    const graph = await generateQuest({
+      campaign_theme: form.campaign_theme.trim() || GENERATE_DEFAULTS.campaign_theme,
+      primary_house: form.primary_house.trim() || GENERATE_DEFAULTS.primary_house,
+      rival_house: form.rival_house.trim() || GENERATE_DEFAULTS.rival_house,
     });
-    setQuests(updated);
+    setGenerating(false);
+    if (!graph) {
+      setGenError(
+        'Generation failed — the gateway returned no quest graph. Nothing was invented to fill the gap.'
+      );
+      return;
+    }
+    setQuests((prev) => [graph, ...prev]);
+    setSelectedQuestId(graph.quest_id);
     globalAudio.playTurnAdvance();
   };
 
   const handleShare = (text: string) => {
     if (onShareToChat) onShareToChat(text);
     globalAudio.playTurnAdvance();
-    setShareAlert('Quest details broadcasted to party chat!');
+    setShareAlert('Outline posted to the local chat feed.');
     setTimeout(() => setShareAlert(null), 2500);
   };
 
   const TABS: { id: typeof activeTab; label: string }[] = [
-    { id: 'quests', label: `Active Quests (${quests.length})` },
-    { id: 'npcs', label: `NPC Dossiers (${npcs.length})` },
-    { id: 'chronicles', label: 'Session Chronicles' },
-    { id: 'loot', label: 'Party Treasury & Loot' },
+    {
+      id: 'quests',
+      label: `Generated Quests${quests.length > 0 ? ` (${quests.length})` : ''}`,
+    },
+    { id: 'notes', label: 'GM Session Notes · LOCAL-ONLY' },
   ];
 
   return (
     <ModalShell
       isOpen={isOpen}
       onClose={onClose}
-      title="Campaign Notes & Interactive Quest Journal"
-      subtitle="Active quest objectives, NPC dossiers, session chronicles, and party treasury ledger."
+      title="Quest Journal"
+      subtitle="Quest graphs generated live by the gateway quest engine, plus GM session notes that never leave this browser."
       icon={<BookOpen className="w-5 h-5" />}
       size="xl"
       footer={
@@ -205,224 +130,348 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
       }
     >
       {/* Tab Navigation */}
-        <div className="vtt-tabbar w-full font-mono text-xs">
-          {TABS.map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              data-active={activeTab === tab.id}
-              className="vtt-tab"
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
+      <div className="vtt-tabbar w-full font-mono text-xs">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            data-active={activeTab === tab.id}
+            className="vtt-tab"
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-        {/* Content Body */}
-        <div className="p-6 overflow-y-auto flex-1 max-h-[60vh] vtt-scrollbar">
-          {shareAlert && (
-            <div
-              className="mb-4 border-l-4 border-[var(--state-success)] bg-[color-mix(in_srgb,var(--state-success)_10%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2 animate-fadeIn"
-            >
-              <Sparkles className="w-4 h-4 shrink-0" style={{ color: 'var(--state-success)' }} />
-              <span className="text-[var(--rp-parchment-200)]">{shareAlert}</span>
-            </div>
-          )}
+      {/* Content Body */}
+      <div className="p-6 overflow-y-auto flex-1 max-h-[60vh] vtt-scrollbar">
+        {shareAlert && (
+          <div
+            className="mb-4 border-l-4 border-[var(--state-success)] bg-[color-mix(in_srgb,var(--state-success)_10%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2 animate-fadeIn"
+          >
+            <Sparkles className="w-4 h-4 shrink-0" style={{ color: 'var(--state-success)' }} />
+            <span className="text-[var(--rp-parchment-200)]">{shareAlert}</span>
+          </div>
+        )}
 
-          {/* Quests Tab */}
-          {activeTab === 'quests' && (
-            <div className="grid grid-cols-3 gap-6 h-full">
-              {/* Quest List — ledger entries on tavern chrome */}
-              <div className="col-span-1 space-y-2 border-r border-tavern-border pr-4 font-mono text-xs">
-                {quests.map((q) => {
-                  const isSelected = q.id === activeQuest.id;
-                  return (
-                    <div
-                      key={q.id}
-                      onClick={() => {
-                        setSelectedQuestId(q.id);
-                        globalAudio.playTurnAdvance();
-                      }}
-                      className={`p-3 rounded-xl border transition cursor-pointer space-y-1 ${
-                        isSelected
-                          ? 'bg-tavern-surface border-tavern-accent shadow-[0_0_14px_rgba(217,119,6,0.2)]'
-                          : 'vtt-surface rounded-xl hover:border-[var(--rp-leather-600)]'
-                      }`}
-                    >
-                      <div className={`font-bold truncate ${isSelected ? 'text-tavern-accent' : 'text-[var(--rp-parchment-100)]'}`}>{q.title}</div>
-                      <div className="flex items-center justify-between text-[10px] text-[var(--rp-parchment-300)]">
-                        <span>{q.location}</span>
-                        <span className={`${STATUS_BADGE[q.status]} uppercase`}>
-                          {q.status}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
+        {/* Generated Quests Tab */}
+        {activeTab === 'quests' && (
+          <div className="space-y-5">
+            {/* GM Generation Panel */}
+            {isGM ? (
+              <div
+                className="vtt-surface rounded-xl p-4 space-y-3"
+                aria-label="Generate a quest"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="vtt-section-header text-xs font-bold flex items-center gap-2">
+                    <GitBranch className="w-4 h-4 text-tavern-accent" />
+                    Generate Quest (GM)
+                  </div>
+                  <span
+                    className="text-[10px] text-[var(--rp-parchment-300)] font-mono"
+                    title="The /api/v1/quest/generate route does not enforce roles server-side yet."
+                  >
+                    client-side gate only — server route unauthenticated
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  <label className="space-y-1 block">
+                    <span className="text-[10px] uppercase font-mono text-[var(--rp-parchment-300)]">Campaign Theme</span>
+                    <input
+                      value={form.campaign_theme}
+                      onChange={(e) => setForm({ ...form, campaign_theme: e.target.value })}
+                      placeholder={GENERATE_DEFAULTS.campaign_theme}
+                      className="vtt-input w-full text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1 block">
+                    <span className="text-[10px] uppercase font-mono text-[var(--rp-parchment-300)]">Primary House</span>
+                    <input
+                      value={form.primary_house}
+                      onChange={(e) => setForm({ ...form, primary_house: e.target.value })}
+                      placeholder={GENERATE_DEFAULTS.primary_house}
+                      className="vtt-input w-full text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1 block">
+                    <span className="text-[10px] uppercase font-mono text-[var(--rp-parchment-300)]">Rival House</span>
+                    <input
+                      value={form.rival_house}
+                      onChange={(e) => setForm({ ...form, rival_house: e.target.value })}
+                      placeholder={GENERATE_DEFAULTS.rival_house}
+                      className="vtt-input w-full text-xs"
+                    />
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => void handleGenerate()}
+                    disabled={generating}
+                    className="vtt-btn vtt-btn-primary font-display tracking-wide disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${generating ? 'animate-spin' : ''}`} />
+                    <span>{generating ? 'Generating…' : 'Generate Quest'}</span>
+                  </button>
+                  {genError && (
+                    <span className="text-xs text-[var(--state-danger,crimson)] flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                      {genError}
+                    </span>
+                  )}
+                </div>
               </div>
+            ) : (
+              <div
+                className="border-l-4 border-[var(--rp-leather-600)] bg-[color-mix(in_srgb,var(--rp-leather-600)_8%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2"
+              >
+                <Lock className="w-4 h-4 shrink-0" style={{ color: 'var(--rp-leather-600)' }} />
+                <span className="text-[var(--rp-parchment-200)]">
+                  Quest generation is a GM action. You can view quests the GM has generated at this table.
+                </span>
+              </div>
+            )}
 
-              {/* Quest Details — the quest prints as an in-world document */}
-              <div className="col-span-2 space-y-4 flex flex-col justify-between">
-                <div className="space-y-4">
-                  <div className="vtt-parchment rounded-xl p-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <h3 className="text-lg font-bold font-display tracking-wide" style={{ color: 'var(--parchment-ink)' }}>
+            {quests.length === 0 ? (
+              <div className="vtt-parchment rounded-xl p-6 text-center space-y-2">
+                <Info className="w-5 h-5 mx-auto" style={{ color: 'var(--statblock-header)', opacity: 0.7 }} />
+                <p className="text-sm font-display" style={{ color: 'var(--parchment-ink)' }}>
+                  No quest generated yet this session.
+                </p>
+                <p className="text-xs" style={{ color: 'var(--parchment-ink)', opacity: 0.75 }}>
+                  Everything shown here comes from the engine's theme tables via
+                  POST /api/v1/quest/generate — nothing is pre-seeded or demo-filled.
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-6">
+                {/* Generated-graph list */}
+                <div className="col-span-1 space-y-2 border-r border-tavern-border pr-4 font-mono text-xs">
+                  {quests.map((q) => {
+                    const isSelected = !!activeQuest && q.quest_id === activeQuest.quest_id;
+                    return (
+                      <div
+                        key={q.quest_id}
+                        onClick={() => {
+                          setSelectedQuestId(q.quest_id);
+                          globalAudio.playTurnAdvance();
+                        }}
+                        className={`p-3 rounded-xl border transition cursor-pointer space-y-1 ${
+                          isSelected
+                            ? 'bg-tavern-surface border-tavern-accent shadow-[0_0_14px_rgba(217,119,6,0.2)]'
+                            : 'vtt-surface rounded-xl hover:border-[var(--rp-leather-600)]'
+                        }`}
+                      >
+                        <div className={`font-bold truncate ${isSelected ? 'text-tavern-accent' : 'text-[var(--rp-parchment-100)]'}`}>{q.title}</div>
+                        <div className="flex items-center justify-between text-[10px] text-[var(--rp-parchment-300)]">
+                          <span>{Object.keys(q.nodes).length} nodes</span>
+                          {q.coverage_note && (
+                            <span className="uppercase" title={q.coverage_note}>
+                              partial
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Selected graph detail */}
+                <div className="col-span-2 space-y-4">
+                  {activeQuest && (
+                    <>
+                      <div className="vtt-parchment rounded-xl p-4 space-y-3">
+                        <h3
+                          className="text-lg font-bold font-display tracking-wide"
+                          style={{ color: 'var(--parchment-ink)' }}
+                        >
                           {activeQuest.title}
                         </h3>
-                        <div className="text-xs mt-0.5" style={{ color: 'var(--parchment-ink)', opacity: 0.75 }}>
-                          Giver: <strong className="font-display" style={{ color: 'var(--statblock-header)' }}>{activeQuest.giver}</strong> · Region:{' '}
-                          <strong style={{ color: 'var(--parchment-ink)' }}>{activeQuest.location}</strong>
+                        <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>
+                          {activeQuest.summary}
+                        </p>
+
+                        {activeQuest.coverage_note && (
+                          <div
+                            className="rounded-lg px-3 py-2 text-[11px] leading-relaxed flex items-start space-x-2"
+                            style={{
+                              backgroundColor: 'color-mix(in srgb, var(--rp-crimson-400) 12%, transparent)',
+                              color: 'var(--parchment-ink)',
+                            }}
+                          >
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" style={{ color: 'var(--rp-crimson-400)' }} />
+                            <span>
+                              <strong>Coverage note from the engine:</strong> {activeQuest.coverage_note}
+                            </span>
+                          </div>
+                        )}
+
+                        <div
+                          className="flex justify-end pt-2"
+                          style={{ borderTop: '1px solid var(--rp-leather-700)' }}
+                        >
+                          <button
+                            onClick={() =>
+                              handleShare(
+                                `📜 Quest Outline (engine-generated): "${activeQuest.title}" — ${Object.keys(activeQuest.nodes).length} nodes`
+                              )
+                            }
+                            className="vtt-btn vtt-btn-primary font-display tracking-wide"
+                          >
+                            <Share2 className="w-3.5 h-3.5" />
+                            <span>Share Outline to Chat</span>
+                          </button>
                         </div>
                       </div>
 
-                      <div className="flex items-center space-x-2 text-xs shrink-0">
-                        <span className="vtt-badge">🪙 {activeQuest.goldReward} GP</span>
-                        <span className="vtt-badge">⭐ {activeQuest.xpReward} XP</span>
-                      </div>
-                    </div>
-
-                    <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>
-                      {activeQuest.description}
-                    </p>
-
-                    {/* Step Checklist — inked checkboxes: leather ring when
-                        open, iron-ink fill once struck through */}
-                    <div className="space-y-2">
-                      <div
-                        className="text-xs font-display tracking-wider uppercase"
-                        style={{ color: 'var(--statblock-header)' }}
-                      >
-                        Objective Steps
-                      </div>
-                      <div className="space-y-1.5">
-                        {activeQuest.steps.map((step, idx) => (
-                          <div
-                            key={idx}
-                            onClick={() => handleToggleStep(idx)}
-                            className="flex items-center space-x-2.5 p-2 rounded-lg border cursor-pointer transition text-xs"
-                            style={{ borderColor: 'var(--rp-leather-700)' }}
-                          >
-                            <div
-                              className={`w-4 h-4 rounded-full flex items-center justify-center border ${
-                                step.done ? '' : 'bg-transparent'
-                              }`}
-                              style={{
-                                borderColor: step.done ? 'var(--rp-leather-700)' : 'var(--rp-leather-600)',
-                                backgroundColor: step.done ? 'var(--parchment-ink)' : 'transparent',
-                                boxShadow: step.done ? 'inset 0 0 0 1px var(--rp-leather-700)' : undefined,
-                              }}
-                            >
-                              {step.done && <Check className="w-3 h-3" style={{ color: 'var(--parchment-paper)' }} />}
-                            </div>
-                            <span
-                              style={{ color: 'var(--parchment-ink)', opacity: step.done ? 0.55 : 0.95 }}
-                              className={step.done ? 'line-through' : ''}
-                            >
-                              {step.text}
-                            </span>
-                          </div>
+                      {/* DAG nodes, walked forward from initial_node_id */}
+                      <div className="space-y-3">
+                        <div
+                          className="text-xs font-display tracking-wider uppercase flex items-center gap-2"
+                          style={{ color: 'var(--statblock-header)' }}
+                        >
+                          <GitBranch className="w-4 h-4" />
+                          Structure ({orderQuestNodes(activeQuest).length} nodes)
+                        </div>
+                        {orderQuestNodes(activeQuest).map((node, idx) => (
+                          <NodeCard key={node.node_id} node={node} index={idx} graph={activeQuest} />
                         ))}
                       </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex justify-end pt-3 border-t border-tavern-border">
-                  <button
-                    onClick={() => handleShare(`📜 Quest Update: "${activeQuest.title}" (${activeQuest.status.toUpperCase()})`)}
-                    className="vtt-btn vtt-btn-primary font-display tracking-wide"
-                  >
-                    <Share2 className="w-3.5 h-3.5" />
-                    <span>Share Quest to Chat</span>
-                  </button>
+                    </>
+                  )}
                 </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {/* NPCs Tab — dossier cards as parchment records */}
-          {activeTab === 'npcs' && (
-            <div className="grid grid-cols-3 gap-4">
-              {npcs.map((npc) => (
-                <div key={npc.id} className="vtt-parchment p-4 rounded-xl space-y-2">
-                  <div className="flex items-center space-x-2.5">
-                    <span className="text-2xl">{npc.avatarIcon}</span>
-                    <div>
-                      {/* Dossier nameplate — Cinzel small caps crimson, book style */}
-                      <div
-                        className="text-sm font-bold font-display tracking-wide lowercase"
-                        style={{ fontVariant: 'small-caps', color: 'var(--statblock-header)' }}
-                      >
-                        {npc.name}
-                      </div>
-                      <div className="text-[10px]" style={{ color: 'var(--parchment-ink)', opacity: 0.7 }}>
-                        {npc.role} · {npc.faction}
-                      </div>
-                    </div>
-                  </div>
-                  <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>{npc.notes}</p>
-                  <div className="pt-2 border-t text-[10px]" style={{ borderColor: 'var(--rp-leather-700)', color: 'var(--parchment-ink)', opacity: 0.8 }}>
-                    Disposition:{' '}
-                    <span className={`${DISPOSITION_BADGE[npc.disposition]} uppercase ml-1`}>
-                      {npc.disposition}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+            <p className="text-[10px] font-mono text-[var(--rp-parchment-300)] leading-relaxed">
+              Rendered from the gateway quest engine (POST /api/v1/quest/generate, GET
+              /api/v1/quest/active). This journal holds generated graphs for this session
+              only; it does not persist them, and the gateway keeps only its most recent one.
+            </p>
+          </div>
+        )}
 
-          {/* Session Chronicles Tab */}
-          {activeTab === 'chronicles' && (
-            <div className="space-y-3">
-              {chronicles.map((ch, idx) => (
-                <div key={idx} className="vtt-surface rounded-xl p-3.5 flex items-start space-x-3">
-                  <span className="vtt-badge shrink-0 font-mono font-bold">
-                    {ch.date}
-                  </span>
-                  <p className="text-xs text-[var(--rp-parchment-200)] flex-1 mt-0.5">{ch.entry}</p>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Party Treasury Tab */}
-          {activeTab === 'loot' && (
-            <div className="space-y-6">
-              {/* Coin Pouch */}
-              <div className="grid grid-cols-3 gap-4">
-                <div className="vtt-card-elevated rounded-xl p-4 text-center">
-                  <div className="text-2xl font-bold font-mono text-tavern-accent">🪙 {loot.gold}</div>
-                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Gold Pieces (GP)</div>
-                </div>
-                <div className="vtt-card-elevated rounded-xl p-4 text-center">
-                  <div className="text-2xl font-bold font-mono text-[var(--rp-parchment-100)]">💎 {loot.platinum}</div>
-                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Platinum Pieces (PP)</div>
-                </div>
-                <div className="vtt-card-elevated rounded-xl p-4 text-center">
-                  <div className="text-2xl font-bold font-mono text-[var(--rp-crimson-400)]">✨ {loot.electrum}</div>
-                  <div className="text-xs text-[var(--rp-parchment-300)] font-mono uppercase mt-1">Electrum (EP)</div>
-                </div>
+        {/* GM Session Notes Tab */}
+        {activeTab === 'notes' && (
+          <div className="space-y-3">
+            {!isGM && (
+              <div className="border-l-4 border-[var(--rp-leather-600)] bg-[color-mix(in_srgb,var(--rp-leather-600)_8%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-center space-x-2">
+                <Lock className="w-4 h-4 shrink-0" style={{ color: 'var(--rp-leather-600)' }} />
+                <span className="text-[var(--rp-parchment-200)]">
+                  Session notes are GM-only.
+                </span>
               </div>
-
-              {/* Magical Inventory */}
-              <div className="space-y-2">
-                <div className="vtt-section-header text-xs font-bold">
-                  Shared Party Magical Items
-                </div>
-                <div className="grid grid-cols-2 gap-2 font-mono text-xs">
-                  {loot.items.map((item, idx) => (
-                    <div key={idx} className="vtt-surface rounded-lg p-3 text-[var(--rp-parchment-200)] flex items-center space-x-2">
-                      <Sparkles className="w-4 h-4 text-tavern-accent shrink-0" />
-                      <span>{item}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
+            )}
+            <div
+              className="border-l-4 border-[#d97706] bg-[color-mix(in_srgb,#d97706_10%,transparent)] rounded-r-lg px-3 py-2 text-xs flex items-start space-x-2"
+            >
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" style={{ color: '#d97706' }} />
+              <span className="text-[var(--rp-parchment-100)] font-bold">
+                LOCAL-ONLY: these notes exist solely in this browser tab's memory. They are
+                never sent to the server, never written to disk or campaign saves, and are
+                erased permanently when you close this modal, refresh, or leave the table.
+              </span>
             </div>
-          )}
-        </div>
+            <textarea
+              value={sessionNotes}
+              onChange={(e) => isGM && setSessionNotes(e.target.value)}
+              readOnly={!isGM}
+              rows={12}
+              placeholder={
+                isGM
+                  ? 'Scratch notes for the current session — initiative quirks, NPC moods, open threads… (LOCAL-ONLY, not saved)'
+                  : ''
+              }
+              className="vtt-input w-full text-xs leading-relaxed font-mono resize-y"
+              aria-label="GM session notes (local-only)"
+            />
+            <p className="text-[10px] font-mono text-[var(--rp-parchment-300)]">
+              {sessionNotes.length} characters · LOCAL-ONLY · no persistence anywhere
+            </p>
+          </div>
+        )}
+      </div>
     </ModalShell>
   );
 };
+
+/** One DAG node rendered as an in-world document card with its choice edges. */
+const NodeCard: React.FC<{
+  node: EngineQuestNode;
+  index: number;
+  graph: QuestGraph;
+}> = ({ node, index, graph }) => (
+  <div className="vtt-parchment rounded-xl p-3.5 space-y-2.5">
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="font-mono text-[10px]" style={{ color: 'var(--parchment-ink)', opacity: 0.55 }}>
+          {String(index + 1).padStart(2, '0')}
+        </span>
+        <span
+          className="text-sm font-bold font-display tracking-wide lowercase truncate"
+          style={{ fontVariant: 'small-caps', color: 'var(--statblock-header)' }}
+        >
+          {node.title}
+        </span>
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0">
+        {node.node_id === graph.initial_node_id && (
+          <span className="vtt-badge vtt-badge-success uppercase text-[9px]">start</span>
+        )}
+        <span className={`${nodeBadge(node.node_type)} uppercase text-[9px]`}>
+          {node.node_type.replace(/_/g, ' ')}
+        </span>
+      </div>
+    </div>
+
+    <p className="text-xs leading-relaxed" style={{ color: 'var(--parchment-ink)' }}>
+      {node.narrative_prompt}
+    </p>
+
+    {node.choices.length > 0 && (
+      <div className="space-y-1.5 pt-1">
+        <div
+          className="text-[10px] uppercase tracking-wider font-mono"
+          style={{ color: 'var(--parchment-ink)', opacity: 0.65 }}
+        >
+          Choices
+        </div>
+        {node.choices.map((choice) => (
+          <div
+            key={choice.choice_id}
+            className="flex items-start justify-between gap-3 p-2 rounded-lg text-xs"
+            style={{
+              border: '1px solid var(--rp-leather-700)',
+              color: 'var(--parchment-ink)',
+            }}
+          >
+            <span className="leading-snug">{choice.prompt_text}</span>
+            <span className="shrink-0 flex flex-col items-end gap-1 font-mono text-[10px]" style={{ opacity: 0.85 }}>
+              {choice.skill_check_required && (
+                <span>
+                  {choice.skill_check_required[0]} DC {choice.skill_check_required[1]}
+                </span>
+              )}
+              {(choice.rewards_gold > 0 || choice.rewards_xp > 0) && (
+                <span>
+                  {choice.rewards_gold > 0 ? `+${choice.rewards_gold} gp` : ''}
+                  {choice.rewards_gold > 0 && choice.rewards_xp > 0 ? ' · ' : ''}
+                  {choice.rewards_xp > 0 ? `+${choice.rewards_xp} xp` : ''}
+                </span>
+              )}
+              {Object.entries(choice.faction_reputation_deltas).map(([faction, delta]) => (
+                <span key={faction}>
+                  {delta >= 0 ? '+' : ''}
+                  {delta} rep {faction}
+                </span>
+              ))}
+              <span style={{ opacity: 0.6 }}>→ {graph.nodes[choice.target_node_id]?.title ?? choice.target_node_id}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    )}
+  </div>
+);
