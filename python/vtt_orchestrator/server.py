@@ -35,6 +35,7 @@ from .compendium.starter_adventures import (
     list_starter_adventures,
 )
 from .compendium.homebrew_parser import global_homebrew_parser
+from .compendium.roll20_importer import global_roll20_importer
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .routing.intent_router import LLM_CLASSIFIER_KILL_SWITCH_ENV
 from .schemas.models import (
@@ -2601,6 +2602,171 @@ async def npc_record_interaction(
         "stance": _npc_disposition_engine.stance(npc_id, player_id),
         "disposition": _npc_disposition_engine.disposition(npc_id, player_id),
     }
+
+
+# --- External platform import (Pillar 10 interop) -----------------------------------
+# Wire-up of the tested importers in compendium/ onto the HTTP surface. Roll20
+# exports are single JSON documents, so they arrive as one request body;
+# Foundry modules are directory trees and are deliberately NOT implemented
+# over this transport (see foundry_import_preview below).
+
+# Sanity bound on an import body. Real Roll20 character/campaign exports are
+# kilobytes; anything near this limit is an accidental dump or abuse.
+_MAX_IMPORT_BODY_BYTES = 2 * 1024 * 1024
+
+_ABILITY_ORDER = ("STR", "DEX", "CON", "INT", "WIS", "CHA")
+
+
+class Roll20ImportRequest(BaseModel):
+    # Untyped on purpose: the importer itself validates the export's shape and
+    # raises ValueError for anything unrecognized (mapped to 422 below), so the
+    # gateway must not pre-empt it with a stricter schema.
+    character_json: Any
+
+
+def _import_int(value: Any, default: int) -> int:
+    """Int coercion for imported stats; non-numeric -> the create-character
+    default (the importer already warned about the unmappable raw value)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return int(value)
+
+
+def _import_text(value: Any, default: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _projected_to_character_payload(projected: Dict[str, Any]) -> Dict[str, Any]:
+    """Map one importer projection onto the EXISTING storage payload shape
+    served by POST /api/v1/characters (CharacterCreateRequest).
+
+    Missing values fall back to that route's exact defaults rather than being
+    fabricated as plausible-looking stats; every such substitution was already
+    emitted as a warning by the importer and is surfaced again in the import
+    response envelope, so nothing is silently invented.
+
+    max_hp/temp_hp have no slot in the current storage shape and are dropped
+    here (documented lossiness of this iteration, not a silent guess).
+    """
+    klass = str(_import_text(projected.get("character_class"), "fighter")).lower()
+    abilities_raw = projected.get("abilities") or {}
+    return {
+        "name": projected["name"],
+        "character_class": klass,
+        "level": min(20, max(1, _import_int(projected.get("level"), 1))),
+        "race": _import_text(projected.get("race"), "Human"),
+        "background": _import_text(projected.get("background"), "Soldier"),
+        "alignment": _import_text(projected.get("alignment"), "Neutral Good"),
+        "abilities": {
+            key: _import_int(abilities_raw.get(key), 10) for key in _ABILITY_ORDER
+        },
+        "hp": _import_int(projected.get("hp"), 12),
+        "ac": _import_int(projected.get("ac"), 16),
+        "speed": _import_int(projected.get("speed"), 30),
+        "features": [],
+        "spells": [],
+    }
+
+
+@app.post("/api/v1/import/roll20")
+async def import_roll20(
+    req: Roll20ImportRequest,
+    request: Request,
+    token: str = Depends(_require_auth),
+):
+    """Persist characters from a Roll20 JSON export under the caller's account.
+
+    Accepts either a single-character export ({name, attribs[]}) or a campaign
+    export (a list, or {"characters": [...]}). Each recognized character is
+    persisted through the same storage path as POST /api/v1/characters and
+    owned by the authenticated caller; malformed members of a campaign are
+    skipped with warnings instead of aborting the batch, while an entirely
+    unrecognizable document fails with 422.
+    """
+    user_id = _require_user_id(token)
+
+    # Size sanity before touching the parser: declared Content-Length when the
+    # transport provides it, otherwise the size of what we actually parsed.
+    declared = request.headers.get("content-length", "")
+    body_size = int(declared) if declared.isdigit() else len(
+        json.dumps(req.character_json, default=str)
+    )
+    if body_size > _MAX_IMPORT_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Import body exceeds {_MAX_IMPORT_BODY_BYTES} byte sanity bound "
+                f"(got {body_size}); Roll20 character exports are far smaller — "
+                "is this the wrong file?"
+            ),
+        )
+
+    try:
+        result = global_roll20_importer.import_character(req.character_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if isinstance(result.get("characters"), list):
+        projected_list = result["characters"]
+        skipped = result.get("skipped", 0)
+        warnings = [str(w) for w in result.get("warnings", [])]
+    else:
+        projected_list = [result]
+        skipped = 0
+        warnings = []
+
+    # A batch in which NOTHING was recognizable persisted zero rows; answering
+    # 200 would hide the failure, so it fails loud with the skip reasons.
+    if not projected_list:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Roll20 import persisted no characters: "
+                + ("; ".join(warnings) if warnings else "no recognizable characters in export")
+            ),
+        )
+
+    persisted: List[Dict[str, Any]] = []
+    for projected in projected_list:
+        record = await storage_backend.create_character(
+            user_id, _projected_to_character_payload(projected)
+        )
+        warnings.extend(f"{projected['name']}: {w}" for w in projected.get("warnings", []))
+        persisted.append({
+            "character_id": record["character_id"],
+            "name": record["name"],
+            "character_class": record["character_class"],
+            "level": record["level"],
+        })
+
+    return {
+        "imported": len(persisted),
+        "skipped": skipped,
+        "warnings": warnings,
+        "characters": persisted,
+    }
+
+
+@app.post("/api/v1/import/foundry/preview")
+async def foundry_import_preview(token: str = Depends(_require_auth)):
+    """Deliberate stub, not an accident.
+
+    A Foundry module is a DIRECTORY tree (module.json manifest plus NDJSON
+    pack database files), which cannot be delivered as a single JSON body the
+    way a Roll20 export can. Receiving one requires multipart upload support
+    so clients can attach the module files; until that transport exists there
+    is no honest preview to serve, so this answers 501 rather than pretending.
+    """
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "NOT_IMPLEMENTED: Foundry module directories require multipart "
+            "upload support to receive module.json plus its NDJSON pack files; "
+            "single-body JSON import cannot represent a module tree. Deferred "
+            "to a future iteration — use POST /api/v1/import/roll20 for "
+            "single-document Roll20 exports meanwhile."
+        ),
+    )
 
 
 def start_server():
