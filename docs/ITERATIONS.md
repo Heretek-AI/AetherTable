@@ -165,6 +165,24 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 > diagnostics) at loop close-out alongside cargo/pytest/vitest runs below.
 
 
+| 81 | tests | Vitest client unit suite: 66→69 tests over SRD-derived pure modules | 2f8e978 | vitest ✓ |
+| 82 | P8-depth | Dynasty lineages/alliances/prestige with dominance weights; legacy seed output pinned | dac7f36 | pytest ✓ |
+| 83 | P2 | Role-enforced handout persistence backend + typed store; no gm_only existence oracle | 1a36cb6 | pytest ✓ |
+| 84 | A6-fix | Rate-limit flake fixed (per-test window clearing); Wizard HP hit-die table corrected; scripted-mode network leak closed; tautology removed | 703f5c1 | all ✓ |
+| 85 | durability | GM campaign autosave from live engine state, rolling per-session slot | d9c3973 | pytest ✓ |
+| 86 | honesty | Compendium demo fallbacks purged; per-section status panels; cross-section search | 028d33a | tsc ✓ |
+| 87-88 | honesty | Lore assertion panel on epistemic graph; WFC studio on real generator, local-synthesis deleted | 01be577/eb66fe1 | tsc ✓ |
+| 89 | honesty | Dynasty view on real /dynasty routes; fabricated empirical card → live benchmark endpoint | 695f403 | tsc ✓ |
+| 90 | P2-wire | Quest journal generates real parametrized DAGs; invented content deleted | 9b1d29c | tsc ✓ |
+| 91 | honesty | Marketplace/subscription surfaces honestly labeled PREVIEW; purchase fictions removed | cea6ff1 | tsc ✓ |
+| 92 | P9-wire | Boss bar + initiative HUD on real engine state; missing combat-path auth tokens fixed | 9b77c3c | tsc ✓ |
+| 93 | docs | Tracker close-out reconciliation + Loop Summary with source-verified limits | 23ca2c3 | manual ✓ |
+| 94-95 | security | Server-side quest route auth (GM-only generate); client stale copy + missing headers fixed | c5d9cc6/83ef76c | pytest+tsc ✓ |
+| 96-97 | docs | README status refresh + CLAUDE.md count sync, all figures re-measured at write time | 024d6e8 | gates ✓ |
+
+### Iteration-100 closing gate
+(pending)
+
 ### Iteration-80 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, recall 23/23, trust boundary held.
 
