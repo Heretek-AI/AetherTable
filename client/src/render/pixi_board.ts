@@ -24,6 +24,31 @@ export class PixiBoard {
     return this.ready;
   }
 
+  /**
+   * Env-gated backend preference (see src/types/env.d.ts). Defaults to
+   * WebGL-first for production stability; set VITE_PIXI_PREFERENCE=webgpu
+   * to opt in to WebGPU with automatic WebGL fallback.
+   */
+  private static rendererPreference(): 'webgl' | 'webgpu' {
+    return import.meta.env.VITE_PIXI_PREFERENCE === 'webgpu' ? 'webgpu' : 'webgl';
+  }
+
+  private async createApp(
+    gridWidth: number,
+    gridHeight: number,
+    preference: 'webgl' | 'webgpu'
+  ): Promise<Application> {
+    const app = new Application();
+    await app.init({
+      preference,
+      width: gridWidth * this.cellSize,
+      height: gridHeight * this.cellSize,
+      backgroundAlpha: 0,
+      antialias: true,
+    });
+    return app;
+  }
+
   public async init(
     host: HTMLElement,
     gridWidth: number,
@@ -31,16 +56,21 @@ export class PixiBoard {
     walls: Set<string>
   ): Promise<boolean> {
     try {
-      const app = new Application();
-      // WebGPU preferred, WebGL fallback — Pixi v8 handles backend selection;
-      // 'webgl-first' keeps production stability per current renderer guidance.
-      await app.init({
-        preference: 'webgl',
-        width: gridWidth * this.cellSize,
-        height: gridHeight * this.cellSize,
-        backgroundAlpha: 0,
-        antialias: true,
-      });
+      let app: Application | null = null;
+      const preference = PixiBoard.rendererPreference();
+      if (preference === 'webgpu') {
+        // WebGPU-first; any init failure (no adapter, driver error, etc.)
+        // retries below with WebGL before the DOM fallback chain kicks in.
+        try {
+          app = await this.createApp(gridWidth, gridHeight, 'webgpu');
+        } catch (e) {
+          console.warn('[PixiBoard] WebGPU init failed, falling back to WebGL:', e);
+          app = null;
+        }
+      }
+      if (!app) {
+        app = await this.createApp(gridWidth, gridHeight, 'webgl');
+      }
       host.appendChild(app.canvas);
       app.canvas.style.display = 'block';
       this.app = app;
