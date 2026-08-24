@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS narrative_state.player_characters (
 
 CREATE INDEX IF NOT EXISTS idx_player_characters_owner
     ON narrative_state.player_characters (owner_user_id);
+
+CREATE TABLE IF NOT EXISTS narrative_state.handouts (
+    handout_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID REFERENCES narrative_state.campaigns(campaign_id) ON DELETE SET NULL,
+    lobby_id    UUID REFERENCES narrative_state.lobbies(lobby_id) ON DELETE SET NULL,
+    title       TEXT NOT NULL,
+    content_md  TEXT NOT NULL DEFAULT '',
+    revealed_to TEXT NOT NULL DEFAULT 'all'
+                CHECK (revealed_to IN ('all', 'party', 'gm_only')),
+    created_by  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_handouts_campaign
+    ON narrative_state.handouts (campaign_id, created_at DESC);
 """
 
 
@@ -120,6 +135,7 @@ class MemoryStore:
         self.engine_snapshots: Dict[str, Dict[str, Any]] = {}  # session_id -> snapshot
         self.lobbies: Dict[str, Dict[str, Any]] = {}           # lobby_id -> record
         self.characters: Dict[str, Dict[str, Any]] = {}        # character_id -> record
+        self.handouts: Dict[str, Dict[str, Any]] = {}          # handout_id -> record
         self._counter = 0
 
     @property
@@ -321,6 +337,50 @@ class MemoryStore:
             return False
         del self.characters[character_id]
         return True
+
+    # -- handouts --
+
+    async def create_handout(self, title: str, content_md: str, revealed_to: str,
+                             created_by: str, campaign_id: Optional[str] = None,
+                             lobby_id: Optional[str] = None) -> Dict[str, Any]:
+        handout_id = f"hnd_{secrets.token_hex(6)}"
+        record = {
+            "handout_id": handout_id,
+            "campaign_id": campaign_id,
+            "lobby_id": lobby_id,
+            "title": title,
+            "content_md": content_md,
+            "revealed_to": revealed_to,
+            "created_by": created_by,
+            "created_at": time.time(),
+        }
+        self.handouts[handout_id] = record
+        return dict(record)
+
+    async def list_handouts(self, campaign_id: Optional[str] = None,
+                            visible_only_for_role: Optional[str] = None) -> List[Dict[str, Any]]:
+        rows = [
+            h for h in self.handouts.values()
+            if campaign_id is None or h["campaign_id"] == campaign_id
+        ]
+        rows.sort(key=lambda h: h["created_at"], reverse=True)
+        if visible_only_for_role is not None and visible_only_for_role not in ("gm", "admin"):
+            rows = [h for h in rows if h["revealed_to"] in ("all", "party")]
+        return [dict(h) for h in rows]
+
+    async def get_handout(self, handout_id: str) -> Optional[Dict[str, Any]]:
+        record = self.handouts.get(handout_id)
+        return dict(record) if record else None
+
+    async def update_handout(self, handout_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        record = self.handouts.get(handout_id)
+        if record is None:
+            return None
+        record.update(fields)
+        return dict(record)
+
+    async def delete_handout(self, handout_id: str) -> bool:
+        return self.handouts.pop(handout_id, None) is not None
 
 
 class PostgresStore:
@@ -605,6 +665,87 @@ class PostgresStore:
         status = await self.pool.execute(
             "DELETE FROM narrative_state.player_characters WHERE character_id = $1 AND owner_user_id = $2",
             character_id, owner_user_id,
+        )
+        return status.endswith("1")
+
+    # -- handouts --
+
+    _HANDOUT_COLUMNS = """handout_id, campaign_id, lobby_id, title, content_md,
+                          revealed_to, created_by, created_at"""
+
+    @staticmethod
+    def _handout_row(row: Any) -> Dict[str, Any]:
+        record = dict(row)
+        record["handout_id"] = str(record["handout_id"])
+        for key in ("campaign_id", "lobby_id"):
+            if record[key] is not None:
+                record[key] = str(record[key])
+        return record
+
+    async def create_handout(self, title: str, content_md: str, revealed_to: str,
+                             created_by: str, campaign_id: Optional[str] = None,
+                             lobby_id: Optional[str] = None) -> Dict[str, Any]:
+        row = await self.pool.fetchrow(
+            f"""INSERT INTO narrative_state.handouts
+                    (title, content_md, revealed_to, created_by, campaign_id, lobby_id)
+                VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid)
+                RETURNING {self._HANDOUT_COLUMNS}""",
+            title, content_md, revealed_to, created_by, campaign_id, lobby_id,
+        )
+        return self._handout_row(row)
+
+    async def list_handouts(self, campaign_id: Optional[str] = None,
+                            visible_only_for_role: Optional[str] = None) -> List[Dict[str, Any]]:
+        visibility = ""
+        if visible_only_for_role is not None and visible_only_for_role not in ("gm", "admin"):
+            visibility = "AND revealed_to IN ('all', 'party')"
+        rows = await self.pool.fetch(
+            f"""SELECT {self._HANDOUT_COLUMNS}
+                FROM narrative_state.handouts
+                WHERE (($1::uuid IS NULL) OR (campaign_id = $1::uuid)) {visibility}
+                ORDER BY created_at DESC""",
+            campaign_id,
+        )
+        return [self._handout_row(r) for r in rows]
+
+    async def get_handout(self, handout_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            row = await self.pool.fetchrow(
+                f"SELECT {self._HANDOUT_COLUMNS} FROM narrative_state.handouts WHERE handout_id = $1",
+                handout_id,
+            )
+        except Exception:
+            return None
+        return self._handout_row(row) if row else None
+
+    async def update_handout(self, handout_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Only whitelisted columns can be patched; the route validates values.
+        allowed = {"title", "content_md", "revealed_to", "campaign_id", "lobby_id"}
+        sets, params = [], []
+        for key in allowed & fields.keys():
+            params.append(fields[key])
+            if key in ("campaign_id", "lobby_id"):
+                sets.append(f"{key} = ${len(params)}::uuid")
+            else:
+                sets.append(f"{key} = ${len(params)}")
+        if not sets:
+            row = await self.pool.fetchrow(
+                f"""SELECT {self._HANDOUT_COLUMNS} FROM narrative_state.handouts
+                    WHERE handout_id = $1""", handout_id)
+            return self._handout_row(row) if row else None
+        params.append(handout_id)
+        row = await self.pool.fetchrow(
+            f"""UPDATE narrative_state.handouts SET {', '.join(sets)}
+                WHERE handout_id = ${len(params)}
+                RETURNING {self._HANDOUT_COLUMNS}""",
+            *params,
+        )
+        return self._handout_row(row) if row else None
+
+    async def delete_handout(self, handout_id: str) -> bool:
+        status = await self.pool.execute(
+            "DELETE FROM narrative_state.handouts WHERE handout_id = $1",
+            handout_id,
         )
         return status.endswith("1")
 

@@ -566,6 +566,111 @@ def classify_intent(req: ClassifyRequest):
     return router.classify_utterance(req.utterance, req.speaker_id)
 
 
+# --- Handouts ---------------------------------------------------------------------
+
+class HandoutCreateRequest(BaseModel):
+    title: str
+    content_md: str = ""
+    revealed_to: Literal["all", "party", "gm_only"] = "all"
+    campaign_id: Optional[str] = None
+    lobby_id: Optional[str] = None
+
+
+class HandoutUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    content_md: Optional[str] = None
+    revealed_to: Optional[Literal["all", "party", "gm_only"]] = None
+    campaign_id: Optional[str] = None
+    lobby_id: Optional[str] = None
+
+
+def _handout_can_view(record: Dict[str, Any], role: str) -> bool:
+    """Role visibility for handouts: GM/admin sees everything; players and
+    spectators (and any unrecognized role — fails closed) see only rows
+    revealed to 'all' or 'party'. gm_only content never leaves the GM view,
+    including via direct GET."""
+    if role in ("gm", "admin"):
+        return True
+    return record.get("revealed_to", "gm_only") in ("all", "party")
+
+
+@app.post("/api/v1/handouts")
+async def create_handout(
+    req: HandoutCreateRequest, token: str = Depends(_require_auth)
+):
+    actor = _caller_actor(token)
+    return await storage_backend.create_handout(
+        title=req.title.strip() or "Untitled Handout",
+        content_md=req.content_md,
+        revealed_to=req.revealed_to,
+        created_by=actor["user_id"],
+        campaign_id=req.campaign_id or None,
+        lobby_id=req.lobby_id or None,
+    )
+
+
+@app.get("/api/v1/handouts")
+async def list_handouts(
+    campaign_id: Optional[str] = Query(None), token: str = Depends(_require_auth)
+):
+    actor = _caller_actor(token)
+    role = actor["role"]
+    rows = await storage_backend.list_handouts(
+        campaign_id=campaign_id,
+        # Non-GM callers are filtered at the storage layer; the in-process
+        # re-check below is defense-in-depth against a backend that ignores
+        # the visibility hint.
+        visible_only_for_role=role,
+    )
+    visible = [r for r in rows if _handout_can_view(r, role)]
+    return {"total": len(visible), "handouts": visible}
+
+
+@app.get("/api/v1/handouts/{handout_id}")
+async def get_handout(handout_id: str, token: str = Depends(_require_auth)):
+    """Reads ONE handout, filtered by the caller's role. A player asking for a
+    gm_only row gets the same 404 as a nonexistent id so the route cannot be
+    probed as an existence oracle for unrevealed content."""
+    actor = _caller_actor(token)
+    record = await storage_backend.get_handout(handout_id)
+    if record is None or not _handout_can_view(record, actor["role"]):
+        raise HTTPException(status_code=404, detail="Handout not found")
+    return record
+
+
+@app.put("/api/v1/handouts/{handout_id}")
+async def update_handout(
+    handout_id: str, req: HandoutUpdateRequest, token: str = Depends(_require_auth)
+):
+    """Patches a handout. Authorizable by its creator or any GM/admin; other
+    authenticated callers get the same 404 as a nonexistent id."""
+    actor = _caller_actor(token)
+    record = await storage_backend.get_handout(handout_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Handout not found")
+    if record["created_by"] != actor["user_id"] and actor["role"] not in ("gm", "admin"):
+        raise HTTPException(status_code=404, detail="Handout not found")
+    fields = req.model_dump(exclude_none=True)
+    updated = await storage_backend.update_handout(handout_id, fields)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Handout not found")
+    return updated
+
+
+@app.delete("/api/v1/handouts/{handout_id}")
+async def delete_handout(handout_id: str, token: str = Depends(_require_auth)):
+    actor = _caller_actor(token)
+    record = await storage_backend.get_handout(handout_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Handout not found")
+    if record["created_by"] != actor["user_id"] and actor["role"] not in ("gm", "admin"):
+        raise HTTPException(status_code=404, detail="Handout not found")
+    deleted = await storage_backend.delete_handout(handout_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Handout not found")
+    return {"status": "deleted"}
+
+
 @app.get("/api/v1/compendium/spells")
 def get_compendium_spells(
     q: Optional[str] = Query(None, description="Search query for spell name"),
