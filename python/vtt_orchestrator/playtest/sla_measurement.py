@@ -5,7 +5,9 @@ docs-honesty iteration removed as unverifiable:
 
     * rules engine  < 10 ms   (POST {engine}/api/v1/actions/check)
     * spatial+cover < 15 ms   (POST {engine}/api/v1/spatial/los, /spatial/path)
-    * intent parse  < 150 ms  (POST {gateway}/api/v1/intent/classify)
+    * intent parse  < 150 ms  (POST {gateway}/api/v1/intent/classify — this
+                      endpoint is the DETERMINISTIC KEYWORD REGEX path, and the
+                      row is labelled ``intent_parsing_keyword`` to say so)
     * SSE start     500-1200 ms time-to-first-token
                               (POST {gateway}/api/v1/narrative/stream)
 
@@ -26,6 +28,12 @@ Honesty contract (non-negotiable):
 5. The SSE first-token row reports whether the stream ran in live-LLM mode
    or honest-degradation fallback, because the two measure different things
    (remote model latency vs local deterministic narration).
+6. The LLM-assisted classification row (``intent_parsing_llm``, timing the
+   real ``classify_with_llm`` round-trip) is measured ONLY when
+   ``RUN_LIVE_LLM=1`` AND a live LLM key is configured; otherwise that row is
+   OMITTED entirely — never simulated, never filled with keyword timings.
+7. An SSE first-token verdict needs at least MIN_SSE_SAMPLES valid samples;
+   fewer prints WITHHELD instead of PASS.
 
 This harness deliberately lives OUTSIDE scripts/run_all_benchmarks.sh so it
 is not part of the default benchmark gate yet. Invoke it via
@@ -34,6 +42,7 @@ is not part of the default benchmark gate yet. Invoke it via
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -49,6 +58,17 @@ TRANSPORT_ALLOWANCE_MS = 5.0
 #: Below this many valid samples a category is withheld rather than judged.
 MIN_VALID_SAMPLES = 30
 
+#: The SSE first-token row intentionally runs few streams, but a percentile
+#: still needs more than one or two observations before "PASS" means anything;
+#: below this it prints WITHHELD instead of PASS.
+MIN_SSE_SAMPLES = 3
+
+#: Opt-in switch for the LLM-assisted classification row (real network calls
+#: against the configured chat-completions endpoint; costs real tokens).
+def _run_live_llm_enabled() -> bool:
+    """Read at call time (not import time) so tests and shells can toggle it."""
+    return os.environ.get("RUN_LIVE_LLM", "").strip().lower() in {"1", "true", "yes"}
+
 #: GOALS.md declared SLAs (milliseconds). ``sse_first_token`` encodes only the
 #: upper bound of the declared 500-1200 ms window: faster first tokens can
 #: never be an SLA violation, so enforcing the lower bound would be dishonest.
@@ -56,7 +76,11 @@ SLA_TARGETS_MS: Dict[str, float] = {
     "rules_engine": 10.0,
     "spatial_los": 15.0,
     "spatial_path": 15.0,
-    "intent_parsing": 150.0,
+    # Deliberately named "..._keyword": /api/v1/intent/classify is the
+    # deterministic regex fast path, NOT an LLM measurement. The LLM-assisted
+    # path gets its own row (intent_parsing_llm) and only under RUN_LIVE_LLM=1.
+    "intent_parsing_keyword": 150.0,
+    "intent_parsing_llm": 150.0,
     "sse_first_token": 1200.0,
 }
 
@@ -206,6 +230,50 @@ def measure_sse_first_token(
     return m
 
 
+def measure_llm_classification(utterance: str, *, n: int) -> Optional[Measurement]:
+    """Time ``n`` REAL ``classify_with_llm`` round-trips (prompt + completion).
+
+    Returns None when no live LLM key is configured: without a key the method
+    silently answers from its keyword fast path, so "measuring" it would put
+    keyword timings under an LLM label. Callers OMIT the row in that case —
+    never simulate.
+
+    Only samples whose FINAL label came from the model (``classifier == "llm"``)
+    count as valid; keyword-fallback turns (kill switch, HTTP error,
+    unparseable JSON) are reported as excluded with their honest reasons.
+    """
+    from ..routing.intent_router import IntentClassificationRouter
+
+    router = IntentClassificationRouter()
+    if router.llm_gateway.config.is_mock:
+        return None
+
+    m = Measurement()
+    fallback_counts: Dict[str, int] = {}
+
+    async def _drive() -> None:
+        for _ in range(n):
+            start = time.perf_counter_ns()
+            decision = await router.classify_with_llm(utterance)
+            elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+            if decision.get("classifier") == "llm":
+                m.samples_ms.append(elapsed_ms)
+            else:
+                reason = str(decision.get("fallback_reason") or "keyword_fallback")
+                fallback_counts[reason] = fallback_counts.get(reason, 0) + 1
+
+    asyncio.run(_drive())
+    m.excluded = [
+        f"keyword_fallback ({reason}) x{count}"
+        for reason, count in sorted(fallback_counts.items())
+    ]
+    m.notes.append(
+        "each sample is one full classify_with_llm round-trip "
+        "(chat-completions request + reply), timed client-side"
+    )
+    return m
+
+
 # --------------------------------------------------------------------------
 # Request payloads (realistic shapes; ids-only where the trust boundary
 # demands it — no client-supplied bonuses cross into these calls)
@@ -282,13 +350,16 @@ def judge(category: str, endpoint: str, m: Measurement) -> RowVerdict:
         return RowVerdict(category, endpoint, target_label, None, None, None, 0,
                           "WITHHELD", reason)
 
-    if m.n_valid < MIN_VALID_SAMPLES and category != "sse_first_token":
-        # SSE intentionally runs few streams; every other category needs a
-        # meaningful sample before a percentile verdict means anything.
+    min_samples = MIN_SSE_SAMPLES if category == "sse_first_token" else MIN_VALID_SAMPLES
+    if m.n_valid < min_samples:
+        # SSE runs few streams by design but still needs more than one or two
+        # observations before a percentile "PASS" means anything; every other
+        # category needs a meaningful sample too. Either way: WITHHELD, never
+        # a green PASS on a rump sample.
         return RowVerdict(category, endpoint, target_label,
                           m.percentile(50), m.percentile(95), max(m.samples_ms),
                           m.n_valid, "WITHHELD",
-                          f"only {m.n_valid} valid samples"
+                          f"only {m.n_valid} valid samples (need >= {min_samples})"
                           + (f" ({excluded_note})" if excluded_note else ""))
 
     p95 = m.percentile(95)
@@ -306,33 +377,48 @@ def judge(category: str, endpoint: str, m: Measurement) -> RowVerdict:
 
 def print_report(rows: Sequence[RowVerdict]) -> bool:
     header = (
-        f"{'Category':<18} {'Endpoint':<42} {'N':>5} "
+        f"{'Category':<24} {'Endpoint':<52} {'N':>5} "
         f"{'p50':>10} {'p95':>10} {'max':>10} {'Target':<16} Verdict"
     )
     print(header)
     print("-" * len(header))
     all_pass = True
     any_judged = False
+    n_pass = n_fail = n_withheld = 0
     for r in rows:
         def fmt(v: Optional[float]) -> str:
             return f"{v:.2f}ms" if v is not None else "-"
         print(
-            f"{r.category:<18} {r.endpoint:<42} {r.n_valid:>5} "
+            f"{r.category:<24} {r.endpoint:<52} {r.n_valid:>5} "
             f"{fmt(r.p50):>10} {fmt(r.p95):>10} {fmt(r.max_ms):>10} "
             f"{r.target_label:<16} {r.verdict}"
             + (f" ({r.detail})" if r.detail else "")
         )
         if r.verdict == "FAIL":
             all_pass = False
+            n_fail += 1
+        elif r.verdict == "WITHHELD":
+            n_withheld += 1
+        else:
+            n_pass += 1
         if r.verdict in ("PASS", "FAIL"):
             any_judged = True
+    print()
+    # Explicit tally so a run in which EVERYTHING was withheld can never read
+    # as green: "no failures" and "nothing was actually measured" are printed
+    # as separate, unambiguous lines.
+    print(f"SLA FAILURES: {n_fail}")
+    print(f"PASSED: {n_pass}")
+    print(f"WITHHELD (unmeasurable): {n_withheld}")
     print()
     print(f"Honesty notes:")
     print(f"  * timings are real network round-trips (keep-alive pooled session),")
     print(f"    so thresholds carry a documented +{TRANSPORT_ALLOWANCE_MS:g}ms client-side")
     print(f"    HTTP transport allowance on top of each GOALS.md figure.")
-    print(f"  * rows marked WITHHELD were not measurable (unreachable service or")
+    print(f"  * rows marked WITHHELD were not measurable (unreachable service,")
     print(f"    too few valid samples); they are never filled with simulated data.")
+    print(f"  * the intent_parsing_llm row exists ONLY under RUN_LIVE_LLM=1 with")
+    print(f"    a live key; it is omitted — never simulated — otherwise.")
     if not any_judged:
         print()
         print("NO CATEGORY COULD BE MEASURED — nothing passed or failed.")
@@ -373,6 +459,10 @@ def run_measurement(n_calls: int = 200, sse_streams: int = 1) -> List[RowVerdict
                                        "WITHHELD", "service unreachable"))
 
     # ---- Intent parsing SLA ----------------------------------------------
+    # DISCLOSURE: /api/v1/intent/classify is the deterministic KEYWORD REGEX
+    # classifier (IntentClassificationRouter.classify_utterance). It never
+    # touches the LLM. The row below therefore measures — and is named for —
+    # the keyword path only; the LLM-assisted path gets its own opt-in row.
     with httpx.Client(base_url=GATEWAY_URL, limits=limits) as gateway:
         gateway_up = _service_up(gateway, "")
         if gateway_up:
@@ -381,10 +471,24 @@ def run_measurement(n_calls: int = 200, sse_streams: int = 1) -> List[RowVerdict
                 json_body={"utterance": CLASSIFY_UTTERANCE, "speaker_id": "player"},
                 n=n_calls,
             )
-            rows.append(judge("intent_parsing", "POST :8000/api/v1/intent/classify", m_intent))
+            rows.append(judge("intent_parsing_keyword",
+                              "POST :8000/api/v1/intent/classify (keyword regex)",
+                              m_intent))
         else:
-            rows.append(RowVerdict("intent_parsing", "POST :8000/api/v1/intent/classify",
+            rows.append(RowVerdict("intent_parsing_keyword",
+                                   "POST :8000/api/v1/intent/classify (keyword regex)",
                                    "", None, None, None, 0, "WITHHELD", "service unreachable"))
+
+        # ---- LLM-assisted classification (opt-in, never simulated) --------
+        if _run_live_llm_enabled():
+            llm_row = measure_llm_classification(CLASSIFY_UTTERANCE, n=n_calls)
+            if llm_row is not None:
+                rows.append(judge("intent_parsing_llm",
+                                  "classify_with_llm -> {LLM_API}/chat/completions",
+                                  llm_row))
+            # No key configured: the LLM path cannot be exercised without
+            # pretending keyword answers came from the model, so the row is
+            # simply OMITTED rather than filled with anything synthetic.
 
         # ---- SSE time-to-first-token ------------------------------------
         stream_body: Dict[str, Any] = {

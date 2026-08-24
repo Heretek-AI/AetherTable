@@ -212,5 +212,14 @@ class EngineToolAgent:
                 "tool_trace": trace,
             }
         except RuntimeError as exc:
-            # Honest failure when no LLM key is configured.
-            return {"status": "UNAVAILABLE", "detail": str(exc), "tool_trace": trace}
+            # Honest failure — never a COMPLETED turn with empty narration.
+            # Distinguish "no key configured" from "upstream answered with an
+            # empty stream/body": both are failures, but they mean different
+            # things to whoever is debugging the gateway.
+            detail = str(exc)
+            status = (
+                "LLM_UPSTREAM_EMPTY"
+                if detail.startswith("LLM_UPSTREAM_EMPTY")
+                else "UNAVAILABLE"
+            )
+            return {"status": status, "detail": detail, "tool_trace": trace}

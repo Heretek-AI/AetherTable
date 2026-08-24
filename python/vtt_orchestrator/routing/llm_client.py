@@ -210,7 +210,11 @@ class LLMStreamingGateway:
         Returns the raw assistant message dict, which may contain either
         `content` or `tool_calls` per the OpenAI-compatible contract.
         Raises RuntimeError when only mock mode is configured — a tool-calling
-        agent must NEVER silently fall back to canned strings.
+        agent must NEVER silently fall back to canned strings. Also raises
+        ``RuntimeError("LLM_UPSTREAM_EMPTY: ...")`` when the response carries
+        neither assistant content nor tool_calls (e.g. an SSE body of only
+        ``data: [DONE]``) — an empty turn is an upstream failure, not an
+        answer.
         """
         if self.config.is_mock:
             raise RuntimeError(
@@ -244,6 +248,19 @@ class LLMStreamingGateway:
                     transport = "json"
                     data = resp.json()
             message = data["choices"][0]["message"]
+            has_tool_calls = bool(message.get("tool_calls"))
+            content = message.get("content")
+            has_content = isinstance(content, str) and bool(content.strip())
+            if not has_tool_calls and not has_content:
+                # An empty turn (e.g. an SSE body carrying only `data: [DONE]`
+                # reassembles to content=None / no tool_calls) is an UPSTREAM
+                # FAILURE, not a valid "say nothing" answer. Raising here —
+                # instead of returning a blank message — stops the tool agent
+                # from reporting status COMPLETED with empty narration.
+                raise RuntimeError(
+                    f"LLM_UPSTREAM_EMPTY: {transport} response carried neither "
+                    "assistant content nor tool_calls"
+                )
             _log_llm_call({
                 "ts": time.time(),
                 "kind": "tools",
