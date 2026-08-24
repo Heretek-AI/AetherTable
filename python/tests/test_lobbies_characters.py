@@ -274,3 +274,65 @@ def test_rate_limiter_blocks_flood():
         assert flooded.headers.get("Retry-After")
     finally:
         _rate_windows.pop(key, None)
+
+
+# --- Workstream E: bounded key tracking (mirrors the Rust twin's cap) --------------
+
+def test_sweep_drops_only_keys_past_staleness_bound():
+    from vtt_orchestrator import server
+
+    now = time.time()
+    fresh_default = ("10.0.0.1", "default")   # active inside its 60 s window
+    fresh_auth = ("10.0.0.2", "auth")         # newest hit at exactly 2x window
+    stale_default = ("10.0.0.3", "default")   # fully expired past 2x window
+    empty_key = ("10.0.0.4", "default")       # degenerate: no hits left
+    server._rate_windows.update({
+        fresh_default: [now - 5.0],
+        fresh_auth: [now - 120.0],            # 2x auth window == threshold, kept
+        stale_default: [now - 121.0],         # > 2x default window, swept
+        empty_key: [],
+    })
+    try:
+        server._sweep_stale_rate_keys(now)
+        assert fresh_default in server._rate_windows
+        assert fresh_auth in server._rate_windows
+        assert stale_default not in server._rate_windows
+        assert empty_key not in server._rate_windows
+    finally:
+        for key in (fresh_default, fresh_auth, stale_default, empty_key):
+            server._rate_windows.pop(key, None)
+
+
+def test_middleware_sweeps_stale_keys_when_injected_cap_exceeded(monkeypatch):
+    """A tiny injected cap triggers the sweep on the next admitted request."""
+    from vtt_orchestrator import server
+
+    now = time.time()
+    stale_keys = [(f"192.0.2.{i}", "default") for i in range(1, 6)]
+    live_key = ("203.0.113.7", "default")
+    monkeypatch.setattr(server, "_MAX_TRACKED_KEYS", 3)
+    server._rate_windows.update(
+        {key: [now - 600.0] for key in stale_keys}      # all long-expired
+    )
+    server._rate_windows[live_key] = [now - 1.0]
+    tracked_before = len(server._rate_windows)
+
+    try:
+        # Public route: admitted by the middleware, pushing tracked keys past
+        # the injected cap and firing the stale sweep.
+        resp = client.get("/api/v1/npc/")
+        assert resp.status_code == 200
+        assert len(server._rate_windows) < tracked_before
+        assert live_key in server._rate_windows          # recent key survives
+        assert not any(key in server._rate_windows for key in stale_keys)
+        request_key = ("testclient", "default")
+        assert request_key in server._rate_windows       # current hit retained
+    finally:
+        for key in (*stale_keys, live_key, ("testclient", "default")):
+            server._rate_windows.pop(key, None)
+
+
+def test_default_cap_matches_rust_twin():
+    from vtt_orchestrator import server
+
+    assert server._MAX_TRACKED_KEYS == 100_000

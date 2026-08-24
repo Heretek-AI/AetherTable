@@ -1734,6 +1734,35 @@ _RATE_LIMITS = {  # bucket -> (max_events, window_seconds)
 }
 _rate_windows: Dict[tuple, List[float]] = {}
 
+#: Hard cap on tracked ``(client_ip, bucket)`` keys so an attacker rotating
+#: spoofed source addresses cannot grow the table without bound. Mirrors
+#: ``MAX_TRACKED_KEYS`` in ``crates/vtt-server/src/ratelimit.rs``; exceeded,
+#: keys whose windows are fully expired past the staleness factor below are
+#: swept. Module-level so tests can inject a tiny cap.
+_MAX_TRACKED_KEYS = 100_000
+#: A key is stale once every recorded hit is older than this multiple of its
+#: bucket's window (i.e. it could not affect any current verdict).
+_STALE_KEY_SWEEP_FACTOR = 2.0
+
+
+def _sweep_stale_rate_keys(now: float) -> None:
+    """Drop ``_rate_windows`` entries whose hits all predate the staleness bound.
+
+    A key is swept when its newest hit is older than
+    ``_STALE_KEY_SWEEP_FACTOR * window`` — such a key cannot contribute to any
+    active sliding-window verdict, so dropping it never changes admission
+    decisions. Mirrors the ``retain`` guard in the Rust twin's
+    ``SlidingWindows::check`` (``crates/vtt-server/src/ratelimit.rs``).
+    """
+    stale = [
+        key
+        for key, hits in _rate_windows.items()
+        if not hits
+        or now - max(hits) > _STALE_KEY_SWEEP_FACTOR * _RATE_LIMITS[key[1]][1]
+    ]
+    for key in stale:
+        _rate_windows.pop(key, None)
+
 
 def _bucket_for_path(path: str) -> str:
     if path.startswith("/api/v1/auth"):
@@ -1761,6 +1790,9 @@ async def rate_limit_middleware(request, call_next):
         )
     hits.append(now)
     _rate_windows[key] = hits
+    # Bound memory against spoofed-source floods (same shape as the Rust twin).
+    if len(_rate_windows) > _MAX_TRACKED_KEYS:
+        _sweep_stale_rate_keys(now)
     return await call_next(request)
 
 
@@ -2509,7 +2541,10 @@ class NpcRespondRequest(BaseModel):
 
 class NpcInteractionRequest(BaseModel):
     kind: str
-    magnitude: float = Field(default=1.0, gt=0.0)
+    # Capped at the disposition engine's per-event scale (a magnitude-10 event
+    # already saturates a stance band); larger values would let one call pin a
+    # stance to an extreme. Beyond-cap requests are rejected with 422.
+    magnitude: float = Field(default=1.0, gt=0.0, le=10.0)
 
 
 @app.get("/api/v1/npc/")

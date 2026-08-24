@@ -218,8 +218,15 @@ def test_outcome_shifts_stance_and_persists_across_calls(player):
     assert hostile["stance"] == "hostile"
     assert hostile["reply"] != before["reply"]
 
+    # Max-magnitude aid saturates a band: two capped events climb from
+    # hostile back to allied without ever exceeding the request bound.
+    climb1 = client.post(f"{url}/interactions", params=token,
+                         json={"kind": "aided", "magnitude": 10.0})
+    assert climb1.status_code == 200
+    assert climb1.json()["stance"] == "neutral"
+
     redemption = client.post(f"{url}/interactions", params=token,
-                             json={"kind": "aided", "magnitude": 20.0})
+                             json={"kind": "aided", "magnitude": 10.0})
     assert redemption.status_code == 200
     assert redemption.json()["stance"] == "allied"
 
@@ -236,3 +243,35 @@ def test_interaction_rejects_unknown_kind(player):
         json={"kind": "hugged"},
     )
     assert resp.status_code == 400
+
+
+# --- Magnitude bound ----------------------------------------------------------------
+
+def test_interaction_accepts_magnitude_at_cap(player):
+    """10.0 is the inclusive upper bound and can saturate a stance band."""
+    url = "/api/v1/npc/karas_drowned_steward/interactions"
+    token = {"token": player["token"]}
+
+    aided = client.post(url, params=token, json={"kind": "aided", "magnitude": 10.0})
+    assert aided.status_code == 200
+    # 8.0 * 10 trust from a neutral start clears the +60 allied band outright.
+    assert aided.json()["stance"] == "allied"
+
+    betrayed = client.post(f"/api/v1/npc/baron_aldous_vane/interactions",
+                           params=token, json={"kind": "betrayed", "magnitude": 10.0})
+    assert betrayed.status_code == 200
+    assert betrayed.json()["stance"] == "hostile"
+
+
+def test_interaction_rejects_magnitude_above_cap(player):
+    """11.0 would pin a stance to an extreme in one call -> 422, no mutation."""
+    resp = client.post(
+        "/api/v1/npc/karas_drowned_steward/interactions",
+        params={"token": player["token"]},
+        json={"kind": "aided", "magnitude": 11.0},
+    )
+    assert resp.status_code == 422
+    # The rejected event must not have touched disposition state.
+    assert server._npc_disposition_engine.stance(
+        "karas_drowned_steward", player["user"]["id"]
+    ) == "neutral"
