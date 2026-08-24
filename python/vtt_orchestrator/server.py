@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import secrets
 import time
+from datetime import datetime, timezone
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1294,6 +1296,164 @@ async def engine_session_state(
             f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}",
             actor=actor,
         )
+    )
+
+
+# --- Session replay export -----------------------------------------------------------
+# Turns one engine session's event ledger into a portable, human-auditable
+# artifact. The gateway PROJECTS the ledger — it never fabricates: every
+# summary segment is derived only from payload fields the engine actually
+# sent, missing fields are omitted (never defaulted), and unknown event
+# types pass through with their raw payload as the summary.
+
+def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
+    """Human-readable one-liner for a ledger event, derived ONLY from fields
+    genuinely present in ``payload``. Missing fields are omitted rather than
+    defaulted, so an auditor never reads a number the engine never produced.
+    Unknown event types render their raw payload verbatim."""
+    parts: List[str] = []
+
+    def opt(key: str) -> Any:
+        return payload.get(key)
+
+    if event_type == "ATTACK_RESOLVED":
+        attacker, target = opt("attacker_id"), opt("target_id")
+        is_hit = opt("is_hit")
+        if attacker is not None and target is not None:
+            verb = {True: "hit", False: "missed"}.get(is_hit, "attacked")
+            parts.append(f"{attacker} {verb} {target}")
+        elif attacker is not None or target is not None:
+            who = attacker if attacker is not None else target
+            parts.append(f"{who} attacked" if attacker is not None else f"{who} targeted")
+        damage, hp = opt("total_damage"), opt("target_hp_remaining")
+        if damage is not None:
+            parts.append(f"for {damage}")
+        if hp is not None:
+            parts.append(f"(HP→{hp})")
+    elif event_type == "DAMAGE_APPLIED":
+        target = opt("target_id")
+        amount, hp = opt("amount"), opt("hp_remaining")
+        if target is not None:
+            parts.append(str(target))
+        if amount is not None:
+            parts.append(f"took {amount} damage")
+        if hp is not None:
+            parts.append(f"(HP→{hp})")
+    elif event_type in ("HEALED", "LONG_REST_APPLIED"):
+        target = opt("target_id")
+        amount, hp = opt("amount"), opt("hp_remaining")
+        restored_max = opt("hp_restored_to_max")
+        if target is not None:
+            parts.append(str(target))
+        if amount is not None:
+            parts.append(f"healed for {amount}")
+        if restored_max is not None:
+            parts.append(f"restored to max ({restored_max} HP)")
+        if hp is not None:
+            parts.append(f"(HP→{hp})")
+    elif event_type == "DEATH_SAVE_RESOLVED":
+        roll, outcome = opt("natural_roll"), opt("outcome")
+        if roll is not None:
+            parts.append(f"death save rolled {roll}")
+        if outcome is not None:
+            parts.append(str(outcome))
+    elif event_type == "TURN_ADVANCED":
+        round_no = opt("round")
+        if round_no is not None:
+            parts.append(f"round advanced to {round_no}")
+    elif event_type == "SPELL_CAST":
+        caster, spell = opt("caster_id"), opt("spell_id")
+        damage, hp = opt("damage_total"), opt("target_hp_remaining")
+        if caster is not None and spell is not None:
+            parts.append(f"{caster} cast {spell}")
+        elif caster is not None:
+            parts.append(f"{caster} cast a spell")
+        if damage is not None:
+            parts.append(f"for {damage}")
+        if hp is not None:
+            parts.append(f"(HP→{hp})")
+    elif event_type == "SPELL_COUNTERSPELLED":
+        caster, spell = opt("caster_id"), opt("spell_id")
+        if caster is not None:
+            who = str(caster)
+            parts.append(f"{who}'s {spell} was counterspelled" if spell is not None
+                         else f"{who}'s spell was counterspelled")
+        elif spell is not None:
+            parts.append(f"{spell} was counterspelled")
+    elif event_type == "SESSION_CREATED":
+        name = opt("name")
+        parts.append(f"session created: {name}" if name is not None else "session created")
+    elif event_type == "SAFETY_REWIND_APPLIED":
+        player, topic = opt("triggered_by"), opt("topic")
+        if player is not None:
+            parts.append(f"X-card rewind by {player}")
+        if topic is not None:
+            parts.append(f"on topic '{topic}'")
+
+    # Known type whose payload carried nothing we can describe, OR an event
+    # type this gateway version does not know: show the raw payload honestly.
+    if parts:
+        return " ".join(parts)
+    return json.dumps(payload, sort_keys=True)
+
+
+def _project_ledger_event(event: Any) -> Dict[str, Any]:
+    """One GameEvent -> the auditable projection. Fields absent from the
+    engine's event stay absent/null here; nothing is invented."""
+    event_dict = event if isinstance(event, dict) else {}
+    event_type = event_dict.get("event_type") or ""
+    payload = event_dict.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "sequence_id": event_dict.get("sequence_id"),
+        "actor_id": event_dict.get("actor_id"),
+        "event_type": event_dict.get("event_type"),
+        "is_reverted": bool(event_dict.get("is_reverted")),
+        "summary": _event_summary(event_type, payload),
+    }
+
+
+@app.get("/api/v1/engine/session-replay")
+async def engine_session_replay(session_id: str = Query(...), token: str = Query(...)):
+    """Exports a session's event ledger as a downloadable replay artifact.
+
+    Requires a valid HMAC session token; the caller's real identity is
+    forwarded to the engine's GET /sessions/{id} so its RBAC authorizes the
+    actual participant. Content-Disposition marks it as an attachment so
+    browsers download `replay-<session_id>-<round>.json` instead of rendering.
+    """
+    _require_user_id(token)
+    actor = _caller_actor(token)
+    raw = await _engine_call(
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(session_id)}",
+            actor=actor,
+        )
+    )
+
+    events_raw = raw.get("ledger", {}).get("events", []) if isinstance(raw.get("ledger"), dict) else []
+    events = [_project_ledger_event(e) for e in events_raw]
+
+    combat = raw.get("combat")
+    round_number = combat.get("round") if isinstance(combat, dict) else None
+
+    exported_at = datetime.now(timezone.utc).isoformat()
+    body = {
+        "session_id": raw.get("session_id", engine_client._coerce_uuid(session_id)),
+        "exported_at": exported_at,
+        "round": round_number,
+        "event_count": len(events),
+        "events": events,
+    }
+    # No fabricated round in the filename either: a session with no combat
+    # state exports as "-unknown.json" rather than pretending round 1.
+    filename = f"replay-{body['session_id']}-{round_number if round_number is not None else 'unknown'}.json"
+    return Response(
+        content=json.dumps(body, indent=2, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
