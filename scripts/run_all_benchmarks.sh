@@ -86,6 +86,7 @@ print(f"Genuine Invariant Violations: {report['genuine_invariant_violations']}")
 print(f"Mechanical Compliance Rate (MCR): {mcr}% (Target >= 98.5%)")
 print(f"Hallucination & Continuity Index (HCI): {hci} (Target >= 0.95)")
 print(f"Auditor False-Positive Rate (AFPR): {afpr}% (Target <= 1.5%)")
+print(f"Auditor Recall: {report['auditor_recall_caught']}/{report['auditor_recall_probes']} probes caught = {report['auditor_recall_pct']}% (Target >= 95%)")
 
 if all(report["targets_met"].values()):
     print("Benchmark Status: PASSED ALL TARGETS")

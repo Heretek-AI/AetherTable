@@ -162,9 +162,11 @@ class SyntheticPlaytestRunner:
         trust_probes_total = 0
         trust_probes_rejected = 0
         total_proposals = 0
-        auditor_violations = 0          # genuine invariant failures on live data
+        auditor_violations = 0          # grounded proposals the auditor rejected
         valid_proposals_inspected = 0
         false_positive_rejections = 0
+        recall_probes_total = 0         # injected contradictions that MUST be caught
+        recall_probes_caught = 0
 
         attacker_uuid = engine_client._coerce_uuid("pt-hero")
         target_uuid = engine_client._coerce_uuid("pt-dummy")
@@ -222,9 +224,17 @@ class SyntheticPlaytestRunner:
                     _statblock(target_uuid, "Training Dummy", 500, 13, 2),
                 )
 
-            # Audit a narrative draft grounded in the LIVE outcome.
+            # Audit a narrative draft grounded in the LIVE outcome. Entity
+            # counts come from the live session snapshot — never asserted.
             total_proposals += 1
             valid_proposals_inspected += 1
+            try:
+                ground = engine_client.engine_request_sync(
+                    "GET", f"/api/v1/sessions/{session_id}"
+                )
+                live_count = len(ground.get("entities", {}))
+            except engine_client.EngineUnavailableError:
+                live_count = 2
             cycle_res = self.controller.run_turn_cycle(
                 user_intent=utterance,
                 turn_index=turn,
@@ -233,16 +243,30 @@ class SyntheticPlaytestRunner:
                 dm_draft_generator=lambda ctx: self.dm.generate_combat_draft(
                     utterance, engine_payload, ctx
                 ),
-                active_entity_count=2,
-                previous_entity_count=2,
+                active_entity_count=live_count,
+                previous_entity_count=live_count,
                 ingress_count=0,
                 egress_count=0,
             )
-            if cycle_res["status"] == "FALLBACK_COMMITTED":
-                # The auditor found a genuine violation on live data.
-                auditor_violations += 1
-            elif cycle_res["status"] != "COMMITTED" :
+            if cycle_res["status"] == "COMMITTED":
+                pass
+            else:
+                # Grounded drafts describe the genuine engine outcome, so a
+                # rejection is an auditor FALSE POSITIVE — and it also costs
+                # continuity because the fallback narrative replaced the real
+                # story. (Before Phase 2 this branch was unreachable and AFPR
+                # was tautologically 0.)
                 false_positive_rejections += 1
+                auditor_violations += 1
+
+            # Recall probe (~10% of audited turns): inject a draft narrating
+            # the death of a target the live state says is alive. The auditor
+            # MUST reject it — misses here are hallucinations that would
+            # reach players.
+            if random.random() < 0.10:
+                recall_probes_total += 1
+                if self._run_recall_probe(turn):
+                    recall_probes_caught += 1
 
         elapsed_sec = time.perf_counter() - start_time
 
@@ -252,6 +276,11 @@ class SyntheticPlaytestRunner:
             1.0 - (auditor_violations / max(total_proposals, 1)),
         )
         afpr = (false_positive_rejections / max(valid_proposals_inspected, 1)) * 100.0
+        recall_pct = (
+            (recall_probes_caught / recall_probes_total) * 100.0
+            if recall_probes_total > 0
+            else 100.0
+        )
         trust_boundary_held = (
             trust_probes_rejected == trust_probes_total and trust_probes_total > 0
         )
@@ -266,13 +295,17 @@ class SyntheticPlaytestRunner:
             "trust_probes_rejected_by_engine": trust_probes_rejected,
             "audited_narrative_proposals": total_proposals,
             "genuine_invariant_violations": auditor_violations,
+            "auditor_false_positive_rate_pct": round(afpr, 2),
+            "auditor_recall_probes": recall_probes_total,
+            "auditor_recall_caught": recall_probes_caught,
             "mechanical_compliance_rate_pct": round(mcr, 2),
             "hallucination_continuity_index": round(hci, 3),
-            "auditor_false_positive_rate_pct": round(afpr, 2),
+            "auditor_recall_pct": round(recall_pct, 2),
             "targets_met": {
                 "mcr_passed": mcr >= 98.5,
                 "hci_passed": hci >= 0.95,
                 "afpr_passed": afpr <= 1.5,
+                "auditor_recall_passed": recall_pct >= 95.0,
                 "trust_boundary_held": trust_boundary_held or trust_probes_total == 0,
             },
         }
@@ -305,6 +338,27 @@ class SyntheticPlaytestRunner:
             "target_is_dead": bool(res.get("target_is_dead", False)),
         }
         return True, payload
+
+    def _run_recall_probe(self, turn_index: int) -> bool:
+        """Auditor recall probe: a draft narrating the death of a target that
+        live state says is alive (25 HP, conscious) MUST be rejected by the
+        math-narrative lethality invariant. Returns True when caught."""
+        report = self.auditor.audit_proposal(
+            turn_index=turn_index,
+            entity_id="pc_playtester",
+            proposed_narrative="The training dummy drops dead where it stood.",
+            engine_execution_payload={
+                "action_name": "Recall Probe",
+                "is_hit": True,
+                "total_damage": 0,
+                "target_hp_remaining": 25,
+                "target_is_conscious": True,
+                "target_is_dead": False,
+            },
+            active_entity_count=2,
+            previous_entity_count=2,
+        )
+        return not report.passed
 
     def _run_trust_probe(
         self, session_id: str, attacker_id: str, target_id: str, turn_index: int
