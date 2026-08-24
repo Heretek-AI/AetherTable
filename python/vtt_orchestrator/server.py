@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -132,7 +132,12 @@ async def classify_turn_intent(
     }
 
 
-lore_graph = EpistemicLoreGraphManager()
+# Epistemic graph backend selection (backlog 4.6): NEO4J_ENABLED=1 plus a
+# reachable Neo4j HTTP endpoint selects the durable Cypher-backed store;
+# anything else falls back to the in-memory manager at startup, logged
+# honestly. Both expose the identical surface, so routes below never branch.
+from .lore.neo4j_graph import build_epistemic_graph
+lore_graph = build_epistemic_graph()
 auditor = PreCommitAuditorAgent(lore_graph=lore_graph)
 dm_agent = EncounterDMAgent()
 retry_controller = DiagnosticRetryController(auditor=auditor, max_retries=2)
@@ -370,6 +375,30 @@ def _caller_actor(token: str) -> Dict[str, str]:
     return {"user_id": payload["user_id"], "role": payload.get("role", "player")}
 
 
+def _token_from(request: Request) -> str:
+    """Extracts the caller's HMAC session token: Authorization header first
+    ("Bearer <token>"), then the legacy ?token= query param.
+
+    Tokens in URLs leak into proxy/access logs, so the header is the preferred
+    channel; the query param stays as a back-compat fallback (older clients and
+    the WebSocket handshake surface, where browsers cannot set headers).
+    """
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        candidate = auth[7:].strip()
+        if candidate:
+            return candidate
+    return request.query_params.get("token") or ""
+
+
+async def _require_auth(token: str = Depends(_token_from)) -> str:
+    """FastAPI dependency for protected routes: resolves header-or-query token
+    and 401s when neither channel carries one."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token")
+    return token
+
+
 async def _engine_ground_truth(session_id: str) -> Dict[str, Any]:
     """Fetches LIVE session state from the authoritative engine.
 
@@ -471,7 +500,9 @@ async def auth_session(token: str = Query(...)):
 
 
 class CampaignSaveRequest(BaseModel):
-    token: str
+    # Legacy clients carry the session token here; header auth (Authorization:
+    # Bearer) is preferred and wins when both are present.
+    token: str = ""
     name: str = "Campaign Autosave"
     snapshot: Dict[str, Any]
     round_number: int = 1
@@ -482,8 +513,9 @@ def _owner_or_401(token: str) -> str:
 
 
 @app.post("/api/v1/campaign/save")
-async def campaign_save(req: CampaignSaveRequest):
-    owner = _owner_or_401(req.token)
+async def campaign_save(req: CampaignSaveRequest, token: str = Depends(_token_from)):
+    header_or_query_token = req.token or token
+    owner = _owner_or_401(header_or_query_token)
     meta = await storage_backend.upsert_campaign_save(
         owner, req.name.strip() or "Campaign Autosave", req.snapshot, req.round_number
     )
@@ -491,14 +523,14 @@ async def campaign_save(req: CampaignSaveRequest):
 
 
 @app.get("/api/v1/campaign/saves")
-async def campaign_saves(token: str = Query(...)):
+async def campaign_saves(token: str = Depends(_require_auth)):
     owner = _owner_or_401(token)
     saves = await storage_backend.list_campaign_saves(owner)
     return {"total": len(saves), "saves": saves}
 
 
 @app.get("/api/v1/campaign/save/{save_id}")
-async def campaign_load(save_id: str, token: str = Query(...)):
+async def campaign_load(save_id: str, token: str = Depends(_require_auth)):
     owner = _owner_or_401(token)
     record = await storage_backend.get_campaign_save(owner, save_id)
     if record is None:
@@ -507,7 +539,7 @@ async def campaign_load(save_id: str, token: str = Query(...)):
 
 
 @app.delete("/api/v1/campaign/save/{save_id}")
-async def campaign_delete(save_id: str, token: str = Query(...)):
+async def campaign_delete(save_id: str, token: str = Depends(_require_auth)):
     owner = _owner_or_401(token)
     deleted = await storage_backend.delete_campaign_save(owner, save_id)
     if not deleted:
@@ -882,7 +914,7 @@ async def _profile_of(user_id: str) -> Dict[str, Any]:
 
 
 @app.post("/api/v1/lobbies")
-async def create_lobby(req: LobbyCreateRequest, token: str = Query(...)):
+async def create_lobby(req: LobbyCreateRequest, token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     profile = await _profile_of(user_id)
     return await storage_backend.create_lobby(
@@ -892,13 +924,13 @@ async def create_lobby(req: LobbyCreateRequest, token: str = Query(...)):
 
 
 @app.get("/api/v1/lobbies/mine")
-async def my_lobbies(token: str = Query(...)):
+async def my_lobbies(token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     return {"lobbies": await storage_backend.list_lobbies_for_user(user_id)}
 
 
 @app.post("/api/v1/lobbies/{lobby_id}/join")
-async def join_lobby(lobby_id: str, req: LobbyJoinRequest, token: str = Query(...)):
+async def join_lobby(lobby_id: str, req: LobbyJoinRequest, token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     lobby = await storage_backend.get_lobby(lobby_id)
     if lobby is None:
@@ -913,7 +945,7 @@ async def join_lobby(lobby_id: str, req: LobbyJoinRequest, token: str = Query(..
 
 
 @app.get("/api/v1/lobbies/{lobby_id}")
-async def get_lobby(lobby_id: str, token: str = Query(...)):
+async def get_lobby(lobby_id: str, token: str = Depends(_require_auth)):
     _require_user_id(token)
     lobby = await storage_backend.get_lobby(lobby_id)
     if lobby is None:
@@ -922,7 +954,7 @@ async def get_lobby(lobby_id: str, token: str = Query(...)):
 
 
 @app.post("/api/v1/lobbies/{lobby_id}/launch")
-async def launch_lobby(lobby_id: str, token: str = Query(...)):
+async def launch_lobby(lobby_id: str, token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     lobby = await storage_backend.get_lobby(lobby_id)
     if lobby is None:
@@ -963,19 +995,19 @@ class CharacterCreateRequest(BaseModel):
 
 
 @app.post("/api/v1/characters")
-async def create_character(req: CharacterCreateRequest, token: str = Query(...)):
+async def create_character(req: CharacterCreateRequest, token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     return await storage_backend.create_character(user_id, req.model_dump())
 
 
 @app.get("/api/v1/characters")
-async def list_characters(token: str = Query(...)):
+async def list_characters(token: str = Depends(_require_auth)):
     user_id = _require_user_id(token)
     return {"characters": await storage_backend.list_characters(user_id)}
 
 
 @app.get("/api/v1/characters/{character_id}")
-async def get_character(character_id: str, token: str = Query(...)):
+async def get_character(character_id: str, token: str = Depends(_require_auth)):
     _require_user_id(token)
     record = await storage_backend.get_character(character_id)
     if record is None:
@@ -1007,7 +1039,7 @@ class CharacterDeployRequest(BaseModel):
 
 
 @app.post("/api/v1/characters/{character_id}/deploy")
-async def deploy_character(character_id: str, req: CharacterDeployRequest, token: str = Query(...)):
+async def deploy_character(character_id: str, req: CharacterDeployRequest, token: str = Depends(_require_auth)):
     """Materializes a stored character as an OWNED engine entity — RBAC binds
     it to the deploying player (owner_player_id), so only they may act with it."""
     user_id = _require_user_id(token)

@@ -5,6 +5,8 @@
  * fall back to demo behavior instead of throwing.
  */
 
+import { authHeaders, getStoredToken } from './auth_headers';
+
 /**
  * Member record as returned by the lobby detail endpoint.
  * Backend gaps (follow-up candidates): no ready flag, no latency/ping metric,
@@ -25,21 +27,22 @@ export interface Lobby {
   members: LobbyMember[];
 }
 
-const getToken = (): string | null => sessionStorage.getItem('aethertable_token');
+const getToken = getStoredToken;
 
 async function req<T>(path: string, init?: RequestInit): Promise<T | null> {
   try {
-    const resp = await fetch(path, init);
+    // Identity rides the Authorization header (never the URL — query-string
+    // tokens leak into access logs); the gateway also accepts ?token= for
+    // back-compat with older clients.
+    const resp = await fetch(path, {
+      ...init,
+      headers: { ...authHeaders(), ...(init?.headers ?? {}) },
+    });
     if (!resp.ok) return null;
     return (await resp.json()) as T;
   } catch {
     return null;
   }
-}
-
-function withToken(path: string): string {
-  const token = getToken();
-  return token ? `${path}${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : path;
 }
 
 export async function createLobby(name: string): Promise<Lobby | null> {
@@ -62,7 +65,7 @@ export async function joinLobby(lobbyId: string, inviteCode: string): Promise<Lo
 
 export async function fetchLobby(lobbyId: string): Promise<Lobby | null> {
   if (!getToken()) return null;
-  return req<Lobby>(withToken(`/api/v1/lobbies/${lobbyId}`));
+  return req<Lobby>(`/api/v1/lobbies/${lobbyId}`);
 }
 
 export async function launchLobby(lobbyId: string): Promise<{ session_id: string } | null> {
@@ -110,14 +113,14 @@ export async function saveCharacter(sheet: Record<string, unknown>): Promise<Sto
 
 export async function listCharacters(): Promise<StoredCharacter[]> {
   if (!getToken()) return [];
-  const data = await req<{ characters: StoredCharacter[] }>(withToken('/api/v1/characters'));
+  const data = await req<{ characters: StoredCharacter[] }>('/api/v1/characters');
   return data?.characters ?? [];
 }
 
 /** Fetch one character's full record, including the persisted sheet `data` blob. */
 export async function getCharacter(characterId: string): Promise<FullStoredCharacter | null> {
   if (!getToken()) return null;
-  return req<FullStoredCharacter>(withToken(`/api/v1/characters/${encodeURIComponent(characterId)}`));
+  return req<FullStoredCharacter>(`/api/v1/characters/${encodeURIComponent(characterId)}`);
 }
 
 /**
@@ -151,6 +154,6 @@ export async function deployCharacter(
 
 export async function listMyLobbies(): Promise<Lobby[]> {
   if (!getToken()) return [];
-  const data = await req<{ lobbies: Lobby[] }>(withToken('/api/v1/lobbies/mine'));
+  const data = await req<{ lobbies: Lobby[] }>('/api/v1/lobbies/mine');
   return data?.lobbies ?? [];
 }

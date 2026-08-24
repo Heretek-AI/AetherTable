@@ -85,8 +85,10 @@ def test_lobby_lifecycle(host, guest):
     assert body["session_id"]
     assert body["lobby"]["engine_session_id"] == body["session_id"]
 
-    # Unauthenticated access refused everywhere.
-    assert client.get(f"/api/v1/lobbies/{lobby['lobby_id']}").status_code == 422
+    # Unauthenticated access refused everywhere. These routes now take the
+    # token from the Authorization header or legacy ?token= via _require_auth,
+    # so a missing token is an auth failure (401), not a validation error.
+    assert client.get(f"/api/v1/lobbies/{lobby['lobby_id']}").status_code == 401
 
 
 def test_lobby_unknown_404(host):
