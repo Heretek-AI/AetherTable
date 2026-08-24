@@ -12,12 +12,23 @@
  *   (`token: str = Query(...)`), not the Authorization header. We therefore
  *   send `?token=` here; header auth alone would 422.
  *
+ * Tier policy (server-enforced, never overridden client-side): every
+ * assertion ENTERS at SUBJECTIVE_RUMOR; the gateway's auth model rejects any
+ * higher tier with 403 LORE_TIER_FORBIDDEN when the caller is not a GM, and
+ * even GM callers may only promote ONE step per call. The default tier here
+ * therefore MUST be SUBJECTIVE_RUMOR — a player posting PROPOSED_FACT by
+ * accident would hit 403 just for trying to commit canon.
+ *
  * submit_assertion returns 200 for BOTH outcomes:
  *   { status: "REJECTED_PARADOX", reason, latency_ms }
  *   { status: "COMMITTED" | "STAGED", epistemic_tier, assigned_weight, latency_ms }
- * So this client must NOT collapse responses to null like the other stores do —
- * paradox rejections are real, meaningful results and are surfaced verbatim to
- * the UI via the AssertLoreResult union.
+ * And 403 carries LORE_TIER_FORBIDDEN, which this client surfaces verbatim so
+ * the LorePanel can render an honest "GM promotion required" state instead of
+ * collapsing it into a generic rejection.
+ *
+ * So this client must NOT collapse responses to null like the other stores
+ * do — paradox rejections and tier-forbidden 403s are real, meaningful
+ * results surfaced verbatim to the UI via the AssertLoreResult union.
  */
 
 import { getStoredToken } from './auth_headers';
@@ -48,7 +59,15 @@ export type AssertLoreResult =
       assignedWeight: number;
       latencyMs: number;
     }
-  /** Gateway rejected the request itself (bad token → 401/403, bad payload → 422). */
+  /**
+   * Server rejected the requested tier (non-GM trying to promote, or GM
+   * trying to skip the staged-fact step). The gateway's detail string starts
+   * with LORE_TIER_FORBIDDEN — see assert_lore in server.py. The UI uses
+   * `code` to render an honest "GM promotion required" state instead of a
+   * generic failure banner.
+   */
+  | { outcome: 'LORE_TIER_FORBIDDEN'; detail: string; requestedTier: EpistemicTier }
+  /** Gateway rejected the request itself (bad token → 401, bad payload → 422). */
   | { outcome: 'ERROR'; detail: string }
   /** Network failure / backend unreachable. */
   | { outcome: 'UNREACHABLE' };
@@ -85,7 +104,11 @@ export async function assertLore(
     return { outcome: 'ERROR', detail: 'Sign in first — lore canon writes require an authenticated session.' };
   }
 
-  const tier = opts?.tier ?? 'PROPOSED_FACT';
+  // Server policy (assert_lore in server.py, iteration-5 hardening): every
+  // assertion ENTERS at SUBJECTIVE_RUMOR; promoting above that requires a GM
+  // token AND only one step per call. Defaulting to PROPOSED_FACT would 403
+  // every player submission — we stage at rumor and let the GM UI promote.
+  const tier = opts?.tier ?? 'SUBJECTIVE_RUMOR';
   const body = {
     proposing_entity_id: opts?.proposingEntityId ?? 'ui_player',
     subject_node_id: subject,
@@ -113,6 +136,11 @@ export async function assertLore(
         else if (err.detail != null) detail = JSON.stringify(err.detail);
       } catch {
         /* keep HTTP-status fallback */
+      }
+      // LORE_TIER_FORBIDDEN is its own outcome so the LorePanel can render
+      // an honest "GM promotion required" banner instead of a generic error.
+      if (resp.status === 403 && typeof detail === 'string' && detail.startsWith('LORE_TIER_FORBIDDEN')) {
+        return { outcome: 'LORE_TIER_FORBIDDEN', detail, requestedTier: tier };
       }
       return { outcome: 'ERROR', detail };
     }

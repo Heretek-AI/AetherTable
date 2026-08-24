@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { BookOpen, ScrollText, Users, SendHorizonal, ShieldAlert, CheckCircle2, AlertTriangle, PlugZap } from 'lucide-react';
+import { BookOpen, ScrollText, Users, SendHorizonal, ShieldAlert, CheckCircle2, AlertTriangle, PlugZap, Crown } from 'lucide-react';
 import {
   assertLore,
   listPersonas,
@@ -16,13 +16,19 @@ const TIERS: EpistemicTier[] = ['SUBJECTIVE_RUMOR', 'PROPOSED_FACT', 'VALIDATED_
  * the real endpoints: GET /api/v1/npc/ (public) and POST /api/v1/lore/assert
  * (token-required). Paradox rejections are displayed verbatim — the graph's
  * reason is world state, not an error to hide.
+ *
+ * Server-enforced tier policy (iteration 5): every assertion ENTERS at
+ * SUBJECTIVE_RUMOR; only GM tokens may promote, and only one step per call.
+ * The dropdown therefore defaults to SUBJECTIVE_RUMOR so a player submission
+ * is honest on the first try; higher tiers still exist in the picker for
+ * GMs to drive their own staged canon flow.
  */
 export const LorePanel: React.FC = () => {
   const [personas, setPersonas] = useState<NpcPersona[] | null>(null);
   const [subject, setSubject] = useState('');
   const [predicate, setPredicate] = useState('');
   const [object, setObject] = useState('');
-  const [tier, setTier] = useState<EpistemicTier>('PROPOSED_FACT');
+  const [tier, setTier] = useState<EpistemicTier>('SUBJECTIVE_RUMOR');
   const [result, setResult] = useState<AssertLoreResult | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -153,6 +159,25 @@ const ResultBanner: React.FC<{ result: AssertLoreResult }> = ({ result }) => {
       <div className="text-[11px] font-prose p-2.5 rounded-lg border border-tavern-border bg-[color-mix(in_srgb,var(--tavern-surface)_60%,transparent)]">
         Backend unreachable — nothing was asserted. No local fallback was applied; retry once the
         gateway is up.
+      </div>
+    );
+  }
+
+  if (result.outcome === 'LORE_TIER_FORBIDDEN') {
+    // Iteration 5: surface the server's tier policy honestly. The 403 detail
+    // already names the requested tier and the rule; we add the operator
+    // instruction ("ask the GM to promote") so the player knows what to do
+    // next without inventing a workflow the gateway does not implement.
+    return (
+      <div className="text-[11px] font-prose p-2.5 rounded-lg border border-[color-mix(in_srgb,var(--state-warning)_45%,transparent)] bg-[color-mix(in_srgb,var(--state-warning)_10%,transparent)] flex items-start gap-2">
+        <Crown className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[var(--state-warning)]" />
+        <span>
+          <strong>GM promotion required.</strong> The gateway refused tier{' '}
+          <code className="font-mono text-[10px]">{result.requestedTier}</code>{' '}
+          for this caller — only GM tokens may promote lore above SUBJECTIVE_RUMOR.
+          Ask the table GM to promote this triple one step at a time.
+          <span className="block text-[10px] mt-1 opacity-80">{result.detail}</span>
+        </span>
       </div>
     );
   }

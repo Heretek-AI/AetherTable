@@ -79,6 +79,8 @@ import type { Lobby } from './api/lobby_store';
 import type { CampaignWizardConfig } from './components/CampaignWizardModal';
 import { listSaves, loadCampaign } from './api/campaign_store';
 import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
+import { triggerXCard } from './api/safety_xcard';
+import { canMoveTokensOnTransport } from './sync/transport_gate';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
 import type { CombatantEntry } from './components/InitiativeTracker';
 
@@ -294,6 +296,10 @@ export function App() {
   // Real peer cursors from CRDT awareness. Starts empty and stays empty while
   // alone or on the legacy relay — no fabricated stand-in cursors.
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
+  // Transport the active syncClientRef is bound to. `null` while the Yjs
+  // bootstrap is still racing the 3.5s fallback timer. Drives the
+  // canMoveTokensOnTransport gate (see sync/transport_gate.ts).
+  const [transportKind, setTransportKind] = useState<'YJS' | 'LEGACY_LWW' | null>(null);
   useEffect(() => {
     const env = (import.meta as any).env ?? {};
     const engineWsUrl = env.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
@@ -310,6 +316,7 @@ export function App() {
       setRemoteCursors([]);
       yjsClientRef.current = null;
       setYjsClient(null);
+      setTransportKind('LEGACY_LWW');
       const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
       client.connect();
       syncClientRef.current = client;
@@ -327,6 +334,7 @@ export function App() {
     yjs.connect();
     yjsClientRef.current = yjs;
     setYjsClient(yjs);
+    setTransportKind('YJS');
     // Stamp the signed-in identity into awareness so peers see who this cursor is.
     yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
     syncClientRef.current = {
@@ -680,6 +688,28 @@ export function App() {
   };
 
   const handleTokenMove = (tokenId: string, newX: number, newY: number) => {
+    // Transport-aware authorization gate (iteration 4 follow-up): the legacy
+    // engine LWW relay fails closed for non-GM tokens in non-session rooms.
+    // We refuse the write here and surface an honest banner rather than
+    // fabricating authority the client does not have.
+    const verdict = canMoveTokensOnTransport(
+      transportKind,
+      currentUser.role,
+      Boolean(getStoredToken()),
+    );
+    if (!verdict.canMove) {
+      const reason = verdict.blocked?.detail ?? 'Token move blocked by transport policy.';
+      addSystemMessage(
+        `Token move refused on ${transportKind ?? 'no'} transport: ${reason}`,
+      );
+      // Still update local board state — the move IS the user's intent on
+      // their own screen — but do NOT broadcast to peers who would otherwise
+      // see authority the gateway would reject.
+      setTokens((prev) =>
+        prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t)),
+      );
+      return;
+    }
     setTokens((prev) =>
       prev.map((t) => (t.id === tokenId ? { ...t, x: newX, y: newY } : t))
     );
@@ -1214,19 +1244,27 @@ export function App() {
     addSystemMessage(`SAFETY CARD TRIGGERED: Topic '${topic}' flagged. Requesting authoritative scene rewind.`);
     // Apply the rewind against the authoritative engine ledger when online.
     const sessionId = await ensureEngineSession();
-    fetch('/api/v1/safety/x-card', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        player_id: currentUser.id,
-        topic,
-        current_sequence_id: roundNumber * 10,
-        engine_session_id: sessionId,
-      }),
+    // Iteration 5: the x-card endpoint requires an HMAC session token;
+    // triggerXCard appends ?token= exactly like heal/rest/maneuvers in
+    // api/rules_engine.ts and surfaces NOT_SIGNED_IN / HTTP_ERROR honestly.
+    triggerXCard({
+      player_id: currentUser.id,
+      topic,
+      current_sequence_id: roundNumber * 10,
+      engine_session_id: sessionId,
     })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        const rewind = parseEngineRewind(data);
+      .then((result) => {
+        if (result.kind === 'ERROR') {
+          if (result.failure.kind === 'NOT_SIGNED_IN') {
+            addSystemMessage(`SAFETY X-card: ${result.failure.detail}`);
+          } else if (result.failure.kind === 'HTTP_ERROR') {
+            addSystemMessage(`SAFETY X-card rejected by gateway (${result.failure.status}): ${result.failure.detail}`);
+          } else {
+            addSystemMessage('Intervention recorded locally.');
+          }
+          return;
+        }
+        const rewind = parseEngineRewind(result.body);
         if (!rewind || rewind.status !== 'SAFETY_REWIND_SUCCESS') {
           addSystemMessage('Intervention recorded; engine ledger offline.');
           return;
@@ -1256,8 +1294,7 @@ export function App() {
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           },
         ]);
-      })
-      .catch(() => addSystemMessage('Intervention recorded locally.'));
+      });
     setMessages((prev) => [
       ...prev,
       {
