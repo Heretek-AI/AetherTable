@@ -1724,11 +1724,19 @@ export function App() {
 
       {/* Streamer Broadcast HUD Modal — userRole is passed (not duplicated)
           so the modal REPORTS the live privacy posture instead of keeping its
-          own copy of the filter state. */}
+          own copy of the filter state. The broadcast camera loop receives the
+          SAME filtered inputs the canvas/chat render from (visibleTokens,
+          yjsClient) so its readout cannot disagree with what spectators see. */}
       <StreamerHUDModal
         isOpen={isStreamerHUDOpen}
         onClose={() => setIsStreamerHUDOpen(false)}
         userRole={userRole}
+        syncClient={yjsClient}
+        projectedTokens={visibleTokens}
+        gridWidth={16}
+        gridHeight={12}
+        totalTokenCount={tokens.length}
+        excludedChatLineCount={messages.length - spectatorMessages.length}
         onToggleCinematicMode={(enabled) => {
           setIsLeftDockCollapsed(enabled);
           setIsRightDockCollapsed(enabled);

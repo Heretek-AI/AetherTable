@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useFocusTrap } from './ui/useFocusTrap';
 import {
   Video,
@@ -8,8 +8,17 @@ import {
   Tv,
   Send,
   ShieldAlert,
+  Camera,
+  EyeOff,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import {
+  startBroadcastViewportLoop,
+  type BroadcastViewportInput,
+  type BroadcastViewportSnapshot,
+  type ProjectedBoardToken,
+} from '../render/viewport_sync';
+import type { YjsCrdtClient } from '../sync/yjs_doc_client';
 
 interface StreamerHUDModalProps {
   isOpen: boolean;
@@ -22,14 +31,52 @@ interface StreamerHUDModalProps {
    * and NarrativeChat are really receiving.
    */
   userRole?: 'gm' | 'player' | 'spectator';
+  /** CRDT client backing fog-of-war (same instance the canvas renders from). */
+  syncClient?: YjsCrdtClient | null;
+  /**
+   * The spectator-PROJECTED token list — the same already-filtered array the
+   * canvas renders. Framing reads only this; it never re-filters (see
+   * render/viewport_sync.ts module header).
+   */
+  projectedTokens?: ProjectedBoardToken[];
+  gridWidth?: number;
+  gridHeight?: number;
+  /** UNFILTERED token list size, so this HUD can report how many were hidden. */
+  totalTokenCount: number;
+  /** Chat lines the spectator message stream excludes (App-computed). */
+  excludedChatLineCount: number;
+  /** Capture surface aspect used for the letterbox readout. */
+  broadcastViewportSize?: { width: number; height: number };
 }
+
+const MODE_LABELS: Record<BroadcastViewportSnapshot['mode'], string> = {
+  spectator_projected: 'CAPTURING SPECTATOR-PROJECTED VIEW',
+  gm_passthrough: 'MIRRORING GM VIEW (FILTERING OFF)',
+  locked_board_center: 'LOCKED TO BOARD CENTER (NOTHING VISIBLE)',
+};
 
 export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
   isOpen,
   onClose,
   onToggleCinematicMode,
   userRole = 'gm',
+  syncClient = null,
+  projectedTokens,
+  gridWidth = 16,
+  gridHeight = 12,
+  totalTokenCount = 0,
+  excludedChatLineCount = 0,
+  broadcastViewportSize = { width: 1280, height: 720 },
 }) => {
+  // Per-frame inputs are read through refs inside the polling loop so the
+  // effect above does not restart (and the camera does not stutter) every time
+  // a token moves one cell.
+  const broadcastTokensRef = useRef<ProjectedBoardToken[]>(projectedTokens ?? []);
+  broadcastTokensRef.current = projectedTokens ?? [];
+  const gridWidthRef = useRef(gridWidth);
+  gridWidthRef.current = gridWidth;
+  const gridHeightRef = useRef(gridHeight);
+  gridHeightRef.current = gridHeight;
   const isSpectator = userRole === 'spectator';
   const [isCinematicActive, setIsCinematicActive] = useState(false);
   const [discordWebhookUrl, setDiscordWebhookUrl] = useState('https://discord.com/api/webhooks/1042/aether_stream');
@@ -37,6 +84,32 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
   const [relayDeathSaves, setRelayDeathSaves] = useState(true);
   const [relayBossKills, setRelayBossKills] = useState(true);
   const [testSent, setTestSent] = useState(false);
+
+  // Live broadcast camera snapshot. The polling loop lives in render/
+  // viewport_sync.ts; this modal only renders what it publishes. The loop runs
+  // while the modal is open (it IS the readout surface) and stops on close.
+  const [broadcastSnapshot, setBroadcastSnapshot] = useState<BroadcastViewportSnapshot | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    const handle = startBroadcastViewportLoop(
+      (): BroadcastViewportInput => ({
+        spectatorMode: userRole === 'spectator',
+        projectedTokens: broadcastTokensRef.current,
+        totalTokenCount,
+        excludedChatLines: excludedChatLineCount,
+        syncClient,
+        gridWidth: gridWidthRef.current,
+        gridHeight: gridHeightRef.current,
+        viewportWidthPx: broadcastViewportSize.width,
+        viewportHeightPx: broadcastViewportSize.height,
+      }),
+      setBroadcastSnapshot
+    );
+    return () => handle.stop();
+    // Refs carry the per-frame inputs (see below); the loop itself must not be
+    // torn down when token positions change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, userRole, totalTokenCount, excludedChatLineCount, syncClient, broadcastViewportSize.width, broadcastViewportSize.height]);
 
   if (!isOpen) return null;
 
@@ -141,6 +214,118 @@ export const StreamerHUDModal: React.FC<StreamerHUDModalProps> = ({
                 ? 'Spectator seat: GM-hidden tokens, private GM-whisper channels, and DM-only surfaces (Handouts Vault, Quest Journal notes, Hidden-Info map layer) are excluded from this session view and from OBS capture.'
                 : 'Trusted seat: full table content including GM whispers is visible. Switch to the Spectator lobby seat before broadcasting to enable privacy filtering.'}
             </p>
+            {/* Viewport-mirror status: how the broadcast CAMERA relates to the
+                same filter. Derived from the live loop snapshot, not guessed. */}
+            {broadcastSnapshot && (
+              <p className="text-xs font-mono text-[var(--rp-parchment-200)] border-t border-tavern-border pt-2">
+                Viewport mirror:{' '}
+                <span className="font-bold">
+                  {isSpectator
+                    ? broadcastSnapshot.mode === 'locked_board_center'
+                      ? 'TRACKING PARTY AREA — locked to board center (nothing visible)'
+                      : 'TRACKING PARTY AREA (spectator projection only)'
+                    : 'NOT TRACKING — camera mirrors the seated canvas as-is'}
+                </span>
+                . The fitted frame reads the same filtered token list the canvas
+                renders plus the party-shared fog union, so hidden entities are
+                physically absent from what shapes (and what appears in) the
+                broadcast frame.
+              </p>
+            )}
+          </div>
+
+          {/* Broadcast Capture — live readout of what the projected view hides.
+              Read-only: like the posture card above, this REPORTS the camera
+              controller's output instead of owning any filter state. */}
+          <div className="p-4 vtt-surface rounded-2xl space-y-3 shadow-inner">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center space-x-2">
+                <Camera className="w-4 h-4 text-tavern-accent" />
+                <span className="text-sm font-bold text-[var(--rp-parchment-100)]">
+                  Broadcast Capture
+                </span>
+              </div>
+              <span
+                className={
+                  broadcastSnapshot?.mode === 'spectator_projected'
+                    ? 'vtt-badge vtt-badge-success'
+                    : broadcastSnapshot?.mode === 'locked_board_center'
+                    ? 'vtt-badge'
+                    : 'vtt-badge vtt-badge-danger'
+                }
+              >
+                {broadcastSnapshot ? MODE_LABELS[broadcastSnapshot.mode] : 'STARTING CAMERA LOOP…'}
+              </span>
+            </div>
+
+            <p className="text-xs text-[var(--rp-parchment-300)] font-sans">
+              {broadcastSnapshot?.note ??
+                'Polling the spectator-projected board each frame; the first frame lands momentarily.'}
+            </p>
+
+            {broadcastSnapshot && (
+              <>
+                {/* What the projection HIDES — an honest exclusion readout,
+                    not a green "all safe" claim. */}
+                <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                  <div className="flex items-start space-x-1.5 p-2 bg-black/30 rounded-lg border border-tavern-border">
+                    <EyeOff className="w-3.5 h-3.5 mt-0.5 shrink-0 text-rose-300" />
+                    <span className="text-[var(--rp-parchment-200)]">
+                      Hidden tokens excluded from projection:{' '}
+                      <span className="font-bold">{broadcastSnapshot.readout.hiddenTokens}</span>
+                      {' '}({broadcastSnapshot.readout.visibleTokens} visible)
+                    </span>
+                  </div>
+                  <div className="flex items-start space-x-1.5 p-2 bg-black/30 rounded-lg border border-tavern-border">
+                    <EyeOff className="w-3.5 h-3.5 mt-0.5 shrink-0 text-rose-300" />
+                    <span className="text-[var(--rp-parchment-200)]">
+                      Private chat lines excluded from stream:{' '}
+                      <span className="font-bold">{broadcastSnapshot.readout.excludedChatLines}</span>
+                    </span>
+                  </div>
+                  <div className="flex items-start space-x-1.5 p-2 bg-black/30 rounded-lg border border-tavern-border">
+                    <ShieldAlert className="w-3.5 h-3.5 mt-0.5 shrink-0 text-amber-300" />
+                    <span className="text-[var(--rp-parchment-200)]">
+                      Private fog layers NOT merged into the tracked area:{' '}
+                      <span className="font-bold">
+                        {isSpectator ? 'GM channel + unexplored cells' : 'n/a (filtering off)'}
+                      </span>
+                      {isSpectator && (
+                        <> · party layers merged: <span className="font-bold">{broadcastSnapshot.readout.partyFogLayers}</span></>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex items-start space-x-1.5 p-2 bg-black/30 rounded-lg border border-tavern-border">
+                    <Camera className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[var(--tavern-accent)]" />
+                    <span className="text-[var(--rp-parchment-200)]">
+                      Frame:{' '}
+                      {broadcastSnapshot.camera && broadcastSnapshot.focusRect ? (
+                        <>
+                          zoom <span className="font-bold">{Math.round(broadcastSnapshot.camera.zoom * 100)}%</span>{' '}
+                          · focus{' '}
+                          <span className="font-bold">
+                            [{Math.round(broadcastSnapshot.focusRect.minX / 60)}, {Math.round(broadcastSnapshot.focusRect.minY / 60)}] → [{' '}
+                            {Math.round(broadcastSnapshot.focusRect.maxX / 60)}, {Math.round(broadcastSnapshot.focusRect.maxY / 60)}] cells
+                          </span>{' '}
+                          · letterbox L/R {Math.round(broadcastSnapshot.letterbox.left)}/{Math.round(broadcastSnapshot.letterbox.right)} px
+                        </>
+                      ) : (
+                        'mirroring seated canvas (no independent camera transform)'
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Honest limits — never claimed as a wire-level guarantee. */}
+                <p className="text-[10px] font-mono text-[var(--rp-parchment-300)] leading-relaxed">
+                  Scope: this camera protects what the CAPTURE shows, computed
+                  client-side. It does not encrypt the wire or replace server-side
+                  seat filtering — a spectator peer could still receive more than
+                  it renders unless the relay withholds it (see App.tsx Pillar 9
+                  honest-limits list).
+                </p>
+              </>
+            )}
           </div>
 
           {/* Discord Webhook Relay Form */}
