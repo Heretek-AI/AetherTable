@@ -35,3 +35,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 
 [dev-dependencies]
 actix-http = "3"
+# Socket-level WS client for the relay-RBAC tests (tests/ws_relay_rbac.rs):
+# assertions are about bytes on the wire, not rendering.
+tokio-tungstenite = "0.26"

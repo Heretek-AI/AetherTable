@@ -160,10 +160,19 @@ fn may_control_entity(entity_owner: Option<&String>, role: Role, user_id: &str) 
     }
 }
 
+/// One live WebSocket peer plus the verified identity of its connection.
+/// Role travels WITH the registration so fan-out can be filtered per frame —
+/// client-side spectator filtering protects rendering, not the wire.
+struct PeerConnection {
+    socket: actix_ws::Session,
+    role: Role,
+    user_id: String,
+}
+
 /// Live WebSocket peer registry per room. The CrdtRelayHub merges state
 /// (LWW arbitration); this struct handles the fan-out to connected clients.
 pub struct PeerRegistry {
-    rooms: DashMap<String, DashMap<u64, actix_ws::Session>>,
+    rooms: DashMap<String, DashMap<u64, PeerConnection>>,
     next_peer_id: AtomicU64,
 }
 
@@ -175,12 +184,19 @@ impl PeerRegistry {
         }
     }
 
-    fn join(&self, room_id: &str, session: &actix_ws::Session) -> u64 {
+    fn join(&self, room_id: &str, session: &actix_ws::Session, role: Role, user_id: &str) -> u64 {
         let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         self.rooms
             .entry(room_id.to_string())
             .or_default()
-            .insert(peer_id, session.clone());
+            .insert(
+                peer_id,
+                PeerConnection {
+                    socket: session.clone(),
+                    role,
+                    user_id: user_id.to_string(),
+                },
+            );
         peer_id
     }
 
@@ -190,16 +206,30 @@ impl PeerRegistry {
         }
     }
 
-    async fn broadcast(&self, room_id: &str, except_peer: u64, text: &str) {
+    /// Fan `text` out to every peer in the room except `except_peer` whose
+    /// connection satisfies `eligible`. This is where relay-level RBAC lives:
+    /// eligibility is decided from the PEER's authenticated role/identity,
+    /// never from anything the frame claims about itself.
+    async fn broadcast_if(
+        &self,
+        room_id: &str,
+        except_peer: u64,
+        text: &str,
+        eligible: impl Fn(&PeerConnection) -> bool,
+    ) {
         if let Some(peers) = self.rooms.get(room_id) {
             for entry in peers.iter() {
-                if *entry.key() != except_peer {
-                    let mut peer_session = entry.value().clone();
+                if *entry.key() != except_peer && eligible(entry.value()) {
+                    let mut peer_session = entry.value().socket.clone();
                     // actix-ws Session::text is async; dropped futures never flush.
                     let _ = peer_session.text(text).await;
                 }
             }
         }
+    }
+
+    async fn broadcast(&self, room_id: &str, except_peer: u64, text: &str) {
+        self.broadcast_if(room_id, except_peer, text, |_| true).await;
     }
 
     fn count(&self, room_id: &str) -> usize {
@@ -2250,6 +2280,57 @@ fn cell_hint(map: &SessionMap) -> f32 {
     map.cell_size_feet
 }
 
+/// The token name carried by a TokenUpdate frame, if any (camelCase wire
+/// shape; `tokenId` is an entity DISPLAY NAME on this relay, see
+/// `validate_token_move`).
+fn payload_token_name(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/payload/tokenId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the entity behind a token-name-keyed transform is hidden from
+/// non-GM viewers (`is_visible == false` in the authoritative session state).
+///
+/// The CRDT frame itself carries NO visibility field — `TokenTransform` has
+/// only geometry — so the decision is made against the server-side session
+/// map, resolved by display name exactly like movement-speed validation.
+/// Unknown tokens (free rooms, unregistered names, non-session rooms)
+/// default to visible: we never invent a restriction the data cannot back.
+fn token_is_hidden(data: &AppState, room_id: &str, token_name: &str) -> bool {
+    Uuid::parse_str(room_id)
+        .ok()
+        .and_then(|id| data.sessions.get(&id))
+        .map(|lock| {
+            lock.read()
+                .entities
+                .values()
+                .any(|e| e.name.eq_ignore_ascii_case(token_name) && !e.is_visible)
+        })
+        .unwrap_or(false)
+}
+
+/// Delivery policy for fog layers toward a SPECTATOR connection.
+///
+/// Layer ids are "fog:{user_id}" for per-user private layers (the same
+/// convention the ingress ownership check enforces); any other id is treated
+/// as owner-less and party-shared. A spectator may therefore receive only:
+/// its OWN layer's updates, or shared layers. What it can never receive is
+/// another user's private reveal history.
+///
+/// Note what this deliberately does NOT do: compose a party-merged view.
+/// Merging several users' masks into one union polygon set is a payload
+/// transform the frame format cannot express — the server would have to
+/// rewrite `revealedPolygons`, which no current message type supports. So
+/// spectators simply get fewer frames rather than a merged one.
+fn spectator_may_see_fog_layer(layer_id: &str, viewer_user_id: &str) -> bool {
+    match layer_id.strip_prefix("fog:") {
+        Some(owner) => owner == viewer_user_id,
+        None => true,
+    }
+}
+
 /// Normalize the browser's camelCase TokenUpdate payload into the CRDT
 /// model, validate the movement, and run LWW arbitration; true means
 /// "accept & relay".
@@ -2338,7 +2419,7 @@ async fn ws_sync(
     };
 
     let mut session = session;
-    let peer_id = data.peers.join(&room_id, &session);
+    let peer_id = data.peers.join(&room_id, &session, role, &identity.user_id);
     let hub = Arc::clone(&data.crdt_hub);
     let peers = Arc::clone(&data.peers);
     let app_state = data.clone();
@@ -2351,9 +2432,32 @@ async fn ws_sync(
                     Ok(mut value) => {
                         match value.get("type").and_then(|t| t.as_str()) {
                             Some("TokenUpdate") => {
+                                // Ingress RBAC mirrors every mutating HTTP
+                                // route (`FORBIDDEN_ROLE`): spectators watch
+                                // the board; they do not drive it.
+                                if role == Role::Spectator {
+                                    log::warn!(
+                                        "Dropped TokenUpdate from spectator {}",
+                                        identity.user_id
+                                    );
                                 // Validate movement, then relay only updates that win LWW arbitration.
-                                if accept_token_update(&app_state, &hub, &rid, &value) {
-                                    peers.broadcast(&rid, peer_id, &text).await;
+                                } else if accept_token_update(&app_state, &hub, &rid, &value) {
+                                    // Delivery RBAC: hidden entities never fan
+                                    // out to spectators. The frame carries no
+                                    // visibility field, so hiddenness is read
+                                    // from the authoritative session state.
+                                    let hidden = payload_token_name(&value)
+                                        .map(|name| token_is_hidden(&app_state, &rid, name))
+                                        .unwrap_or(false);
+                                    if hidden {
+                                        peers
+                                            .broadcast_if(&rid, peer_id, &text, |peer| {
+                                                peer.role != Role::Spectator
+                                            })
+                                            .await;
+                                    } else {
+                                        peers.broadcast(&rid, peer_id, &text).await;
+                                    }
                                 }
                             }
                             Some("FogUpdate") => {
@@ -2369,7 +2473,18 @@ async fn ws_sync(
                                 let owned_by_sender =
                                     layer_id == format!("fog:{}", identity.user_id);
                                 if owned_by_sender || role.is_gm() {
-                                    peers.broadcast(&rid, peer_id, &text).await;
+                                    // Delivery RBAC: spectators receive their
+                                    // own layers and owner-less shared layers,
+                                    // but never another user's private fog.
+                                    peers
+                                        .broadcast_if(&rid, peer_id, &text, |peer| {
+                                            peer.role != Role::Spectator
+                                                || spectator_may_see_fog_layer(
+                                                    &layer_id,
+                                                    &peer.user_id,
+                                                )
+                                        })
+                                        .await;
                                 } else {
                                     log::warn!(
                                         "Dropped FogUpdate from {} for foreign layer '{}'",
