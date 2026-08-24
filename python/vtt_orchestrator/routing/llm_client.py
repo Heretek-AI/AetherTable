@@ -167,7 +167,7 @@ class LLMStreamingGateway:
                 "base_url": self.config.base_url,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
                 "status": getattr(locals().get("resp"), "status_code", None),
-                "error": str(exc)[:2000],
+                "error": f"{type(exc).__name__}: {exc}"[:2000],
                 "prompt_chars": len(json.dumps(messages)),
             })
             raise
@@ -235,7 +235,7 @@ class LLMStreamingGateway:
                 "base_url": self.config.base_url,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
                 "status": resp_status,
-                "error": str(exc)[:2000],
+                "error": f"{type(exc).__name__}: {exc}"[:2000],
                 "prompt_chars": len(system_prompt) + len(user_prompt),
             })
             return None
@@ -341,7 +341,7 @@ class LLMStreamingGateway:
                     "model": self.config.model,
                     "base_url": self.config.base_url,
                     "status": None,
-                    "error": str(e)[:2000],
+                    "error": f"{type(e).__name__}: {e}"[:2000],
                 })
                 degradation_reason = f"llm_upstream_error: {str(e)[:200]}"
 
@@ -473,7 +473,7 @@ class LLMStreamingGateway:
                     "model": self.config.model,
                     "base_url": self.config.base_url,
                     "status": getattr(locals().get("resp"), "status_code", None),
-                    "error": str(e)[:2000],
+                    "error": f"{type(e).__name__}: {e}"[:2000],
                 })
                 reason = f"llm_upstream_error: {str(e)[:200]}"
         else:

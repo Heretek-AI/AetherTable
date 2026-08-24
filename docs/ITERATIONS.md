@@ -71,4 +71,12 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 12 | — | Heal/rest gateway proxies with identity forwarding; strict request models; 8 tests | 4527774 | pytest ✓ |
 | 13 | 4.12 | Genuine GOAP planner for factions: STRIPS actions, uniform-cost A*, deterministic, legacy fallback preserved; 19 tests | 50fe903 | pytest ✓ |
 | 14 | 4.5 | Weighted thematic loot tables (3 themes, rarity weights, tier multipliers) replacing seed%100; 8 tests incl. distribution sanity | b42d5a8 | cargo ✓ |
+| 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy; 9 tests | 0a182da | cargo+pytest ✓ |
+| 16 | A1-fix | Audit remediation: LONG_REST rewind arm, HEALED clears death-save baselines; 4 red-first tests | b3fda63 | cargo ✓ |
+| 17 | 3.8 | Honest analytics/admin: live /metrics proxy, offline "—", DEMO badges, fabricated cards removed | 8ac9980 | all ✓ |
+| 18 | 3.1 | Real remote cursors via Yjs awareness; hardcoded peers deleted; honest empty on fallback | a41d778 | tsc ✓ |
+| 19 | wire-up | classify_with_llm wired into turn flow: safety precedence, kill-switch, provenance fields; 8 tests | 39609ae | pytest ✓ |
+| 20 | wire-up | Fail-forward tiers (margin/tier/cost_suggestion) surface in check/save responses; seeded d20s; 5 tests | 97f36f7 | cargo ✓ |
+| 21 | 5.1+5.2 | Agent-driven campaign simulation harness: LLM decisions via custom endpoint, identity-forwarded proxies, counted-metrics reports; 13 mocked tests | b4913c6 | pytest ✓ |
+| 22 | honesty | LLM error logs record exception types (httpx timeouts stringified to ""); live e2e sim run verified vs llm.heretek.one — endpoint unreachable from network, harness fell back honestly, all actions accepted | see git log | pytest ✓ |
 
