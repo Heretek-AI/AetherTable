@@ -15,12 +15,14 @@ player             Own entities (``owner_player_id`` == caller user_id) in
 spectator          Every visible entity reduced to
                    {id, name, is_visible, position, is_player, is_dead}; hidden entities dropped;
                    no HP/AC/abilities/stat blocks anywhere.
-(no token)         Unchanged legacy service-principal read (verbatim).
+(no token)         401 Unauthorized — the route is browser-facing and must
+                   never serve the full engine state anonymously.
 =================  ==========================================================
 
-GET /api/v1/engine/session-replay applies the same policy to the exported
-ledger: spectator exports keep the event narrative but strip numeric
-HP/damage amounts ("took damage", never "took 7 damage").
+GET /api/v1/engine/session-replay AND POST /api/v1/engine/session-state
+apply the same redaction policy to LEDGER EVENTS: spectator exports keep the
+event narrative but strip numeric HP/damage amounts ("took damage", never
+"took 7 damage"); players/GM keep exact numbers.
 
 The engine is monkeypatched throughout: these tests pin the GATEWAY
 projection contract, not the Rust engine itself.
@@ -223,14 +225,17 @@ class TestGmAndAdminProjection:
         assert body["entities"]["e-hidden"]["current_hp"] == 28
         assert body["entities"]["e-hero"]["ac"] == 16
 
-    def test_service_principal_call_stays_verbatim(self, monkeypatch):
-        """Legacy tokenless callers keep the pre-projection contract."""
-        state = _state({"e-hero": _entity("Hero")})
-        captured = _patched_state(monkeypatch, state)
-
-        body = _fetch(None)
-        assert captured["actor"] is None
-        assert body["entities"]["e-hero"]["current_hp"] == 28
+    def test_no_token_is_unauthorized_never_verbatim(self, monkeypatch):
+        """The tokenless 'legacy service-principal verbatim read' must not exist
+        on a browser-facing route: no token is an auth failure, and the engine
+        is never even contacted."""
+        captured = _patched_state(monkeypatch, _state({"e-hero": _entity("Hero")}))
+        resp = client.post(
+            "/api/v1/engine/session-state",
+            json={"session_id": SESSION_ID},
+        )
+        assert resp.status_code == 401
+        assert captured == {}  # engine never saw the request
 
     def test_unknown_role_is_treated_as_spectator(self, monkeypatch):
         """Fail closed: any unrecognized role gets the most restrictive view."""
@@ -366,3 +371,63 @@ class TestSpectatorReplayRedaction:
         body = _export_replay(_token("player-7", "player"), state, monkeypatch)
         summary = body["events"][0]["summary"]
         assert "for 7" in summary and "(HP→13)" in summary
+
+
+# --- Ledger redaction on /api/v1/engine/session-state --------------------------
+# The live snapshot carries the SAME ledger the replay export projects; it must
+# not become a side channel that hands players/spectators raw HP/damage numbers
+# (and hidden-entity event payloads) that replay deliberately strips.
+
+def _fetch_state_events(token: str, events: list[dict], monkeypatch) -> dict:
+    """POSTs session-state with a patched engine returning ``events``."""
+    state = _state({"e-hero": _entity("Hero")})
+    state["ledger"] = {"current_sequence": len(events), "events": events}
+    _patched_state(monkeypatch, state)
+    return _fetch(token)
+
+
+class TestSessionStateLedgerRedaction:
+    def test_spectator_ledger_numbers_are_stripped(self, monkeypatch):
+        events = [
+            _event(1, "ATTACK_RESOLVED", {
+                "attacker_id": ATTACKER, "target_id": TARGET,
+                "is_hit": True, "total_damage": 7, "target_hp_remaining": 13,
+            }),
+            _event(2, "DAMAGE_APPLIED", {"target_id": TARGET, "amount": 11, "hp_remaining": 4}),
+        ]
+        body = _fetch_state_events(_token("watcher-1", "spectator"), events, monkeypatch)
+
+        ledger_events = body["ledger"]["events"]
+        first, second = ledger_events[0], ledger_events[1]
+        assert "damage dealt" in first["summary"] and "hit" in first["summary"]
+        assert "7" not in first["summary"] and "13" not in first["summary"]
+        assert "took damage" in second["summary"]
+        assert "11" not in second["summary"] and "4)" not in second["summary"]
+
+    def test_spectator_ledger_payload_is_never_dumped_raw(self, monkeypatch):
+        """The projected event must be a summary — no verbatim payload dict."""
+        events = [_event(1, "MYSTERY_EVENT", {"secret_hp": 42})]
+        body = _fetch_state_events(_token("watcher-1", "spectator"), events, monkeypatch)
+
+        event = body["ledger"]["events"][0]
+        assert event.get("payload") is None or event.get("payload") == {}
+        assert json.dumps(event).find("42") == -1
+
+    def test_player_ledger_keeps_exact_numbers_like_replay(self, monkeypatch):
+        events = [
+            _event(1, "ATTACK_RESOLVED", {
+                "attacker_id": ATTACKER, "target_id": TARGET,
+                "is_hit": True, "total_damage": 7, "target_hp_remaining": 13,
+            }),
+        ]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert "for 7" in summary and "(HP→13)" in summary
+
+    def test_gm_ledger_keeps_exact_numbers(self, monkeypatch):
+        events = [
+            _event(1, "HEALED", {"target_id": TARGET, "amount": 5, "hp_remaining": 18}),
+        ]
+        body = _fetch_state_events(_token("gm-1", "gm"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert "healed for 5" in summary and "(HP→18)" in summary

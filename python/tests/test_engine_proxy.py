@@ -581,9 +581,10 @@ class TestSessionStateProxy:
         assert resp.status_code == 200
         assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
 
-    def test_missing_token_stays_service_mediated(self, monkeypatch):
-        """Legacy callers that omit the token keep working via the service
-        principal instead of breaking."""
+    def test_missing_token_is_unauthorized_never_anonymous_read(self, monkeypatch):
+        """Audit remediation: the tokenless 'legacy service-principal verbatim
+        read' is gone — this browser-facing route requires a valid token and
+        never contacts the engine anonymously."""
         captured: dict = {}
 
         async def fake_engine_request(method, path, payload=None, *, actor=None):
@@ -596,8 +597,8 @@ class TestSessionStateProxy:
             "/api/v1/engine/session-state",
             json={"session_id": self.SESSION_ID},
         )
-        assert resp.status_code == 200
-        assert captured["actor"] is None
+        assert resp.status_code == 401
+        assert captured == {}
 
     def test_invalid_token_is_unauthorized(self):
         resp = client.post(
@@ -615,6 +616,7 @@ class TestSessionStateProxy:
 
         resp = client.post(
             "/api/v1/engine/session-state",
+            params={"token": self._token("gm-1", "gm")},
             json={"session_id": self.SESSION_ID},
         )
         assert resp.status_code == 404
@@ -624,6 +626,7 @@ class TestSessionStateProxy:
         monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
         resp = client.post(
             "/api/v1/engine/session-state",
+            params={"token": self._token("gm-1", "gm")},
             json={"session_id": self.SESSION_ID},
         )
         assert resp.status_code == 502
@@ -654,6 +657,7 @@ class TestSessionStateProxy:
         monkeypatch.setattr(engine_client, "engine_request", reject_non_get)
         resp = client.post(
             "/api/v1/engine/session-state",
+            params={"token": self._token("gm-1", "gm")},
             json={"session_id": self.SESSION_ID},
         )
         assert resp.status_code == 200

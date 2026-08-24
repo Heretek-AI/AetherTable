@@ -156,6 +156,42 @@ def test_character_persistence_and_deploy(host, guest):
     assert denied.status_code == 403
 
 
+def test_character_get_is_owner_scoped(host, guest):
+    """IDOR: GET /characters/{id} must not serve another user's sheet.
+
+    A foreign (but authenticated) caller gets 404 — the same answer as a
+    nonexistent id — so the route cannot be used as an existence oracle.
+    """
+    record = _make_character(host["token"], "Veldren Ash")
+
+    # Owner reads their own character in full.
+    own = client.get(
+        f"/api/v1/characters/{record['character_id']}",
+        params={"token": host["token"]},
+    )
+    assert own.status_code == 200, own.text
+    assert own.json()["character_id"] == record["character_id"]
+    assert own.json()["owner_user_id"] == host["user"]["id"]
+
+    # Another authenticated user gets the not-found answer, not the sheet.
+    stolen = client.get(
+        f"/api/v1/characters/{record['character_id']}",
+        params={"token": guest["token"]},
+    )
+    assert stolen.status_code == 404
+
+    # A garbage id behaves identically (no distinguishable error shape).
+    missing = client.get(
+        "/api/v1/characters/00000000-0000-0000-0000-000000000000",
+        params={"token": guest["token"]},
+    )
+    assert missing.status_code == 404
+
+    # No token at all is an auth failure, never a read.
+    anon = client.get(f"/api/v1/characters/{record['character_id']}")
+    assert anon.status_code == 401
+
+
 # --- Workstream C: proxy routes --------------------------------------------------
 
 def test_engine_proxy_routes_contract():

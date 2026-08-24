@@ -1020,9 +1020,15 @@ async def list_characters(token: str = Depends(_require_auth)):
 
 @app.get("/api/v1/characters/{character_id}")
 async def get_character(character_id: str, token: str = Depends(_require_auth)):
-    _require_user_id(token)
+    """Reads ONE character — but only for its owner.
+
+    Ownership is enforced here (not just token validity): a valid token
+    belonging to someone else gets the same 404 as a nonexistent id, so the
+    route can't be probed as an existence oracle for other players' sheets.
+    """
+    user_id = _require_user_id(token)
     record = await storage_backend.get_character(character_id)
-    if record is None:
+    if record is None or record.get("owner_user_id") != user_id:
         raise HTTPException(status_code=404, detail="Character not found")
     return record
 
@@ -1416,13 +1422,34 @@ def _project_entities(
     return projected
 
 
+def _project_ledger(ledger: Any, *, redact_numbers: bool) -> Any:
+    """Projects a snapshot's ``ledger`` field with the replay-export policy.
+
+    Events travel through :func:`_project_ledger_event` exactly as they do in
+    the replay export — never as raw payloads. Under ``redact_numbers``
+    (spectators and unrecognized roles) summaries additionally strip exact
+    HP/damage amounts ("took damage", never "took 7 damage"); trusted roles
+    keep the exact numbers.
+    """
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("events"), list):
+        return ledger  # metadata-only ledger: nothing to project
+    projected = dict(ledger)
+    projected["events"] = [
+        _project_ledger_event(e, redact_numbers=redact_numbers)
+        for e in ledger["events"]
+    ]
+    return projected
+
+
 def _project_session_state(
-    state: Any, actor: Optional[Dict[str, str]]
+    state: Any, actor: Dict[str, str]
 ) -> Any:
     """Projects a live session snapshot for the calling role.
 
-    Projection matrix (``entities`` map only; every other top-level field —
-    session_id, combat, ledger metadata — travels verbatim):
+    The caller is ALWAYS an authenticated actor (the route 401s without a
+    valid session token); there is no anonymous verbatim read.
+
+    Projection matrix:
 
     ================  =========================================================
     Caller role       Entities received
@@ -1436,47 +1463,61 @@ def _project_session_state(
                       projection; hidden entities dropped; no HP/AC/abilities/
                       attacks anywhere.
     any other role    Spectator view (fails closed).
-    no token          Legacy service-principal read, returned verbatim.
     ================  =========================================================
+
+    Ledger EVENTS get the same policy as the replay export: spectators and
+    unrecognized roles receive redacted summaries only ("took damage", never
+    "took 7 damage"); GM/admin/player keep exact numbers.
     """
-    if actor is None:
-        return state  # legacy service-mediated call: unchanged contract
-    if not isinstance(state, dict) or not isinstance(state.get("entities"), dict):
+    if not isinstance(actor, dict) or not actor.get("user_id"):
+        raise HTTPException(status_code=401, detail="Missing session token")
+    if not isinstance(state, dict):
         return state  # nothing recognizable to project; pass through honestly
     role = actor.get("role", "")
     privileged = role in _PRIVILEGED_ROLES
     user_id = actor["user_id"] if role in _PLAYER_VISIBLE_ROLES else None
     state = dict(state)
-    state["entities"] = _project_entities(
-        state["entities"],
-        user_id if user_id is not None else "",
-        privileged,
+    if isinstance(state.get("entities"), dict):
+        state["entities"] = _project_entities(
+            state["entities"],
+            user_id if user_id is not None else "",
+            privileged,
+        )
+    # Fail closed exactly like engine_session_replay: only roles trusted with
+    # stat detail see unredacted ledger numbers.
+    redact_numbers = role not in _PLAYER_VISIBLE_ROLES
+    state["ledger"] = _project_ledger(
+        state.get("ledger"), redact_numbers=redact_numbers
     )
     return state
 
 
 @app.post("/api/v1/engine/session-state")
 async def engine_session_state(
-    req: EngineSessionStateRequest, token: Optional[str] = Query(None)
+    req: EngineSessionStateRequest, token: str = Depends(_require_auth)
 ):
     """GET-style read proxy over the engine's GET /api/v1/sessions/{id}.
+
+    Requires a valid HMAC session token (Authorization header or legacy
+    ?token=): this is a browser-facing route and never serves full engine
+    state anonymously. Internal callers read the engine directly via
+    engine_client instead.
 
     The browser holds no HMAC engine token, so it has no direct readable path
     to authoritative state (this is what left clients unable to converge local
     tokens after an X-card rewind). This route gives it one round trip through
     the orchestrator, forwarding the caller's identity so the engine's RBAC
-    authorizes the real participant; callers without a token stay
-    service-mediated like the other proxies.
+    authorizes the real participant.
 
     Before returning, the gateway PROJECTS the payload by the caller's role
     (see :func:`_project_session_state`): spectators and non-owner players get
     public board tokens only ({id, name, is_visible, position, is_player,
     is_dead}), owners get their own sheets in full, and GM/admin alone receive
-    the complete authoritative state including hidden entities. See the matrix
-    in ``_project_session_state``'s docstring; the same policy drives replay
-    export redaction in ``engine_session_replay``.
+    the complete authoritative state including hidden entities. Ledger events
+    are redacted with the same policy as the replay export. See the matrix in
+    ``_project_session_state``'s docstring.
     """
-    actor = _caller_actor(token) if token else None
+    actor = _caller_actor(token)
     state = await _engine_call(
         engine_client.engine_request(
             "GET",
