@@ -16,24 +16,24 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
       ui/safety_xcard.ts, LiteLLMCircuitBreakerGateway
 - [ ] 3.7 Remove unused y-indexeddb dep or wire it; drop committed dist artifacts
 - [ ] 3.8 AnalyticsView/AdminDashboard fetch real endpoints or are labeled DEMO
-- [ ] 3.9 LobbyView seats come from lobby member API (no hardcoded roster)
+- [x] 3.9 LobbyView seats come from lobby member API (no hardcoded roster)
 - [ ] 3.10 Client sends auth tokens on all API calls (headers, not query strings)
 - [ ] 3.11 WebGPU preference option for Pixi init (env-gated)
 - [ ] 3.12 manualChunks splitting; kill >500 kB chunk warnings
 
 ### Phase 4 — Missing pillars & engine depth
-- [ ] 4.1 Fail-forward margin bands (M = roll − DC) in vtt-core + tests
-- [ ] 4.2 NPC disposition scoring (trust/fear/decay) in python simulation + tests
+- [x] 4.1 Fail-forward margin bands (M = roll − DC) in vtt-core + tests
+- [x] 4.2 NPC disposition scoring (trust/fear/decay) in python simulation + tests
 - [ ] 4.3 Heal/rest endpoint in vtt-server; wire death-save tally reset
-- [ ] 4.4 Multi-term dice expressions ("2d6+1d4+3") in vtt-core DiceEngine
+- [x] 4.4 Multi-term dice expressions ("2d6+1d4+3") in vtt-core DiceEngine
 - [ ] 4.5 Real loot tables replacing seed % 100 arithmetic
 - [ ] 4.6 Neo4j-backed epistemic graph (driver optional; in-memory fallback)
 - [ ] 4.7 Qdrant-backed lore/compendium RAG lookup (optional; fallback offline)
 - [ ] 4.8 LLM-assisted intent classification with keyword fallback (.env LLM)
-- [ ] 4.9 Degraded marker on SSE narrative fallback frames
-- [ ] 4.10 Engine-tier rate limiting (actix-governor)
-- [ ] 4.11 Concentration auto-check hooks on damage events
-- [ ] 4.12 Faction GOAP planner upgrade (plan search over action preconditions)
+- [x] 4.9 Degraded marker on SSE narrative fallback frames
+- [x] 4.10 Engine-tier rate limiting (actix-governor)
+- [x] 4.11 Concentration auto-check hooks on damage events
+- [x] 4.12 Faction GOAP planner upgrade (plan search over action preconditions)
 
 ### Phase 5 — Productization & gameplay
 - [ ] 5.1 Agent-driven campaign simulation: synthetic players register → lobby →
@@ -58,4 +58,9 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | # | Item | Summary | Commit | Gates |
 |---|------|---------|--------|-------|
 | 1 | 3.6 + 3.7 | Dead code sweep (App.tsx unreachable dup block, audio_vad_pipeline.ts, ui/safety_xcard.ts); y-indexeddb wired as IndexedDB persistence for Y.Doc rooms | 3d6ba67 | tsc+vite ✓ |
+| 2 | 4.2 | NPC disposition scoring engine: trust/fear decay, alignment bias, stress amplification, stance bands; injectable clock; 15 tests | 9b6caf1 | pytest ✓ |
+| 3 | 4.1 | Fail-forward margin tiers in vtt-core (CriticalSuccess/Success/SuccessAtCost/CriticalFailure), deterministic cost suggestions, nat20/1 conventions; 11 tests | see git log | cargo ✓ |
+| 4 | 3.9 | Live lobby roster from GET /lobbies/{id}; fake players/pings removed; real invite URLs | 7e3aead | tsc+vite ✓ |
+| 5 | 4.9 | SSE degradation markers: leading {degraded,reason} frame + per-frame tags on fallback; non-streaming degraded flag | 9367081 | pytest ✓ |
+| 6 | 4.4 + R1 | Multi-term dice expression evaluator in vtt-core (seeded, bounded); OSS crates rejected as unmaintained | see git log | cargo ✓ |
 
