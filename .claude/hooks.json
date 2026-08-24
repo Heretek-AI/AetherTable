@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PostFileEdit": [
+      {
+        "matcher": ".github/workflows/*.{yml,yaml}",
+        "command": "if command -v zizmor >/dev/null 2>&1; then zizmor ${filePath}; fi"
+      },
+      {
+        "matcher": "{Dockerfile*,Containerfile*}",
+        "command": "if command -v hadolint >/dev/null 2>&1; then hadolint ${filePath}; fi"
+      },
+      {
+        "matcher": ".claude/skills/*.md",
+        "command": "skillcheck check ${filePath}"
+      },
+      {
+        "matcher": "SKILL.md",
+        "command": "skillcheck check ${filePath}"
+      }
+    ],
+    "PreCommit": [
+      {
+        "command": "npx lefthook run pre-commit"
+      }
+    ]
+  }
+}

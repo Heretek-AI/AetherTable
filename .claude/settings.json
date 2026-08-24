@@ -1,0 +1,8 @@
+{
+  "governance": {
+    "locked": true,
+    "agentGateVersion": "1.0.0",
+    "enforceMechanicalGates": true,
+    "lspDiagnosticStreaming": true
+  }
+}
