@@ -754,6 +754,106 @@ export async function engineSessionRoster(
   return outcome;
 }
 
+/* --- Procedural maps: real WFC generation ---------------------------------
+ *
+ * POST /api/v1/engine/map/generate proxies vtt-server's WFC route
+ * (POST /api/v1/maps/generate -> DungeonGenerator::generate_room), which runs
+ * a socket-matching solver with restart-on-contradiction and a flood-fill
+ * walkability guarantee. No local synthesis exists here: if the engine cannot
+ * produce a map, the outcome says so instead of inventing one.
+ */
+
+/** Verbatim body of POST /api/v1/maps/generate: `{width, height, tiles}` with
+ * tiles as Vec<Vec<u8>> — 0 floor, 1 wall, 2 door, 3 altar, 4 chest. */
+export interface EngineGeneratedMap {
+  width: number;
+  height: number;
+  tiles: number[][];
+}
+
+export type EngineMapGenerateOutcome =
+  | { kind: 'applied'; data: EngineGeneratedMap }
+  | { kind: 'rejected'; status: number; code: string | null; message: string | null }
+  /** Engine/gateway unreachable or an unrecognized 5xx — nothing was decided. */
+  | { kind: 'unreachable' };
+
+/**
+ * Generate a dungeon through the authoritative WFC solver. Same seed ⇒
+ * byte-identical tile grid (engine-side RNG); omitting the seed lets the
+ * engine apply its documented default (1337).
+ *
+ * Failure mapping note: vtt-server answers a fully-exhausted solver with HTTP
+ * 500 `{"error": "WFC_CONTRADICTION_EXHAUSTED after N attempts"}`, which the
+ * gateway forwards verbatim inside `{detail}`. A bare 500 would normally mean
+ * "unreachable", so a recognized machine code in the body is promoted to a
+ * rejection first — callers can then show its honest meaning ("every collapse
+ * attempt contradicted; no map exists") rather than a network error.
+ */
+export async function engineGenerateMap(params: {
+  width: number;
+  height: number;
+  seed?: number;
+  theme?: string;
+}): Promise<EngineMapGenerateOutcome> {
+  try {
+    const resp = await fetch('/api/v1/engine/map/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        width: params.width,
+        height: params.height,
+        ...(params.seed !== undefined ? { seed: params.seed } : {}),
+        theme: params.theme ?? 'dungeon',
+      }),
+    });
+    const payload: unknown = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
+      const d = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+      const code = typeof d?.error === 'string' ? d.error : null;
+      if (code) {
+        return {
+          kind: 'rejected',
+          status: resp.status,
+          code,
+          message: typeof d?.message === 'string' ? d.message : null,
+        };
+      }
+      if (resp.status >= 500) return { kind: 'unreachable' };
+      return {
+        kind: 'rejected',
+        status: resp.status,
+        code: null,
+        message:
+          typeof raw === 'string'
+            ? raw
+            : typeof d?.message === 'string'
+              ? d.message
+              : `HTTP ${resp.status}`,
+      };
+    }
+    const m = payload as Partial<EngineGeneratedMap> | null;
+    const tilesOk =
+      !!m &&
+      Array.isArray(m.tiles) &&
+      m.tiles.length > 0 &&
+      m.tiles.every((row) => Array.isArray(row) && row.every((c) => typeof c === 'number'));
+    if (!tilesOk || typeof m!.width !== 'number' || typeof m!.height !== 'number') {
+      // A 2xx without the documented grid is a gateway contract break.
+      return {
+        kind: 'rejected',
+        status: 502,
+        code: 'MALFORMED_MAP_RESPONSE',
+        message: 'map/generate proxy answered without a tile grid',
+      };
+    }
+    return { kind: 'applied', data: m as EngineGeneratedMap };
+  } catch {
+    console.warn('Rules engine unreachable; no map was generated.');
+    return { kind: 'unreachable' };
+  }
+}
+
 /**
  * Read the caller-projected entity roster for a session through the gateway's
  * read proxy. Hidden entities are filtered out for players by the projection
