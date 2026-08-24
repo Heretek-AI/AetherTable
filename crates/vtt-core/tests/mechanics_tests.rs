@@ -430,6 +430,228 @@ fn test_safety_rewind_replays_death_save_tallies() {
     assert!(!restored.is_dead);
 }
 
+/// Appends a rest/heal-style ledger event and returns its sequence id, so
+/// callers can rewind to a point immediately after it.
+fn append_and_seq(
+    session: &mut GameSession,
+    actor: uuid::Uuid,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> u64 {
+    session
+        .ledger
+        .append_event(session.session_id, session.campaign_id, actor, event_type, payload)
+        .sequence_id
+}
+
+fn attack_event(target: uuid::Uuid, hp_remaining: i32) -> serde_json::Value {
+    serde_json::json!({
+        "target_id": target.to_string(),
+        "total_damage": 0,
+        "target_hp_remaining": hp_remaining,
+        "target_is_conscious": hp_remaining > 0,
+        "target_is_dead": false,
+    })
+}
+
+#[test]
+fn test_safety_rewind_between_long_rest_and_attack_restores_post_rest_max_hp() {
+    let mut session = session_with_pair();
+    let (a_id, b_id): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    // Baseline: B is battered down to 4 HP.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 4),
+    );
+    // B long-rests back to full.
+    let seq_after_rest = append_and_seq(
+        &mut session,
+        b_id,
+        "LONG_REST_APPLIED",
+        serde_json::json!({
+            "target_id": b_id.to_string(),
+            "hp_restored_to_max": 30,
+            "hp_remaining": 30,
+        }),
+    );
+    // Then takes another hit — the one the X-card rewinds away.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 3),
+    );
+
+    // Live state drifted to the post-attack HP before the rewind.
+    session.entities.get_mut(&b_id).unwrap().current_hp = 3;
+
+    session.safety_rewind(seq_after_rest);
+
+    let b = &session.entities[&b_id];
+    assert_eq!(
+        b.current_hp, 30,
+        "rewind landing between a long rest and a later attack must restore post-rest HP"
+    );
+    assert!(b.is_conscious);
+    assert!(!b.is_dead);
+}
+
+#[test]
+fn test_safety_rewind_after_heal_of_dying_entity_does_not_resurrect_stale_failures() {
+    let mut session = session_with_pair();
+    let victim = *session.entities.keys().next().unwrap();
+    knock_down(&mut session, victim);
+
+    // Dying at failures = 2, then saved by a heal that clears the tally.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        victim,
+        "DEATH_SAVE_RESOLVED",
+        serde_json::json!({
+            "outcome": "PENDING", "natural_roll": 5,
+            "successes": 0, "failures": 2,
+            "is_stabilized": false, "is_dead": false,
+        }),
+    );
+    let seq_after_heal = append_and_seq(
+        &mut session,
+        victim,
+        "HEALED",
+        serde_json::json!({
+            "target_id": victim.to_string(),
+            "amount": 10,
+            "hp_remaining": 10,
+        }),
+    );
+    // One more surviving-later event for the rewind to revert: a fresh
+    // (post-heal) failed save recorded against the healed target's ally.
+    let other = *session.entities.keys().find(|k| **k != victim).unwrap();
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        other,
+        "ATTACK_RESOLVED",
+        attack_event(other, 15),
+    );
+
+    // Live state drifted: still carrying the stale pre-heal tally.
+    let e = session.entities.get_mut(&victim).unwrap();
+    e.death_saves = vtt_core::types::DeathSaveState {
+        successes: 0,
+        failures: 2,
+        is_stabilized: false,
+        is_dead: false,
+    };
+
+    session.safety_rewind(seq_after_heal);
+
+    let restored = &session.entities[&victim];
+    assert_eq!(restored.current_hp, 10);
+    assert!(
+        restored.death_saves.failures == 0
+            && !restored.death_saves.is_stabilized,
+        "a heal replayed by the rewind must clear stale death-save tallies, got {:?}",
+        restored.death_saves
+    );
+}
+
+#[test]
+fn test_safety_rewind_between_heal_and_later_wound_restores_post_heal_hp() {
+    let mut session = session_with_pair();
+    let (a_id, b_id): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    // Baseline damage, then a heal on top of it.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 12),
+    );
+    let seq_after_heal = append_and_seq(
+        &mut session,
+        b_id,
+        "HEALED",
+        serde_json::json!({
+            "target_id": b_id.to_string(),
+            "amount": 8,
+            "hp_remaining": 20,
+        }),
+    );
+    // A later wound the rewind will discard.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 5),
+    );
+
+    session.entities.get_mut(&b_id).unwrap().current_hp = 5;
+
+    session.safety_rewind(seq_after_heal);
+
+    assert_eq!(
+        session.entities[&b_id].current_hp, 20,
+        "rewind landing between a heal and a later wound must keep the post-heal total"
+    );
+}
+
+#[test]
+fn test_safety_rewind_ignores_surviving_short_rest_event() {
+    let mut session = session_with_pair();
+    let (a_id, b_id): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    // Baseline damage; then a short rest (mechanically a no-op today); then
+    // another wound the rewind discards.
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 12),
+    );
+    let seq_after_short_rest = append_and_seq(
+        &mut session,
+        uuid::Uuid::nil(),
+        "SHORT_REST_APPLIED",
+        serde_json::json!({"triggered_by": "tester"}),
+    );
+    session.ledger.append_event(
+        session.session_id,
+        session.campaign_id,
+        a_id,
+        "ATTACK_RESOLVED",
+        attack_event(b_id, 2),
+    );
+
+    session.entities.get_mut(&b_id).unwrap().current_hp = 2;
+
+    let report = session.safety_rewind(seq_after_short_rest);
+
+    assert_eq!(report.reverted_event_count, 1);
+    assert_eq!(
+        session.entities[&b_id].current_hp, 12,
+        "a surviving short-rest event must not alter replayed HP in either direction"
+    );
+    assert!(session.entities[&b_id].is_conscious);
+}
+
 // ---------------------------------------------------------------------------
 // Fail-forward resolution engine (GOALS.md Pillar 8): non-binary skill-check
 // success margins M = Roll − DC.

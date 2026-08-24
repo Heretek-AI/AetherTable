@@ -741,12 +741,43 @@ impl GameSession {
                 // HEALED carries absolute hp_remaining like DAMAGE_APPLIED, so
                 // replays landing between a heal and a later wound keep the
                 // post-heal total instead of regressing to the last damage.
+                // Regaining hit points also wipes accumulated death-save
+                // tallies (SRD, mirrored from reset_death_saves_if_healed on
+                // the live heal endpoint): recording a cleared baseline here
+                // means an earlier surviving DEATH_SAVE_RESOLVED (e.g. a dying
+                // entity saved at failures = 2) no longer overrides the heal,
+                // and live-drifted tallies are reset too. A save resolved
+                // AFTER the heal re-inserts its tally and still wins.
                 "HEALED" => {
                     let tid = ev.payload.get("target_id").and_then(|v| v.as_str());
                     let hp = ev.payload.get("hp_remaining").and_then(|v| v.as_i64());
                     if let (Some(tid), Some(hp)) = (tid, hp) {
                         if let Ok(tid) = Uuid::parse_str(tid) {
-                            hp_state.insert(tid, (hp as i32, hp > 0, false));
+                            let hp = hp as i32;
+                            hp_state.insert(tid, (hp, hp > 0, false));
+                            if hp > 0 {
+                                death_save_state.insert(tid, DeathSaveState::default());
+                            }
+                        }
+                    }
+                }
+                // LONG_REST_APPLIED restores HP exactly like HEALED (absolute
+                // hp_remaining, conscious unless dead) and by SRD design also
+                // wipes death-save tallies — same cleanup.
+                // SHORT_REST_APPLIED is intentionally NOT handled: it is a
+                // mechanical no-op today (hit-dice spending is a future hook),
+                // so a surviving short-rest event must change nothing during
+                // replay; it falls through to the catch-all arm.
+                "LONG_REST_APPLIED" => {
+                    let tid = ev.payload.get("target_id").and_then(|v| v.as_str());
+                    let hp = ev.payload.get("hp_remaining").and_then(|v| v.as_i64());
+                    if let (Some(tid), Some(hp)) = (tid, hp) {
+                        if let Ok(tid) = Uuid::parse_str(tid) {
+                            let hp = hp as i32;
+                            hp_state.insert(tid, (hp, hp > 0, false));
+                            if hp > 0 {
+                                death_save_state.insert(tid, DeathSaveState::default());
+                            }
                         }
                     }
                 }
