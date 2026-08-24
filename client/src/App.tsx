@@ -2,6 +2,11 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, laz
 // Eager: only what first paint needs — landing page (default route), navbar,
 // and the Cmd+K palette. Everything else is code-split below.
 import { Navbar, SaaSView } from './components/Navbar';
+import {
+  applyAtmosphereToDocument,
+  loadStoredAtmosphereId,
+  storeAtmosphereId,
+} from './theme/atmospheres';
 import { LandingPageView } from './components/LandingPageView';
 import { CommandPalette } from './components/CommandPalette';
 
@@ -106,6 +111,21 @@ export function App() {
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
+  // Dynamic Thematic Atmosphere (GOALS.md Pillar 2). Initialized from this
+  // browser's localStorage and applied to :root via a style element below.
+  //
+  // SYNC LIMITATION (honest): this selection is LOCAL-ONLY. There is no Yjs /
+  // network channel carrying it, so a player client does not receive the
+  // host's choice — every client applies whatever its own storage holds.
+  // Selection UI in the Navbar is GM-gated; non-GMs see the locally applied
+  // atmosphere read-only until atmosphere state moves through the CRDT relay.
+  const [atmosphereId, setAtmosphereId] = useState<string>(() => loadStoredAtmosphereId());
+
+  useEffect(() => {
+    applyAtmosphereToDocument(atmosphereId);
+    storeAtmosphereId(atmosphereId);
+    return () => applyAtmosphereToDocument('default');
+  }, [atmosphereId]);
   const [activePing, setActivePing] = useState<{ x: number; y: number } | null>(null);
   const [activePeerTyping, setActivePeerTyping] = useState<string | null>(null);
 
@@ -1151,6 +1171,9 @@ export function App() {
         onOpenSafety={() => setIsSafetyOpen(true)}
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         onOpenJukebox={() => setIsJukeboxOpen(true)}
+        activeAtmosphereId={atmosphereId}
+        onSelectAtmosphere={setAtmosphereId}
+        canManageAtmosphere={userRole === 'gm'}
                 onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
         onOpenMapEditor={guardGmSurface('the Map & Hidden-Info Layer editor', () => setIsMapEditorOpen(true))}

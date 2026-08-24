@@ -34,9 +34,17 @@ import {
   Tv,
   Zap,
   Save,
+  Moon,
+  Castle,
+  Eye,
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { User, DEMO_ACCOUNTS } from '../types/auth';
+import {
+  ATMOSPHERE_PRESETS,
+  AtmospherePreset,
+  DEFAULT_ATMOSPHERE_ID,
+} from '../theme/atmospheres';
 
 export type SaaSView = 'landing' | 'tabletop' | 'compendium' | 'builder' | 'encounters' | 'marketplace' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics' | 'admin';
 
@@ -46,6 +54,12 @@ interface NavbarProps {
   onOpenSafety: () => void;
   onOpenAudioMixer?: () => void;
   onOpenJukebox?: () => void;
+  /** Active Dynamic Thematic Atmosphere id ('default' = stock palette). */
+  activeAtmosphereId?: string;
+  /** GM-only: applies a preset to :root + persists it (see theme/atmospheres.ts). */
+  onSelectAtmosphere?: (id: string) => void;
+  /** False for players/spectators: they see the selection read-only. */
+  canManageAtmosphere?: boolean;
   onOpenCommandPalette?: () => void;
   onOpenMapEditor?: () => void;
   onOpenHandouts?: () => void;
@@ -68,6 +82,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSafety,
   onOpenAudioMixer,
   onOpenJukebox,
+  activeAtmosphereId,
+  onSelectAtmosphere,
+  canManageAtmosphere,
   onOpenCommandPalette,
   onOpenMapEditor,
   onOpenHandouts,
@@ -467,6 +484,74 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </button>
               )}
 
+              {/* ── Dynamic Thematic Atmosphere (GOALS.md Pillar 2) ─────────
+                  Selecting a preset overrides the semantic palette tokens on
+                  :root via a style element (theme/atmospheres.ts) and persists
+                  to localStorage.
+                  LIMITATION, stated honestly: atmosphere state lives in local
+                  React state + this browser's storage only — there is no sync
+                  channel, so non-GM clients do NOT receive the host's choice;
+                  they see their own locally-applied selection read-only here. */}
+              {onSelectAtmosphere && (
+                <div className="pt-1 mt-1 border-t border-[var(--tavern-border)]">
+                  <div className="flex items-center gap-1.5 px-2 py-1 text-[9px] uppercase tracking-wider font-bold text-[var(--rp-parchment-300)]">
+                    <Moon className="w-3 h-3 text-[var(--encounter-token-ring)]" />
+                    Table Atmosphere
+                    {!canManageAtmosphere && (
+                      <span className="ml-auto normal-case tracking-normal text-[8px] text-[var(--rp-parchment-300)]/70">
+                        GM-controlled
+                      </span>
+                    )}
+                  </div>
+
+                  {[
+                    ...(canManageAtmosphere
+                      ? [{ id: DEFAULT_ATMOSPHERE_ID, name: 'Default Obsidian', description: 'Stock tavern & parchment palette' } as Pick<AtmospherePreset, 'id' | 'name' | 'description'>]
+                      : []),
+                    ...ATMOSPHERE_PRESETS,
+                  ].map((preset) => {
+                    const isActive = activeAtmosphereId === preset.id;
+                    const PresetIcon = ATMOSPHERE_ICONS[preset.id];
+                    return (
+                      <button
+                        key={preset.id}
+                        onClick={() => {
+                          if (!canManageAtmosphere) return;
+                          onSelectAtmosphere(preset.id);
+                          setActiveDropdown(null);
+                        }}
+                        disabled={!canManageAtmosphere && !isActive}
+                        title={
+                          canManageAtmosphere
+                            ? `Apply ${preset.name}`
+                            : `${preset.name} — only the GM can change the table atmosphere`
+                        }
+                        className={`w-full flex items-center space-x-2.5 p-2 rounded-lg text-left transition ${
+                          isActive
+                            ? 'bg-amber-950/60 text-amber-300'
+                            : canManageAtmosphere
+                              ? 'hover:bg-[var(--rp-leather-700)] text-[var(--rp-parchment-200)] cursor-pointer'
+                              : 'text-[var(--rp-parchment-300)] opacity-70 cursor-default'
+                        }`}
+                      >
+                        {PresetIcon ? (
+                          <PresetIcon className="w-4 h-4 shrink-0 text-[var(--encounter-token-ring)]" />
+                        ) : (
+                          <Moon className="w-4 h-4 shrink-0 text-[var(--rp-parchment-300)]" />
+                        )}
+                        <div className="min-w-0">
+                          <div className="font-bold">{preset.name}</div>
+                          <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans truncate">
+                            {preset.description}
+                          </div>
+                        </div>
+                        {isActive && <CheckCircle2 className="w-3.5 h-3.5 ml-auto shrink-0 text-emerald-400" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               {onOpenMapEditor && (
                 <button
                   onClick={() => {
@@ -693,6 +778,13 @@ export const Navbar: React.FC<NavbarProps> = ({
       </div>
     </header>
   );
+};
+
+// Per-preset glyph for the Atmosphere picker; unknown ids fall back to Moon.
+const ATMOSPHERE_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
+  'gothic-horror': Castle,
+  'high-fantasy': Sparkles,
+  'eldritch-mystery': Eye,
 };
 
 // Helper icon component for pen/layer tool

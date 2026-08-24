@@ -57,6 +57,12 @@
   --state-danger: var(--rp-crimson-600);
   --state-success: var(--rp-forest-600);
 
+  /* Encounter styling defaults — retinted per theme by theme/atmospheres.ts
+     (Dynamic Thematic Atmosphere). Components may consume these directly; the
+     stock values mirror the obsidian/amber palette below. */
+  --encounter-token-ring: var(--tavern-accent);
+  --encounter-crit-flash: var(--rp-crimson-400);
+
   /* Statblock (official-5e-book) semantics */
   --statblock-header: var(--rp-crimson-600);
   --statblock-rule: color-mix(in srgb, var(--rp-crimson-650) 55%, transparent);
