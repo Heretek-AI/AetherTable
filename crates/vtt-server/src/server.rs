@@ -19,8 +19,10 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use vtt_core::{
@@ -174,11 +176,20 @@ struct PeerConnection {
     role: Role,
 }
 
+/// Per-peer CursorAwareness fan-out cap, frames per sliding minute
+/// (relay-audit ingress flood). Chosen to sit far above legitimate pointer-
+/// update rates (~2/s) while capping the fan-out multiplier a single peer can
+/// impose on a full room.
+const CURSOR_FRAMES_PER_MINUTE: u32 = 120;
+const CURSOR_WINDOW: Duration = Duration::from_secs(60);
+
 /// Live WebSocket peer registry per room. The CrdtRelayHub merges state
 /// (LWW arbitration); this struct handles the fan-out to connected clients.
 pub struct PeerRegistry {
     rooms: DashMap<String, DashMap<u64, PeerConnection>>,
     next_peer_id: AtomicU64,
+    /// Sliding-window hit log per peer id for cursor-frame admission.
+    cursor_hits: DashMap<u64, VecDeque<Instant>>,
 }
 
 impl PeerRegistry {
@@ -186,6 +197,7 @@ impl PeerRegistry {
         Self {
             rooms: DashMap::new(),
             next_peer_id: AtomicU64::new(1),
+            cursor_hits: DashMap::new(),
         }
     }
 
@@ -208,6 +220,28 @@ impl PeerRegistry {
         if let Some(peers) = self.rooms.get(room_id) {
             peers.remove(&peer_id);
         }
+        self.cursor_hits.remove(&peer_id);
+    }
+
+    /// Admits at most [`CURSOR_FRAMES_PER_MINUTE`] frames per peer id over the
+    /// last [`CURSOR_WINDOW`] sliding window; `false` means the caller drops
+    /// the frame silently. Keyed by the server-assigned peer id — never by
+    /// anything client-supplied.
+    fn admit_cursor_frame(&self, peer_id: u64) -> bool {
+        let now = Instant::now();
+        let mut entry = self.cursor_hits.entry(peer_id).or_default();
+        while let Some(front) = entry.front() {
+            if now.duration_since(*front) >= CURSOR_WINDOW {
+                entry.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.len() >= CURSOR_FRAMES_PER_MINUTE as usize {
+            return false;
+        }
+        entry.push_back(now);
+        true
     }
 
     /// Fan `text` out to every peer in the room except `except_peer` whose
@@ -2697,6 +2731,39 @@ fn token_is_hidden(data: &AppState, room_id: &str, token_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this SENDER may drive the token identified by display name — the
+/// relay-path counterpart of the ownership gate on HTTP `POST /move`
+/// (`may_control_entity`): GMs control everything; players control only the
+/// entities bound to their own user id; unowned entities are DM-controlled
+/// and usable by any non-spectator until claimed.
+///
+/// Tokens whose entity cannot be resolved (free rooms like the lobby,
+/// unregistered names) are treated as UNOWNED — the same fail-open default as
+/// movement validation and hiddenness, so we never invent a restriction the
+/// data cannot back. Spectators are rejected before that fallback applies.
+fn may_control_token(
+    data: &AppState,
+    room_id: &str,
+    token_name: &str,
+    role: Role,
+    user_id: &str,
+) -> bool {
+    if role == Role::Spectator {
+        return false;
+    }
+    let entity_owner = Uuid::parse_str(room_id)
+        .ok()
+        .and_then(|id| data.sessions.get(&id))
+        .and_then(|lock| {
+            lock.read()
+                .entities
+                .values()
+                .find(|e| e.name.eq_ignore_ascii_case(token_name))
+                .and_then(|e| e.owner_player_id.clone())
+        });
+    may_control_entity(entity_owner.as_ref(), role, user_id)
+}
+
 /// Recomputes the party-merged fog view for SPECTATOR peers from the layers
 /// currently retained in the relay hub (relay-audit structural limit #1).
 ///
@@ -2969,19 +3036,45 @@ async fn ws_sync(
                                         "Dropped TokenUpdate from spectator {}",
                                         identity.user_id
                                     );
+                                // Ownership gate mirrors HTTP `POST /move`
+                                // (`ENTITY_NOT_OWNED`): a player may move only
+                                // tokens bound to their own user id; GMs move
+                                // everything. Rejected moves are retained in
+                                // NO CRDT state and fanned out to NOBODY.
+                                } else if !payload_token_name(&value)
+                                    .map(|name| {
+                                        may_control_token(
+                                            &app_state,
+                                            &rid,
+                                            name,
+                                            role,
+                                            &identity.user_id,
+                                        )
+                                    })
+                                    .unwrap_or(false)
+                                {
+                                    log::warn!(
+                                        "Dropped TokenUpdate from {} over a token they do not control",
+                                        identity.user_id
+                                    );
                                 // Validate movement, then relay only updates that win LWW arbitration.
                                 } else if accept_token_update(&app_state, &hub, &rid, &value) {
-                                    // Delivery RBAC: hidden entities never fan
-                                    // out to spectators. The frame carries no
-                                    // visibility field, so hiddenness is read
-                                    // from the authoritative session state.
+                                    // Delivery RBAC: hidden-token transforms go
+                                    // to GM peers ONLY. This matches the initial
+                                    // snapshot policy — non-GM snapshots never
+                                    // contain hidden entities, so delivering
+                                    // their live deltas to players/spectators
+                                    // would leak both existence and movement of
+                                    // what they cannot see. Hiddenness is read
+                                    // from the authoritative session state (the
+                                    // frame carries no visibility field).
                                     let hidden = payload_token_name(&value)
                                         .map(|name| token_is_hidden(&app_state, &rid, name))
                                         .unwrap_or(false);
                                     if hidden {
                                         peers
                                             .broadcast_if(&rid, peer_id, &text, |peer| {
-                                                peer.role != Role::Spectator
+                                                peer.role.is_gm()
                                             })
                                             .await;
                                     } else {
@@ -3064,19 +3157,32 @@ async fn ws_sync(
                                 }
                             }
                             Some("CursorAwareness") => {
-                                // Stamp server-verified identity onto the
-                                // cursor so clients cannot impersonate peers.
-                                if let Some(payload) =
-                                    value.get_mut("payload").and_then(|p| p.as_object_mut())
-                                {
-                                    payload.insert(
-                                        "clientId".to_string(),
-                                        serde_json::json!(fnv1a_hash(&identity.user_id)),
+                                // Ingress flood cap (relay audit): cursors are
+                                // high-frequency by design, so a misbehaving
+                                // peer must not multiply its traffic across
+                                // every room member. Over-cap frames are
+                                // dropped SILENTLY before any fan-out — no
+                                // error frame, no disconnect.
+                                if peers.admit_cursor_frame(peer_id) {
+                                    // Stamp server-verified identity onto the
+                                    // cursor so clients cannot impersonate peers.
+                                    if let Some(payload) =
+                                        value.get_mut("payload").and_then(|p| p.as_object_mut())
+                                    {
+                                        payload.insert(
+                                            "clientId".to_string(),
+                                            serde_json::json!(fnv1a_hash(&identity.user_id)),
+                                        );
+                                    }
+                                    peers
+                                        .broadcast(&rid, peer_id, &value.to_string())
+                                        .await;
+                                } else {
+                                    log::debug!(
+                                        "Dropped over-cap CursorAwareness frame from peer {}",
+                                        peer_id
                                     );
                                 }
-                                peers
-                                    .broadcast(&rid, peer_id, &value.to_string())
-                                    .await;
                             }
                             Some("Heartbeat") => {
                                 let _ = session.text(text.clone()).await;

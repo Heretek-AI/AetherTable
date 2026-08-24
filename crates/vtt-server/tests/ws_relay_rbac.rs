@@ -4,10 +4,15 @@
 //! rendering, not the wire": CrdtRelayHub + PeerRegistry fan every accepted
 //! frame out to EVERY connected peer regardless of role. These tests pin the
 //! relay-level contract:
-//! - hidden entities (`is_visible == false`) never reach spectator peers,
-//!   while GM and player peers keep receiving their transforms;
+//! - hidden entities (`is_visible == false`) reach GM peers ONLY on live
+//!   deltas, matching the initial-snapshot policy that hides them from every
+//!   non-GM role (snapshot/delta hidden-policy alignment);
 //! - spectators cannot inject token moves (mirrors FORBIDDEN_ROLE on every
-//!   mutating HTTP route);
+//!   mutating HTTP route), and neither can a player moving someone else's
+//!   token — ownership is resolved by display name against session state,
+//!   mirroring `may_control_entity` on HTTP `POST /move`;
+//! - per-peer CursorAwareness frames are capped (~120/min, sliding minute);
+//!   over-cap frames are silently dropped;
 //! - spectators receive ONE party-merged fog layer (`party-explored`) whose
 //!   polygons are the union of every layer retained in the relay hub — never
 //!   the individual per-user layers themselves (relay-audit structural limit
@@ -214,9 +219,52 @@ fn token_update(token_name: &str, x: f64, y: f64) -> serde_json::Value {
     })
 }
 
-/// Creates a session and spawns one HIDDEN entity ("Orc") plus one visible
-/// one ("Hero"), returning the session id.
-async fn seed_hidden_and_visible_entities(
+fn cursor_frame(x: f64, y: f64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "CursorAwareness",
+        "payload": {"x": x, "y": y}
+    })
+}
+
+/// A minimal valid EntityState wire shape for the relay tests.
+fn entity_json(id: Uuid, name: &str, visible: bool, owner: Option<&str>) -> serde_json::Value {
+    let mut entity = serde_json::json!({
+        "id": id,
+        "compendium_id": format!("test_{}", name),
+        "name": name,
+        "is_player": false,
+        "current_hp": 20,
+        "max_hp": 20,
+        "temp_hp": 0,
+        "ac": 12,
+        "speed_feet": 30.0,
+        "position": [2.5, 2.5, 0.0],
+        "zone_id": "Zone_Default",
+        "abilities": {
+            "strength": 14, "dexterity": 12, "constitution": 12,
+            "intelligence": 10, "wisdom": 10, "charisma": 10
+        },
+        "conditions": [],
+        "action_budget": {
+            "action": true, "bonus_action": true, "reaction": true,
+            "movement_remaining_feet": 30.0, "free_object_interaction": true
+        },
+        "spell_slots_remaining": {},
+        "attacks": [{"name": "Club", "attack_bonus": 3,
+                     "damage_expression": "1d6", "damage_type": "bludgeoning"}],
+        "resistances": [], "vulnerabilities": [], "immunities": [],
+        "inventory": {"items": {}},
+        "is_conscious": true, "is_dead": false,
+        "is_visible": visible
+    });
+    if let Some(owner) = owner {
+        entity["owner_player_id"] = serde_json::json!(owner);
+    }
+    entity
+}
+
+/// Creates one empty session as the GM, returning its id.
+async fn create_session(
     app: &impl Service<
         actix_http::Request,
         Response = actix_web::dev::ServiceResponse<
@@ -226,67 +274,69 @@ async fn seed_hidden_and_visible_entities(
     >,
 ) -> Uuid {
     let gm = format!("Bearer {}", sign_token_with_role("gm-1", "gm"));
-
     let req = test::TestRequest::post()
         .uri("/api/v1/sessions")
-        .insert_header(("Authorization", gm.clone()))
+        .insert_header(("Authorization", gm))
         .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Relay RBAC"}))
         .to_request();
     let res = test::call_service(app, req).await;
     assert_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = test::read_body_json(res).await;
-    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+    body["session_id"].as_str().unwrap().parse().unwrap()
+}
 
-    for (id, name, visible) in [
-        (Uuid::new_v4(), "Orc", false),
-        (Uuid::new_v4(), "Hero", true),
-    ] {
-        let entity = serde_json::json!({
-            "id": id,
-            "compendium_id": format!("test_{}", name),
-            "name": name,
-            "is_player": name == "Hero",
-            "current_hp": 20,
-            "max_hp": 20,
-            "temp_hp": 0,
-            "ac": 12,
-            "speed_feet": 30.0,
-            "position": [2.5, 2.5, 0.0],
-            "zone_id": "Zone_Default",
-            "abilities": {
-                "strength": 14, "dexterity": 12, "constitution": 12,
-                "intelligence": 10, "wisdom": 10, "charisma": 10
-            },
-            "conditions": [],
-            "action_budget": {
-                "action": true, "bonus_action": true, "reaction": true,
-                "movement_remaining_feet": 30.0, "free_object_interaction": true
-            },
-            "spell_slots_remaining": {},
-            "attacks": [{"name": "Club", "attack_bonus": 3,
-                         "damage_expression": "1d6", "damage_type": "bludgeoning"}],
-            "resistances": [], "vulnerabilities": [], "immunities": [],
-            "inventory": {"items": {}},
-            "is_conscious": true, "is_dead": false,
-            "is_visible": visible
-        });
-        let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
-            .insert_header(("Authorization", gm.clone()))
-            .set_json(entity)
-            .to_request();
-        let res = test::call_service(app, req).await;
-        assert_eq!(res.status(), StatusCode::OK, "spawn of {}", name);
-    }
+/// Spawns one entity into the session as the GM.
+async fn spawn_entity(
+    app: &impl Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<
+            actix_web::body::EitherBody<actix_web::body::BoxBody>,
+        >,
+        Error = actix_web::Error,
+    >,
+    session_id: Uuid,
+    entity: serde_json::Value,
+) {
+    let name = entity["name"].as_str().unwrap_or("?").to_string();
+    let gm = format!("Bearer {}", sign_token_with_role("gm-1", "gm"));
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(("Authorization", gm))
+        .set_json(entity)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "spawn of {}", name);
+}
+
+/// Creates a session and spawns one HIDDEN entity ("Orc") plus one visible
+/// one ("Hero"), both unowned, returning the session id.
+async fn seed_hidden_and_visible_entities(
+    app: &impl Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<
+            actix_web::body::EitherBody<actix_web::body::BoxBody>,
+        >,
+        Error = actix_web::Error,
+    >,
+) -> Uuid {
+    let session_id = create_session(app).await;
+    spawn_entity(app, session_id, entity_json(Uuid::new_v4(), "Orc", false, None)).await;
+    spawn_entity(app, session_id, entity_json(Uuid::new_v4(), "Hero", true, None)).await;
     session_id
 }
 
+/// Hidden-policy alignment (relay audit MED): the initial snapshot hides
+/// hidden entities from every non-GM role, so live deltas must match — a
+/// hidden token's transform reaches GM peers ONLY. Players used to receive
+/// hidden-token movement deltas even though their snapshot never contained
+/// the token; that inconsistency is what this test pins shut.
 #[actix_web::test]
-async fn hidden_token_transform_never_reaches_spectator_but_reaches_player() {
+async fn hidden_token_transform_reaches_gm_peers_only() {
     let (app, table) = start_table().await;
     let session_id = seed_hidden_and_visible_entities(&app).await;
 
     let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut gm2 = connect_ws(&table, session_id, &sign_token_with_role("gm-2", "gm")).await;
     let mut player =
         connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
     let mut spectator =
@@ -295,10 +345,17 @@ async fn hidden_token_transform_never_reaches_spectator_but_reaches_player() {
     // GM moves the HIDDEN orc.
     send_json(&mut gm, token_update("Orc", 5.0, 5.0)).await;
 
-    let player_frame = next_delta_frame(&mut player, 1500).await;
+    let other_gm_frame = next_delta_frame(&mut gm2, 1500).await;
     assert!(
-        player_frame.as_deref().map(|f| f.contains("Orc")).unwrap_or(false),
-        "player peer must receive hidden-token transforms, got {:?}",
+        other_gm_frame.as_deref().map(|f| f.contains("Orc")).unwrap_or(false),
+        "GM peers must still receive hidden-token transforms, got {:?}",
+        other_gm_frame
+    );
+
+    let player_frame = next_delta_frame(&mut player, 400).await;
+    assert!(
+        player_frame.is_none(),
+        "player peers must NOT receive hidden-token transforms (snapshot parity), got {:?}",
         player_frame
     );
 
@@ -307,6 +364,111 @@ async fn hidden_token_transform_never_reaches_spectator_but_reaches_player() {
         spectator_frame.is_none(),
         "spectator peer must NOT receive hidden-token transforms, got {:?}",
         spectator_frame
+    );
+}
+
+// --- TokenUpdate ownership gate ------------------------------------------------
+//
+// Relay audit HIGH: the relay arm gated only spectators, so any PLAYER could
+// move ANY token (including GM-owned NPCs) over the WebSocket, while the HTTP
+// /move route correctly enforces `may_control_entity`. The fix resolves the
+// token's entity by display name against session state and accepts/relays a
+// transform only when the sender is a GM, owns that entity, or the entity is
+// unowned. Rejected moves fan out to NOBODY.
+
+#[actix_web::test]
+async fn player_cannot_move_gm_owned_npc_but_moves_own_token() {
+    let (app, table) = start_table().await;
+    let session_id = create_session(&app).await;
+    spawn_entity(
+        &app,
+        session_id,
+        entity_json(Uuid::new_v4(), "Goblin", true, Some("gm-1")),
+    )
+    .await;
+    spawn_entity(
+        &app,
+        session_id,
+        entity_json(Uuid::new_v4(), "Hero", true, Some("player-a")),
+    )
+    .await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    // A second, uninvolved player observes fan-out: the hijacked move must not
+    // reach ANYONE, not just the rightful owner.
+    let mut other_player =
+        connect_ws(&table, session_id, &sign_token_with_role("player-b", "player")).await;
+    let mut owner =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+
+    // Player A tries to move the GM-owned goblin.
+    send_json(&mut owner, token_update("Goblin", 9.0, 9.0)).await;
+
+    let gm_frame = next_delta_frame(&mut gm, 400).await;
+    assert!(
+        gm_frame.is_none(),
+        "hijacked move of a GM-owned NPC must not reach the GM, got {:?}",
+        gm_frame
+    );
+    let bystander_frame = next_delta_frame(&mut other_player, 400).await;
+    assert!(
+        bystander_frame.is_none(),
+        "rejected moves must fan out to nobody, got {:?}",
+        bystander_frame
+    );
+
+    // The same player moving their OWN token still works end to end.
+    send_json(&mut owner, token_update("Hero", 6.0, 6.0)).await;
+    let own_move = next_delta_frame(&mut gm, 1500).await;
+    assert!(
+        own_move.as_deref().map(|f| f.contains("Hero")).unwrap_or(false),
+        "a player's move of their own token must be accepted and relayed, got {:?}",
+        own_move
+    );
+    let bystander_echo = next_delta_frame(&mut other_player, 1500).await;
+    assert!(
+        bystander_echo.as_deref().map(|f| f.contains("Hero")).unwrap_or(false),
+        "legitimate moves still reach other players, got {:?}",
+        bystander_echo
+    );
+}
+
+// --- CursorAwareness ingress flood cap ------------------------------------------
+
+/// Relay audit: any peer could fan arbitrary cursor frames room-wide. The cap
+/// is per peer id over a sliding minute; over-cap frames are silently dropped.
+#[actix_web::test]
+async fn cursor_flood_beyond_per_peer_cap_is_not_fanned_out() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut observer =
+        connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut flooder =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+
+    for i in 0..200u32 {
+        send_json(&mut flooder, cursor_frame(f64::from(i), 0.0)).await;
+    }
+
+    // Count the cursor frames actually fanned out to the observer until the
+    // wire goes quiet.
+    let mut received = 0usize;
+    while let Some(frame) = next_delta_frame(&mut observer, 800).await {
+        if frame.contains("CursorAwareness") {
+            received += 1;
+        }
+    }
+
+    assert!(
+        received > 0,
+        "cursor frames under the cap must still fan out"
+    );
+    assert!(
+        received <= 120,
+        "per-peer cursor cap (~120/min) must drop later frames in a 200-frame burst; \
+         fanned out {}",
+        received
     );
 }
 
