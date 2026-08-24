@@ -5,6 +5,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_URL="${ENGINE_API_URL:-http://localhost:8088}"
 ENGINE_PID=""
 
+# The engine fails closed without a shared HMAC secret. Pin one for local
+# benchmark runs so the engine and the Python signer agree (the Python
+# gateway/playtest fall back to this same dev default when unset).
+export AUTH_SECRET="${AUTH_SECRET:-aethertable-dev-secret}"
+
 cleanup() {
   if [ -n "$ENGINE_PID" ] && kill -0 "$ENGINE_PID" 2>/dev/null; then
     kill "$ENGINE_PID" 2>/dev/null || true
@@ -51,7 +56,9 @@ PYTHONPATH=python python3 -m pytest python/tests -q
 echo ""
 echo "[4/4] Running Headless Synthetic Multi-Agent Playtest Benchmark (LIVE)..."
 set +e
-PYTHONPATH=python python3 -c '
+# Quoted-delimiter heredoc: the Python below reaches the interpreter
+# byte-for-byte, so nested quotes of either kind are safe.
+PYTHONPATH=python python3 - <<'PYBENCH'
 from vtt_orchestrator.playtest.synthetic_playtest import SyntheticPlaytestRunner
 
 runner = SyntheticPlaytestRunner(num_turns=200)
@@ -71,11 +78,11 @@ if not report.get("engine_live"):
     print("Engine unreachable — metrics WITHHELD, never simulated.")
     raise SystemExit(1)
 
-print(f"Standard Actions Adjudicated: {report[\"standard_mechanical_requests\"]}")
-print(f"Accepted by Engine:           {report[\"standard_accepted_by_engine\"]}")
-print(f"Trust-Boundary Probes:        {report[\"trust_probes_rejected_by_engine\"]}/{report[\"trust_boundary_probes\"]} rejected")
-print(f"Audited Narrative Proposals:  {report[\"audited_narrative_proposals\"]}")
-print(f"Genuine Invariant Violations: {report[\"genuine_invariant_violations\"]}")
+print(f"Standard Actions Adjudicated: {report['standard_mechanical_requests']}")
+print(f"Accepted by Engine:           {report['standard_accepted_by_engine']}")
+print(f"Trust-Boundary Probes:        {report['trust_probes_rejected_by_engine']}/{report['trust_boundary_probes']} rejected")
+print(f"Audited Narrative Proposals:  {report['audited_narrative_proposals']}")
+print(f"Genuine Invariant Violations: {report['genuine_invariant_violations']}")
 print(f"Mechanical Compliance Rate (MCR): {mcr}% (Target >= 98.5%)")
 print(f"Hallucination & Continuity Index (HCI): {hci} (Target >= 0.95)")
 print(f"Auditor False-Positive Rate (AFPR): {afpr}% (Target <= 1.5%)")
@@ -85,7 +92,7 @@ if all(report["targets_met"].values()):
 else:
     print("Benchmark Status: TARGETS NOT MET")
     raise SystemExit(1)
-'
+PYBENCH
 BENCH_STATUS=$?
 set -e
 

@@ -168,6 +168,7 @@ class SyntheticPlaytestRunner:
 
         attacker_uuid = engine_client._coerce_uuid("pt-hero")
         target_uuid = engine_client._coerce_uuid("pt-dummy")
+        dummy_generation = 0
 
         for turn in range(self.num_turns):
             roll = random.random()
@@ -207,6 +208,19 @@ class SyntheticPlaytestRunner:
             )
             if accepted:
                 standard_accepted += 1
+
+            # A destroyed sparring partner is replaced so later turns measure
+            # action acceptance rather than the engine correctly refusing
+            # corpse attacks (TARGET_ALREADY_DEAD).
+            if engine_payload.get("target_is_dead") or int(
+                engine_payload.get("target_hp_remaining", 1)
+            ) <= 0:
+                dummy_generation += 1
+                target_uuid = engine_client._coerce_uuid(f"pt-dummy-{dummy_generation}")
+                _spawn_entity(
+                    session_id,
+                    _statblock(target_uuid, "Training Dummy", 500, 13, 2),
+                )
 
             # Audit a narrative draft grounded in the LIVE outcome.
             total_proposals += 1
