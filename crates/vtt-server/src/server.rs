@@ -24,7 +24,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use vtt_core::{
-    Ability, ActionResolver, Condition, DeathSaveState, DiceEngine, GameSession, RulesEvaluator,
+    Ability, ActionResolver, Condition, DiceEngine, GameSession, RulesEvaluator,
     SessionMap,
 };
 use vtt_crdt_sync::{CrdtRelayHub, CrdtSyncMessage, TokenTransform, VectorClock};
@@ -287,6 +287,10 @@ async fn create_session(
     req: web::Json<CreateSessionReq>,
     identity: AuthIdentity,
 ) -> impl Responder {
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, Uuid::nil(), role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot create sessions");
+    }
     let session_id = Uuid::new_v4();
     data.session_owners.insert(session_id, identity.user_id.clone());
     let mut session = GameSession::new(session_id, req.campaign_id, req.session_name.clone());
@@ -325,8 +329,29 @@ async fn restore_session(
     data: web::Data<AppState>,
     path: web::Path<Uuid>,
     body: web::Json<GameSession>,
+    identity: AuthIdentity,
 ) -> impl Responder {
     let session_id = path.into_inner();
+    // Restoring overwrites a table wholesale — only a GM, the session's
+    // recorded owner, or the gateway's server-mediated durability principal
+    // (post-restart hydration) may do that.
+    let role = Role::from_identity(&identity);
+    let is_service_principal = identity.user_id == "orchestrator-service";
+    if !role.is_gm() && !is_service_principal {
+        let is_owner = data
+            .session_owners
+            .get(&session_id)
+            .map(|owner| *owner == identity.user_id)
+            .unwrap_or(false);
+        if !is_owner {
+            return reject(
+                &data,
+                403,
+                "FORBIDDEN_ROLE",
+                "only the session owner or a GM may restore this session",
+            );
+        }
+    }
     if body.session_id != session_id {
         return reject(
             &data,
@@ -337,6 +362,7 @@ async fn restore_session(
     }
     let entity_count = body.entities.len();
     let event_count = body.ledger.events.len();
+    data.session_owners.insert(session_id, identity.user_id.clone());
     data.sessions.insert(session_id, Arc::new(RwLock::new(body.into_inner())));
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -463,8 +489,16 @@ async fn set_session_map(
 
 /// Advances one full round via the core lifecycle engine: action budgets
 /// refresh AND condition clocks tick (countdowns, end-of-turn saves, expiries).
-async fn next_turn(data: web::Data<AppState>, path: web::Path<Uuid>) -> impl Responder {
+async fn next_turn(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    identity: AuthIdentity,
+) -> impl Responder {
     let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot advance the round");
+    }
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
         let campaign_id = session.campaign_id;
@@ -1189,31 +1223,36 @@ async fn resolve_death_save(
         if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
             return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
         }
-        let mut dice = DiceEngine::new();
-        let natural_roll = dice.roll_d20();
-        let campaign_id = session.campaign_id;
 
-        if !session.entities.contains_key(&req.entity_id) {
-            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in session");
+        let entity = match session.entities.get(&req.entity_id) {
+            Some(e) => e,
+            None => return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in session"),
+        };
+        // SRD: regaining hit points wipes the death-save ledger. A healed
+        // entity has no business rolling death saves, but clear any stale
+        // tally eagerly so it can never leak into a later drop.
+        if entity.current_hp > 0 {
+            if let Some(e) = session.entities.get_mut(&req.entity_id) {
+                e.reset_death_saves_if_healed();
+            }
+            return reject(
+                &data,
+                400,
+                "INVALID_STATE",
+                "entity has hit points and is not making death saves",
+            );
         }
 
-        // Reconstruct death-save counters from live HP rather than trusting
-        // client-supplied tallies.
-        let was_dead = session
-            .entities
-            .get(&req.entity_id)
-            .map(|e| e.is_dead)
-            .unwrap_or(false);
-        let mut state = DeathSaveState {
-            successes: 0,
-            failures: 0,
-            is_stabilized: false,
-            is_dead: was_dead,
-        };
+        let mut state = entity.death_saves;
+        let was_dead = entity.is_dead;
+        let campaign_id = session.campaign_id;
+        let mut dice = DiceEngine::new();
+        let natural_roll = dice.roll_d20();
         let outcome = ActionResolver::resolve_death_save(&mut state, natural_roll);
         data.count_valid();
-        if state.is_dead && !was_dead {
-            if let Some(entity) = session.entities.get_mut(&req.entity_id) {
+        if let Some(entity) = session.entities.get_mut(&req.entity_id) {
+            entity.death_saves = state;
+            if state.is_dead && !was_dead {
                 entity.is_dead = true;
             }
         }
@@ -1406,8 +1445,15 @@ async fn trigger_safety_rewind(
     data: web::Data<AppState>,
     path: web::Path<Uuid>,
     req: web::Json<SafetyXCardReq>,
+    identity: AuthIdentity,
 ) -> impl Responder {
     let session_id = path.into_inner();
+    // Safety tools are player-veto authority (Pillar 11): any authenticated
+    // non-spectator participant may raise an X-card.
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot trigger safety rewind");
+    }
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
 
@@ -1446,6 +1492,7 @@ async fn trigger_safety_rewind(
             "SAFETY_REWIND_APPLIED",
             serde_json::json!({
                 "triggered_by": req.player_id,
+                "raised_by_identity": identity.user_id,
                 "topic": req.topic,
                 "reverted_to_sequence": req.target_sequence_id,
                 "reverted_event_count": report.reverted_event_count,
@@ -1776,7 +1823,10 @@ pub async fn run() -> std::io::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8088);
 
-    let verifier = Arc::new(AuthVerifier::from_env());
+    let verifier = Arc::new(AuthVerifier::from_env().map_err(|e| {
+        log::error!("{e}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+    })?);
     log::info!("HMAC auth enabled (gateway-shared secret)");
 
     let mut app_state = AppState::new();
@@ -1846,22 +1896,29 @@ pub async fn run() -> std::io::Result<()> {
                         state2.persistence_failures.fetch_add(1, Ordering::Relaxed);
                         log::warn!("persistence: session upsert failed: {}", e);
                     }
-                    for (actor_id, event_type, payload, state_hash, seq, is_reverted) in batch {
-                        if let Err(e) = crate::persistence::insert_event(
-                            &pool, sid, campaign_id, actor_id, &event_type, payload,
-                            &state_hash, seq, is_reverted,
-                        )
-                        .await
-                        {
-                            failed = true;
-                            state2.persistence_failures.fetch_add(1, Ordering::Relaxed);
-                            log::warn!("persistence: event insert failed: {}", e);
-                            break;
+                    // Track the highest sequence that actually landed so a
+                    // mid-batch failure only retries the failed suffix next
+                    // tick. insert_event is idempotent (ON CONFLICT DO
+                    // NOTHING), so re-draining an already-flushed prefix is
+                    // harmless rather than a unique-index poison-pill.
+                    let mut last_flushed = last;
+                    if !failed {
+                        for (actor_id, event_type, payload, state_hash, seq, is_reverted) in &batch {
+                            if let Err(e) = crate::persistence::insert_event(
+                                &pool, sid, campaign_id, *actor_id, event_type, payload.clone(),
+                                state_hash, *seq, *is_reverted,
+                            )
+                            .await
+                            {
+                                state2.persistence_failures.fetch_add(1, Ordering::Relaxed);
+                                log::warn!("persistence: event insert failed: {}", e);
+                                break;
+                            }
+                            last_flushed = *seq;
                         }
                     }
-                    if !failed {
-                        let watermark = { lock.read().ledger.current_sequence };
-                        state2.flush_watermarks.insert(sid, watermark);
+                    if last_flushed > last {
+                        state2.flush_watermarks.insert(sid, last_flushed);
                     }
                 }
             }

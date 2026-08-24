@@ -717,3 +717,147 @@ async fn map_geometry_blocks_line_of_sight_attacks() {
         assert_eq!(body["error"], "NO_LINE_OF_SIGHT");
     }
 }
+
+// --- Privileged-route RBAC ----------------------------------------------------
+
+#[actix_web::test]
+async fn spectator_cannot_create_sessions_or_advance_rounds() {
+    let app = test_app().await;
+    let spec = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
+
+    // Session creation is privileged.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&spec))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Nope"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // A GM sets up a table; the spectator still cannot drive its rounds.
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Real"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/turn/next", sid))
+        .insert_header(bearer(&spec))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[actix_web::test]
+async fn restore_session_requires_owner_gm_or_service() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let other = sign_token_with_role("player-9", "player", TEST_SECRET);
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+
+    // GM creates (and therefore owns) a table.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Owned"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+
+    // Snapshot it.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", sid))
+        .insert_header(bearer(&gm))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let snapshot: serde_json::Value = test::read_body_json(res).await;
+
+    // A random player may not overwrite someone else's table…
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&other))
+        .set_json(snapshot.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // …nor an unowned session they just discovered the id of…
+    let fresh = Uuid::new_v4();
+    let mut stolen = snapshot.clone();
+    stolen["session_id"] = serde_json::json!(fresh.to_string());
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", fresh))
+        .insert_header(bearer(&other))
+        .set_json(stolen)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // The recorded owner may restore their own table.
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&gm))
+        .set_json(snapshot.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // And the gateway's mediated durability principal may hydrate any table.
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&service))
+        .set_json(snapshot)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn x_card_open_to_players_blocked_for_spectators() {
+    let app = test_app().await;
+    let gm = sign_token("gm-1", TEST_SECRET);
+    let spec = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
+    let player = sign_token_with_role("player-2", "player", TEST_SECRET);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Safe"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid = body["session_id"].as_str().unwrap().to_string();
+
+    let card = serde_json::json!({
+        "player_id": "player-2",
+        "topic": "spider imagery",
+        "target_sequence_id": 0
+    });
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", sid))
+        .insert_header(bearer(&spec))
+        .set_json(card.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Safety tools are player-veto authority: any non-spectator may raise one.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", sid))
+        .insert_header(bearer(&player))
+        .set_json(card)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
+}

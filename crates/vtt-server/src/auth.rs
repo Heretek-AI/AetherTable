@@ -36,18 +36,23 @@ pub struct AuthIdentity {
 }
 
 impl AuthVerifier {
-    pub fn from_env() -> Self {
+    /// Fails closed: without a shared secret every HMAC token would be
+    /// forgeable, so startup aborts instead of silently accepting tokens
+    /// signed with a hardcoded dev fallback.
+    pub fn from_env() -> anyhow::Result<Self> {
         let secret = std::env::var("VTT_ENGINE_SECRET")
             .or_else(|_| std::env::var("AUTH_SECRET"))
-            .unwrap_or_else(|_| {
-                log::warn!(
-                    "Neither VTT_ENGINE_SECRET nor AUTH_SECRET set — falling back to dev secret"
-                );
-                "aethertable-dev-secret".to_string()
-            });
-        Self {
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "refusing to start: set VTT_ENGINE_SECRET (or AUTH_SECRET) to the \
+                     gateway-shared HMAC secret"
+                )
+            })?;
+        Ok(Self {
             secret: Arc::new(secret),
-        }
+        })
     }
 
     /// Verifies signature + expiry of a gateway-signed token.
@@ -99,8 +104,10 @@ fn now_unix() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Extracts a bearer token from the Authorization header or ?token= query
-/// (browsers cannot set custom headers on WebSocket handshakes).
+/// Extracts a bearer token from the Authorization header, or from `?token=`
+/// on WebSocket handshakes only (browsers cannot set custom headers there).
+/// Query strings leak into access logs, so plain HTTP callers must use the
+/// header.
 pub fn extract_token(req: &ServiceRequest) -> Option<String> {
     if let Some(header) = req.headers().get(AUTHORIZATION) {
         if let Ok(value) = header.to_str() {
@@ -108,6 +115,9 @@ pub fn extract_token(req: &ServiceRequest) -> Option<String> {
                 return Some(token.trim().to_string());
             }
         }
+    }
+    if !req.path().starts_with("/ws/") {
+        return None;
     }
     for pair in req.query_string().split('&') {
         let mut parts = pair.splitn(2, '=');
