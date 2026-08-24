@@ -140,8 +140,13 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 76 | P3/6-wire | Spellbook casts real spells via engine slot pipeline; fabricated stats deleted | f921ecc | tsc ✓ |
 | 77 | data | Conservative spell-damage extraction: 73/352 enriched, warn-not-guess, deterministic CLI | 96676b4 | pytest ✓ |
 
+| 78 | A5-fix | Six findings: Help-promise burn, under-level casts, absurd-formula reject, GM-only monster spawns, honesty lows | 7271475 | all ✓ |
+| 79 | P8-fix | Quest engine parametrized: 3 theme tables, level scaling, length plans, coverage notes; 20 tests | e51bb2b | pytest ✓ |
+| 80 | P5-depth | Concordia social-dialogue phase in campaign sim with norms enforcement + stance shifts; 11 tests | 7a104a7 | pytest ✓ |
+
 ### Iteration-80 milestone gate
-(pending)
+(running)
+
 
 ### Iteration-50 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall 20/20, trust boundary held. Suite: 399 passed / 2 skipped.
