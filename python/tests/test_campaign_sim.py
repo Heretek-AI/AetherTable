@@ -30,12 +30,17 @@ import uuid as uuid_mod
 
 import httpx
 import pytest
+from types import SimpleNamespace
 
 from vtt_orchestrator.routing import engine_client, llm_client as llm_client_module
 from vtt_orchestrator.routing.engine_client import EngineRejectedError
 from vtt_orchestrator.routing.llm_client import LLMConfig, LLMStreamingGateway
 from vtt_orchestrator.server import app
-from vtt_orchestrator.simulation.campaign_sim import CampaignSimulation, CampaignSimPlayer
+from vtt_orchestrator.simulation.campaign_sim import (
+    CampaignSimulation,
+    CampaignSimPlayer,
+    scripted_decision,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +141,19 @@ class FakeEngine:
         return [c for c in self.calls if substring in c["path"]]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_rate_limiter_windows():
+    """The orchestrator's in-process rate limiter keeps 60s sliding windows in
+    module state; a full test file issues far more than the auth bucket's
+    30 requests/minute through the shared ASGI app. Reset the windows around
+    every test so order and suite size can never starve later sims of setup."""
+    from vtt_orchestrator import server as server_module
+
+    server_module._rate_windows.clear()
+    yield
+    server_module._rate_windows.clear()
+
+
 @pytest.fixture()
 def fake_engine(monkeypatch):
     """Replaces the engine transport AND clears ambient LLM credentials so a
@@ -159,6 +177,13 @@ def make_simulation(players=2, rounds=3, **kwargs):
 
 def run(players=2, rounds=3, **kwargs):
     return asyncio.run(make_simulation(players, rounds, **kwargs).run())
+
+
+def run_with_sim(players=2, rounds=3, **kwargs):
+    """Like ``run`` but also hands back the simulation instance so tests can
+    inspect its disposition engine directly."""
+    sim = make_simulation(players, rounds, **kwargs)
+    return sim, asyncio.run(sim.run())
 
 
 # ---------------------------------------------------------------------------
@@ -453,3 +478,144 @@ class TestReportShape:
         monkeypatch.setattr(engine_client, "engine_request", tagging)
         report = run(players=1, rounds=2)
         assert report["totals"]["degraded_flags_seen"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Social-state telemetry (campaign_sim x npc_disposition integration)
+# ---------------------------------------------------------------------------
+
+def _all_turns(report):
+    return [t for r in report["rounds"] for t in r["turns"]]
+
+
+class TestSocialStateTelemetry:
+    def test_accepted_attacks_record_attacked_kind_on_target(self, fake_engine):
+        sim, report = run_with_sim(players=2, rounds=3)
+
+        history = sim.disposition.history()
+        accepted_attacks = [t for t in _all_turns(report)
+                            if t["action"] == "attack" and t["accepted"]]
+        assert accepted_attacks, "scripted policy must attack in round 1"
+        assert len(history) == len(accepted_attacks)
+        # Exactly the expected directed kind onto the attacked target.
+        assert all(rec.kind == "attacked" for rec in history)
+        assert all(rec.npc_id == DUMMY_ID for rec in history)
+        entity_ids = {p["entity_id"] for p in report["per_player"]}
+        assert all(rec.player_id in entity_ids for rec in history)
+
+    def test_checks_and_moves_record_no_disposition_entries(self, fake_engine):
+        sim, report = run_with_sim(players=2, rounds=4)
+
+        non_attack_turns = [t for t in _all_turns(report) if t["action"] != "attack"]
+        assert any(t["accepted"] for t in non_attack_turns), \
+            "scenario must contain accepted checks/moves"
+        index_of = {p["name"]: i for i, p in enumerate(report["per_player"])}
+        attack_ts = {t["round"] * 10.0 + index_of[t["player"]]
+                     for t in _all_turns(report) if t["action"] == "attack"}
+        recorded_ts = {rec.timestamp for rec in sim.disposition.history()}
+        # Every recorded interaction sits on an attack turn's sim-clock slot —
+        # checks/moves contributed nothing.
+        assert recorded_ts <= attack_ts
+        assert all(rec.kind == "attacked" for rec in sim.disposition.history())
+
+    def test_rejected_attacks_record_nothing(self, fake_engine):
+        fake_engine.reject("/action/attack", "TARGET_OUT_OF_RANGE")
+
+        sim, report = run_with_sim(players=2, rounds=2)
+
+        attacks = [t for t in _all_turns(report) if t["action"] == "attack"]
+        assert attacks and all(t["rejected"] for t in attacks)
+        assert sim.disposition.history() == []
+        assert report["totals"]["disposition_interactions"] == 0
+
+    def test_report_carries_per_player_stances_and_interaction_totals(self, fake_engine):
+        sim, report = run_with_sim(players=2, rounds=2)
+
+        totals = report["totals"]
+        history = sim.disposition.history()
+        assert totals["disposition_interactions"] == len(history) > 0
+        assert totals["disposition_interactions_by_kind"] == {
+            "attacked": len(history),
+        }
+        for entry in report["per_player"]:
+            # One accepted attack each -> the dummy tracks a stance toward them,
+            # keyed by display name (name preferred over raw id).
+            assert entry["interactions_recorded"] == 1
+            assert entry["stances"] == {
+                "Training Dummy":
+                    sim.disposition.stance(DUMMY_ID, entry["entity_id"]),
+            }
+
+    def test_hostile_stance_after_repeated_attacks(self, fake_engine, llm_mode, monkeypatch):
+        _install_upstream(monkeypatch, [
+            json.dumps({"action": "attack", "target_id": DUMMY_ID})
+        ] * 3)
+
+        sim, report = run_with_sim(players=1, rounds=3)
+
+        kinds = [rec.kind for rec in sim.disposition.history()]
+        assert kinds == ["attacked", "attacked", "attacked"]
+        player = report["per_player"][0]
+        assert player["interactions_recorded"] == 3
+        assert player["stances"] == {"Training Dummy": "hostile"}
+
+    def test_decision_prompt_includes_current_target_stances(self, fake_engine,
+                                                             llm_mode, monkeypatch):
+        upstream = _install_upstream(monkeypatch, [
+            json.dumps({"action": "check"}),
+        ])
+
+        run_with_sim(players=1, rounds=1)
+
+        prompt_text = json.dumps(upstream.calls[0]["payload"]["messages"])
+        assert "stances_toward_you" in prompt_text
+        # The training dummy has no relationship yet -> surfaced as neutral.
+        assert "neutral" in prompt_text
+
+    def test_scripted_policy_inputs_receive_stances_unknown_targets_neutral(
+            self, fake_engine):
+        sim = CampaignSimulation(mode="scripted")
+        stub = SimpleNamespace(entity_id="pc-1")
+        snapshot = {"entities": [
+            {"id": "pc-1", "name": "Me", "hp": 28, "max_hp": 28, "ac": 16,
+             "is_player": True, "is_dead": False},
+            {"id": "npc-9", "name": "Goblin", "hp": 7, "max_hp": 7, "ac": 13,
+             "is_player": False, "is_dead": False},
+        ]}
+
+        view = sim._stance_view(stub, snapshot)
+        assert view == {"Goblin": "neutral"}          # unknown target -> neutral
+        assert sim._stance_toward("totally-unknown", "pc-1") == "neutral"
+        assert sim._stance_toward("x", None) == "neutral"
+
+        decision = scripted_decision(stub, snapshot, 1, view)
+        assert decision["action"] == "attack"
+        assert decision["target_id"] == "npc-9"
+
+    def test_timestamps_deterministic_across_identical_runs(self, fake_engine):
+        sim_a, rep_a = run_with_sim(players=2, rounds=3)
+        sim_b, rep_b = run_with_sim(players=2, rounds=3)
+
+        # Each run signs up fresh users, so raw player UUIDs differ; project
+        # them onto stable per-player slots before comparing.
+        def normalized(report, sim):
+            slot = {p["entity_id"]: i for i, p in enumerate(report["per_player"])}
+            return [(slot.get(r.player_id, r.player_id), r.npc_id, r.kind,
+                     r.magnitude, r.timestamp)
+                    for r in sim.disposition.history()]
+
+        hist_a = normalized(rep_a, sim_a)
+        hist_b = normalized(rep_b, sim_b)
+        assert hist_a and hist_a == hist_b
+        assert [p["stances"] for p in rep_a["per_player"]] == \
+            [p["stances"] for p in rep_b["per_player"]]
+        assert [p["interactions_recorded"] for p in rep_a["per_player"]] == \
+            [p["interactions_recorded"] for p in rep_b["per_player"]]
+
+        # Timestamps are pure sim-clock values (round * 10 + turn index),
+        # never wall-clock reads.
+        index_of = {p["name"]: i for i, p in enumerate(rep_a["per_player"])}
+        expected_ts = {t["round"] * 10.0 + index_of[t["player"]]
+                       for t in _all_turns(rep_a)
+                       if t["action"] == "attack" and t["accepted"]}
+        assert {rec.timestamp for rec in sim_a.disposition.history()} == expected_ts

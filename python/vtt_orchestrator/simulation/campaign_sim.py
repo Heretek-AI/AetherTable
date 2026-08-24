@@ -17,6 +17,20 @@ tagged ``mode: "scripted"`` and never touches the network.
 The report fabricates nothing: every number in it is counted from observed
 proxy responses.
 
+Social-state telemetry (integration with ``npc_disposition``): every
+ACCEPTED attack a player lands on an NPC/target records an ``"attacked"``
+directed interaction on that target's ``NpcDispositionEngine`` state toward
+the player; accepted checks and moves record nothing. Each candidate
+target's CURRENT stance toward the acting player is injected into both the
+LLM decision prompt and the scripted-policy inputs so decisions are socially
+grounded, with unknown targets defaulting to a neutral stance. All
+timestamps passed to the engine are explicit sim-clock values
+(``round * 10.0 + turn index``) — never wall-clock. There is deliberately NO
+``"aided"`` hook yet: the sim's action vocabulary (attack/move/check) has no
+heal-like action reachable through the proxies, so cooperative interactions
+cannot be observed here; when a heal/protection action exists it should call
+``_record_social`` with kind ``"aided"``.
+
 Importable API only — no HTTP routes are added this iteration. To run live:
 
     # 1. authoritative engine:      cargo run -p vtt-server
@@ -37,6 +51,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ..routing.llm_client import LLMConfig, LLMStreamingGateway
+from .npc_disposition import NpcDispositionEngine
 
 ORCHESTRATOR_URL = os.environ.get(
     "ORCHESTRATOR_URL",
@@ -339,13 +354,25 @@ def _as_int(value: Any) -> Optional[int]:
         return None
 
 
-def scripted_decision(player: CampaignSimPlayer, snapshot: Dict[str, Any], round_no: int) -> Dict[str, Any]:
+def scripted_decision(
+    player: CampaignSimPlayer,
+    snapshot: Dict[str, Any],
+    round_no: int,
+    stances: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Deterministic fallback policy — no RNG anywhere:
 
     round % 3 == 0 -> Perception-style check; badly hurt -> retreat move;
     even rounds -> reposition move; otherwise attack the lowest-id living
     hostile; with no legal target left, fall back to a check.
+
+    ``stances`` maps target display name/id -> current disposition stance of
+    that target toward this player (socially grounded input). The current
+    rules do not branch on it, but it is part of the contract so future
+    policies (and the LLM fallback path) see the same social state the LLM
+    sees.
     """
+    del stances  # documented input for socially-aware policy variants
     own = next((e for e in snapshot["entities"] if e["id"] == player.entity_id), None)
     if round_no % 3 == 0 or own is None:
         return {"action": "check"}
@@ -381,7 +408,17 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_decision_prompts(snapshot: Dict[str, Any], player: CampaignSimPlayer) -> tuple:
+def build_decision_prompts(
+    snapshot: Dict[str, Any],
+    player: CampaignSimPlayer,
+    stances: Optional[Dict[str, str]] = None,
+) -> tuple:
+    """Build the (system, user) decision prompts.
+
+    ``stances`` carries each visible NPC/target's CURRENT disposition stance
+    toward this player (neutral for anything unknown) so the model reasons
+    over social state, not just HP bars.
+    """
     own = next((e for e in snapshot["entities"] if e["id"] == player.entity_id), {})
     view = [
         {k: e[k] for k in ("id", "name", "hp", "ac", "is_player", "is_dead")}
@@ -389,8 +426,14 @@ def build_decision_prompts(snapshot: Dict[str, Any], player: CampaignSimPlayer) 
     ]
     user_prompt = (
         "Battlefield state:\n"
-        + json.dumps({"you": own, "entities": view}, default=str)
-        + "\nChoose your single action as JSON per the schema."
+        + json.dumps(
+            {"you": own, "entities": view,
+             "stances_toward_you": dict(stances or {})},
+            default=str,
+        )
+        + "\n'stances_toward_you' is each target's current attitude toward you "
+        "(hostile/unfriendly/neutral/friendly/allied). "
+        "Choose your single action as JSON per the schema."
     )
     return SYSTEM_PROMPT, user_prompt
 
@@ -449,6 +492,7 @@ class CampaignSimulation:
         base_url: Optional[str] = None,
         transport=None,
         table_name: str = "Campaign Sim Table",
+        disposition_engine: Optional[NpcDispositionEngine] = None,
     ):
         if players < 1:
             raise ValueError("players must be >= 1")
@@ -462,6 +506,75 @@ class CampaignSimulation:
         self.mode = mode or ("llm" if not self.gateway.config.is_mock else "scripted")
         self._base_url = base_url
         self._transport = transport
+        # Social-state telemetry. The engine's own clock is pinned to a
+        # constant: every call this sim makes passes an EXPLICIT deterministic
+        # timestamp (sim clock), so the fallback clock is never consulted.
+        self.disposition = disposition_engine or NpcDispositionEngine(clock=lambda: 0.0)
+        # npc_id -> best-known display name (from snapshots), for report keys.
+        self._npc_names: Dict[str, str] = {}
+
+    @property
+    def _end_ts(self) -> float:
+        """Deterministic end-of-run sim-clock reading for stance snapshots."""
+        return self.rounds_n * 10.0 + self.players_n
+
+    def _stance_toward(self, npc_id: str, player_id: Optional[str]) -> str:
+        """Current stance of ``npc_id`` toward ``player_id`` — defensive:
+        unknown targets (or missing ids) read as neutral."""
+        if not player_id or not npc_id:
+            return "neutral"
+        try:
+            return self.disposition.stance(npc_id, player_id, timestamp=self._end_ts)
+        except Exception:  # never let telemetry break the run
+            return "neutral"
+
+    def _stance_view(self, player, snapshot: Dict[str, Any]) -> Dict[str, str]:
+        """Map every visible NPC/target (name preferred over id) to its CURRENT
+        stance toward the acting player. Unknown/untracked targets come back
+        neutral from the disposition engine itself."""
+        stances: Dict[str, str] = {}
+        for entity in snapshot.get("entities", []):
+            if entity["id"] == player.entity_id or entity.get("is_player"):
+                continue
+            key = entity.get("name") or str(entity["id"])
+            stances[key] = self._stance_toward(entity["id"], player.entity_id)
+            self._npc_names.setdefault(str(entity["id"]), key)
+        return stances
+
+    def _record_social(self, player, decision, result, round_no: int) -> None:
+        """Disposition hook: accepted attacks record ``"attacked"`` on the
+        target's state toward the attacker. Checks/moves record nothing, and
+        there is no heal-like action in the sim vocabulary yet so ``"aided"``
+        is unreachable (see module docstring)."""
+        if decision.get("action") != "attack" or not result.get("accepted"):
+            return
+        npc_id = str(decision.get("target_id") or "")
+        actor_id = player.entity_id or player.name
+        if not npc_id or npc_id == actor_id:
+            return
+        ts = round_no * 10.0 + player.index  # deterministic sim clock
+        try:
+            self.disposition.record_interaction(
+                npc_id=npc_id, player_id=actor_id, kind="attacked",
+                magnitude=1.0, timestamp=ts,
+            )
+        except ValueError:  # defensive: never fabricate telemetry
+            return
+        self._npc_names.setdefault(npc_id, npc_id)
+
+    def _stances_snapshot(self, player) -> Dict[str, str]:
+        """End-of-run {target name_or_id: stance} per player, from recorded
+        history only (never invents a relationship that was never touched)."""
+        pid = player.entity_id or player.name
+        out: Dict[str, str] = {}
+        for npc_id in sorted({r.npc_id for r in self.disposition.history()
+                              if r.player_id == pid}):
+            out[self._npc_names.get(npc_id, npc_id)] = self._stance_toward(npc_id, pid)
+        return out
+
+    def _interactions_count(self, player) -> int:
+        pid = player.entity_id or player.name
+        return sum(1 for r in self.disposition.history() if r.player_id == pid)
 
     async def run(self) -> Dict[str, Any]:
         started_wall = time.time()
@@ -483,6 +596,8 @@ class CampaignSimulation:
                 "llm_decisions_accepted": 0,
                 "llm_fallbacks": 0,
                 "degraded_flags_seen": 0,
+                "disposition_interactions": 0,
+                "disposition_interactions_by_kind": {},
             },
             "per_player": [],
             "rounds": [],
@@ -517,6 +632,13 @@ class CampaignSimulation:
             report["errors"].append(f"aborted mid-run: {exc}")
 
         report["per_player"] = [self._player_summary(p, report) for p in players]
+        # Social-state telemetry: counted from the disposition engine's own
+        # history — nothing here is extrapolated.
+        by_kind: Dict[str, int] = {}
+        for record in self.disposition.history():
+            by_kind[record.kind] = by_kind.get(record.kind, 0) + 1
+        report["totals"]["disposition_interactions"] = len(self.disposition.history())
+        report["totals"]["disposition_interactions_by_kind"] = by_kind
         report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         return report
 
@@ -541,8 +663,13 @@ class CampaignSimulation:
 
     async def _take_turn(self, player: CampaignSimPlayer, round_no: int) -> Dict[str, Any]:
         snapshot = await player.observe_session()
-        decision, source, fallback_reason, llm_used = await self._decide(player, snapshot, round_no)
+        stances = self._stance_view(player, snapshot)
+        decision, source, fallback_reason, llm_used = await self._decide(
+            player, snapshot, round_no, stances)
         result = await player.execute(decision)
+        # Social-state telemetry AFTER the proxy verdict: only ACCEPTED
+        # attacks touch disposition state (checks/moves record nothing).
+        self._record_social(player, decision, result, round_no)
         return {
             "round": round_no,
             "player": player.name,
@@ -561,20 +688,24 @@ class CampaignSimulation:
             "llm_called": llm_used,
         }
 
-    async def _decide(self, player, snapshot, round_no):
+    async def _decide(self, player, snapshot, round_no, stances=None):
         """LLM decision with per-turn deterministic fallback, or scripted mode.
+
+        Both paths receive the same socially-grounded ``stances`` input (each
+        candidate target's CURRENT stance toward the acting player).
 
         Returns (decision, source, fallback_reason|None, llm_was_called).
         """
         if self.mode != "llm":
-            return scripted_decision(player, snapshot, round_no), "scripted", None, False
+            return scripted_decision(player, snapshot, round_no, stances), \
+                "scripted", None, False
 
-        system_prompt, user_prompt = build_decision_prompts(snapshot, player)
+        system_prompt, user_prompt = build_decision_prompts(snapshot, player, stances)
         parsed = await self.gateway.complete_json(system_prompt, user_prompt)
         decision, problem = validate_decision(parsed)
         if decision is None:
             reason = problem if parsed is not None else "llm_unavailable_or_unparseable"
-            fallback = scripted_decision(player, snapshot, round_no)
+            fallback = scripted_decision(player, snapshot, round_no, stances)
             fallback["reason"] = f"scripted fallback ({reason})"
             return fallback, "llm_fallback", reason, True
         return decision, "llm", None, True
@@ -613,6 +744,10 @@ class CampaignSimulation:
             "accepted": sum(1 for t in turns if t["accepted"]),
             "rejected": sum(1 for t in turns if t["rejected"]),
             "turns_taken": len(turns),
+            # Snapshot at run end: {target_name_or_id: stance} plus how many
+            # directed interactions this player's actions recorded.
+            "stances": self._stances_snapshot(player),
+            "interactions_recorded": self._interactions_count(player),
         }
 
 
