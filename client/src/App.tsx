@@ -702,7 +702,8 @@ export function App() {
         if (!sessionId) return;
         setCombatSessionId(sessionId);
       }
-      // The gateway's read proxy is authenticated (token: str = Query(...));
+      // The gateway's read proxy is authenticated (_require_auth: Bearer
+      // header or ?token= back-compat);
       // the stored session token rides in the query string like every other
       // /api/v1/engine/* browser call (see api/rules_engine.ts).
       const token = getStoredToken();

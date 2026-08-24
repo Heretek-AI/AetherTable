@@ -282,7 +282,7 @@ def test_engine_proxy_routes_contract():
     )
     auth = {"params": {"token": gm_token}}
 
-    session_resp = client.post("/api/v1/engine/session", json={})
+    session_resp = client.post("/api/v1/engine/session", params=auth["params"], json={})
     if session_resp.status_code == 502:
         pytest.skip("engine not running")
     session_id = session_resp.json()["session_id"]

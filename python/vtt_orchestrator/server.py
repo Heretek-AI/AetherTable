@@ -933,13 +933,30 @@ async def _engine_call(coro) -> Any:
         raise HTTPException(status_code=exc.status_code, detail=detail)
 
 
+# --- Proxy identity contract (audit remediation) -----------------------------
+# EVERY browser-facing /api/v1/engine/* proxy route resolves its caller via
+# _require_auth (Authorization Bearer header first, legacy ?token= fallback) and
+# forwards the VERIFIED identity (_caller_actor) so the engine's RBAC authorizes
+# the real participant. There is deliberately NO optional-token back-compat path:
+# an anonymous request is a 401 with an honest error body and never reaches the
+# engine under the orchestrator-service principal. Service-principal forwarding
+# still exists only for orchestrator-INTERNAL calls that bypass these routes and
+# speak to the engine directly via routing.engine_client (campaign autosave,
+# safety rewind, lobby launch, character deploy).
+
 @app.post("/api/v1/engine/session")
-async def engine_create_session(req: EngineSessionRequest):
-    return await _engine_call(engine_client.create_session(req.campaign_id, req.session_name))
+async def engine_create_session(
+    req: EngineSessionRequest, token: str = Depends(_require_auth)
+):
+    return await _engine_call(
+        engine_client.create_session(req.campaign_id, req.session_name, _caller_actor(token))
+    )
 
 
 @app.post("/api/v1/engine/attack")
-async def engine_resolve_attack(req: EngineAttackRequest, token: Optional[str] = Query(None)):
+async def engine_resolve_attack(
+    req: EngineAttackRequest, token: str = Depends(_require_auth)
+):
     # Reference-only payload: ids + optional action index. No math crosses
     # this boundary in either direction — the engine owns every modifier.
     action = {
@@ -947,41 +964,59 @@ async def engine_resolve_attack(req: EngineAttackRequest, token: Optional[str] =
         "target_id": engine_client._coerce_uuid(req.target_id),
         "action_index": req.action_index,
     }
-    actor = _caller_actor(token) if token else None
     return await _engine_call(
-        engine_client.resolve_attack(req.session_id, action, actor=actor)
+        engine_client.resolve_attack(
+            req.session_id, action, actor=_caller_actor(token)
+        )
     )
 
 
 @app.post("/api/v1/engine/check")
-async def engine_resolve_check(req: EngineCheckRequest):
-    return await _engine_call(engine_client.resolve_check(req.model_dump()))
+async def engine_resolve_check(
+    req: EngineCheckRequest, token: str = Depends(_require_auth)
+):
+    return await _engine_call(
+        engine_client.resolve_check(req.model_dump(), actor=_caller_actor(token))
+    )
 
 
 @app.post("/api/v1/engine/save")
-async def engine_resolve_save(req: EngineSaveRequest):
+async def engine_resolve_save(
+    req: EngineSaveRequest, token: str = Depends(_require_auth)
+):
     payload = req.model_dump()
     if payload["ability"]:
         # Engine Ability enum expects SCREAMING_SNAKE_CASE ("DEXTERITY").
         payload["ability"] = payload["ability"].upper()
-    return await _engine_call(engine_client.resolve_save(payload))
+    return await _engine_call(
+        engine_client.resolve_save(payload, actor=_caller_actor(token))
+    )
 
 
 @app.post("/api/v1/engine/concentration")
-async def engine_resolve_concentration(req: EngineConcentrationRequest):
-    return await _engine_call(engine_client.resolve_concentration(req.model_dump()))
+async def engine_resolve_concentration(
+    req: EngineConcentrationRequest, token: str = Depends(_require_auth)
+):
+    return await _engine_call(
+        engine_client.resolve_concentration(req.model_dump(), actor=_caller_actor(token))
+    )
 
 
 @app.post("/api/v1/engine/death-save")
-async def engine_resolve_death_save(req: EngineDeathSaveRequest, token: Optional[str] = Query(None)):
-    actor = _caller_actor(token) if token else None
+async def engine_resolve_death_save(
+    req: EngineDeathSaveRequest, token: str = Depends(_require_auth)
+):
     return await _engine_call(
-        engine_client.resolve_death_save(req.session_id, req.entity_id, actor=actor)
+        engine_client.resolve_death_save(
+            req.session_id, req.entity_id, actor=_caller_actor(token)
+        )
     )
 
 
 @app.post("/api/v1/engine/map/generate")
-async def engine_generate_map(req: EngineMapGenerateRequest):
+async def engine_generate_map(
+    req: EngineMapGenerateRequest, token: str = Depends(_require_auth)
+):
     # Translate to the engine's RoomDescriptor contract
     # ({room_id, x, y, width, height, theme}); tiles come back as a
     # Vec<Vec<u8>> grid (0 floor, 1 wall, 2 door, 3 altar, 4 chest).
@@ -993,27 +1028,42 @@ async def engine_generate_map(req: EngineMapGenerateRequest):
         "height": req.height,
         "theme": req.theme,
     }
-    return await _engine_call(engine_client.generate_map({"room_desc": room_desc, "seed": req.seed}))
+    return await _engine_call(
+        engine_client.generate_map(
+            {"room_desc": room_desc, "seed": req.seed}, actor=_caller_actor(token)
+        )
+    )
 
 
 @app.get("/api/v1/engine/rooms/{room_id}/presence")
-async def engine_room_presence(room_id: str):
+async def engine_room_presence(room_id: str, token: str = Depends(_require_auth)):
     return await _engine_call(
-        engine_client.engine_request("GET", f"/api/v1/rooms/{room_id}/presence")
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/rooms/{room_id}/presence",
+            actor=_caller_actor(token),
+        )
     )
 
 
 @app.get("/api/v1/engine/metrics")
-async def engine_metrics():
+async def engine_metrics(token: str = Depends(_require_auth)):
     """Read-only telemetry proxy to the engine's public GET /metrics.
 
-    vtt-server exposes /metrics on PUBLIC_PATHS (crates/vtt-server/src/auth.rs),
-    so this call needs NO forwarded actor identity — it is service-mediated by
-    design and never mutates state. Returns the engine's honest counters
-    verbatim (MCR, action tallies, auditor rejection rate, persistence
-    failures); the gateway adds nothing and fabricates nothing. An unreachable
-    engine maps to 502 so clients can render an explicit degraded state.
+    Audit remediation: this is a BROWSER-FACING gateway route, so the caller
+    must present a valid HMAC session token (header or ?token=) — the dashboard
+    is attributable like every other proxy. The hop itself stays service-
+    mediated: vtt-server exposes /metrics on PUBLIC_PATHS
+    (crates/vtt-server/src/auth.rs), so NO actor identity is forwarded and no
+    actor token is minted for the read; it never mutates state. Returns the
+    engine's honest counters verbatim (MCR, action tallies, auditor rejection
+    rate, persistence failures); the gateway adds nothing and fabricates
+    nothing. An unreachable engine maps to 502 so clients can render an
+    explicit degraded state.
     """
+    # Verify the caller's signature/expiry before any engine traffic —
+    # presence alone in the dependency is not enough for an attributable read.
+    _caller_actor(token)
     raw = await _engine_call(engine_client.engine_request("GET", "/metrics"))
     # Whitelist projection: only counters the dashboard is allowed to show.
     keys = (
@@ -1484,7 +1534,7 @@ class EngineRestRequest(BaseModel):
 
 
 @app.post("/api/v1/engine/spawn")
-async def engine_spawn(req: EngineSpawnRequest, token: str = Query(...)):
+async def engine_spawn(req: EngineSpawnRequest, token: str = Depends(_require_auth)):
     # JSON mode keeps tuples (position) as arrays on the wire; the engine's
     # Option<String> owner_player_id is omitted rather than nulled.
     payload = req.entity.model_dump(mode="json")
@@ -1503,7 +1553,7 @@ async def engine_spawn(req: EngineSpawnRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/cast-spell")
-async def engine_cast_spell(req: EngineCastSpellRequest, token: str = Query(...)):
+async def engine_cast_spell(req: EngineCastSpellRequest, token: str = Depends(_require_auth)):
     actor = _caller_actor(token)
     payload: Dict[str, Any] = {
         "caster_id": engine_client._coerce_uuid(req.caster_id),
@@ -1520,7 +1570,7 @@ async def engine_cast_spell(req: EngineCastSpellRequest, token: str = Query(...)
 
 
 @app.post("/api/v1/engine/move")
-async def engine_move(req: EngineMoveRequest, token: str = Query(...)):
+async def engine_move(req: EngineMoveRequest, token: str = Depends(_require_auth)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1535,7 +1585,7 @@ async def engine_move(req: EngineMoveRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/turn-next")
-async def engine_turn_next(req: EngineSessionActionRequest, token: str = Query(...)):
+async def engine_turn_next(req: EngineSessionActionRequest, token: str = Depends(_require_auth)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1558,7 +1608,7 @@ class EngineCombatActionRequest(BaseModel):
 
 
 @app.post("/api/v1/engine/combat/begin")
-async def engine_combat_begin(req: EngineCombatActionRequest, token: str = Query(...)):
+async def engine_combat_begin(req: EngineCombatActionRequest, token: str = Depends(_require_auth)):
     """GM action: roll initiative and open combat on the authoritative engine.
 
     All initiative math (d20 + DEX, tie-breaks) is engine-owned; the gateway
@@ -1576,7 +1626,7 @@ async def engine_combat_begin(req: EngineCombatActionRequest, token: str = Query
 
 
 @app.post("/api/v1/engine/combat/end")
-async def engine_combat_end(req: EngineCombatActionRequest, token: str = Query(...)):
+async def engine_combat_end(req: EngineCombatActionRequest, token: str = Depends(_require_auth)):
     """GM action: clear the initiative tracker. Ids-only payload, real-actor
     forwarding — same contract as every other mutating proxy."""
     return await _engine_call(
@@ -1590,7 +1640,7 @@ async def engine_combat_end(req: EngineCombatActionRequest, token: str = Query(.
 
 
 @app.post("/api/v1/engine/damage")
-async def engine_damage(req: EngineDamageRequest, token: str = Query(...)):
+async def engine_damage(req: EngineDamageRequest, token: str = Depends(_require_auth)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1605,7 +1655,7 @@ async def engine_damage(req: EngineDamageRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/reactions/arm")
-async def engine_arm_reaction(req: EngineArmReactionRequest, token: str = Query(...)):
+async def engine_arm_reaction(req: EngineArmReactionRequest, token: str = Depends(_require_auth)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1620,7 +1670,7 @@ async def engine_arm_reaction(req: EngineArmReactionRequest, token: str = Query(
 
 
 @app.post("/api/v1/engine/heal")
-async def engine_heal(req: EngineHealRequest, token: str = Query(...)):
+async def engine_heal(req: EngineHealRequest, token: str = Depends(_require_auth)):
     # Healing math (deficit clamping, death-save wipe) is engine-owned; the
     # gateway forwards the caller identity so its RBAC checks entity ownership.
     return await _engine_call(
@@ -1637,7 +1687,7 @@ async def engine_heal(req: EngineHealRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/rest")
-async def engine_rest(req: EngineRestRequest, token: str = Query(...)):
+async def engine_rest(req: EngineRestRequest, token: str = Depends(_require_auth)):
     return await _engine_call(
         engine_client.engine_request(
             "POST",
@@ -1720,7 +1770,7 @@ def _maneuver_proxy(engine_path_suffix: str, payload: Dict[str, Any], actor: Dic
 
 
 @app.post("/api/v1/engine/grapple")
-async def engine_grapple(req: EngineGrappleRequest, token: str = Query(...)):
+async def engine_grapple(req: EngineGrappleRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "grapple",
         {
@@ -1734,7 +1784,7 @@ async def engine_grapple(req: EngineGrappleRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/shove")
-async def engine_shove(req: EngineShoveRequest, token: str = Query(...)):
+async def engine_shove(req: EngineShoveRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "shove",
         {
@@ -1748,7 +1798,7 @@ async def engine_shove(req: EngineShoveRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/dodge")
-async def engine_dodge(req: EngineEntityActionRequest, token: str = Query(...)):
+async def engine_dodge(req: EngineEntityActionRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "dodge",
         {
@@ -1760,7 +1810,7 @@ async def engine_dodge(req: EngineEntityActionRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/dash")
-async def engine_dash(req: EngineEntityActionRequest, token: str = Query(...)):
+async def engine_dash(req: EngineEntityActionRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "dash",
         {
@@ -1772,7 +1822,7 @@ async def engine_dash(req: EngineEntityActionRequest, token: str = Query(...)):
 
 
 @app.post("/api/v1/engine/disengage")
-async def engine_disengage(req: EngineEntityActionRequest, token: str = Query(...)):
+async def engine_disengage(req: EngineEntityActionRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "disengage",
         {
@@ -1784,7 +1834,7 @@ async def engine_disengage(req: EngineEntityActionRequest, token: str = Query(..
 
 
 @app.post("/api/v1/engine/stabilize")
-async def engine_stabilize(req: EngineStabilizeRequest, token: str = Query(...)):
+async def engine_stabilize(req: EngineStabilizeRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "stabilize",
         {
@@ -1804,7 +1854,7 @@ class EngineReadyActionRequest(BaseModel):
 
 
 @app.post("/api/v1/engine/ready")
-async def engine_ready_action(req: EngineReadyActionRequest, token: str = Query(...)):
+async def engine_ready_action(req: EngineReadyActionRequest, token: str = Depends(_require_auth)):
     payload: Dict[str, Any] = {
         "session_id": req.session_id,
         "entity_id": engine_client._coerce_uuid(req.entity_id),
@@ -1842,7 +1892,7 @@ class EngineHelpRequest(BaseModel):
 
 
 @app.post("/api/v1/engine/offhand")
-async def engine_offhand_attack(req: EngineOffhandRequest, token: str = Query(...)):
+async def engine_offhand_attack(req: EngineOffhandRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "offhand",
         {
@@ -1856,7 +1906,7 @@ async def engine_offhand_attack(req: EngineOffhandRequest, token: str = Query(..
 
 
 @app.post("/api/v1/engine/help")
-async def engine_help_action(req: EngineHelpRequest, token: str = Query(...)):
+async def engine_help_action(req: EngineHelpRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "help",
         {
@@ -2180,7 +2230,7 @@ def _project_ledger_event(event: Any, *, redact_numbers: bool = False) -> Dict[s
 
 
 @app.get("/api/v1/engine/session-replay")
-async def engine_session_replay(session_id: str = Query(...), token: str = Query(...)):
+async def engine_session_replay(session_id: str = Query(...), token: str = Depends(_require_auth)):
     """Exports a session's event ledger as a downloadable replay artifact.
 
     Requires a valid HMAC session token; the caller's real identity is

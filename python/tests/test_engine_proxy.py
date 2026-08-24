@@ -35,12 +35,194 @@ def live_engine():
     return None
 
 
+def _signed_token(user_id: str = "player-7", role: str = "player") -> str:
+    """A valid gateway session token for proxy-auth tests."""
+    import time as _time
+
+    from vtt_orchestrator.server import _sign_token
+
+    return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+
 class TestEngineDown:
     def test_unreachable_engine_returns_502(self, monkeypatch):
         monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
-        response = client.post("/api/v1/engine/check", json={"modifier": 3, "dc": 12})
+        response = client.post(
+            "/api/v1/engine/check",
+            params={"token": _signed_token()},
+            json={"modifier": 3, "dc": 12},
+        )
         assert response.status_code == 502
         assert "unreachable" in response.json()["detail"].lower()
+
+    def test_unreachable_engine_is_401_before_dialing_when_anonymous(self, monkeypatch):
+        """No credential never reaches the engine-dial stage at all."""
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        response = client.post("/api/v1/engine/check", json={"modifier": 3, "dc": 12})
+        assert response.status_code == 401
+
+
+class TestProxyAuthRequired:
+    """Audit remediation: EVERY narrative-facing /api/v1/engine/* proxy route
+    requires an attributable identity. A missing or expired token is a 401 with
+    an honest error body — the optional-token back-compat paths that forwarded
+    actor=None (orchestrator-service principal) are gone, so no combat can be
+    resolved anonymously anymore."""
+
+    # (path, body-or-None-for-GET) for every narrative-facing proxy route.
+    ANONYMOUS_CASES = {
+        "create-session": ("/api/v1/engine/session", {"session_name": "anon"}),
+        "attack": (
+            "/api/v1/engine/attack",
+            {"session_id": "s", "attacker_id": "a", "target_id": "b"},
+        ),
+        "check": ("/api/v1/engine/check", {"modifier": 3, "dc": 12}),
+        "save": ("/api/v1/engine/save", {"save_modifier": 2, "dc": 10}),
+        "concentration": ("/api/v1/engine/concentration", {"con_modifier": 0, "damage_taken": 8}),
+        "death-save": ("/api/v1/engine/death-save", {"session_id": "s", "entity_id": "e"}),
+        "map-generate": ("/api/v1/engine/map/generate", {"width": 16, "height": 12}),
+        "room-presence": ("GET", "/api/v1/engine/rooms/aethertable-live/presence"),
+        "metrics": ("GET", "/api/v1/engine/metrics"),
+        "spawn": (
+            "/api/v1/engine/spawn",
+            {"session_id": "s", "entity": {"name": "goblin"}},
+        ),
+        "move": ("/api/v1/engine/move", {"session_id": "s", "entity_id": "e", "x": 0, "y": 0, "z": 0}),
+        "turn-next": ("/api/v1/engine/turn-next", {"session_id": "s"}),
+        "combat-begin": ("/api/v1/engine/combat/begin", {"session_id": "s"}),
+        "combat-end": ("/api/v1/engine/combat/end", {"session_id": "s"}),
+        "damage": (
+            "/api/v1/engine/damage",
+            {"session_id": "s", "target_id": "t", "source_event_sequence": 1},
+        ),
+        "arm-reaction": (
+            "/api/v1/engine/reactions/arm",
+            {"session_id": "s", "entity_id": "e", "reaction_type": "opportunity"},
+        ),
+        "heal": ("/api/v1/engine/heal", {"session_id": "s", "entity_id": "e", "amount": 5}),
+        "rest": ("/api/v1/engine/rest", {"session_id": "s", "kind": "short"}),
+        "cast-spell": (
+            "/api/v1/engine/cast-spell",
+            {"session_id": "s", "caster_id": "c", "spell": {}, "cast_level": 1},
+        ),
+        "grapple": (
+            "/api/v1/engine/grapple",
+            {"session_id": "s", "attacker_id": "a", "defender_id": "d", "defender_skill": "athletics"},
+        ),
+        "shove": (
+            "/api/v1/engine/shove",
+            {"session_id": "s", "attacker_id": "a", "defender_id": "d", "shove_effect": "prone"},
+        ),
+        "dodge": ("/api/v1/engine/dodge", {"session_id": "s", "entity_id": "e"}),
+        "dash": ("/api/v1/engine/dash", {"session_id": "s", "entity_id": "e"}),
+        "disengage": ("/api/v1/engine/disengage", {"session_id": "s", "entity_id": "e"}),
+        "stabilize": (
+            "/api/v1/engine/stabilize",
+            {"session_id": "s", "healer_id": "h", "target_id": "t"},
+        ),
+        "ready": (
+            "/api/v1/engine/ready",
+            {"session_id": "s", "entity_id": "e", "description": "hold"},
+        ),
+        "offhand": (
+            "/api/v1/engine/offhand",
+            {"session_id": "s", "attacker_id": "a", "target_id": "t", "offhand_index": 0},
+        ),
+        "help": (
+            "/api/v1/engine/help",
+            {"session_id": "s", "helper_id": "h", "target_entity_id": "t"},
+        ),
+    }
+
+    def test_missing_token_is_401_on_every_narrative_route(self):
+        for name, case in self.ANONYMOUS_CASES.items():
+            if isinstance(case, tuple) and case[0] == "GET":
+                _, path = case
+                resp = client.get(path)
+            else:
+                path, body = case
+                resp = client.post(path, json=body)
+            assert resp.status_code == 401, f"{name}: anonymous access must be refused"
+            detail = resp.json().get("detail")
+            assert detail, f"{name}: 401 must carry an honest error body"
+
+    def test_expired_token_is_401(self):
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        expired = _sign_token(
+            {"user_id": "player-7", "role": "player", "exp": _time.time() - 10}
+        )
+        resp = client.post(
+            "/api/v1/engine/attack",
+            params={"token": expired},
+            json={"session_id": "s", "attacker_id": "a", "target_id": "b"},
+        )
+        assert resp.status_code == 401
+
+    def test_garbage_bearer_header_is_401(self):
+        resp = client.post(
+            "/api/v1/engine/attack",
+            headers={"Authorization": "Bearer not.a.valid.token"},
+            json={"session_id": "s", "attacker_id": "a", "target_id": "b"},
+        )
+        assert resp.status_code == 401
+
+    def test_valid_bearer_header_is_accepted_and_forwarded(self, monkeypatch):
+        """The preferred Authorization-header channel works on these routes too."""
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["path"], captured["actor"] = path, actor
+            return {"roll": 11}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        resp = client.post(
+            "/api/v1/engine/check",
+            headers={"Authorization": f"Bearer {_signed_token('player-7', 'player')}"},
+            json={"modifier": 3, "dc": 12},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+
+    def test_valid_token_forwards_real_identity_on_dice_proxies(self, monkeypatch):
+        """attack / check / save / concentration / death-save / map-generate /
+        create-session each act as the VERIFIED caller, never the service
+        principal."""
+        cases = [
+            ("/api/v1/engine/session", {"session_name": "authd"}, "create_session"),
+            (
+                "/api/v1/engine/attack",
+                {"session_id": "s", "attacker_id": "a", "target_id": "b"},
+                None,
+            ),
+            ("/api/v1/engine/check", {"modifier": 3, "dc": 12}, None),
+            ("/api/v1/engine/save", {"save_modifier": 2, "dc": 10}, None),
+            ("/api/v1/engine/concentration", {"con_modifier": 0, "damage_taken": 8}, None),
+            (
+                "/api/v1/engine/death-save",
+                {"session_id": "s", "entity_id": "e"},
+                None,
+            ),
+            ("/api/v1/engine/map/generate", {"width": 16, "height": 12}, None),
+        ]
+        for path, body, _ in cases:
+            captured: dict = {}
+
+            async def fake_engine_request(method, p, payload=None, *, actor=None):
+                captured["actor"] = actor
+                return {}
+
+            monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+            resp = client.post(
+                path,
+                params={"token": _signed_token("gm-2", "gm")},
+                json=body,
+            )
+            assert resp.status_code == 200, f"{path}: {resp.text}"
+            assert captured["actor"] == {"user_id": "gm-2", "role": "gm"}, path
+            monkeypatch.undo()
 
 
 def _entity_payload(entity_id: str, name: str, hp: int, ac: int) -> dict:
@@ -89,7 +271,11 @@ def _entity_payload(entity_id: str, name: str, hp: int, ac: int) -> dict:
 
 class TestEngineProxy:
     def test_create_session(self, live_engine):
-        resp = client.post("/api/v1/engine/session", json={"session_name": "pytest"})
+        resp = client.post(
+            "/api/v1/engine/session",
+            params={"token": _signed_token()},
+            json={"session_name": "pytest"},
+        )
         assert resp.status_code == 200
         assert resp.json()["session_id"]
 
@@ -97,6 +283,7 @@ class TestEngineProxy:
         """Trust inversion regression: extra combat-math fields are refused."""
         resp = client.post(
             "/api/v1/engine/attack",
+            params={"token": _signed_token()},
             json={
                 "session_id": "anything",
                 "attacker_id": "thorin",
@@ -109,7 +296,9 @@ class TestEngineProxy:
         assert resp.status_code == 422, "client-supplied math must be rejected"
 
     def test_attack_resolution_contract(self, live_engine):
-        created = client.post("/api/v1/engine/session", json={}).json()
+        created = client.post(
+            "/api/v1/engine/session", params={"token": _signed_token()}, json={}
+        ).json()
         session_id = created["session_id"]
 
         # Spawn both parties so the engine resolves from real stat blocks.
@@ -123,6 +312,7 @@ class TestEngineProxy:
 
         resp = client.post(
             "/api/v1/engine/attack",
+            params={"token": _signed_token()},
             json={
                 "session_id": session_id,
                 "attacker_id": "thorin",
@@ -142,21 +332,27 @@ class TestEngineProxy:
 
     def test_check_with_advantage_stays_bounded(self, live_engine):
         resp = client.post(
-            "/api/v1/engine/check", json={"modifier": 5, "dc": 13, "advantage": True}
+            "/api/v1/engine/check",
+            params={"token": _signed_token()},
+            json={"modifier": 5, "dc": 13, "advantage": True},
         )
         assert resp.status_code == 200
         assert 1 <= resp.json()["roll"] <= 20
 
     def test_save_normalizes_ability_casing(self, live_engine):
         resp = client.post(
-            "/api/v1/engine/save", json={"save_modifier": 2, "dc": 10, "ability": "wisdom"}
+            "/api/v1/engine/save",
+            params={"token": _signed_token()},
+            json={"save_modifier": 2, "dc": 10, "ability": "wisdom"},
         )
         assert resp.status_code == 200
         assert resp.json()["ability"] == "WISDOM"
 
     def test_concentration_dc_is_max_of_half_damage_or_ten(self, live_engine):
         resp = client.post(
-            "/api/v1/engine/concentration", json={"con_modifier": 0, "damage_taken": 30}
+            "/api/v1/engine/concentration",
+            params={"token": _signed_token()},
+            json={"con_modifier": 0, "damage_taken": 30},
         )
         assert resp.status_code == 200
         assert resp.json()["dc"] == 15
@@ -164,7 +360,9 @@ class TestEngineProxy:
     def test_death_save_resolves_from_server_state(self, live_engine):
         """Death saves now run against the server-side entity; the client may
         only reference it (no client-supplied counters accepted)."""
-        created = client.post("/api/v1/engine/session", json={}).json()
+        created = client.post(
+            "/api/v1/engine/session", params={"token": _signed_token()}, json={}
+        ).json()
         session_id = created["session_id"]
         spawn = engine_client.engine_request_sync(
             "POST",
@@ -175,6 +373,7 @@ class TestEngineProxy:
 
         resp = client.post(
             "/api/v1/engine/death-save",
+            params={"token": _signed_token()},
             json={"session_id": session_id, "entity_id": "dying-hero"},
         )
         assert resp.status_code == 200
@@ -184,7 +383,9 @@ class TestEngineProxy:
 
     def test_map_generation_returns_wall_grid(self, live_engine):
         resp = client.post(
-            "/api/v1/engine/map/generate", json={"width": 16, "height": 12, "seed": 42}
+            "/api/v1/engine/map/generate",
+            params={"token": _signed_token()},
+            json={"width": 16, "height": 12, "seed": 42},
         )
         assert resp.status_code == 200
         tiles = resp.json()["tiles"]
@@ -220,11 +421,11 @@ class TestProxyIdentity:
         )
         assert resp.status_code == 401
 
-    def test_turn_next_requires_a_token(self):
-        resp = client.post(
-            "/api/v1/engine/turn-next", json={"session_id": "s"}
-        )
-        assert resp.status_code == 422, "missing required token query param"
+    def test_turn_next_without_a_token_is_unauthorized(self):
+        """Audit remediation: a missing credential is an honest 401, not the
+        old 422 validation error and never an anonymous forward."""
+        resp = client.post("/api/v1/engine/turn-next", json={"session_id": "s"})
+        assert resp.status_code == 401
 
     def test_valid_player_token_forwards_real_identity(self, monkeypatch):
         captured: dict = {}
@@ -262,9 +463,17 @@ class TestProxyIdentity:
         assert resp.status_code == 200
         assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
 
-    def test_attack_without_token_stays_service_mediated(self, monkeypatch):
-        """Legacy callers that omit the token keep working via the service
-        principal instead of breaking."""
+    def test_turn_next_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/turn-next",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": "s"},
+        )
+        assert resp.status_code == 401
+
+    def test_valid_player_token_forwards_real_identity_on_attack(self, monkeypatch):
+        """The attack proxy acts as the verified caller — the optional-token
+        service-principal path (actor=None) that used to sit here is gone."""
         captured: dict = {}
 
         async def fake_engine_request(method, path, payload=None, *, actor=None):
@@ -275,10 +484,11 @@ class TestProxyIdentity:
 
         resp = client.post(
             "/api/v1/engine/attack",
+            params={"token": self._token("player-7", "player")},
             json={"session_id": "s", "attacker_id": "a", "target_id": "b"},
         )
         assert resp.status_code == 200
-        assert captured["actor"] is None
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
 
 class TestHealRestProxyIdentity:
     """Identity forwarding + payload contract for the heal/rest proxies
@@ -314,16 +524,17 @@ class TestHealRestProxyIdentity:
         )
         assert resp.status_code == 401
 
-    def test_heal_requires_a_token(self):
+    def test_heal_without_a_token_is_unauthorized(self):
+        """Audit remediation: missing credential -> 401, never anonymous."""
         resp = client.post(
             "/api/v1/engine/heal",
             json={"session_id": "s", "entity_id": "e", "amount": 5},
         )
-        assert resp.status_code == 422, "missing required token query param"
+        assert resp.status_code == 401
 
-    def test_rest_requires_a_token(self):
+    def test_rest_without_a_token_is_unauthorized(self):
         resp = client.post("/api/v1/engine/rest", json={"session_id": "s", "kind": "short"})
-        assert resp.status_code == 422, "missing required token query param"
+        assert resp.status_code == 401
 
     def test_valid_player_token_forwards_identity_and_payload_shape(self, monkeypatch):
         captured: dict = {}
@@ -539,10 +750,12 @@ class TestManeuverProxyIdentity:
         assert resp.status_code == 200
         assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
 
-    def test_missing_token_is_422_on_every_route(self):
+    def test_missing_token_is_401_on_every_route(self):
+        """Audit remediation: a missing credential is a 401 with an honest
+        error body — never an anonymous service-principal forward."""
         for name, body in self.ROUTES.items():
             resp = client.post(f"/api/v1/engine/{name}", json=body)
-            assert resp.status_code == 422, f"{name}: missing required token query param"
+            assert resp.status_code == 401, f"{name}: anonymous access must be refused"
 
     def test_invalid_token_is_401_on_every_route(self):
         for name, body in self.ROUTES.items():
@@ -719,10 +932,10 @@ class TestOffhandAndHelpProxies:
             assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}, path
             monkeypatch.undo()
 
-    def test_missing_token_is_422_and_invalid_token_is_401(self):
+    def test_missing_token_is_401_and_invalid_token_is_401(self):
         for path, body in (("offhand", self.OFFHAND), ("help", self.HELP)):
             assert (
-                client.post(f"/api/v1/engine/{path}", json=body).status_code == 422
+                client.post(f"/api/v1/engine/{path}", json=body).status_code == 401
             ), path
             assert (
                 client.post(
@@ -767,10 +980,13 @@ class TestOffhandAndHelpProxies:
 class TestMetricsProxy:
     """GET /api/v1/engine/metrics — read-only telemetry proxy.
 
-    The engine's GET /metrics sits on PUBLIC_PATHS (crates/vtt-server/src/
-    auth.rs), so the gateway must NOT mint an actor token for it and must
-    surface the engine's honest counters verbatim (no fabrication) with a 502
-    when the engine is unreachable so clients can render a degraded state.
+    Audit remediation: this browser-facing proxy requires an attributable
+    caller identity like every other /api/v1/engine/* route (a missing or
+    expired token is a 401). The engine's GET /metrics itself sits on
+    PUBLIC_PATHS (crates/vtt-server/src/auth.rs), so once the gateway has
+    authenticated the caller it must NOT mint an actor token for the hop and
+    must surface the engine's honest counters verbatim (no fabrication) with a
+    502 when the engine is unreachable so clients can render a degraded state.
     """
 
     ENGINE_METRICS = {
@@ -784,6 +1000,21 @@ class TestMetricsProxy:
         "target_sla_ms": 10,
     }
 
+    def _get(self, **kwargs):
+        return client.get(
+            "/api/v1/engine/metrics", params={"token": _signed_token("admin-1", "admin")}, **kwargs
+        )
+
+    def test_metrics_without_a_token_is_unauthorized(self):
+        """Audit remediation: anonymous dashboard reads are refused."""
+        resp = client.get("/api/v1/engine/metrics")
+        assert resp.status_code == 401
+        assert resp.json()["detail"]
+
+    def test_metrics_with_invalid_token_is_unauthorized(self):
+        resp = client.get("/api/v1/engine/metrics", params={"token": "junk.token"})
+        assert resp.status_code == 401
+
     def test_metrics_needs_no_actor_public_path(self, monkeypatch):
         """/metrics is unauthenticated on the engine, so no actor is forwarded."""
         captured: dict = {}
@@ -796,7 +1027,7 @@ class TestMetricsProxy:
 
         monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
 
-        resp = client.get("/api/v1/engine/metrics")
+        resp = self._get()
         assert resp.status_code == 200
         assert captured == {
             "method": "GET",
@@ -813,11 +1044,17 @@ class TestMetricsProxy:
 
     def test_metrics_is_read_only_get(self):
         """Mutating verbs must not reach the engine through this route."""
-        assert client.post("/api/v1/engine/metrics").status_code == 405
+        assert (
+            client.post(
+                "/api/v1/engine/metrics",
+                params={"token": _signed_token("admin-1", "admin")},
+            ).status_code
+            == 405
+        )
 
     def test_unreachable_engine_maps_to_502(self, monkeypatch):
         monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
-        resp = client.get("/api/v1/engine/metrics")
+        resp = self._get()
         assert resp.status_code == 502
         assert "unreachable" in resp.json()["detail"].lower()
 
@@ -826,7 +1063,7 @@ class TestMetricsProxy:
             raise engine_client.EngineRejectedError(404, '{"error": "not_found"}')
 
         monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
-        resp = client.get("/api/v1/engine/metrics")
+        resp = self._get()
         assert resp.status_code == 404
         assert resp.json()["detail"] == {"error": "not_found"}
 
@@ -839,7 +1076,7 @@ class TestMetricsProxy:
             return payload
 
         monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
-        resp = client.get("/api/v1/engine/metrics")
+        resp = self._get()
         assert resp.status_code == 200
         assert "internal_debug_secret" not in resp.json()
 
@@ -1036,13 +1273,13 @@ class TestCombatProxy:
         )
         assert resp.status_code == 401
 
-    def test_begin_requires_a_token(self):
+    def test_begin_without_a_token_is_unauthorized(self):
         resp = client.post("/api/v1/engine/combat/begin", json={"session_id": "s"})
-        assert resp.status_code == 422, "missing required token query param"
+        assert resp.status_code == 401, "missing credential is an honest 401"
 
-    def test_end_requires_a_token(self):
+    def test_end_without_a_token_is_unauthorized(self):
         resp = client.post("/api/v1/engine/combat/end", json={"session_id": "s"})
-        assert resp.status_code == 422, "missing required token query param"
+        assert resp.status_code == 401, "missing credential is an honest 401"
 
     def test_begin_forwards_identity_and_engine_path(self, monkeypatch):
         captured: dict = {}

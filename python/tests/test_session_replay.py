@@ -193,7 +193,10 @@ class TestReplayAuth:
         assert _export("not.a.valid.token").status_code == 401
 
     def test_missing_token_is_rejected(self, patched_ledger):
-        assert _export(None).status_code == 422
+        # Audit remediation: the replay route now resolves its token through
+        # _require_auth, so a MISSING credential is an honest 401 (not the old
+        # 422 validation error) and never an anonymous export.
+        assert _export(None).status_code == 401
 
 
 class TestReplayErrorMapping:

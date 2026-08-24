@@ -1,11 +1,17 @@
 /**
  * Engine telemetry client — GET /api/v1/engine/metrics.
  *
- * Read-only proxy to the Rust engine's public GET /metrics (unauthenticated
- * per crates/vtt-server/src/auth.rs PUBLIC_PATHS). Every field here is a real
- * counter maintained by vtt-server; the UI must render null as "—", never
- * invent values when the engine is unreachable.
+ * Read-only proxy to the Rust engine's public GET /metrics. The GATEWAY route
+ * is browser-facing and authenticated (the caller's session token rides in the
+ * Authorization header), while the engine hop itself stays service-mediated —
+ * /metrics sits on PUBLIC_PATHS in crates/vtt-server/src/auth.rs, so no actor
+ * identity is needed downstream. Every field here is a real counter maintained
+ * by vtt-server; the UI must render null as "—", never invent values when the
+ * engine is unreachable or the caller is signed out (both render "unreachable"
+ * rather than fake numbers).
  */
+
+import { authHeaders } from './auth_headers';
 
 export interface EngineMetrics {
   /** Percentage of adjudicated actions that executed without rejection. */
@@ -29,7 +35,7 @@ export type EngineMetricsResult =
  */
 export async function fetchEngineMetrics(): Promise<EngineMetricsResult> {
   try {
-    const resp = await fetch('/api/v1/engine/metrics');
+    const resp = await fetch('/api/v1/engine/metrics', { headers: authHeaders() });
     if (!resp.ok) return { status: 'unreachable' };
     const metrics = (await resp.json()) as EngineMetrics;
     return { status: 'live', metrics };

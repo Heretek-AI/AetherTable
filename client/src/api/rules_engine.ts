@@ -6,6 +6,12 @@
  * the engine is unreachable so callers can fall back to local rolling and the
  * demo never hard-blocks.
  *
+ * EVERY /api/v1/engine/* call carries the caller's identity (?token= like all
+ * other engine calls in this file) — the gateway 401s anonymous requests
+ * instead of resolving combat under its service principal. Signed-out callers
+ * get the local-dice fallback for read-style helpers, and an explicit
+ * NOT_AUTHENTICATED rejection on mutating ones.
+ *
  * Mutating actions (heal/rest) additionally report WHY they failed — the
  * gateway surfaces the engine's authoritative rejection verbatim (see
  * `_engine_call` in python/vtt_orchestrator/server.py), so callers can show
@@ -32,9 +38,18 @@ export interface EngineCheckResult {
   outcome: string;
 }
 
+/**
+ * POST an authenticated engine-proxy call. The stored session token rides in
+ * the query string exactly like every other /api/v1/engine/* call in this
+ * file (heal/rest/maneuvers); the gateway 401s tokenless requests rather than
+ * resolving anything anonymously. Returns null when signed out or unreachable
+ * so dice helpers can fall back to local rolling.
+ */
 async function enginePost<T>(path: string, body: unknown): Promise<T | null> {
+  const token = getStoredToken();
+  if (!token) return null;
   try {
-    const resp = await fetch(path, {
+    const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -162,10 +177,10 @@ function rejectionFrom(status: number, payload: unknown): EngineActionOutcome<ne
 }
 
 /**
- * POST variant used by mutating actions. The /api/v1/engine/heal and
- * /api/v1/engine/rest gateway routes declare `token: str = Query(...)` — the
- * token is read from the query string ONLY there (not the header-or-query
- * `_token_from` dependency other routes use), so these calls append ?token=.
+ * POST variant used by mutating actions. Every gateway engine proxy resolves
+ * its caller through `_require_auth` (Authorization Bearer header first,
+ * legacy ?token= query param as back-compat); like all other calls in this
+ * file these append ?token= so the request stays attributable either way.
  */
 async function engineActionPost<T>(path: string, body: unknown): Promise<EngineActionOutcome<T>> {
   try {
@@ -241,8 +256,8 @@ export async function engineRest(params: {
  * the engine rolls the contests against server-side stat blocks and either
  * applies them to its ledger or refuses with a machine code the UI quotes
  * verbatim (ATTACKER_NOT_FOUND, OUT_OF_REACH, ACTION_ECONOMY_EXHAUSTED, …).
- * The gateway routes declare `token: str = Query(...)`, so these calls append
- * ?token= exactly like engineHeal/engineRest.
+ * These calls append ?token= exactly like engineHeal/engineRest so the gateway
+ * forwards the real caller to the engine's RBAC.
  */
 
 /** Verbatim body of POST /api/v1/sessions/{id}/action/grapple. */
@@ -507,7 +522,8 @@ export async function engineHelp(params: {
  *
  * The grimoire list is read from the gateway's SRD compendium
  * (GET /api/v1/compendium/spells); casting posts through the cast-spell
- * proxy (POST /api/v1/engine/cast-spell, token Query param) into vtt-core's
+ * proxy (POST /api/v1/engine/cast-spell, authenticated like every engine
+ * call) into vtt-core's
  * slot ledger, upcast ladder and concentration lifecycle. Nothing here
  * invents spell statistics: fields the compendium does not carry (damage
  * formula/type, save attribute) are sent as null so the engine — not the
@@ -780,7 +796,9 @@ export type EngineMapGenerateOutcome =
 /**
  * Generate a dungeon through the authoritative WFC solver. Same seed ⇒
  * byte-identical tile grid (engine-side RNG); omitting the seed lets the
- * engine apply its documented default (1337).
+ * engine apply its documented default (1337). Authenticated like every other
+ * engine call: the stored session token rides in ?token= and a signed-out
+ * caller gets an explicit NOT_AUTHENTICATED rejection (no anonymous map gen).
  *
  * Failure mapping note: vtt-server answers a fully-exhausted solver with HTTP
  * 500 `{"error": "WFC_CONTRADICTION_EXHAUSTED after N attempts"}`, which the
@@ -789,14 +807,23 @@ export type EngineMapGenerateOutcome =
  * rejection first — callers can then show its honest meaning ("every collapse
  * attempt contradicted; no map exists") rather than a network error.
  */
+const NOT_SIGNED_IN_MAP: EngineMapGenerateOutcome = {
+  kind: 'rejected',
+  status: 401,
+  code: 'NOT_AUTHENTICATED',
+  message: 'Sign in to generate maps through the authoritative engine.',
+};
+
 export async function engineGenerateMap(params: {
   width: number;
   height: number;
   seed?: number;
   theme?: string;
 }): Promise<EngineMapGenerateOutcome> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN_MAP;
   try {
-    const resp = await fetch('/api/v1/engine/map/generate', {
+    const resp = await fetch(`/api/v1/engine/map/generate?token=${encodeURIComponent(token)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

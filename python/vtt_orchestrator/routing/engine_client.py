@@ -120,11 +120,14 @@ def _coerce_uuid(value: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
 
-async def create_session(campaign_id: str, session_name: str) -> Dict[str, Any]:
+async def create_session(
+    campaign_id: str, session_name: str, actor: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     return await engine_request(
         "POST",
         "/api/v1/sessions",
         {"campaign_id": _coerce_uuid(campaign_id), "session_name": session_name},
+        actor=actor,
     )
 
 
@@ -139,16 +142,22 @@ async def resolve_attack(
     )
 
 
-async def resolve_check(action: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", "/api/v1/actions/check", action)
+async def resolve_check(
+    action: Dict[str, Any], *, actor: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    return await engine_request("POST", "/api/v1/actions/check", action, actor=actor)
 
 
-async def resolve_save(action: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", "/api/v1/actions/save", action)
+async def resolve_save(
+    action: Dict[str, Any], *, actor: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    return await engine_request("POST", "/api/v1/actions/save", action, actor=actor)
 
 
-async def resolve_concentration(action: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", "/api/v1/actions/concentration", action)
+async def resolve_concentration(
+    action: Dict[str, Any], *, actor: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    return await engine_request("POST", "/api/v1/actions/concentration", action, actor=actor)
 
 
 async def resolve_death_save(
@@ -167,5 +176,7 @@ async def resolve_death_save(
     )
 
 
-async def generate_map(request: Dict[str, Any]) -> Dict[str, Any]:
-    return await engine_request("POST", "/api/v1/maps/generate", request)
+async def generate_map(
+    request: Dict[str, Any], *, actor: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    return await engine_request("POST", "/api/v1/maps/generate", request, actor=actor)

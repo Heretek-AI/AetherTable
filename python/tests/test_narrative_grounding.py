@@ -5,9 +5,16 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from vtt_orchestrator.server import app, extract_srd_context
+from vtt_orchestrator.server import _sign_token, app, extract_srd_context
 
 client = TestClient(app)
+
+
+def _auth_token(user_id: str, role: str = "player") -> str:
+    """Valid HMAC session token for authenticated proxy calls."""
+    import time
+
+    return _sign_token({"user_id": user_id, "role": role, "exp": time.time() + 600})
 
 
 def _stream_text(intent: str, action: str) -> str:
@@ -75,7 +82,11 @@ class TestXCard:
 
     def test_x_card_rewinds_engine_session_when_online(self):
         # Create a session through the proxy; if the engine is down, skip.
-        create = client.post("/api/v1/engine/session", json={"session_name": "safety-test"})
+        create = client.post(
+            "/api/v1/engine/session",
+            params={"token": _auth_token("safety-gm", "gm")},
+            json={"session_name": "safety-test"},
+        )
         if create.status_code != 200:
             pytest.skip("vtt-server engine not running")
 

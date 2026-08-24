@@ -14,6 +14,7 @@ import {
   Radio
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { getStoredToken } from '../api/auth_headers';
 import { User } from '../types/auth';
 
 export interface PlayerSeat {
@@ -47,7 +48,12 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
   useEffect(() => {
     let cancelled = false;
     const pollPresence = () => {
-      fetch('/api/v1/engine/rooms/aethertable-live/presence')
+      // Authenticated like every other /api/v1/engine/* call: the gateway 401s
+      // anonymous presence reads, and a signed-out visitor simply keeps the
+      // solo-session fallback (livePeers stays null).
+      const token = getStoredToken();
+      const authSuffix = token ? `?token=${encodeURIComponent(token)}` : '';
+      fetch(`/api/v1/engine/rooms/aethertable-live/presence${authSuffix}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((data) => {
           if (!cancelled) setLivePeers(data ? data.connected_peers : null);

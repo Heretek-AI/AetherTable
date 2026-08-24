@@ -295,3 +295,5 @@ every 10 iterations; adversarial audit sweeps ~every 10.
 
 ### Iteration 1 — b111d02 — fix(server): role-project GET /sessions/{id} (P1.1) — cargo 236/18, clippy clean
 ### Iteration 2 — this commit — feat(gateway): strict typed EngineSpawnEntity schema; deploy-math residue disclosed (P1.2) — pytest 569
+### Iteration 3 — (next commit) — feat(gateway,client): mandatory auth on all engine proxies + client token completion (P1.3) — pytest 578, vitest 75, benchmarks ALL PASSED
+### Iteration 4 — 0bd7df5 — fix(server): exact public paths, fail-closed room control, per-user WS cap (P1.7) — cargo 242/18
