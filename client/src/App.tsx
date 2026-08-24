@@ -149,14 +149,11 @@ export function App() {
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
   const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
-  // Dynamic Thematic Atmosphere (GOALS.md Pillar 2). Initialized from this
-  // browser's localStorage and applied to :root via a style element below.
-  //
-  // SYNC LIMITATION (honest): this selection is LOCAL-ONLY. There is no Yjs /
-  // network channel carrying it, so a player client does not receive the
-  // host's choice — every client applies whatever its own storage holds.
-  // Selection UI in the Navbar is GM-gated; non-GMs see the locally applied
-  // atmosphere read-only until atmosphere state moves through the CRDT relay.
+  // Dynamic Thematic Atmosphere (GOALS.md Pillar 2). DUAL-source truth:
+  // seeded from this browser's localStorage, then adopted live from the shared
+  // Yjs `atmosphere` map whenever the room carries a selection (see
+  // sync/yjs_doc_client.ts). The local copy still persists to localStorage so
+  // the palette survives offline / no-relay runs honestly.
   const [atmosphereId, setAtmosphereId] = useState<string>(() => loadStoredAtmosphereId());
 
   useEffect(() => {
@@ -164,6 +161,23 @@ export function App() {
     storeAtmosphereId(atmosphereId);
     return () => applyAtmosphereToDocument('default');
   }, [atmosphereId]);
+
+  /**
+   * Write-through selection used by the GM-gated Navbar picker and the New
+   * Campaign wizard: applies locally right away AND publishes to the CRDT room
+   * so peers converge within one relay tick (writes are queued in the Y.Doc and
+   * flushed on connect if the socket isn't up yet). Policy stays client-side:
+   * only this handler's callers — all GM-gated UI — ever publish.
+   */
+  const handleSelectAtmosphere = useCallback(
+    (id: string) => {
+      setAtmosphereId(id);
+      yjsClientRef.current?.setAtmosphereId(id, currentUser.id);
+    },
+    [currentUser.id]
+  );
+  // (The live room→state follow subscription lives just below the yjsClient
+  // state declaration — see "adopt the room's atmosphere".)
   const [activePing, setActivePing] = useState<{ x: number; y: number } | null>(null);
   const [activePeerTyping, setActivePeerTyping] = useState<string | null>(null);
 
@@ -261,6 +275,21 @@ export function App() {
   // State mirror of the ref so TacticalCanvas re-renders with fog/presence
   // once the Yjs client exists (refs alone don't trigger renders).
   const [yjsClient, setYjsClient] = useState<YjsCrdtClient | null>(null);
+
+  // Adopt the room's atmosphere: subscribe to the shared Yjs `atmosphere` map
+  // for as long as the CRDT transport exists. The subscription fires
+  // immediately with any existing entry (load-from-room path; falls back to the
+  // localStorage seed in `atmosphereId` above when the room has none yet), then
+  // on every remote change — including the IndexedDB restore that can land
+  // after mount. Our own writes echo back too; an identical id bails out of
+  // re-rendering, so there is no feedback loop.
+  useEffect(() => {
+    if (!yjsClient) return undefined;
+    return yjsClient.observeAtmosphereId((selection) => {
+      setAtmosphereId((prev) => (prev === selection.id ? prev : selection.id));
+    });
+  }, [yjsClient]);
+
   // Real peer cursors from CRDT awareness. Starts empty and stays empty while
   // alone or on the legacy relay — no fabricated stand-in cursors.
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
@@ -1270,7 +1299,8 @@ export function App() {
   /**
    * New Campaign wizard completion — fires ONLY after a real lobby was created
    * server-side. Applies the wizard's selections where real mechanisms exist:
-   * campaign title state and the local atmosphere preset. Rule version / party
+   * campaign title state and the table-wide atmosphere preset (write-through to
+   * the CRDT room via handleSelectAtmosphere). Rule version / party
    * size / starting level have no server field yet (the lobby API takes just a
    * name), so they are acknowledged in chat rather than silently dropped.
    */
@@ -1280,7 +1310,7 @@ export function App() {
     loadAdventureKey: string | null
   ) => {
     setCampaignTitle(config.name);
-    if (config.atmosphereId !== atmosphereId) setAtmosphereId(config.atmosphereId);
+    if (config.atmosphereId !== atmosphereId) handleSelectAtmosphere(config.atmosphereId);
     addSystemMessage(
       `Campaign "${config.name}" created — invite code shared in the wizard. ` +
         `Config: ${config.ruleVersion === 'srd_5_2' ? 'SRD 5.2' : 'SRD 5.1'}, ` +
@@ -1454,7 +1484,7 @@ export function App() {
         onOpenAudioMixer={() => setIsAudioMixerOpen(true)}
         onOpenJukebox={() => setIsJukeboxOpen(true)}
         activeAtmosphereId={atmosphereId}
-        onSelectAtmosphere={setAtmosphereId}
+        onSelectAtmosphere={handleSelectAtmosphere}
         canManageAtmosphere={userRole === 'gm'}
                 onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
         onOpenCampaignWizard={guardGmSurface('the New Campaign wizard', () => setIsCampaignWizardOpen(true))}

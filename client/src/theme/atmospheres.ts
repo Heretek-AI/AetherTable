@@ -13,12 +13,16 @@
  * no honest match we OMIT the binding entirely — we never invent a track id,
  * and we never auto-start audio here (the Jukebox owns play/pause).
  *
- * SYNC LIMITATION (documented honestly, not faked): the selected atmosphere
- * lives in React state in App.tsx + this browser's localStorage only. There is
- * no Yjs/network channel carrying it, so a player client does NOT receive the
- * host's choice — each client applies whatever its own localStorage holds (or
- * the stock palette). Wiring this through the CRDT relay is future work; until
- * then non-GM clients simply see their own local selection.
+ * SYNC: the selected atmosphere travels through the SAME Yjs CRDT relay as
+ * tokens and fog layers — a top-level `atmosphere` Y.Map entry carrying
+ * {id, set_by, ts} (see sync/yjs_doc_client.ts getAtmosphereId/setAtmosphereId/
+ * observeAtmosphereId). No protocol change was needed: arbitrary maps already
+ * ride ysync. App.tsx holds DUAL-source truth — it adopts whatever the room map
+ * says (live, and on join) and falls back to this browser's localStorage when
+ * the room has no entry yet (first-ever session / relay unreachable). Policy is
+ * enforced purely client-side: the transport accepts writes from any role, but
+ * only the GM/admin Navbar UI ever calls the setter. Concurrent GM selections
+ * converge via Y.Map's built-in resolution (see yjs_doc_client.ts).
  */
 
 /** Track ids that really exist in AudioManager.AMBIENCE_RECIPES today. */
@@ -53,6 +57,30 @@ export const DEFAULT_ATMOSPHERE_ID = 'default';
 
 /** localStorage key for the locally-persisted selection. */
 export const ATMOSPHERE_STORAGE_KEY = 'aethertable.atmosphere';
+
+/**
+ * Shape of the shared room-wide selection stored in the Yjs doc's top-level
+ * `atmosphere` Y.Map (under the fixed key 'current'). `ts` is an informational
+ * wall-clock stamp for debugging/UI; it does NOT drive conflict resolution —
+ * Yjs merges concurrent writes by its own causal ordering (see the comment on
+ * YjsCrdtClient.setAtmosphereId in sync/yjs_doc_client.ts).
+ */
+export interface AtmosphereSelection {
+  /** Preset id or DEFAULT_ATMOSPHERE_ID. */
+  id: string;
+  /** Auth user id of whoever last published the selection. */
+  set_by: string;
+  /** Wall-clock ms when that client wrote the entry. */
+  ts: number;
+}
+
+/**
+ * Coerce any raw value (localStorage junk, a Y.Map entry from an older/other
+ * build, tampered data) into a known preset id, defaulting to the stock palette.
+ */
+export function normalizeAtmosphereId(raw: unknown): string {
+  return typeof raw === 'string' && getAtmosphere(raw) ? raw : DEFAULT_ATMOSPHERE_ID;
+}
 
 export const ATMOSPHERE_PRESETS: AtmospherePreset[] = [
   {

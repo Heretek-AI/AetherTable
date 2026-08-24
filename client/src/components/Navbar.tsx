@@ -56,7 +56,8 @@ interface NavbarProps {
   onOpenJukebox?: () => void;
   /** Active Dynamic Thematic Atmosphere id ('default' = stock palette). */
   activeAtmosphereId?: string;
-  /** GM-only: applies a preset to :root + persists it (see theme/atmospheres.ts). */
+  /** GM-only: applies the preset locally AND publishes it to the CRDT room
+   *  (App.handleSelectAtmosphere — see theme/atmospheres.ts + sync/yjs_doc_client.ts). */
   onSelectAtmosphere?: (id: string) => void;
   /** False for players/spectators: they see the selection read-only. */
   canManageAtmosphere?: boolean;
@@ -505,12 +506,13 @@ export const Navbar: React.FC<NavbarProps> = ({
 
               {/* ── Dynamic Thematic Atmosphere (GOALS.md Pillar 2) ─────────
                   Selecting a preset overrides the semantic palette tokens on
-                  :root via a style element (theme/atmospheres.ts) and persists
-                  to localStorage.
-                  LIMITATION, stated honestly: atmosphere state lives in local
-                  React state + this browser's storage only — there is no sync
-                  channel, so non-GM clients do NOT receive the host's choice;
-                  they see their own locally-applied selection read-only here. */}
+                  :root via a style element (theme/atmospheres.ts), persists to
+                  localStorage, and publishes through the Yjs CRDT relay so every
+                  peer converges on the same table atmosphere.
+                  Policy stays client-side: the picker is GM-gated below (the
+                  transport itself accepts writes from any role), non-GMs see the
+                  room-wide selection read-only and follow remote GM switches
+                  live. */}
               {onSelectAtmosphere && (
                 <div className="pt-1 mt-1 border-t border-[var(--tavern-border)]">
                   <div className="flex items-center gap-1.5 px-2 py-1 text-[9px] uppercase tracking-wider font-bold text-[var(--rp-parchment-300)]">

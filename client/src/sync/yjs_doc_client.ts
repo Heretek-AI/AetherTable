@@ -1,9 +1,10 @@
 /**
  * True CRDT synchronization client built on Yjs + y-websocket.
  *
- * Token transforms AND fog-of-war masks live in Y.Maps inside one Y.Doc,
- * merged by the Yjs CRDT algorithm (causal ordering, not wall-clock LWW),
- * persisted by the relay, and fanned out through the y-websocket provider.
+ * Token transforms, fog-of-war masks, AND the room-wide table-atmosphere
+ * selection live in Y.Maps inside one Y.Doc, merged by the Yjs CRDT algorithm
+ * (causal ordering, not wall-clock LWW), persisted by the relay, and fanned
+ * out through the y-websocket provider.
  *
  * Public surface mirrors the legacy `VttCrdtSyncClient` so the app shell can
  * switch transports transparently; falls back to that relay when no
@@ -18,6 +19,7 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 // Vite's export-map resolution alike. If it ever stops being a transitive dep,
 // promote `y-protocols` to an explicit dependency in client/package.json.
 import { Awareness } from 'y-protocols/awareness';
+import { AtmosphereSelection, normalizeAtmosphereId } from '../theme/atmospheres';
 
 export interface TokenTransformData {
   tokenId: string;
@@ -55,6 +57,26 @@ interface CursorAwarenessState {
 
 type RemoteTokenListener = (payload: TokenTransformData) => void;
 type RemoteCursorListener = (cursors: RemoteCursor[]) => void;
+type AtmosphereListener = (selection: AtmosphereSelection) => void;
+
+/** Fixed Y.Map key holding the room-wide AtmosphereSelection. */
+const ATMOSPHERE_KEY = 'current';
+
+/**
+ * Validate a raw `atmosphere` map entry into an AtmosphereSelection, or null
+ * when absent/malformed (pre-sync docs, partial writes, tampered data).
+ */
+function readAtmosphereEntry(raw: unknown): AtmosphereSelection | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const rec = raw as Record<string, unknown>;
+  if (typeof rec.id !== 'string') return null;
+  return {
+    // Unknown preset ids degrade to the stock palette on the consumer side.
+    id: normalizeAtmosphereId(rec.id),
+    set_by: typeof rec.set_by === 'string' ? rec.set_by : '',
+    ts: typeof rec.ts === 'number' && Number.isFinite(rec.ts) ? rec.ts : 0,
+  };
+}
 
 /** Peer cursor colors are assigned deterministically from user_id. */
 const CURSOR_PALETTE = [
@@ -82,9 +104,11 @@ export class YjsCrdtClient {
   private idb: IndexeddbPersistence | null = null;
   private tokens: Y.Map<Record<string, unknown>>;
   private fog: Y.Map<Uint8Array>;
+  private atmosphere: Y.Map<unknown>;
   private remoteListeners = new Set<RemoteTokenListener>();
   private tokenObservers = new Map<string, () => void>();
   private cursorListeners = new Set<RemoteCursorListener>();
+  private atmosphereListeners = new Set<AtmosphereListener>();
   /** Presence protocol instance. The provider owns one; we only create our own for local-only mode. */
   private awareness: Awareness | null = null;
   private ownAwareness = false;
@@ -100,6 +124,7 @@ export class YjsCrdtClient {
   constructor(serverUrl: string, roomId: string) {
     this.tokens = this.doc.getMap('tokens');
     this.fog = this.doc.getMap('fog');
+    this.atmosphere = this.doc.getMap('atmosphere');
 
     // Offline persistence: mirror the Y.Doc into IndexedDB so a room survives
     // page reloads even when the relay is unreachable. Scoped per room.
@@ -151,6 +176,14 @@ export class YjsCrdtClient {
         const value = this.tokens.get(tokenId) as TokenTransformData | undefined;
         if (value) this.remoteListeners.forEach((listener) => listener(value));
       });
+    });
+
+    // Fan out atmosphere changes to listeners (local writes included; App.tsx
+    // treats a same-id echo as a no-op, so there is no feedback loop).
+    this.atmosphere.observe(() => {
+      if (!this.atmosphereListeners.size) return;
+      const selection = this.getAtmosphereId();
+      if (selection) this.atmosphereListeners.forEach((listener) => listener(selection));
     });
   }
 
@@ -332,6 +365,55 @@ export class YjsCrdtClient {
     };
   }
 
+  // --- Table atmosphere (shared preset selection) --------------------------
+
+  /**
+   * Publish the room-wide atmosphere preset. Writes ride the same Y.Doc /
+   * ysync relay as tokens and fog — no protocol change.
+   *
+   * POLICY NOTE: the transport accepts this write from ANY role; the GM-only
+   * restriction lives entirely in the UI layer (Navbar gates the picker, App
+   * only calls this from the GM-gated handler). We deliberately do not fake a
+   * server-side role check that does not exist.
+   *
+   * CONFLICT SEMANTICS: everything is stored under ONE map key ('current'), so
+   * concurrent writers resolve via Y.Map's built-in last-write-wins per key —
+   * causally ordered writes converge on whichever update arrived later at each
+   * replica, and TRUE simultaneous writes (no causal ordering) are broken
+   * deterministically by Yjs's internal entry comparison (clientID), not by
+   * `ts`. The `ts` stamp is informational/debug only. In practice exactly one
+   * GM writes this key, so the concurrent-writer path is a safety net, not a
+   * designed-for case.
+   */
+  public setAtmosphereId(id: string, setBy: string): void {
+    const entry: AtmosphereSelection = {
+      id: normalizeAtmosphereId(id),
+      set_by: setBy,
+      ts: Date.now(),
+    };
+    this.atmosphere.set(ATMOSPHERE_KEY, entry);
+  }
+
+  /** Current room-wide selection, or null when nothing has been published yet. */
+  public getAtmosphereId(): AtmosphereSelection | null {
+    return readAtmosphereEntry(this.atmosphere.get(ATMOSPHERE_KEY));
+  }
+
+  /**
+   * Subscribe to the room-wide atmosphere. Fires IMMEDIATELY with the current
+   * snapshot when one exists (covering late joiners and the IndexedDB restore
+   * racing app mount), then again whenever the entry appears or changes —
+   * locally or remotely. Returns an unsubscribe function.
+   */
+  public observeAtmosphereId(cb: AtmosphereListener): () => void {
+    this.atmosphereListeners.add(cb);
+    const existing = this.getAtmosphereId();
+    if (existing) cb(existing);
+    return () => {
+      this.atmosphereListeners.delete(cb);
+    };
+  }
+
   public destroy(): void {
     this.tokenObservers.forEach((off) => off());
     if (this.cursorFlushTimer !== null) {
@@ -346,6 +428,7 @@ export class YjsCrdtClient {
       /* doc may already be torn down */
     }
     this.cursorListeners.clear();
+    this.atmosphereListeners.clear();
     if (this.ownAwareness) this.awareness?.destroy();
     this.idb?.destroy();
     this.provider?.destroy();
