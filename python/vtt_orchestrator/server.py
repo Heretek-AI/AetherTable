@@ -2786,8 +2786,18 @@ class ConcordiaNegotiateRequest(BaseModel):
 
 
 @app.post("/api/v1/quest/generate")
-def generate_quest(req: QuestGenerateRequest):
+def generate_quest(req: QuestGenerateRequest, token: str = Depends(_require_auth)):
+    """GM-only quest generation (mirrors the autosave role gate).
+
+    Generation mutates shared gateway state — it replaces the module-level
+    ``active_campaign_quest`` graph every player's journal reads — so a player
+    caller is rejected 403 before any engine-side generation runs.
+    """
     global active_campaign_quest
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="QUEST_GENERATION_GM_ONLY")
+
     quest = global_quest_generator.generate_campaign_quest(
         campaign_theme=req.campaign_theme,
         primary_house=req.primary_house,
@@ -2798,7 +2808,10 @@ def generate_quest(req: QuestGenerateRequest):
 
 
 @app.get("/api/v1/quest/active")
-def get_active_quest():
+def get_active_quest(token: str = Depends(_require_auth)):
+    # Authenticated read, any role: the active graph is shared campaign state
+    # players must be able to see (mirrors handout reads).
+
     global active_campaign_quest
     if not active_campaign_quest:
         active_campaign_quest = global_quest_generator.generate_campaign_quest()
@@ -2806,7 +2819,12 @@ def get_active_quest():
 
 
 @app.post("/api/v1/quest/concordia-negotiate")
-def negotiate_concordia_pact(req: ConcordiaNegotiateRequest):
+def negotiate_concordia_pact(
+    req: ConcordiaNegotiateRequest, token: str = Depends(_require_auth)
+):
+    # Token-required pact computation over supplied inputs; open to any
+    # authenticated role (players drive negotiation from the dialogue view).
+
     result = global_concordia_engine.negotiate_treaty(
         house_a_name=req.house_a,
         house_b_name=req.house_b,
