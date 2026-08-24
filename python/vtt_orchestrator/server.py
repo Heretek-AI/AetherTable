@@ -1462,10 +1462,21 @@ async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
         violation (e.g. narrated death of a still-breathing target) emits a
         corrective system event and CUTS the stream; unaudited continuation
         is never forwarded.
+
+        Honest degradation: when the LLM gateway signals its deterministic
+        fallback (a (DEGRADED_MARKER, reason) sentinel item), a leading
+        {"degraded": true, "reason": ...} frame is emitted and every
+        subsequent frame — including the final done frame — carries
+        {"degraded": true} so clients can distinguish canned narration from
+        real model output.
         """
         import json as _json
 
+        from .routing.llm_client import DEGRADED_MARKER
+
         pending = ""
+        degraded = False
+        degradation_reason: str | None = None
 
         def audit(sentence: str) -> list:
             verdict = auditor.audit_proposal(
@@ -1484,10 +1495,25 @@ async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
             yield "data: " + _json.dumps({
                 "token": f" [SYSTEM: narrative halted by Pre-Commit Auditor — {corrective}]",
                 "done": False,
+                **({"degraded": True, "reason": degradation_reason} if degraded else {}),
             }) + "\n\n"
-            yield "data: " + _json.dumps({"token": "", "done": True}) + "\n\n"
+            yield "data: " + _json.dumps({
+                "token": "",
+                "done": True,
+                **({"degraded": True} if degraded else {}),
+            }) + "\n\n"
 
         async for chunk in raw_generator:
+            if isinstance(chunk, tuple):
+                # Degradation sentinel from the deterministic fallback path.
+                if chunk and chunk[0] == DEGRADED_MARKER:
+                    degraded = True
+                    degradation_reason = str(chunk[1]) if len(chunk) > 1 else "unknown"
+                    yield "data: " + _json.dumps({
+                        "degraded": True,
+                        "reason": degradation_reason,
+                    }) + "\n\n"
+                continue
             if not chunk.startswith("data: "):
                 continue
             try:
@@ -1513,6 +1539,7 @@ async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
                 yield "data: " + _json.dumps({
                     "token": sentence,
                     "done": False,
+                    **({"degraded": True} if degraded else {}),
                 }) + "\n\n"
                 pending = pending[match.end():]
 
@@ -1524,9 +1551,17 @@ async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
                 for out in halt_frames(corrective):
                     yield out
                 return
-            yield "data: " + _json.dumps({"token": pending, "done": False}) + "\n\n"
+            yield "data: " + _json.dumps({
+                "token": pending,
+                "done": False,
+                **({"degraded": True} if degraded else {}),
+            }) + "\n\n"
 
-        yield "data: " + _json.dumps({"token": "", "done": True}) + "\n\n"
+        yield "data: " + _json.dumps({
+            "token": "",
+            "done": True,
+            **({"degraded": True} if degraded else {}),
+        }) + "\n\n"
 
     return StreamingResponse(
         audited_stream(),

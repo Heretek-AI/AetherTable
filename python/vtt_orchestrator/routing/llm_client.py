@@ -8,6 +8,12 @@ import httpx
 
 LLM_LOG_PATH = os.environ.get("LLM_LOG_PATH", "logs/llm_calls.jsonl")
 
+# Sentinel yielded as the FIRST item of a degraded (deterministic fallback)
+# narrative stream: ("__DEGRADED__", reason). Gateways detect the tuple and
+# must surface honest degradation metadata to clients instead of silently
+# passing fabricated narration off as real LLM output.
+DEGRADED_MARKER = "__DEGRADED__"
+
 
 def _log_llm_call(record: Dict[str, Any]) -> None:
     """Appends one structured JSONL record per upstream LLM interaction.
@@ -139,17 +145,27 @@ class LLMStreamingGateway:
         user_intent: str,
         engine_payload: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[Any, None]:
         """
         Yields SSE formatted chunks: `data: {"token": "...", "done": false}\n\n`
+
+        Honest degradation contract: when the live upstream fails (or is not
+        configured), the FIRST yielded item is the sentinel tuple
+        `(DEGRADED_MARKER, reason)` so gateways can tag every subsequent
+        fallback frame as degraded instead of passing canned narration off as
+        genuine LLM output.
         """
         context = context or {}
         action_name = engine_payload.get("action_name", "Action")
         is_hit = engine_payload.get("is_hit", True)
         total_dmg = engine_payload.get("total_damage", 0)
+        srd_tail = self._srd_tail(context)
 
         # If real API key is present, attempt live upstream OpenAI-compatible streaming
-        if not self.config.is_mock:
+        degradation_reason: Optional[str] = None
+        if self.config.is_mock:
+            degradation_reason = "mock_mode: no LLM key configured"
+        else:
             try:
                 system_prompt = (
                     "You are the Encounter Dungeon Master for an authoritative Virtual Tabletop. "
@@ -214,6 +230,9 @@ class LLMStreamingGateway:
                             "status": response.status_code,
                             "error": "non-200 streaming response",
                         })
+                        degradation_reason = (
+                            f"llm_upstream_http_{response.status_code}"
+                        )
             except Exception as e:
                 # Structured record + smooth failover to deterministic mock.
                 _log_llm_call({
@@ -224,10 +243,24 @@ class LLMStreamingGateway:
                     "status": None,
                     "error": str(e)[:2000],
                 })
+                degradation_reason = f"llm_upstream_error: {str(e)[:200]}"
+
+        # Honest-degradation marker BEFORE any fallback token: the gateway can
+        # detect this tuple and tag every downstream frame as degraded.
+        if degradation_reason:
+            yield (DEGRADED_MARKER, degradation_reason)
 
         # High-Speed Deterministic Generator Fallback
-        # Weave SRD compendium facts into the narration so even the offline
-        # generator stays mechanically faithful to the stat blocks.
+        for tok in self._canned_tokens(action_name, is_hit, total_dmg, srd_tail):
+            await asyncio.sleep(0.02)  # Simulate 50 tokens/sec streaming
+            yield f"data: {json.dumps({'token': tok, 'done': False})}\n\n"
+
+        yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
+
+    @staticmethod
+    def _srd_tail(context: Dict[str, Any]) -> list:
+        """SRD compendium facts woven into offline narration so even the
+        deterministic generator stays faithful to the stat blocks."""
         srd_tail: list = []
         for fact in (context or {}).get("srd", [])[:2]:
             if fact.get("type") == "monster":
@@ -242,7 +275,12 @@ class LLMStreamingGateway:
                     f"{fact['name']} ", f"is ", f"a {fact.get('level_name')} ",
                     f"{fact.get('school')} ", f"spell ", f"— ", f"{fact.get('snippet', '')} ",
                 ])
+        return srd_tail
 
+    @staticmethod
+    def _canned_tokens(
+        action_name: str, is_hit: bool, total_dmg: Any, srd_tail: list
+    ) -> list:
         if is_hit:
             tokens = [
                 "With ", "unwavering ", "conviction, ", "the ", "strike ", f"of {action_name} ",
@@ -260,8 +298,88 @@ class LLMStreamingGateway:
         if srd_tail:
             tokens = tokens + ["\n\n"] + srd_tail
 
-        for tok in tokens:
-            await asyncio.sleep(0.02)  # Simulate 50 tokens/sec streaming
-            yield f"data: {json.dumps({'token': tok, 'done': False})}\n\n"
+        return tokens
 
-        yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
+    async def generate_narrative(
+        self,
+        user_intent: str,
+        engine_payload: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Non-streaming narrative generation with an honest degradation flag.
+
+        Returns `{"narrative": str, "degraded": bool, ...}`. When the upstream
+        LLM is unavailable (mock mode, HTTP failure, or exception), the
+        deterministic fallback text is returned with `"degraded": true` and a
+        `"reason"` so callers never mistake canned narration for model output.
+        """
+        context = context or {}
+        action_name = engine_payload.get("action_name", "Action")
+        is_hit = engine_payload.get("is_hit", True)
+        total_dmg = engine_payload.get("total_damage", 0)
+
+        if not self.config.is_mock:
+            started = time.perf_counter()
+            try:
+                payload = {
+                    "model": self.config.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are the Encounter Dungeon Master for an "
+                                "authoritative Virtual Tabletop. Narrate the resolved "
+                                "action in 2-3 sentences based strictly on the "
+                                "deterministic engine facts. Do not contradict the "
+                                "engine payload."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Player Action: {user_intent}\n"
+                                f"Engine Resolution: {action_name}, Hit: {is_hit}, "
+                                f"Damage: {total_dmg} HP.\n"
+                                f"Context: {json.dumps(context)}"
+                            ),
+                        },
+                    ],
+                    "max_tokens": 200,
+                    "temperature": 0.7,
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.config.api_key}",
+                    "Content-Type": "application/json",
+                }
+                endpoint = f"{self.config.base_url.rstrip('/')}/chat/completions"
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(endpoint, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    narrative = resp.json()["choices"][0]["message"]["content"] or ""
+                _log_llm_call({
+                    "ts": time.time(),
+                    "kind": "generate_narrative",
+                    "model": self.config.model,
+                    "base_url": self.config.base_url,
+                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                    "status": resp.status_code,
+                    "response_chars": len(narrative),
+                })
+                return {"narrative": narrative, "degraded": False}
+            except Exception as e:
+                _log_llm_call({
+                    "ts": time.time(),
+                    "kind": "generate_narrative",
+                    "model": self.config.model,
+                    "base_url": self.config.base_url,
+                    "status": getattr(locals().get("resp"), "status_code", None),
+                    "error": str(e)[:2000],
+                })
+                reason = f"llm_upstream_error: {str(e)[:200]}"
+        else:
+            reason = "mock_mode: no LLM key configured"
+
+        narrative = "".join(
+            self._canned_tokens(action_name, is_hit, total_dmg, self._srd_tail(context))
+        )
+        return {"narrative": narrative, "degraded": True, "reason": reason}

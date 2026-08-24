@@ -221,6 +221,10 @@ async def test_llm_streaming_gateway():
     gateway = LLMStreamingGateway(LLMConfig())
     collected_tokens = []
     async for chunk in gateway.stream_narrative("I cast Fireball", {"action_name": "Fireball", "is_hit": True, "total_damage": 28}):
+        if isinstance(chunk, tuple):
+            # Honest-degradation sentinel ("__DEGRADED__", reason) — mock mode
+            # has no upstream key, so the fallback marker leads the stream.
+            continue
         if chunk.startswith("data: "):
             parsed = json.loads(chunk[6:].strip())
             if not parsed.get("done"):
