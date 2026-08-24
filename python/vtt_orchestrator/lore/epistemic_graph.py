@@ -34,6 +34,15 @@ def epistemic_tier_weight(epistemic_tier) -> float:
     )
 
 
+def _tier_rank(epistemic_tier: EpistemicTier) -> int:
+    """Position along the Pillar-7 progression (rumor < proposed < canon)."""
+    return {
+        EpistemicTier.SUBJECTIVE_RUMOR: 0,
+        EpistemicTier.PROPOSED_FACT: 1,
+        EpistemicTier.VALIDATED_CANON: 2,
+    }[epistemic_tier]
+
+
 class EpistemicLoreGraphManager:
     """
     Manages the 3-Tier Sanctioned Retcon Lore Graph and Paradox Detection Queries (<40ms SLA).
@@ -111,6 +120,33 @@ class EpistemicLoreGraphManager:
             "assigned_weight": weight,
             "latency_ms": latency,
         }
+
+    def current_tier(
+        self, subject_id: str, predicate: str, object_id: str
+    ) -> Optional[EpistemicTier]:
+        """Highest epistemic tier currently held by this exact triple.
+
+        Used by the server's promotion gate: VALIDATED_CANON is only reachable
+        when the same subject/predicate/object already sits at PROPOSED_FACT,
+        which forces the Pillar-7 walk (rumor -> proposed fact -> canon) to
+        pass through paradox review at every hop. Reads the synchronous
+        in-memory projection maintained by submit_assertion.
+        """
+        best: Optional[EpistemicTier] = None
+        for edge in self.edges:
+            if (
+                edge["from"] == subject_id
+                and edge["rel"] == predicate
+                and edge["to"] == object_id
+            ):
+                tier = edge.get("tier")
+                if isinstance(tier, str):
+                    tier = EpistemicTier(tier)
+                if tier is None:
+                    continue
+                if best is None or _tier_rank(tier) > _tier_rank(best):
+                    best = tier
+        return best
 
     def apply_edge_weight_decay(self, decay_factor: float = 0.95):
         """Dynamic edge weight decay for background aging in working memory."""

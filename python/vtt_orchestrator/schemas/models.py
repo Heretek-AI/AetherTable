@@ -74,7 +74,10 @@ class LoreAssertionPayload(BaseModel):
     predicate_relation: str
     object_node_id: str
     confidence_score: float = Field(0.7, ge=0.0, le=1.0)
-    epistemic_tier: EpistemicTier = EpistemicTier.PROPOSED_FACT
+    # Pillar-7: submitted assertions enter at the bottom of the progression
+    # (rumor). Promotion to proposed_fact/validated_canon is a server-side
+    # decision gated on the CALLER's role, never a request-body default.
+    epistemic_tier: EpistemicTier = EpistemicTier.SUBJECTIVE_RUMOR
     context_sentence: str
 
 

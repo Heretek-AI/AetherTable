@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..schemas.models import LoreAssertionPayload
+from ..schemas.models import EpistemicTier, LoreAssertionPayload
 from .epistemic_graph import (
     INTACT_PREDICATES,
     LIVING_PREDICATES,
@@ -159,6 +159,34 @@ class Neo4jEpistemicGraph:
             "assigned_weight": weight,
             "latency_ms": latency,
         }
+
+    def current_tier(
+        self, subject_id: str, predicate: str, object_id: str
+    ) -> Optional[EpistemicTier]:
+        """Highest epistemic tier held by this exact triple (promotion gate).
+
+        Reads the synchronous projection that every commit through this
+        process mirrors (see :meth:`_project_committed_edge`), mirroring the
+        in-memory manager's contract so the server-side promotion rule is
+        backend-independent.
+        """
+        from .epistemic_graph import _tier_rank
+
+        best: Optional[EpistemicTier] = None
+        for edge in self.edges:
+            if (
+                edge["from"] == subject_id
+                and edge["rel"] == predicate
+                and edge["to"] == object_id
+            ):
+                tier = edge.get("tier")
+                if isinstance(tier, str):
+                    tier = EpistemicTier(tier)
+                if tier is None:
+                    continue
+                if best is None or _tier_rank(tier) > _tier_rank(best):
+                    best = tier
+        return best
 
     def apply_edge_weight_decay(self, decay_factor: float = 0.95) -> None:
         """Age staged edges down; validated canon (weight == 1.0) never decays."""

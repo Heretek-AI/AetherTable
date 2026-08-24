@@ -66,8 +66,11 @@ class TestSrdGrounding:
 
 class TestXCard:
     def test_x_card_records_intervention_without_engine(self):
+        # X-card is state-affecting: an authenticated token is required, and a
+        # non-GM may only file the intervention under their own user id.
         resp = client.post(
             "/api/v1/safety/x-card",
+            params={"token": _auth_token("usr_test", "player")},
             json={
                 "player_id": "usr_test",
                 "topic": "spiders",
@@ -80,8 +83,17 @@ class TestXCard:
         assert body["target_sequence_id"] == 6
         assert "engine_rewind" not in body, "no rewind attempted without a bound session"
 
+    def test_anonymous_x_card_is_rejected(self):
+        resp = client.post(
+            "/api/v1/safety/x-card",
+            json={"player_id": "usr_test", "topic": "spiders", "current_sequence_id": 7},
+        )
+        assert resp.status_code == 401
+
     def test_x_card_rewinds_engine_session_when_online(self):
         # Create a session through the proxy; if the engine is down, skip.
+        # A GM token is used because out-of-band sessions have no lobby
+        # membership record a player could be validated against.
         create = client.post(
             "/api/v1/engine/session",
             params={"token": _auth_token("safety-gm", "gm")},
@@ -93,8 +105,9 @@ class TestXCard:
         session_id = create.json()["session_id"]
         resp = client.post(
             "/api/v1/safety/x-card",
+            params={"token": _auth_token("safety-gm", "gm")},
             json={
-                "player_id": "usr_test",
+                "player_id": "safety-gm",
                 "topic": "torture",
                 "current_sequence_id": 5,
                 "engine_session_id": session_id,

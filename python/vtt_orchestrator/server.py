@@ -2854,18 +2854,106 @@ def compendium_lore_lookup(
     return {"query": q, "facts": extract_srd_context(q), "retrieval": "substring"}
 
 
+async def _caller_is_session_participant(user_id: str, engine_session_id: str) -> bool:
+    """True when the caller's lobby membership is bound to this engine session.
+
+    The gateway's authoritative session-membership data IS the lobby roster:
+    members join via invite code and the host's launch binds
+    ``engine_session_id`` onto the lobby (storage.set_lobby_session). That
+    binding is what legitimizes a participant for session-affecting actions.
+    """
+    lobbies = await storage_backend.list_lobbies_for_user(user_id)
+    return any(
+        lobby.get("engine_session_id") == engine_session_id for lobby in lobbies
+    )
+
+
 @app.post("/api/v1/lore/assert")
 def assert_lore(
     assertion: LoreAssertionPayload,
     token: str = Query(..., description="HMAC session token"),
 ):
-    # Lore canon is shared world state — writes require an authenticated user.
-    _require_user_id(token)
+    """Commit or stage a lore assertion under the Pillar-7 epistemic ladder.
+
+    Authorization model (enforced here, never taken from the request body):
+
+    * Every assertion ENTERS at SUBJECTIVE_RUMOR — that is the schema default.
+    * player/spectator tokens (and any unrecognized role — fails closed) can
+      never set a tier above rumor; their assertions stage into the paradox /
+      verification pipeline like everyone else's rumors. A request body that
+      claims more gets an honest 403, not a silent downgrade.
+    * gm/admin tokens may promote ONE step per call:
+      rumor -> PROPOSED_FACT directly, and an existing staged PROPOSED_FACT
+      triple on to VALIDATED_CANON (weight 1.0). Jumping two steps in one call
+      is refused so canon always passes through the staged-fact review.
+
+    Response shape (unchanged across all outcomes):
+      ``{status, epistemic_tier, assigned_weight, latency_ms}`` where status is
+      COMMITTED | STAGED | REJECTED_PARADOX; 403 refusals carry a
+      ``LORE_TIER_FORBIDDEN`` detail string.
+    """
+    actor = _caller_actor(token)  # 401 on invalid/expired tokens
+
+    requested = assertion.epistemic_tier
+    if requested != EpistemicTier.SUBJECTIVE_RUMOR:
+        if actor.get("role", "") not in ("gm", "admin"):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "LORE_TIER_FORBIDDEN: only GM tokens may promote lore above "
+                    f"SUBJECTIVE_RUMOR; requested {requested.value}. Your "
+                    f"assertion was NOT committed — resubmit without an "
+                    f"epistemic_tier to enter it as a rumor."
+                ),
+            )
+        if requested == EpistemicTier.VALIDATED_CANON:
+            current = lore_graph.current_tier(
+                assertion.subject_node_id,
+                assertion.predicate_relation,
+                assertion.object_node_id,
+            )
+            if current != EpistemicTier.PROPOSED_FACT:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "LORE_TIER_FORBIDDEN: promotion is one step per call — "
+                        "VALIDATED_CANON requires this exact triple to already be "
+                        f"staged at PROPOSED_FACT (found {current.value if current else 'nothing'})."
+                    ),
+                )
+
     return lore_graph.submit_assertion(assertion)
 
 
 @app.post("/api/v1/spotlight/record")
-def record_spotlight(req: UtteranceRecordRequest):
+async def record_spotlight(
+    req: UtteranceRecordRequest, token: str = Depends(_require_auth)
+):
+    """Records one spoken utterance for agency tracking.
+
+    speaker_id must BE the authenticated caller (user id, username, or display
+    name — case-insensitive) unless the caller holds a gm/admin token: letting
+    a client attribute utterances to other voices would let one player skew
+    spotlight/agency scoring for the whole table. 403 with a
+    ``SPOTLIGHT_SPOOFED_SPEAKER`` detail otherwise.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        profile = await storage_backend.get_user_by_id(actor["user_id"])
+        identities = {actor["user_id"]}
+        if profile:
+            identities.update(
+                str(profile.get(field, "")).strip().lower()
+                for field in ("username", "display_name", "displayName")
+            )
+        if req.speaker_id.strip().lower() not in {i for i in identities if i}:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "SPOTLIGHT_SPOOFED_SPEAKER: you may only record your own "
+                    "voice; ask the GM to attribute other speakers."
+                ),
+            )
     spotlight_tracker.record_utterance(req.speaker_id, req.duration_sec)
     return {
         "status": "recorded",
@@ -2875,7 +2963,8 @@ def record_spotlight(req: UtteranceRecordRequest):
 
 
 @app.get("/api/v1/spotlight/agency")
-def get_spotlight_agency():
+def get_spotlight_agency(token: str = Depends(_require_auth)):
+    _caller_actor(token)  # authenticated read; any role
     return {
         "agency_weights": spotlight_tracker.calculate_agency_weights(),
         "sidelined_players": spotlight_tracker.get_sidelined_players(),
@@ -2883,7 +2972,56 @@ def get_spotlight_agency():
 
 
 @app.post("/api/v1/safety/x-card")
-async def trigger_x_card(req: XCardRequest):
+async def trigger_x_card(req: XCardRequest, token: str = Depends(_require_auth)):
+    """Player-veto safety intervention (Pillar-11).
+
+    Trust decisions:
+
+    * An authenticated HMAC token is REQUIRED. An x-card rewinds scene state,
+      which makes it state-affecting even though its purpose is protective.
+    * The intervention must be filed under the CALLER's own user id unless the
+      caller is gm/admin — no filing interventions attributed to someone else.
+    * When ``engine_session_id`` names a live session, legitimacy comes from
+      the membership data the gateway actually owns: gm/admin globally, or any
+      member of a lobby bound to that engine session (host launch creates the
+      binding; invite-code joins create the roster). Everyone else — including
+      otherwise-valid tokens naming sessions they never joined — gets 403.
+    * Sessions with NO lobby binding (created out-of-band through the engine
+      proxy) are rewindable by gm/admin tokens ONLY, because there is no
+      roster proving a player's standing: fail closed.
+    * When no session is named, nothing is rewound; any authenticated caller
+      may still record the intervention against their own id.
+
+    Response shape unchanged: ``{status, target_sequence_id, ...,
+    engine_rewind?}`` where ``engine_rewind`` appears only when a session was
+    named.
+    """
+    actor = _caller_actor(token)
+    is_staff = actor.get("role", "") in ("gm", "admin")
+
+    if req.player_id != actor["user_id"] and not is_staff:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "X_CARD_IDENTITY_MISMATCH: file the intervention under your own "
+                "player id."
+            ),
+        )
+
+    if req.engine_session_id and not is_staff:
+        participant = await _caller_is_session_participant(
+            actor["user_id"], req.engine_session_id
+        )
+        if not participant:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "X_CARD_NOT_A_PARTICIPANT: only session participants (via a "
+                    "lobby bound to that session) or GMs may trigger a rewind of "
+                    f"session {req.engine_session_id}."
+                ),
+            )
+
     result = safety_gateway.trigger_x_card(
         player_id=req.player_id,
         topic=req.topic,
