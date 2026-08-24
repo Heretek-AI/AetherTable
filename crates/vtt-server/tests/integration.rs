@@ -1384,3 +1384,287 @@ async fn long_rest_restores_owned_entities_short_rest_is_a_hook() {
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
 }
+
+// --- Fail-forward wire-up (audit remediation) -------------------------------
+//
+// The fail-forward resolution engine (CheckOutcomeTier bands + deterministic
+// cost suggestions) must be observable on the live HTTP surface, not just in
+// vtt-core unit tests. These tests pin the d20 via the optional `seed` field
+// (same pattern as the attack endpoint) and assert:
+//   - margin arithmetic: margin == roll + modifier - dc
+//   - tier band membership for every CheckOutcomeTier band
+//   - cost_suggestion present IFF tier == "success_at_cost"
+//   - pre-existing fields are unchanged (back-compat)
+
+/// Smallest seed whose first d20 equals `target` (mirrors server-side
+/// `DiceEngine::with_seed(seed)` then a single `roll_d20()` call).
+fn seed_producing_roll(target: i32) -> u64 {
+    for seed in 0..100_000u64 {
+        if vtt_core::DiceEngine::with_seed(seed).roll_d20() == target {
+            return seed;
+        }
+    }
+    panic!("no seed in 0..100_000 produces d20 == {target}");
+}
+
+const ALL_TIERS: [&str; 4] = [
+    "critical_success",
+    "success",
+    "success_at_cost",
+    "critical_failure",
+];
+
+/// Universal implications between the reported tier and the reported
+/// margin/natural roll, derived from the Pillar-8 band table plus the
+/// natural-20-lifts / natural-1-drops convention.
+fn assert_tier_consistent_with_margin(tier: &str, margin: i64, natural_roll: i64) {
+    match tier {
+        "critical_success" => assert!(
+            margin >= 10 || (natural_roll == 20 && margin >= 0),
+            "critical_success needs margin>=10 or nat20 lift, got margin={margin} roll={natural_roll}"
+        ),
+        "success" => assert!(
+            (margin >= 0 && natural_roll != 1)
+                || (natural_roll == 20 && margin >= -5),
+            "success impossible at margin={margin} roll={natural_roll}"
+        ),
+        "success_at_cost" => assert!(
+            ((-5..0).contains(&margin) && natural_roll != 1 && natural_roll != 20)
+                || (natural_roll == 20 && margin < -5)
+                || (natural_roll == 1 && margin >= 0),
+            "success_at_cost impossible at margin={margin} roll={natural_roll}"
+        ),
+        "critical_failure" => assert!(
+            (margin < -5 && natural_roll != 20)
+                || (natural_roll == 1 && (-5..0).contains(&margin)),
+            "critical_failure impossible at margin={margin} roll={natural_roll}"
+        ),
+        other => panic!("unknown tier {other:?}"),
+    }
+}
+
+fn assert_check_fail_forward_shape(body: &serde_json::Value) {
+    // Back-compat: legacy fields survive untouched.
+    for key in ["roll", "modifier", "total", "dc", "outcome"] {
+        assert!(!body[key].is_null(), "legacy field {key} missing");
+    }
+
+    let roll = body["roll"].as_i64().expect("roll is an integer");
+    let modifier = body["modifier"].as_i64().expect("modifier is an integer");
+    let total = body["total"].as_i64().expect("total is an integer");
+    let dc = body["dc"].as_i64().expect("dc is an integer");
+    let margin = body["margin"].as_i64().expect("margin is an integer");
+    let tier = body["tier"].as_str().expect("tier is a string");
+
+    assert_eq!(
+        total,
+        roll + modifier,
+        "total must stay roll+modifier"
+    );
+    assert_eq!(margin, total - dc, "margin must equal total-dc");
+    assert!(
+        ALL_TIERS.contains(&tier),
+        "tier {tier:?} not one of {ALL_TIERS:?}"
+    );
+
+    if tier == "success_at_cost" {
+        // A deterministic suggestion exists exactly for genuine shortfalls
+        // (-5 <= M < 0). A tier lifted/dropped into SuccessAtCost purely by
+        // the natural-1/natural-20 convention has no engine-defined cost, so
+        // the field stays absent rather than being fabricated.
+        if (-5..0).contains(&margin) {
+            let cost = body["cost_suggestion"]
+                .as_str()
+                .expect("cost_suggestion string required for costed margins");
+            assert!(!cost.is_empty());
+        } else {
+            assert!(
+                body.get("cost_suggestion").is_none(),
+                "no engine-defined cost exists outside the -5..0 band"
+            );
+        }
+    } else {
+        assert!(
+            body.get("cost_suggestion").is_none(),
+            "cost_suggestion must be absent unless tier==success_at_cost"
+        );
+    }
+
+    assert_tier_consistent_with_margin(tier, margin, roll);
+}
+
+async fn post_actions(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    path: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let token = sign_token("gm-1", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri(path)
+        .insert_header(bearer(&token))
+        .set_json(payload)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "path {path}");
+    test::read_body_json(res).await
+}
+
+#[actix_web::test]
+async fn check_exposes_fail_forward_fields_across_all_tiers() {
+    let app = test_app().await;
+
+    // (natural_roll, modifier, dc, expected_tier, expected_cost_suggestion)
+    let cases: [(i32, i32, i32, &str, Option<&str>); 6] = [
+        (15, 5, 10, "critical_success", None),           // M = +10
+        (10, 3, 10, "success", None),                    // M = +3
+        (8, 2, 12, "success_at_cost", Some("alert_clock_tick")),     // M = -2
+        (7, 2, 12, "success_at_cost", Some("condition_prone")),      // M = -3
+        (3, 0, 15, "critical_failure", None),            // M = -12
+        // Natural 1 drops the tier one full band: M = 0 lands at
+        // success_at_cost, but with no engine-defined cost (suggestions exist
+        // only for genuine -5..0 shortfalls).
+        (1, 9, 10, "success_at_cost", None),
+    ];
+
+    for (natural, modifier, dc, expected_tier, expected_cost) in cases {
+        let body = post_actions(
+            &app,
+            "/api/v1/actions/check",
+            serde_json::json!({
+                "modifier": modifier,
+                "dc": dc,
+                "cost_margin": 5,
+                "seed": seed_producing_roll(natural),
+            }),
+        )
+        .await;
+
+        assert_eq!(body["roll"], natural, "seed must pin the d20 to {natural}");
+        assert_eq!(body["tier"], expected_tier, "case roll={natural}");
+        assert_eq!(body["margin"], natural + modifier - dc);
+        match expected_cost {
+            Some(cost) => assert_eq!(body["cost_suggestion"], cost),
+            None => assert!(body.get("cost_suggestion").is_none()),
+        }
+        assert_check_fail_forward_shape(&body);
+    }
+}
+
+#[actix_web::test]
+async fn check_legacy_outcome_field_is_unchanged_by_fail_forward_fields() {
+    let app = test_app().await;
+
+    // Same request as the SuccessAtCost case above; the legacy `outcome`
+    // vocabulary must still be present and still SCREAMING_SNAKE_CASE.
+    let body = post_actions(
+        &app,
+        "/api/v1/actions/check",
+        serde_json::json!({
+            "modifier": 2,
+            "dc": 12,
+            "cost_margin": 5,
+            "seed": seed_producing_roll(8),
+        }),
+    )
+    .await;
+    assert_eq!(body["outcome"], "SUCCESS_AT_A_COST");
+
+    // And a plain success keeps its legacy label too.
+    let body = post_actions(
+        &app,
+        "/api/v1/actions/check",
+        serde_json::json!({
+            "modifier": 3,
+            "dc": 10,
+            "cost_margin": 5,
+            "seed": seed_producing_roll(10),
+        }),
+    )
+    .await;
+    assert_eq!(body["outcome"], "SUCCESS");
+    assert_eq!(body["tier"], "success");
+}
+
+#[actix_web::test]
+async fn check_unseeded_rolls_stay_structurally_fail_forward_consistent() {
+    let app = test_app().await;
+
+    for _ in 0..25 {
+        let body = post_actions(
+            &app,
+            "/api/v1/actions/check",
+            serde_json::json!({"modifier": 4, "dc": 13, "cost_margin": 5}),
+        )
+        .await;
+        assert_check_fail_forward_shape(&body);
+    }
+}
+
+#[actix_web::test]
+async fn save_exposes_fail_forward_fields_across_all_tiers() {
+    let app = test_app().await;
+
+    // (natural_roll, save_modifier, dc, expected_tier, binary_passed)
+    let cases: [(i32, i32, i32, &str, bool); 4] = [
+        (12, 8, 10, "critical_success", true),   // M = +10
+        (10, 3, 10, "success", true),            // M = +3
+        (8, 2, 12, "success_at_cost", false),    // M = -2: promoted by fail-forward…
+        (3, 0, 15, "critical_failure", false),   // M = -12
+    ];
+
+    for (natural, modifier, dc, expected_tier, legacy_passed) in cases {
+        let body = post_actions(
+            &app,
+            "/api/v1/actions/save",
+            serde_json::json!({
+                "save_modifier": modifier,
+                "dc": dc,
+                "ability": "DEXTERITY",
+                "seed": seed_producing_roll(natural),
+            }),
+        )
+        .await;
+
+        assert_eq!(body["natural_roll"], natural, "seed must pin the d20");
+        assert_eq!(body["total"], natural + modifier);
+        assert_eq!(body["margin"], natural + modifier - dc);
+        assert_eq!(body["tier"], expected_tier);
+
+        // Back-compat: binary pass flag keeps today's threshold semantics.
+        assert_eq!(body["passed"], legacy_passed);
+
+        if expected_tier == "success_at_cost" {
+            assert!(body["cost_suggestion"].is_string());
+        } else {
+            assert!(body.get("cost_suggestion").is_none());
+        }
+    }
+}
+
+#[actix_web::test]
+async fn save_auto_fail_forces_critical_failure_tier() {
+    let app = test_app().await;
+
+    // Paralyzed auto-fails STR/DEX saves regardless of the roll.
+    let body = post_actions(
+        &app,
+        "/api/v1/actions/save",
+        serde_json::json!({
+            "save_modifier": 9,
+            "dc": 10,
+            "ability": "STRENGTH",
+            "conditions": ["paralyzed"],
+            "seed": seed_producing_roll(20),
+        }),
+    )
+    .await;
+
+    assert_eq!(body["auto_failed"], true);
+    assert_eq!(body["passed"], false);
+    assert_eq!(body["tier"], "critical_failure");
+    assert!(body.get("cost_suggestion").is_none());
+}

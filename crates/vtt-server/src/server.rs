@@ -24,8 +24,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use vtt_core::{
-    Ability, ActionResolver, Condition, DiceEngine, GameSession, RulesEvaluator,
-    SessionMap,
+    Ability, ActionResolver, CheckOutcomeTier, Condition, CostSuggestion, DiceEngine,
+    GameSession, RulesEvaluator, SessionMap,
 };
 use vtt_crdt_sync::{CrdtRelayHub, CrdtSyncMessage, TokenTransform, VectorClock};
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
@@ -1273,6 +1273,57 @@ async fn take_rest(
 
 // --- Stateless rule calculators (dice utilities; still authenticated) -------
 
+/// Snake-case wire name for a [`CheckOutcomeTier`]. (The core enum itself
+/// serializes SCREAMING_SNAKE_CASE for ledger payloads; the HTTP contract is
+/// snake_case, matching the rest of this endpoint's response vocabulary.)
+fn tier_wire_name(tier: CheckOutcomeTier) -> &'static str {
+    match tier {
+        CheckOutcomeTier::CriticalSuccess => "critical_success",
+        CheckOutcomeTier::Success => "success",
+        CheckOutcomeTier::SuccessAtCost => "success_at_cost",
+        CheckOutcomeTier::CriticalFailure => "critical_failure",
+    }
+}
+
+/// Deterministic wire name for a [`CostSuggestion`] — no RNG involved, so
+/// replays of the same margin always render the same suggestion.
+fn cost_suggestion_name(suggestion: &CostSuggestion) -> String {
+    match suggestion {
+        CostSuggestion::InspirationLoss => "inspiration_loss".to_string(),
+        CostSuggestion::AlertClockTick => "alert_clock_tick".to_string(),
+        CostSuggestion::Condition(condition) => {
+            let name = serde_json::to_value(condition)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{condition:?}").to_lowercase());
+            format!("condition_{name}")
+        }
+    }
+}
+
+/// Annotate an already-serialized roll response with the fail-forward fields
+/// derived from the shared core engine ([`RulesEvaluator::resolve_check_margin`]).
+///
+/// Legacy fields on `body` are left untouched so existing clients keep their
+/// exact current semantics; the tier/margin/cost fields are purely additive.
+fn with_fail_forward_fields(
+    mut body: serde_json::Value,
+    natural_roll: i32,
+    modifier: i32,
+    dc: i32,
+) -> serde_json::Value {
+    let (_, margin, tier) = RulesEvaluator::resolve_check_margin(natural_roll, modifier, dc);
+    body["margin"] = serde_json::json!(margin);
+    body["tier"] = serde_json::json!(tier_wire_name(tier));
+    if tier == CheckOutcomeTier::SuccessAtCost {
+        if let Some(cost) = RulesEvaluator::suggest_cost(margin) {
+            body["cost_suggestion"] = serde_json::json!(cost_suggestion_name(&cost));
+        }
+    }
+    body
+}
+
+
 #[derive(Debug, Deserialize)]
 pub struct CheckActionReq {
     pub modifier: i32,
@@ -1280,11 +1331,18 @@ pub struct CheckActionReq {
     pub cost_margin: i32,
     pub advantage: Option<bool>,
     pub disadvantage: Option<bool>,
+    /// Optional deterministic seed pinning the d20 (any value is equally
+    /// valid — the engine decides what the seed means). Omitted → server
+    /// entropy. Mirrors the seed field on the other roll endpoints.
+    pub seed: Option<u64>,
 }
 
 async fn resolve_check(data: web::Data<AppState>, req: web::Json<CheckActionReq>) -> impl Responder {
     data.count_request();
-    let mut dice = DiceEngine::new();
+    let mut dice = match req.seed {
+        Some(seed) => DiceEngine::with_seed(seed),
+        None => DiceEngine::new(),
+    };
     // Honor advantage/disadvantage by pre-selecting the kept d20
     // (tuples are (used_roll, r1, r2)) before 4-tier resolution.
     let kept_roll = if req.disadvantage.unwrap_or(false) {
@@ -1307,16 +1365,22 @@ async fn resolve_check(data: web::Data<AppState>, req: web::Json<CheckActionReq>
         } else {
             "CRITICAL_FAILURE"
         };
-        serde_json::json!({
-            "roll": natural_roll,
-            "modifier": req.modifier,
-            "total": total,
-            "dc": req.dc,
-            "outcome": outcome,
-        })
+        with_fail_forward_fields(
+            serde_json::json!({
+                "roll": natural_roll,
+                "modifier": req.modifier,
+                "total": total,
+                "dc": req.dc,
+                "outcome": outcome,
+            }),
+            natural_roll,
+            req.modifier,
+            req.dc,
+        )
     } else {
-        let res = ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
-        serde_json::json!(res)
+        let res =
+            ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
+        with_fail_forward_fields(serde_json::json!(res), res.roll, req.modifier, req.dc)
     };
     data.count_valid();
     HttpResponse::Ok().json(res)
@@ -1332,11 +1396,17 @@ pub struct SaveActionReq {
     pub disadvantage: Option<bool>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Optional deterministic seed pinning the d20 (see `CheckActionReq`).
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 async fn resolve_save(data: web::Data<AppState>, req: web::Json<SaveActionReq>) -> impl Responder {
     data.count_request();
-    let mut dice = DiceEngine::new();
+    let mut dice = match req.seed {
+        Some(seed) => DiceEngine::with_seed(seed),
+        None => DiceEngine::new(),
+    };
     // Advantage tuples are (used_roll, r1, r2).
     let natural_roll = if req.disadvantage.unwrap_or(false) {
         dice.roll_d20_disadvantage().0
@@ -1354,9 +1424,22 @@ async fn resolve_save(data: web::Data<AppState>, req: web::Json<SaveActionReq>) 
         let total = natural_roll + req.save_modifier;
         (total >= req.dc, total)
     };
+
+    // Fail-forward annotation (Pillar 8): tier bands come from the shared
+    // core engine. The binary `passed` flag keeps today's threshold semantics;
+    // SuccessAtCost is surfaced additively so clients can render "succeeded,
+    // but pay a price". Auto-failing conditions override the tier — no roll
+    // can rescue them — while margin stays consistent with the reported total.
+    let (_, engine_margin, engine_tier) =
+        RulesEvaluator::resolve_check_margin(natural_roll, req.save_modifier, req.dc);
+    let (margin, tier) = if auto_fail {
+        (total - req.dc, CheckOutcomeTier::CriticalFailure)
+    } else {
+        (engine_margin, engine_tier)
+    };
     data.count_valid();
 
-    HttpResponse::Ok().json(serde_json::json!({
+    let mut body = serde_json::json!({
         "ability": req.ability.unwrap_or(Ability::Strength),
         "natural_roll": natural_roll,
         "save_modifier": req.save_modifier,
@@ -1364,7 +1447,15 @@ async fn resolve_save(data: web::Data<AppState>, req: web::Json<SaveActionReq>) 
         "dc": req.dc,
         "auto_failed": auto_fail,
         "passed": passed,
-    }))
+    });
+    body["margin"] = serde_json::json!(margin);
+    body["tier"] = serde_json::json!(tier_wire_name(tier));
+    if tier == CheckOutcomeTier::SuccessAtCost {
+        if let Some(cost) = RulesEvaluator::suggest_cost(margin) {
+            body["cost_suggestion"] = serde_json::json!(cost_suggestion_name(&cost));
+        }
+    }
+    HttpResponse::Ok().json(body)
 }
 
 #[derive(Debug, Deserialize)]
