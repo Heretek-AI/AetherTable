@@ -25,6 +25,13 @@ import {
 import { Token } from './TacticalCanvas';
 import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
 import {
+  EngineActionOutcome,
+  EngineHealResult,
+  ensureEngineSession,
+  engineHeal,
+  engineRest,
+} from '../api/rules_engine';
+import {
   ABILITY_KEYS,
   ABILITY_LABELS,
   AbilityKey,
@@ -42,6 +49,14 @@ interface CharacterSheetProps {
   onOpenGrimoire?: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  /**
+   * Explicit authoritative engine session id (e.g. App's combatSessionId).
+   * OPTIONAL: when omitted the sheet lazily creates/reuses its own session
+   * via ensureEngineSession(), so heal/rest work without App wiring. Pass it
+   * to share one engine session across the whole table view — the follow-up
+   * is literally `engineSessionId={combatSessionId}` in App.tsx.
+   */
+  engineSessionId?: string | null;
 }
 
 /* Design-token shorthands (official-5e-book system). */
@@ -58,6 +73,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   onOpenGrimoire,
   isCollapsed,
   onToggleCollapse,
+  engineSessionId,
 }) => {
   const [activeTab, setActiveTab] = useState<'actions' | 'spells' | 'inventory' | 'features'>('actions');
 
@@ -105,6 +121,112 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
       cancelled = true;
     };
   }, [activeToken?.isPlayer, activeToken?.name]);
+
+  /* --- Authoritative recovery (engine heal/rest) --------------------------
+   * The token's live HP arrives through props from engine-mirrored session
+   * state; these controls only SEND intents to the engine and report its
+   * verbatim response. No local HP mutation ever happens here — an optimistic
+   * update would desync the sheet from the authoritative ledger.
+   */
+  const [recoveryBusy, setRecoveryBusy] = useState<'heal' | 'short' | 'long' | null>(null);
+  const [recoveryFeedback, setRecoveryFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
+  const [healAmount, setHealAmount] = useState(0);
+  const [confirmLongRest, setConfirmLongRest] = useState(false);
+
+  // Ownership gate: findCharacterForToken matches the token against the
+  // SIGNED-IN player's roster, so a non-null binding proves this token is the
+  // caller's own character — never someone else's, never a hostile NPC.
+  const ownsBoundCharacter = Boolean(activeToken?.isPlayer && boundCharacter);
+  // Missing HP is read from the LIVE prop each render so clamping always
+  // reflects the latest engine state, not a stale snapshot.
+  const missingHp = activeToken
+    ? Math.max(0, Math.floor(activeToken.maxHp) - Math.floor(activeToken.hp))
+    : 0;
+
+  // Reset per-token UI state when the selection changes.
+  useEffect(() => {
+    setRecoveryFeedback(null);
+    setConfirmLongRest(false);
+    setHealAmount(activeToken ? Math.max(0, Math.floor(activeToken.maxHp) - Math.floor(activeToken.hp)) : 0);
+  }, [activeToken?.id]);
+
+  /** Explicit prop wins; otherwise lazily reuse/create this client's session. */
+  const resolveEngineSession = async (): Promise<string | null> => {
+    if (engineSessionId) return engineSessionId;
+    return ensureEngineSession();
+  };
+
+  /** Turns one outcome union into honest inline feedback. Never throws. */
+  const describeOutcome = (
+    outcome: EngineActionOutcome<EngineHealResult>,
+    maxHp: number,
+  ): { tone: 'ok' | 'error'; text: string } => {
+    if (outcome.kind === 'unreachable') {
+      return { tone: 'error', text: 'Rules engine unreachable — nothing changed.' };
+    }
+    if (outcome.kind === 'rejected') {
+      const label = outcome.code ? `${outcome.code}${outcome.message ? `: ${outcome.message}` : ''}` : outcome.message || `HTTP ${outcome.status}`;
+      return { tone: 'error', text: `Rejected by the engine — ${label}` };
+    }
+    return { tone: 'ok', text: `Engine confirms ${outcome.data.hp_remaining}/${maxHp} HP remaining.` };
+  };
+
+  const handleEngineHeal = async () => {
+    if (!activeToken || recoveryBusy || missingHp <= 0 || healAmount <= 0) return;
+    setRecoveryBusy('heal');
+    try {
+      const sessionId = await resolveEngineSession();
+      if (!sessionId) {
+        setRecoveryFeedback({ tone: 'error', text: 'Rules engine unreachable — nothing changed.' });
+        return;
+      }
+      const outcome = await engineHeal({ sessionId, entityId: activeToken.id, amount: healAmount });
+      setRecoveryFeedback(describeOutcome(outcome, activeToken.maxHp));
+    } finally {
+      setRecoveryBusy(null);
+    }
+  };
+
+  const handleEngineRest = async (kind: 'short' | 'long') => {
+    if (!activeToken || recoveryBusy) return;
+    // Long rest is disruptive (full HP for every controlled entity): two-step
+    // inline confirmation instead of a surprise commit.
+    if (kind === 'long' && !confirmLongRest) {
+      setConfirmLongRest(true);
+      return;
+    }
+    setConfirmLongRest(false);
+    setRecoveryBusy(kind);
+    try {
+      const sessionId = await resolveEngineSession();
+      if (!sessionId) {
+        setRecoveryFeedback({ tone: 'error', text: 'Rules engine unreachable — nothing changed.' });
+        return;
+      }
+      const outcome = await engineRest({ sessionId, kind });
+      if (outcome.kind !== 'applied') {
+        setRecoveryFeedback(describeOutcome(outcome, activeToken.maxHp));
+        return;
+      }
+      if (kind === 'long') {
+        const mine = outcome.data.entities?.find((e) => e.entity_id === activeToken.id);
+        setRecoveryFeedback({
+          tone: 'ok',
+          text: mine
+            ? `Long rest applied by the engine — ${mine.hp_remaining}/${activeToken.maxHp} HP remaining.`
+            : `Long rest recorded (${outcome.data.restored_entities ?? 0} entities restored).`,
+        });
+      } else {
+        setRecoveryFeedback({
+          tone: 'ok',
+          text:
+            'Short rest recorded on the engine ledger. Hit-dice spending is not yet implemented engine-side.',
+        });
+      }
+    } finally {
+      setRecoveryBusy(null);
+    }
+  };
 
   /**
    * All modifiers derived from the stored ability scores via the shared SRD
@@ -298,7 +420,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               onClick={handleLongRest}
               className="vtt-btn vtt-btn-secondary p-1.5"
               style={{ padding: '0.35rem' }}
-              title="Take Long Rest (Recover HP & Spell Slots)"
+              title="Clear LOCAL trackers only (spell slots, death saves, exhaustion) — authoritative HP recovery lives under Authoritative Recovery below"
             >
               <Sun className="w-4 h-4" style={{ color: 'var(--tavern-accent)' }} />
             </button>
@@ -332,6 +454,97 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Authoritative recovery — engine heal/rest. Rendered only when the
+            token is the signed-in player's own bound character AND an engine
+            session can be resolved; feedback always quotes the engine's
+            verbatim response or rejection code. No optimistic HP edits. */}
+        {ownsBoundCharacter && (
+          <div
+            className="rounded-md p-3 space-y-2"
+            style={{ border: `1px solid ${LEATHER_HAIRLINE}`, background: 'color-mix(in srgb, var(--parchment-paper-aged) 40%, transparent)' }}
+          >
+            <div className="vtt-section-header text-[11px]">Authoritative Recovery</div>
+
+            {/* Heal: amount clamped to the LIVE missing deficit from props */}
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={missingHp}
+                value={Math.min(healAmount, missingHp)}
+                disabled={recoveryBusy !== null || missingHp === 0}
+                onChange={(e) => {
+                  const parsed = Math.floor(Number(e.target.value));
+                  setHealAmount(Number.isFinite(parsed) ? Math.max(0, Math.min(parsed, missingHp)) : 0);
+                }}
+                aria-label={`Hit points to restore (max ${missingHp})`}
+                className="vtt-input w-16 px-1.5 py-1 text-xs tabular-nums"
+                style={{ color: INK }}
+              />
+              <button
+                type="button"
+                onClick={() => void handleEngineHeal()}
+                disabled={recoveryBusy !== null || missingHp === 0 || healAmount <= 0}
+                title={missingHp === 0 ? 'Already at full HP' : `Ask the engine to restore up to ${missingHp} HP`}
+                className="vtt-btn vtt-btn-secondary flex-1 text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Heart className="w-3.5 h-3.5" style={{ color: 'var(--state-success)' }} />
+                  {recoveryBusy === 'heal' ? 'Healing…' : `Heal (${missingHp} missing)`}
+                </span>
+              </button>
+            </div>
+
+            {/* Rests: short is instant; long needs an inline confirmation */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => void handleEngineRest('short')}
+                disabled={recoveryBusy !== null}
+                title="Record a short rest on the engine ledger"
+                className="vtt-btn vtt-btn-secondary text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Activity className="w-3.5 h-3.5" style={{ color: 'var(--tavern-accent-deep)' }} />
+                  {recoveryBusy === 'short' ? 'Resting…' : 'Short Rest'}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleEngineRest('long')}
+                onBlur={() => setConfirmLongRest(false)}
+                disabled={recoveryBusy !== null}
+                title="Long rest: restores your controlled entities to full HP engine-side"
+                className={`text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                  confirmLongRest ? 'vtt-btn vtt-btn-danger' : 'vtt-btn vtt-btn-secondary'
+                }`}
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Moon className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                  {recoveryBusy === 'long' ? 'Resting…' : confirmLongRest ? 'Confirm?' : 'Long Rest'}
+                </span>
+              </button>
+            </div>
+
+            {/* Honest result / rejection readout — aria-live for screen readers */}
+            <div aria-live="polite" className="min-h-[1rem]">
+              {recoveryFeedback && (
+                <p
+                  className="text-[11px] font-prose leading-snug break-words"
+                  style={{
+                    color:
+                      recoveryFeedback.tone === 'ok'
+                        ? 'var(--state-success)'
+                        : 'var(--state-danger)',
+                  }}
+                >
+                  {recoveryFeedback.text}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Everything below this line is derived from a real bound record.
             Without one we render an explicit empty state — never fake numbers. */}
