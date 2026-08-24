@@ -67,10 +67,28 @@ async fn start_table() -> (
     >,
     String, // ws:// address of the live server
 ) {
+    start_table_with(AppState::new()).await
+}
+
+/// Variant letting a test customize AppState (e.g. the per-user WS
+/// connection cap) before it is shared by both the in-process REST service
+/// and the live socket server.
+async fn start_table_with(
+    state_value: AppState,
+) -> (
+    impl Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<
+            actix_web::body::EitherBody<actix_web::body::BoxBody>,
+        >,
+        Error = actix_web::Error,
+    >,
+    String, // ws:// address of the live server
+) {
     let verifier = Arc::new(AuthVerifier {
         secret: Arc::new(TEST_SECRET.to_string()),
     });
-    let state = web::Data::new(AppState::new());
+    let state = web::Data::new(state_value);
     let limits = RateLimits::explicit(1_000_000, 1_000_000, 1_000_000);
 
     let app = test::init_service(
@@ -108,11 +126,32 @@ async fn start_table() -> (
 }
 
 async fn connect_ws(addr: &str, session_id: Uuid, token: &str) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let url = format!("ws://{}/ws/sessions/{}/sync?token={}", addr, session_id, token);
+    connect_ws_room(addr, &session_id.to_string(), token).await
+}
+
+/// Variant accepting an ARBITRARY room id — free rooms like the legacy
+/// `'aethertable-live'` fallback are not Uuids but real clients use them.
+async fn connect_ws_room(
+    addr: &str,
+    room_id: &str,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let url = format!("ws://{}/ws/sessions/{}/sync?token={}", addr, room_id, token);
     let (stream, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("websocket handshake");
     stream
+}
+
+/// Attempts a WS handshake and returns the HTTP status outcome: 101 on
+/// success, otherwise the refusal status the server answered with.
+async fn ws_handshake_status(addr: &str, room_id: &str, token: &str) -> u16 {
+    let url = format!("ws://{}/ws/sessions/{}/sync?token={}", addr, room_id, token);
+    match tokio_tungstenite::connect_async(url).await {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("unexpected handshake failure: {e}"),
+    }
 }
 
 async fn send_json(
@@ -866,4 +905,129 @@ async fn initial_snapshot_serves_spectators_the_party_merged_fog_view() {
         "GM snapshots must keep listing individual layers, got {:?}",
         gm_layers
     );
+}
+
+// --- Iteration 4: fail-closed control in non-session rooms -------------------
+
+/// Relay audit (iteration 4): `may_control_token` parsed the room id as a Uuid
+/// and, on failure, fell through to "unowned entity" semantics — controllable
+/// by ANY non-spectator. Free rooms (`aethertable-live`, lobby names) carry no
+/// authoritative roster, so every player could drive every token. Control
+/// claims must FAIL CLOSED there; read-only fan-out stays open.
+#[actix_web::test]
+async fn player_cannot_drive_tokens_in_free_rooms() {
+    let (app, table) = start_table().await;
+    let _ = &app; // free room needs no REST seeding
+    let free_room = "aethertable-live";
+
+    let mut sender = connect_ws_room(&table, free_room, &sign_token_with_role("player-1", "player")).await;
+    let _snapshot = read_initial_snapshot(&mut sender).await;
+    let mut watcher = connect_ws_room(&table, free_room, &sign_token_with_role("player-2", "player")).await;
+    let _snapshot = read_initial_snapshot(&mut watcher).await;
+
+    send_json(&mut sender, token_update("Hero", 4.0, 5.0)).await;
+
+    assert!(
+        next_delta_frame(&mut watcher, 700).await.is_none(),
+        "a player's TokenUpdate in a NON-SESSION room must be dropped, not fanned out"
+    );
+}
+
+/// Same fail-closed rule for rooms whose id LOOKS like a session but has no
+/// live session behind it — no authoritative roster, so no ownership to lean on.
+#[actix_web::test]
+async fn player_cannot_drive_tokens_in_uuid_rooms_without_a_session() {
+    let (app, table) = start_table().await;
+    let _ = &app;
+    let ghost_room = Uuid::new_v4().to_string();
+
+    let mut sender = connect_ws_room(&table, &ghost_room, &sign_token_with_role("player-1", "player")).await;
+    let _snapshot = read_initial_snapshot(&mut sender).await;
+    let mut watcher = connect_ws_room(&table, &ghost_room, &sign_token_with_role("player-2", "player")).await;
+    let _snapshot = read_initial_snapshot(&mut watcher).await;
+
+    send_json(&mut sender, token_update("Hero", 4.0, 5.0)).await;
+
+    assert!(
+        next_delta_frame(&mut watcher, 700).await.is_none(),
+        "TokenUpdate over an unresolvable session id must be dropped"
+    );
+}
+
+/// The chosen semantics: GMs keep administrative control everywhere (they
+/// already control every entity), and READ-ONLY fan-out in free rooms stays
+/// allowed so existing clients on the legacy `'aethertable-live'` fallback
+/// still see state. Pinned here so the fail-closed change cannot silently
+/// break either property.
+#[actix_web::test]
+async fn gm_writes_and_read_only_fanout_survive_in_free_rooms() {
+    let (_app, table) = start_table().await;
+    let free_room = "aethertable-live";
+
+    let mut gm = connect_ws_room(&table, free_room, &sign_token_with_role("gm-1", "gm")).await;
+    let _snapshot = read_initial_snapshot(&mut gm).await;
+    let mut watcher = connect_ws_room(&table, free_room, &sign_token_with_role("watcher", "spectator")).await;
+    let _snapshot = read_initial_snapshot(&mut watcher).await;
+
+    send_json(&mut gm, token_update("Hero", 4.0, 5.0)).await;
+
+    let frame = next_delta_frame(&mut watcher, 1500)
+        .await
+        .expect("GM TokenUpdate in a free room must still fan out");
+    assert!(
+        frame.contains("TokenUpdate"),
+        "expected the GM's TokenUpdate delta, got {frame}"
+    );
+}
+
+// --- Iteration 4: per-user concurrent WS connection cap ----------------------
+
+/// `/ws/sync` used to be unmetered AND uncapped per user. Now each user may
+/// hold at most `VTT_WS_PER_USER` (default 8) LIVE connections: excess
+/// upgrades get an honest HTTP refusal, and slots are released on close so a
+/// reconnect storm can never lock a user out permanently.
+#[actix_web::test]
+async fn ws_connections_beyond_per_user_cap_are_refused_and_released_on_close() {
+    let cap_state = {
+        let mut s = AppState::new();
+        s.ws_per_user_cap = 2;
+        s
+    };
+    let (_app, table) = start_table_with(cap_state).await;
+    let room = Uuid::new_v4().to_string();
+    let flooder = sign_token_with_role("flooder-user", "gm");
+
+    let mut s1 = connect_ws_room(&table, &room, &flooder).await;
+    read_initial_snapshot(&mut s1).await;
+    let mut s2 = connect_ws_room(&table, &room, &flooder).await;
+    read_initial_snapshot(&mut s2).await;
+
+    // Third concurrent socket for the SAME user is refused honestly.
+    let status = ws_handshake_status(&table, &room, &flooder).await;
+    assert_eq!(
+        status, 429,
+        "upgrade beyond the per-user cap must be refused with HTTP 429, got {status}"
+    );
+
+    // A DIFFERENT user is unaffected by someone else's cap.
+    let other = connect_ws_room(&table, &room, &sign_token_with_role("other-user", "gm")).await;
+    drop(other);
+
+    // Release on close: closing one live socket frees its slot, so the
+    // flooder can reconnect after a bounded wait (no permanent lockout).
+    drop(s1);
+    let mut reconnected = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if ws_handshake_status(&table, &room, &flooder).await == 101 {
+            reconnected = Some(true);
+            break;
+        }
+    }
+    assert_eq!(
+        reconnected,
+        Some(true),
+        "closing a live connection must release its per-user slot"
+    );
+    drop(s2);
 }

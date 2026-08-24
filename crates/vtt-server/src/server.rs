@@ -44,6 +44,32 @@ use vtt_wfc::{DungeonGenerator, RoomDescriptor};
 /// Default per-update movement ceiling when no matching entity can be resolved.
 const DEFAULT_MOVE_STEP_FEET: f32 = 30.0;
 
+/// Default per-user concurrent WebSocket connection cap for `/ws/sync`
+/// (`VTT_WS_PER_USER` overrides). Sized to cover one user with several tabs,
+/// a reconnect storm's overlap window, and a spectator HUD, while capping the
+/// fan-out multiplier a single identity can pin on the server.
+pub const DEFAULT_WS_CONNECTIONS_PER_USER: usize = 8;
+
+/// Fail-soft positive-usize env parser mirroring
+/// [`crate::ratelimit::parse_per_minute`]: unset, garbage, zero or negative
+/// input yields `default`.
+fn parse_env_usize(raw: Option<String>, default: usize) -> usize {
+    match raw {
+        None => default,
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                log::warn!(
+                    "env value {:?} unusable; falling back to default {}",
+                    s,
+                    default
+                );
+                default
+            }
+        },
+    }
+}
+
 pub struct AppState {
     pub sessions: DashMap<Uuid, Arc<RwLock<GameSession>>>,
     pub crdt_hub: Arc<CrdtRelayHub>,
@@ -61,6 +87,9 @@ pub struct AppState {
     pub flush_watermarks: DashMap<Uuid, u64>,
     /// Count of failed durable writes since boot (surfaced via /metrics).
     pub persistence_failures: Arc<AtomicU64>,
+    /// Per-user concurrent WebSocket connection cap (`VTT_WS_PER_USER`,
+    /// default [`DEFAULT_WS_CONNECTIONS_PER_USER`]). Fail-soft parse.
+    pub ws_per_user_cap: usize,
     // --- Honest metrics: every counter reflects a verified outcome. ---
     pub total_action_requests: AtomicU64,
     pub valid_action_executions: AtomicU64,
@@ -82,6 +111,10 @@ impl AppState {
             db: None,
             flush_watermarks: DashMap::new(),
             persistence_failures: Arc::new(AtomicU64::new(0)),
+            ws_per_user_cap: parse_env_usize(
+                std::env::var("VTT_WS_PER_USER").ok(),
+                DEFAULT_WS_CONNECTIONS_PER_USER,
+            ),
             total_action_requests: AtomicU64::new(0),
             valid_action_executions: AtomicU64::new(0),
             rejected_action_requests: AtomicU64::new(0),
@@ -190,6 +223,13 @@ pub struct PeerRegistry {
     next_peer_id: AtomicU64,
     /// Sliding-window hit log per peer id for cursor-frame admission.
     cursor_hits: DashMap<u64, VecDeque<Instant>>,
+    /// LIVE WebSocket connections per authenticated user id (relay audit,
+    /// iteration 4): `/ws/sync` is deliberately unmetered by the rate
+    /// limiter, so this is the only bound on how many sockets one identity
+    /// can hold. Slots are acquired at upgrade time and released when the
+    /// peer's message loop ends, so a reconnect storm cannot lock a user out
+    /// permanently — closing any live socket frees its slot immediately.
+    user_connections: DashMap<String, usize>,
 }
 
 impl PeerRegistry {
@@ -198,7 +238,38 @@ impl PeerRegistry {
             rooms: DashMap::new(),
             next_peer_id: AtomicU64::new(1),
             cursor_hits: DashMap::new(),
+            user_connections: DashMap::new(),
         }
+    }
+
+    /// Acquires one of `cap` concurrent connection slots for `user_id`.
+    /// Check-and-increment happens under the entry's shard guard, so two
+    /// simultaneous upgrades cannot both squeeze under the cap. `false`
+    /// means the caller must refuse the upgrade.
+    fn acquire_user_slot(&self, user_id: &str, cap: usize) -> bool {
+        let cap = cap.max(1); // a cap of 0 would silently lock everyone out
+        let mut count = self
+            .user_connections
+            .entry(user_id.to_string())
+            .or_insert(0);
+        if *count >= cap {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Releases one slot when a connection ends. Saturating so a double
+    /// release can never push the count negative.
+    fn release_user_slot(&self, user_id: &str) {
+        if let Some(mut count) = self.user_connections.get_mut(user_id) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Live connection count for one user (test/metrics introspection).
+    pub fn user_connection_count(&self, user_id: &str) -> usize {
+        self.user_connections.get(user_id).map(|c| *c).unwrap_or(0)
     }
 
     fn join(&self, room_id: &str, session: &actix_ws::Session, role: Role) -> u64 {
@@ -3625,13 +3696,27 @@ fn token_is_hidden(data: &AppState, room_id: &str, token_name: &str) -> bool {
 /// Whether this SENDER may drive the token identified by display name — the
 /// relay-path counterpart of the ownership gate on HTTP `POST /move`
 /// (`may_control_entity`): GMs control everything; players control only the
-/// entities bound to their own user id; unowned entities are DM-controlled
-/// and usable by any non-spectator until claimed.
+/// entities bound to their own user id; unowned entities inside a LIVE
+/// session are DM-controlled and usable by any non-spectator until claimed.
 ///
-/// Tokens whose entity cannot be resolved (free rooms like the lobby,
-/// unregistered names) are treated as UNOWNED — the same fail-open default as
-/// movement validation and hiddenness, so we never invent a restriction the
-/// data cannot back. Spectators are rejected before that fallback applies.
+/// NON-SESSION rooms fail CLOSED (relay audit, iteration 4). When the room id
+/// is not a Uuid or resolves to no live session there is NO authoritative
+/// roster to resolve ownership against, so the old behavior — treating every
+/// token as unowned/DM-controlled — handed any authenticated player total
+/// control of the free room (`aethertable-live`, lobby). Semantics chosen:
+/// - Players/SPECTATORS: no token writes in a room without an authoritative
+///   roster (spectators were always denied).
+/// - GMs: keep administrative control everywhere — they already control
+///   every entity in every session, and this preserves ops/admin utility of
+///   free rooms.
+/// - READ-ONLY fan-out in free rooms stays open to all roles: existing
+///   clients ride the legacy `'aethertable-live'` fallback transport and must
+///   still receive deltas; only control claims are refused.
+///
+/// Inside a live session the resolution stays exactly `may_control_entity`:
+/// an unknown token NAME in a real session is still treated as DM-owned
+/// (fail-open by documented design), because the session itself provides the
+/// authoritative context those checks lean on.
 fn may_control_token(
     data: &AppState,
     room_id: &str,
@@ -3642,16 +3727,18 @@ fn may_control_token(
     if role == Role::Spectator {
         return false;
     }
-    let entity_owner = Uuid::parse_str(room_id)
+    let session = Uuid::parse_str(room_id)
         .ok()
-        .and_then(|id| data.sessions.get(&id))
-        .and_then(|lock| {
-            lock.read()
-                .entities
-                .values()
-                .find(|e| e.name.eq_ignore_ascii_case(token_name))
-                .and_then(|e| e.owner_player_id.clone())
-        });
+        .and_then(|id| data.sessions.get(&id));
+    let Some(session_lock) = session else {
+        return role.is_gm();
+    };
+    let entity_owner = session_lock
+        .read()
+        .entities
+        .values()
+        .find(|e| e.name.eq_ignore_ascii_case(token_name))
+        .and_then(|e| e.owner_player_id.clone());
     may_control_entity(entity_owner.as_ref(), role, user_id)
 }
 
@@ -3890,10 +3977,34 @@ async fn ws_sync(
         });
     let role = Role::from_identity(&identity);
 
+    // Per-user concurrency cap (relay audit, iteration 4): refused BEFORE the
+    // upgrade so an excess socket gets an honest HTTP 429 instead of a silent
+    // half-open upgrade. The slot is released when the peer's message loop
+    // ends (any close/disconnect), so reconnect storms self-heal.
+    if !data
+        .peers
+        .acquire_user_slot(&identity.user_id, data.ws_per_user_cap)
+    {
+        log::warn!(
+            "WS upgrade refused: user '{}' at per-user cap of {} live connections",
+            identity.user_id,
+            data.ws_per_user_cap
+        );
+        return HttpResponse::TooManyRequests().json(serde_json::json!({
+            "error": "WS_CONNECTION_LIMIT",
+            "detail": format!(
+                "concurrent WebSocket limit ({}) reached for this user; close another tab or retry once one closes",
+                data.ws_per_user_cap
+            ),
+            "limit": data.ws_per_user_cap,
+        }));
+    }
+
     let (response, session, mut msg_stream) = match actix_ws::handle(&req, body) {
         Ok(handshake) => handshake,
         Err(e) => {
-            return HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()}))
+            data.peers.release_user_slot(&identity.user_id);
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()}));
         }
     };
 
@@ -4102,6 +4213,7 @@ async fn ws_sync(
             }
         }
         peers.leave(&rid, peer_id);
+        peers.release_user_slot(&identity.user_id);
         // Intentionally not awaited: the task is ending anyway and the close
         // frame is best-effort. `drop` (rather than `let _ =`) makes the
         // immediate-drop explicit for clippy::let_underscore_future.
@@ -4134,7 +4246,9 @@ pub fn configure_app(cfg: &mut web::ServiceConfig) {
 ///
 /// Bucket topology (all per client IP, 60 s sliding windows):
 /// - `/health`, `/metrics`, `/ws/sessions/{id}/sync`: UNMETERED (ops probes
-///   and the sync channel must never throttle).
+///   and the sync channel must never throttle). The sync channel is instead
+///   bounded by a PER-USER concurrent connection cap (`VTT_WS_PER_USER`,
+///   default 8) enforced in `ws_sync` — excess upgrades get HTTP 429.
 /// - `/api/v1` outer scope: generous READ bucket — safety net over everything,
 ///   including read-only `/rooms/{id}/presence`.
 /// - `/api/v1/scripts/*`: strict SCRIPT bucket — wasm compile / Rhai

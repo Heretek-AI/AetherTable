@@ -23,6 +23,18 @@ type HmacSha256 = Hmac<Sha256>;
 /// Routes that unauthenticated callers may reach (liveness/metrics only).
 const PUBLIC_PATHS: &[&str] = &["/health", "/metrics"];
 
+/// Whether `path` is one of the literal public routes.
+///
+/// EXACT matching only. The previous `starts_with` matcher admitted any
+/// lookalike prefix (`/healthz`, `/health-admin`, `/metrics-scraper`) past
+/// the auth gate unauthenticated — an unauthenticated 404 is a probe oracle,
+/// and anything that ever mounts at such a path would silently inherit
+/// "public" status. New public routes must be added to [`PUBLIC_PATHS`]
+/// explicitly.
+fn is_public_path(path: &str) -> bool {
+    PUBLIC_PATHS.contains(&path)
+}
+
 #[derive(Clone)]
 pub struct AuthVerifier {
     pub secret: Arc<String>,
@@ -221,7 +233,7 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let path = req.path();
-        if PUBLIC_PATHS.iter().any(|p| path.starts_with(p)) {
+        if is_public_path(path) {
             let fut = self.service.call(req);
             return Box::pin(async move {
                 Ok(fut.await?.map_into_left_body())
@@ -286,6 +298,30 @@ mod tests {
             "test-secret",
         );
         assert!(verifier.verify(&token).is_none());
+    }
+
+    // --- Public-path matcher (iteration 4) ---------------------------------
+
+    /// Loose `starts_with` matching used to admit lookalike paths
+    /// (`/healthz`, `/metrics-scraper`, `/health/admin`) without a token.
+    /// The matcher must be EXACT: only the literal routes are public.
+    #[test]
+    fn public_paths_match_exactly_not_by_prefix() {
+        assert!(is_public_path("/health"), "exact /health is public");
+        assert!(is_public_path("/metrics"), "exact /metrics is public");
+
+        for lookalike in ["/healthz", "/health-admin", "/healthful", "/metricsx", "/metrics/scrape", "/healthy"] {
+            assert!(
+                !is_public_path(lookalike),
+                "{lookalike} must NOT match a public path by prefix"
+            );
+        }
+
+        // And nothing else leaks through either.
+        assert!(!is_public_path("/api/v1/sessions"));
+        assert!(!is_public_path("/ws/sessions/x/sync"));
+        assert!(!is_public_path(""));
+        assert!(!is_public_path("/"));
     }
 
     #[test]

@@ -153,9 +153,28 @@ fn entity_json(
 #[actix_web::test]
 async fn health_and_public_paths_need_no_auth() {
     let app = test_app().await;
-    let req = test::TestRequest::get().uri("/health").to_request();
-    let res = test::call_service(&app, req).await;
-    assert_eq!(res.status(), StatusCode::OK);
+    for path in ["/health", "/metrics"] {
+        let req = test::TestRequest::get().uri(path).to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "{path} must stay public");
+    }
+}
+
+/// Iteration 4 (auth): the public-path matcher used loose `starts_with`
+/// matching, so `/healthz`, `/metrics-scraper` and friends were reachable
+/// WITHOUT a token. Every lookalike must fail closed with 401.
+#[actix_web::test]
+async fn lookalike_public_paths_require_auth() {
+    let app = test_app().await;
+    for path in ["/healthz", "/health-admin", "/healthful", "/metricsx", "/metrics/scrape"] {
+        let req = test::TestRequest::get().uri(path).to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must not ride /health //metrics prefix matching"
+        );
+    }
 }
 
 #[actix_web::test]

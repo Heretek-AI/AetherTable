@@ -20,7 +20,12 @@
 //!   all of `/api/v1` so read-only polling (`/rooms/{id}/presence`, snapshot
 //!   GETs) stays frictionless.
 //! - `/health`, `/metrics` and the websocket sync alias are UNMETERED — ops
-//!   probes and the sync channel must never be throttled.
+//!   probes and the sync channel must never be throttled. The sync channel is
+//!   NOT unbounded, though: since iteration 4 each authenticated user holds
+//!   at most `VTT_WS_PER_USER` (default 8) LIVE WebSocket connections,
+//!   enforced as a per-user concurrent cap at upgrade time (see
+//!   `AppState::ws_per_user_cap` / `PeerRegistry::acquire_user_slot`),
+//!   released on close — a different control from this module's rate windows.
 //!
 //! Env knobs are fail-soft: `VTT_SCRIPT_RATE` / `VTT_ACTION_RATE` /
 //! `VTT_READ_RATE` accept plain integers ("requests per minute"); unset,
