@@ -15,6 +15,38 @@ LLM_LOG_PATH = os.environ.get("LLM_LOG_PATH", "logs/llm_calls.jsonl")
 DEGRADED_MARKER = "__DEGRADED__"
 
 
+def extract_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    """Defensively pull the first JSON object out of a model message.
+
+    Tolerates markdown code fences, leading prose, and trailing chatter.
+    Returns None when nothing parseable remains — callers must treat that as
+    an upstream failure, never as a valid classification.
+    """
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip()
+    # Strip ```json ... ``` / ``` ... ``` fences if present.
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if candidate.lower().startswith("json"):
+            candidate = candidate[4:]
+        candidate = candidate.strip()
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except (ValueError, TypeError):
+        pass
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(candidate[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _log_llm_call(record: Dict[str, Any]) -> None:
     """Appends one structured JSONL record per upstream LLM interaction.
 
@@ -139,6 +171,74 @@ class LLMStreamingGateway:
                 "prompt_chars": len(json.dumps(messages)),
             })
             raise
+
+    async def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 200,
+        timeout_s: float = 8.0,
+    ) -> Optional[Dict[str, Any]]:
+        """One non-streaming chat-completions round that must answer with JSON.
+
+        Returns the parsed JSON object, or None on ANY failure: mock mode (no
+        key configured), HTTP error, transport exception, or unparseable body.
+        Callers must treat None as "upstream unavailable" and fall back to
+        their deterministic path — this helper never raises.
+        """
+        if self.config.is_mock:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            # Request JSON output only; endpoints that ignore response_format
+            # are still handled by extract_json_object on the reply text.
+            "response_format": {"type": "json_object"},
+        }
+        endpoint = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        started = time.perf_counter()
+        resp_status = None
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                resp = await client.post(endpoint, headers=headers, json=payload)
+                resp_status = getattr(resp, "status_code", None)
+                resp.raise_for_status()
+                raw_content = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")
+            parsed = extract_json_object(raw_content)
+            _log_llm_call({
+                "ts": time.time(),
+                "kind": "classify_json",
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                "status": resp_status,
+                "prompt_chars": len(system_prompt) + len(user_prompt),
+                "response_excerpt": (raw_content or "")[:2000],
+                "parsed_ok": parsed is not None,
+            })
+            return parsed
+        except Exception as exc:
+            _log_llm_call({
+                "ts": time.time(),
+                "kind": "classify_json",
+                "model": self.config.model,
+                "base_url": self.config.base_url,
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                "status": resp_status,
+                "error": str(exc)[:2000],
+                "prompt_chars": len(system_prompt) + len(user_prompt),
+            })
+            return None
 
     async def stream_narrative(
         self,
