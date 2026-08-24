@@ -290,7 +290,20 @@ pub struct InitiativeCombatState {
     pub in_combat: bool,
     pub round: u32,
     pub turn_index: usize,
+    /// Entity ids in initiative order (index 0 acts first). Serde default
+    /// keeps legacy serialized sessions (combat without an order) parsing.
+    #[serde(default)]
     pub order: Vec<Uuid>,
+}
+
+/// One rolled initiative slot, as reported by [`GameSession::begin_combat`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InitiativeEntry {
+    pub entity_id: Uuid,
+    pub name: String,
+    pub dexterity: i32,
+    /// d20 natural roll + DEX modifier.
+    pub initiative_total: i32,
 }
 
 impl InitiativeCombatState {
@@ -308,6 +321,18 @@ impl InitiativeCombatState {
         let current_actor = self.order.get(self.turn_index).cloned();
         (self.turn_index, self.round, current_actor)
     }
+}
+
+/// Orders initiative entries: total descending, ties by higher DEX score,
+/// then alphabetically by name. Free function so the tie-break ladder is
+/// unit-testable without forcing equal dice rolls.
+pub fn sort_initiative_entries(entries: &mut [InitiativeEntry]) {
+    entries.sort_by(|a, b| {
+        b.initiative_total
+            .cmp(&a.initiative_total)
+            .then_with(|| b.dexterity.cmp(&a.dexterity))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -924,5 +949,247 @@ impl GameSession {
     pub fn verify_entity_conservation(&self, previous_count: usize, ingress_count: usize, egress_count: usize) -> bool {
         let expected = previous_count + ingress_count - egress_count;
         self.entities.len() == expected
+    }
+
+    // ------------------------------------------------------------- combat flow
+
+    /// Starts combat: rolls initiative (d20 + DEX modifier per entity), orders
+    /// combatants by total (ties broken by DEX score, then name) and stores the
+    /// ordered ids on [`InitiativeCombatState`]. Round starts at 1 with entity
+    /// `order[0]` on turn.
+    ///
+    /// Rolls are drawn through the caller's [`DiceEngine`] in sorted-id order,
+    /// so a seeded engine reproduces identical initiative for identical state.
+    /// Returns the full rolled order for reporting.
+    pub fn begin_combat(&mut self, dice: &mut DiceEngine) -> Vec<InitiativeEntry> {
+        // Deterministic visit order — HashMap iteration order must never leak
+        // into which die lands on which entity.
+        let mut ids: Vec<Uuid> = self.entities.keys().copied().collect();
+        ids.sort();
+
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            let entity = &self.entities[&id];
+            let dexterity = entity.abilities.dexterity;
+            let natural = dice.roll_d20();
+            entries.push(InitiativeEntry {
+                entity_id: id,
+                name: entity.name.clone(),
+                dexterity,
+                initiative_total: natural + Ability::modifier(dexterity),
+            });
+        }
+        sort_initiative_entries(&mut entries);
+
+        self.combat.in_combat = true;
+        self.combat.round = 1;
+        self.combat.turn_index = 0;
+        self.combat.order = entries.iter().map(|e| e.entity_id).collect();
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            Uuid::nil(),
+            "COMBAT_BEGAN",
+            serde_json::json!({
+                "round": 1,
+                "order": entries.iter().map(|e| serde_json::json!({
+                    "entity_id": e.entity_id,
+                    "initiative_total": e.initiative_total,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+        entries
+    }
+
+    /// Ends combat and clears the initiative tracker. Entities stay on the
+    /// board untouched; returns how many combatants were tracked.
+    pub fn end_combat(&mut self) -> usize {
+        let cleared = self.combat.order.len();
+        let round_fought = self.combat.round;
+        self.combat = InitiativeCombatState::default();
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            Uuid::nil(),
+            "COMBAT_ENDED",
+            serde_json::json!({ "rounds_fought": round_fought }),
+        );
+        cleared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dice::DiceEngine;
+
+    fn entity(id: Uuid, name: &str, dex: i32) -> EntityState {
+        EntityState::new(
+            id,
+            format!("test_{}", name),
+            name.to_string(),
+            true,
+            10,
+            12,
+            30.0,
+            AbilityScores {
+                strength: 10,
+                dexterity: dex,
+                constitution: 10,
+                intelligence: 10,
+                wisdom: 10,
+                charisma: 10,
+            },
+        )
+    }
+
+    #[test]
+    fn test_begin_combat_rolls_dex_modified_initiative_and_orders_desc() {
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        session.add_entity(entity(a, "Ann", 14), None).unwrap(); // DEX mod +2
+        session.add_entity(entity(b, "Bob", 8), None).unwrap(); // DEX mod -1
+
+        let seed = 0xC0FFEE;
+        let mut dice = DiceEngine::with_seed(seed);
+        let entries = session.begin_combat(&mut dice);
+        assert_eq!(entries.len(), 2);
+        assert!(session.combat.in_combat);
+        assert_eq!(session.combat.round, 1);
+        assert_eq!(session.combat.turn_index, 0);
+        // Order stored on the combat state mirrors the reported entries.
+        assert_eq!(
+            session.combat.order,
+            entries.iter().map(|e| e.entity_id).collect::<Vec<_>>()
+        );
+        // Every total is its d20 natural + that entity's DEX modifier.
+        let mut dice = DiceEngine::with_seed(seed);
+        let mut ids: Vec<Uuid> = vec![a, b];
+        ids.sort();
+        let expected: HashMap<Uuid, i32> = ids
+            .into_iter()
+            .map(|id| {
+                let natural = dice.roll_d20();
+                (
+                    id,
+                    natural + Ability::modifier(session.entities[&id].abilities.dexterity),
+                )
+            })
+            .collect();
+        for entry in &entries {
+            assert_eq!(entry.initiative_total, expected[&entry.entity_id]);
+            assert_eq!(entry.name, session.entities[&entry.entity_id].name);
+            assert_eq!(
+                entry.dexterity,
+                session.entities[&entry.entity_id].abilities.dexterity
+            );
+        }
+        // Ordering is non-increasing in initiative total.
+        let ordered: Vec<i32> = entries.iter().map(|e| e.initiative_total).collect();
+        let mut sorted = ordered.clone();
+        sorted.sort_by(|x, y| y.cmp(x));
+        assert_eq!(ordered, sorted);
+    }
+
+    #[test]
+    fn test_initiative_sort_tie_breaks_by_dexterity_then_name() {
+        // Same total, higher DEX wins; same total AND same DEX → name asc.
+        let mut entries = vec![
+            InitiativeEntry { entity_id: Uuid::new_v4(), name: "Zed".into(), dexterity: 14, initiative_total: 12 },
+            InitiativeEntry { entity_id: Uuid::new_v4(), name: "Amy".into(), dexterity: 14, initiative_total: 12 },
+            InitiativeEntry { entity_id: Uuid::new_v4(), name: "Quick".into(), dexterity: 18, initiative_total: 12 },
+            InitiativeEntry { entity_id: Uuid::new_v4(), name: "Slow".into(), dexterity: 8, initiative_total: 15 },
+        ];
+        sort_initiative_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Slow", "Quick", "Amy", "Zed"],
+            "total desc, then DEX desc, then name asc"
+        );
+    }
+
+    #[test]
+    fn test_end_combat_clears_state() {
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(Uuid::new_v4(), "Solo", 10), None).unwrap();
+        let mut dice = DiceEngine::with_seed(7);
+        session.begin_combat(&mut dice);
+        assert!(session.combat.in_combat);
+        // A couple of turns so round > 1 before ending.
+        session.combat.next_turn();
+
+        session.end_combat();
+        assert!(!session.combat.in_combat);
+        assert_eq!(session.combat.round, 0);
+        assert_eq!(session.combat.turn_index, 0);
+        assert!(session.combat.order.is_empty());
+
+        // Combat can begin again cleanly afterwards.
+        let entries = session.begin_combat(&mut dice);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(session.combat.round, 1);
+    }
+
+    #[test]
+    fn test_next_turn_wraps_order_and_increments_round() {
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            session.add_entity(entity(*id, &format!("E{}", i), 10), None).unwrap();
+        }
+        session.begin_combat(&mut DiceEngine::with_seed(3));
+        assert_eq!(session.combat.round, 1);
+        // Turn order is the rolled initiative order, not spawn order.
+        let order = session.combat.order.clone();
+        assert_eq!(order.len(), 3);
+
+        for (step, expected_idx) in [1usize, 2, 0].iter().enumerate() {
+            let (idx, round, actor) = session.combat.next_turn();
+            assert_eq!(idx, *expected_idx, "step {}", step);
+            assert_eq!(actor, Some(order[*expected_idx]), "step {}", step);
+            if step < 2 {
+                assert_eq!(round, 1);
+            }
+        }
+        // Wrapping back to index 0 bumped the round.
+        assert_eq!(session.combat.round, 2);
+
+        let (_, _, actor) = session.combat.next_turn();
+        assert_eq!(actor, Some(order[1]));
+        assert_eq!(session.combat.turn_index, 1);
+    }
+
+    #[test]
+    fn test_next_turn_without_order_is_a_noop() {
+        let mut state = InitiativeCombatState::default();
+        let (idx, round, actor) = state.next_turn();
+        assert_eq!((idx, round, actor), (0, 0, None));
+    }
+
+    #[test]
+    fn test_legacy_combat_payload_without_order_deserializes() {
+        let raw = serde_json::json!({ "in_combat": false, "round": 2, "turn_index": 1 });
+        let state: InitiativeCombatState = serde_json::from_value(raw).expect("legacy payload");
+        assert!(state.order.is_empty());
+        assert_eq!(state.round, 2);
+    }
+
+    #[test]
+    fn test_seeded_begin_combat_is_reproducible() {
+        // Fixed ids so the deterministic sorted-id roll visitation matches
+        // run to run; only the seed varies.
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let build = |seed: u64| {
+            let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+            session.add_entity(entity(a, "Ann", 16), None).unwrap();
+            session.add_entity(entity(b, "Bob", 12), None).unwrap();
+            let mut dice = DiceEngine::with_seed(seed);
+            (session.begin_combat(&mut dice), session.combat.order.clone())
+        };
+        assert_eq!(build(1234), build(1234));
+        assert_ne!(build(1234), build(5678), "different seeds may reorder");
     }
 }

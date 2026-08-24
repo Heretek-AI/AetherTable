@@ -530,6 +530,10 @@ class TestSessionStateProxy:
     SESSION_ID = "12345678-90ab-cdef-1234-567890abcdef"
 
     def test_player_token_forwards_identity_and_uses_engine_get(self, monkeypatch):
+        """Since iteration-32 this proxy PROJECTS entities by role; a player
+        still receives their OWN entity in full (owner_player_id matches),
+        which is what post-rewind client convergence needs. The full
+        projection matrix is pinned in test_session_state_filtering.py."""
         captured: dict = {}
 
         async def fake_engine_request(method, path, payload=None, *, actor=None):
@@ -537,7 +541,7 @@ class TestSessionStateProxy:
             captured["actor"] = actor
             return {
                 "session_id": self.SESSION_ID,
-                "entities": {"hero": {"current_hp": 30}},
+                "entities": {"hero": {"current_hp": 30, "owner_player_id": "player-7"}},
                 "ledger": {"current_sequence": 7},
             }
 
@@ -550,8 +554,6 @@ class TestSessionStateProxy:
             json={"session_id": self.SESSION_ID},
         )
         assert resp.status_code == 200
-        # The FULL authoritative session travels back verbatim — no counts,
-        # no projection — so the client can converge post-rewind state.
         assert resp.json()["session_id"] == self.SESSION_ID
         assert resp.json()["entities"]["hero"]["current_hp"] == 30
         # It is a proxied GET against the canonical session resource...
@@ -655,3 +657,159 @@ class TestSessionStateProxy:
             json={"session_id": self.SESSION_ID},
         )
         assert resp.status_code == 200
+
+
+class TestCombatProxy:
+    """GM combat lifecycle proxies (POST /api/v1/engine/combat/begin,
+    POST /api/v1/engine/combat/end).
+
+    Initiative math is engine-owned; the gateway forwards only the session
+    reference plus the caller's verified identity so the engine's RBAC
+    authorizes the real actor (spectators are refused by the engine)."""
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token(
+            {"user_id": user_id, "role": role, "exp": _time.time() + 600}
+        )
+
+    SESSION_ID = "abcdefab-cdef-abcd-efab-cdefabcdefab"
+
+    def test_begin_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/combat/begin",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 401
+
+    def test_end_with_invalid_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/combat/end",
+            params={"token": "not.a.valid.token"},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 401
+
+    def test_begin_requires_a_token(self):
+        resp = client.post("/api/v1/engine/combat/begin", json={"session_id": "s"})
+        assert resp.status_code == 422, "missing required token query param"
+
+    def test_end_requires_a_token(self):
+        resp = client.post("/api/v1/engine/combat/end", json={"session_id": "s"})
+        assert resp.status_code == 422, "missing required token query param"
+
+    def test_begin_forwards_identity_and_engine_path(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {
+                "status": "COMBAT_BEGAN",
+                "in_combat": True,
+                "round": 1,
+                "turn_index": 0,
+                "order": [
+                    {
+                        "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "hero")),
+                        "name": "Hero",
+                        "dexterity": 14,
+                        "initiative_total": 16,
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/begin",
+            params={"token": token},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200
+        # Full rolled order travels back verbatim — no projection.
+        body = resp.json()
+        assert body["status"] == "COMBAT_BEGAN"
+        assert body["order"][0]["name"] == "Hero"
+        assert body["order"][0]["initiative_total"] == 16
+        # It is a POST against the canonical session resource...
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/combat/begin"
+        )
+        # ...with an empty ids-only payload acting as the REAL caller.
+        assert captured["payload"] == {}
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_end_forwards_gm_role_and_engine_path(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {"status": "COMBAT_ENDED", "rounds_fought": 3}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/end",
+            params={"token": token},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "COMBAT_ENDED", "rounds_fought": 3}
+        assert captured["method"] == "POST"
+        assert captured["path"] == f"/api/v1/sessions/{self.SESSION_ID}/combat/end"
+        assert captured["payload"] == {}
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_begin_rejects_extra_body_fields(self):
+        """Trust-inversion regression: no initiative overrides smuggled past
+        the proxy — clients reference the session, never supply combat math."""
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/begin",
+            params={"token": token},
+            json={
+                "session_id": self.SESSION_ID,
+                "order": [{"entity_id": "x", "initiative_total": 999}],
+            },
+        )
+        assert resp.status_code == 422
+
+    def test_combat_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        for route in ("combat/begin", "combat/end"):
+            resp = client.post(
+                f"/api/v1/engine/{route}",
+                params={"token": self._token("gm-1", "gm")},
+                json={"session_id": self.SESSION_ID},
+            )
+            assert resp.status_code == 502, route
+            assert "unreachable" in resp.json()["detail"].lower()
+
+    def test_combat_session_ids_are_coerced_to_uuids(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured["path"] = path
+            return {"status": "COMBAT_BEGAN"}
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/begin",
+            params={"token": token},
+            json={"session_id": "thorins-table"},
+        )
+        assert resp.status_code == 200
+        assert captured["path"].startswith("/api/v1/sessions/")
+        coerced = captured["path"].split("/")[4]
+        assert coerced == str(uuid.uuid5(uuid.NAMESPACE_URL, "thorins-table"))

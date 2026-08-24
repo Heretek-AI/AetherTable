@@ -1249,6 +1249,49 @@ async def engine_turn_next(req: EngineSessionActionRequest, token: str = Query(.
     )
 
 
+class EngineCombatActionRequest(BaseModel):
+    """Body for the combat-lifecycle proxies: ONLY the session reference —
+    initiative math is engine-owned and any client-supplied order is refused
+    before it can reach the engine."""
+
+    session_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/combat/begin")
+async def engine_combat_begin(req: EngineCombatActionRequest, token: str = Query(...)):
+    """GM action: roll initiative and open combat on the authoritative engine.
+
+    All initiative math (d20 + DEX, tie-breaks) is engine-owned; the gateway
+    forwards only the session reference plus the caller's real identity so the
+    engine's RBAC authorizes the actor. The response carries the full rolled
+    order [{entity_id, name, dexterity, initiative_total}] verbatim."""
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}/combat/begin",
+            {},
+            actor=_caller_actor(token),
+        )
+    )
+
+
+@app.post("/api/v1/engine/combat/end")
+async def engine_combat_end(req: EngineCombatActionRequest, token: str = Query(...)):
+    """GM action: clear the initiative tracker. Ids-only payload, real-actor
+    forwarding — same contract as every other mutating proxy."""
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}/combat/end",
+            {},
+            actor=_caller_actor(token),
+        )
+    )
+
+
 @app.post("/api/v1/engine/damage")
 async def engine_damage(req: EngineDamageRequest, token: str = Query(...)):
     return await _engine_call(
@@ -1316,6 +1359,102 @@ class EngineSessionStateRequest(BaseModel):
         extra = "forbid"
 
 
+# --- Role-based state projection ------------------------------------------------------
+# Gateway-side closure of the iteration-31 finding that this read proxy handed FULL
+# engine state to anyone, leaving spectator filtering render-only. The projection is
+# deliberately conservative and fails closed: an unrecognized role gets the spectator
+# view.
+
+_PRIVILEGED_ROLES = frozenset({"gm", "admin"})
+_PLAYER_VISIBLE_ROLES = frozenset({"gm", "admin", "player"})
+# Board-token facts every participant may see: identity, placement, shown/
+# hidden, whether the token is a PC or an NPC, and whether it still stands.
+# Deliberately EXCLUDES current_hp/max_hp/temp_hp/ac/speed/abilities/attacks/
+# conditions/spell slots/resistances/owner markers — anything a player could
+# use to optimize against the sheet rather than watch the board.
+_PUBLIC_ENTITY_FIELDS = (
+    "id", "name", "is_visible", "position", "is_player", "is_dead",
+)
+
+
+def _public_entity(entity_id: str, entity: Dict[str, Any]) -> Dict[str, Any]:
+    """The board-token view of one entity: who it is and where it stands.
+    No HP, AC, abilities, attacks, conditions, or ownership markers."""
+    projected = {"id": entity_id}
+    for field in _PUBLIC_ENTITY_FIELDS[1:]:
+        if field in entity:
+            projected[field] = entity.get(field)
+    # Prefer the payload's own ``id`` field over the map key when both exist.
+    if isinstance(entity.get("id"), str):
+        projected["id"] = entity["id"]
+    return projected
+
+
+def _entity_is_visible(entity: Dict[str, Any]) -> bool:
+    """An absent flag means visible: the engine defaults entities to shown,
+    and partial payloads must not silently blank the whole board."""
+    return bool(entity.get("is_visible", True))
+
+
+def _project_entities(
+    entities: Dict[str, Any], user_id: Optional[str], privileged: bool
+) -> Dict[str, Any]:
+    """Applies the projection matrix below to the ``entities`` map."""
+    projected: Dict[str, Any] = {}
+    for entity_id, entity in entities.items():
+        if not isinstance(entity, dict):
+            continue  # never forward a malformed entry verbatim
+        if privileged:
+            projected[entity_id] = entity  # GM/admin see hidden entities too
+            continue
+        if not _entity_is_visible(entity):
+            continue  # hidden from everyone but GM/admin
+        if user_id is not None and entity.get("owner_player_id") == user_id:
+            projected[entity_id] = entity  # your own sheet, unredacted
+        else:
+            projected[entity_id] = _public_entity(str(entity_id), entity)
+    return projected
+
+
+def _project_session_state(
+    state: Any, actor: Optional[Dict[str, str]]
+) -> Any:
+    """Projects a live session snapshot for the calling role.
+
+    Projection matrix (``entities`` map only; every other top-level field —
+    session_id, combat, ledger metadata — travels verbatim):
+
+    ================  =========================================================
+    Caller role       Entities received
+    ================  =========================================================
+    gm / admin        Full authoritative stat blocks, including hidden entities.
+    player            Entities they OWN (``owner_player_id`` == their user_id)
+                      in full; every OTHER visible entity reduced to the public
+                      board-token projection (id, name, is_visible, position,
+                      is_player, is_dead); hidden entities dropped.
+    spectator         All visible entities reduced to that same board-token
+                      projection; hidden entities dropped; no HP/AC/abilities/
+                      attacks anywhere.
+    any other role    Spectator view (fails closed).
+    no token          Legacy service-principal read, returned verbatim.
+    ================  =========================================================
+    """
+    if actor is None:
+        return state  # legacy service-mediated call: unchanged contract
+    if not isinstance(state, dict) or not isinstance(state.get("entities"), dict):
+        return state  # nothing recognizable to project; pass through honestly
+    role = actor.get("role", "")
+    privileged = role in _PRIVILEGED_ROLES
+    user_id = actor["user_id"] if role in _PLAYER_VISIBLE_ROLES else None
+    state = dict(state)
+    state["entities"] = _project_entities(
+        state["entities"],
+        user_id if user_id is not None else "",
+        privileged,
+    )
+    return state
+
+
 @app.post("/api/v1/engine/session-state")
 async def engine_session_state(
     req: EngineSessionStateRequest, token: Optional[str] = Query(None)
@@ -1329,18 +1468,23 @@ async def engine_session_state(
     authorizes the real participant; callers without a token stay
     service-mediated like the other proxies.
 
-    NOTE: this exposes exactly what the caller could already see as a session
-    participant. If per-role visibility filtering (spectators vs players vs
-    GM) is ever needed on this payload, that is a separate iteration.
+    Before returning, the gateway PROJECTS the payload by the caller's role
+    (see :func:`_project_session_state`): spectators and non-owner players get
+    public board tokens only ({id, name, is_visible, position, is_player,
+    is_dead}), owners get their own sheets in full, and GM/admin alone receive
+    the complete authoritative state including hidden entities. See the matrix
+    in ``_project_session_state``'s docstring; the same policy drives replay
+    export redaction in ``engine_session_replay``.
     """
     actor = _caller_actor(token) if token else None
-    return await _engine_call(
+    state = await _engine_call(
         engine_client.engine_request(
             "GET",
             f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}",
             actor=actor,
         )
     )
+    return _project_session_state(state, actor)
 
 
 # --- Session replay export -----------------------------------------------------------
@@ -1350,11 +1494,20 @@ async def engine_session_state(
 # sent, missing fields are omitted (never defaulted), and unknown event
 # types pass through with their raw payload as the summary.
 
-def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
+def _event_summary(
+    event_type: str, payload: Dict[str, Any], *, redact_numbers: bool = False
+) -> str:
     """Human-readable one-liner for a ledger event, derived ONLY from fields
     genuinely present in ``payload``. Missing fields are omitted rather than
     defaulted, so an auditor never reads a number the engine never produced.
-    Unknown event types render their raw payload verbatim."""
+    Unknown event types render their raw payload verbatim.
+
+    With ``redact_numbers`` (spectator exports), numeric HP/damage amounts are
+    stripped and narrated qualitatively instead ("took damage", never
+    "took 7 damage"); zero-damage events say nothing rather than claiming
+    damage was dealt. Unprojectable payloads render a withholding note rather
+    than their raw JSON so no number can leak through the fallback path.
+    """
     parts: List[str] = []
 
     def opt(key: str) -> Any:
@@ -1370,9 +1523,12 @@ def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
             who = attacker if attacker is not None else target
             parts.append(f"{who} attacked" if attacker is not None else f"{who} targeted")
         damage, hp = opt("total_damage"), opt("target_hp_remaining")
-        if damage is not None:
+        if redact_numbers:
+            if damage:
+                parts.append("damage dealt")
+        elif damage is not None:
             parts.append(f"for {damage}")
-        if hp is not None:
+        if hp is not None and not redact_numbers:
             parts.append(f"(HP→{hp})")
     elif event_type == "DAMAGE_APPLIED":
         target = opt("target_id")
@@ -1380,8 +1536,8 @@ def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
         if target is not None:
             parts.append(str(target))
         if amount is not None:
-            parts.append(f"took {amount} damage")
-        if hp is not None:
+            parts.append("took damage" if redact_numbers else f"took {amount} damage")
+        if hp is not None and not redact_numbers:
             parts.append(f"(HP→{hp})")
     elif event_type in ("HEALED", "LONG_REST_APPLIED"):
         target = opt("target_id")
@@ -1390,10 +1546,14 @@ def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
         if target is not None:
             parts.append(str(target))
         if amount is not None:
-            parts.append(f"healed for {amount}")
+            parts.append("healed" if redact_numbers else f"healed for {amount}")
         if restored_max is not None:
-            parts.append(f"restored to max ({restored_max} HP)")
-        if hp is not None:
+            parts.append(
+                "restored to max"
+                if redact_numbers
+                else f"restored to max ({restored_max} HP)"
+            )
+        if hp is not None and not redact_numbers:
             parts.append(f"(HP→{hp})")
     elif event_type == "DEATH_SAVE_RESOLVED":
         roll, outcome = opt("natural_roll"), opt("outcome")
@@ -1412,9 +1572,12 @@ def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
             parts.append(f"{caster} cast {spell}")
         elif caster is not None:
             parts.append(f"{caster} cast a spell")
-        if damage is not None:
+        if redact_numbers:
+            if damage:
+                parts.append("damage dealt")
+        elif damage is not None:
             parts.append(f"for {damage}")
-        if hp is not None:
+        if hp is not None and not redact_numbers:
             parts.append(f"(HP→{hp})")
     elif event_type == "SPELL_COUNTERSPELLED":
         caster, spell = opt("caster_id"), opt("spell_id")
@@ -1436,12 +1599,16 @@ def _event_summary(event_type: str, payload: Dict[str, Any]) -> str:
 
     # Known type whose payload carried nothing we can describe, OR an event
     # type this gateway version does not know: show the raw payload honestly.
+    # Under redaction the fallback withholds instead — a raw dump would leak
+    # exactly the numbers we just stripped from the known branches.
     if parts:
         return " ".join(parts)
+    if redact_numbers:
+        return f"{event_type or 'UNKNOWN_EVENT'} occurred (details withheld)"
     return json.dumps(payload, sort_keys=True)
 
 
-def _project_ledger_event(event: Any) -> Dict[str, Any]:
+def _project_ledger_event(event: Any, *, redact_numbers: bool = False) -> Dict[str, Any]:
     """One GameEvent -> the auditable projection. Fields absent from the
     engine's event stay absent/null here; nothing is invented."""
     event_dict = event if isinstance(event, dict) else {}
@@ -1454,7 +1621,9 @@ def _project_ledger_event(event: Any) -> Dict[str, Any]:
         "actor_id": event_dict.get("actor_id"),
         "event_type": event_dict.get("event_type"),
         "is_reverted": bool(event_dict.get("is_reverted")),
-        "summary": _event_summary(event_type, payload),
+        "summary": _event_summary(
+            event_type, payload, redact_numbers=redact_numbers
+        ),
     }
 
 
@@ -1466,6 +1635,11 @@ async def engine_session_replay(session_id: str = Query(...), token: str = Query
     forwarded to the engine's GET /sessions/{id} so its RBAC authorizes the
     actual participant. Content-Disposition marks it as an attachment so
     browsers download `replay-<session_id>-<round>.json` instead of rendering.
+
+    Spectator (and unrecognized-role) exports are REDACTED: summaries keep the
+    narrative ("X hit Y — damage dealt") but strip exact HP/damage amounts,
+    matching the entity projection matrix on /api/v1/engine/session-state.
+    GM/admin/player exports carry the full numbers.
     """
     _require_user_id(token)
     actor = _caller_actor(token)
@@ -1477,8 +1651,12 @@ async def engine_session_replay(session_id: str = Query(...), token: str = Query
         )
     )
 
+    # Fail closed: only roles trusted with stat detail get unredacted numbers.
+    redact_numbers = actor.get("role", "") not in _PLAYER_VISIBLE_ROLES
     events_raw = raw.get("ledger", {}).get("events", []) if isinstance(raw.get("ledger"), dict) else []
-    events = [_project_ledger_event(e) for e in events_raw]
+    events = [
+        _project_ledger_event(e, redact_numbers=redact_numbers) for e in events_raw
+    ]
 
     combat = raw.get("combat")
     round_number = combat.get("round") if isinstance(combat, dict) else None

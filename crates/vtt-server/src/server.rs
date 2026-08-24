@@ -526,6 +526,80 @@ async fn next_turn(
     }
 }
 
+/// Rolls initiative for every entity on the board and opens combat. RBAC
+/// matches every other session mutation (`may_mutate_session`): GMs and
+/// players may start the fight, spectators may not.
+async fn begin_combat(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot start combat");
+    }
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        if session.entities.is_empty() {
+            return reject(
+                &data,
+                422,
+                "COMBAT_NO_ENTITIES",
+                "cannot begin combat with no entities on the board",
+            );
+        }
+        // Same deterministic seeding convention as next_turn: derived from the
+        // session id and ledger position, never client-supplied.
+        let seed = session_id.as_u128() as u64 ^ (session.ledger.current_sequence << 32);
+        let mut dice = DiceEngine::with_seed(seed);
+        let order = session.begin_combat(&mut dice);
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "COMBAT_BEGAN",
+            "in_combat": true,
+            "round": session.combat.round,
+            "turn_index": session.combat.turn_index,
+            "order": order,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+/// Clears the initiative tracker and closes combat. The full serialized
+/// `combat` object (with `order`) flows to clients automatically through
+/// GET /sessions/{id}.
+async fn end_combat(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot end combat");
+    }
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        let rounds_fought = session.combat.round;
+        let had_combat = session.combat.in_combat;
+        session.end_combat();
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "COMBAT_ENDED",
+            "had_active_combat": had_combat,
+            "rounds_fought": rounds_fought,
+            "in_combat": false,
+            "round": 0,
+            "turn_index": 0,
+            "order": [],
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CastSpellReq {
@@ -2312,6 +2386,8 @@ pub fn configure_app_with(
                         .route("/move", web::post().to(move_entity))
                         .route("/reactions/arm", web::post().to(arm_reaction))
                         .route("/turn/next", web::post().to(next_turn))
+                        .route("/combat/begin", web::post().to(begin_combat))
+                        .route("/combat/end", web::post().to(end_combat))
                         .route("/action/death-save", web::post().to(resolve_death_save))
                         .route("/damage", web::post().to(apply_damage))
                         .route("/heal", web::post().to(heal_entity))

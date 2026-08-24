@@ -76,6 +76,27 @@ import type { CampaignSnapshot } from './api/campaign_store';
 import { listSaves, loadCampaign } from './api/campaign_store';
 import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
+import type { CombatantEntry } from './components/InitiativeTracker';
+
+/**
+ * Authoritative engine combat state, mirrored from GET /api/v1/engine/session-state
+ * (`combat` field of the engine's GameSession snapshot). `order` holds REAL
+ * rolled initiative entries [{entity_id, name, dexterity, initiative_total}];
+ * it stays empty until a GM actually begins combat on the engine.
+ */
+interface EngineCombatSnapshot {
+  in_combat: boolean;
+  round: number;
+  turn_index: number;
+  order: CombatantEntry[];
+}
+
+const IDLE_COMBAT_SNAPSHOT: EngineCombatSnapshot = {
+  in_combat: false,
+  round: 0,
+  turn_index: 0,
+  order: [],
+};
 
 // --- Roll history persistence ---------------------------------------------
 const ROLL_HISTORY_KEY = 'vtt_roll_history_v1';
@@ -373,6 +394,13 @@ export function App() {
   const [selectedTokenId, setSelectedTokenId] = useState<string | null>('thorin_1');
   const [currentTurnIndex, setCurrentTurnIndex] = useState(0);
   const [roundNumber, setRoundNumber] = useState(1);
+  // Authoritative combat lifecycle (engine-owned). Starts idle — no
+  // fabricated combatants until a GM rolls initiative for real.
+  const [combat, setCombat] = useState<EngineCombatSnapshot>(IDLE_COMBAT_SNAPSHOT);
+  const [isCombatBusy, setIsCombatBusy] = useState(false);
+  // Engine session this browser talks to through the orchestrator proxies;
+  // null while the engine is unreachable (tracker then shows its empty state).
+  const [combatSessionId, setCombatSessionId] = useState<string | null>(null);
   const [spotlightWeights, setSpotlightWeights] = useState({ Thorin: 0.55, Lyra: 0.45 });
   const [isStreamingResponse, setIsStreamingResponse] = useState(false);
 
@@ -531,15 +559,148 @@ export function App() {
     syncClientRef.current?.updateTokenPosition(tokenId, newX, newY, 0);
   };
 
+  // --- Authoritative combat plumbing (gateway /api/v1/engine/* proxies) ----
+
+  /** Pulls live combat state via the session-state read proxy (service-
+   * mediated like every other proxy call). Never throws: an unreachable
+   * engine simply leaves the last known snapshot on screen. */
+  const refreshCombatState = useCallback(async (): Promise<void> => {
+    try {
+      let sessionId = combatSessionId;
+      if (!sessionId) {
+        sessionId = await ensureEngineSession();
+        if (!sessionId) return;
+        setCombatSessionId(sessionId);
+      }
+      const resp = await fetch('/api/v1/engine/session-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!resp.ok) return;
+      const snap = await resp.json();
+      const c = snap?.combat;
+      if (!c || typeof c !== 'object') return;
+      setCombat({
+        in_combat: Boolean(c.in_combat),
+        round: Number(c.round ?? 0),
+        turn_index: Number(c.turn_index ?? 0),
+        order: Array.isArray(c.order) ? c.order : [],
+      });
+    } catch {
+      /* engine unreachable — keep showing last known state */
+    }
+  }, [combatSessionId]);
+
+  // Poll while at the table so GM actions from another seat converge here too.
+  useEffect(() => {
+    if (currentView !== 'tabletop') return;
+    void refreshCombatState();
+    const timer = window.setInterval(() => void refreshCombatState(), 15000);
+    return () => window.clearInterval(timer);
+  }, [currentView, refreshCombatState]);
+
+  const handleBeginCombat = async () => {
+    if (userRole === 'spectator') {
+      addSystemMessage('🚫 Spectator view: beginning combat is a GM action.');
+      return;
+    }
+    setIsCombatBusy(true);
+    try {
+      let sessionId = combatSessionId;
+      if (!sessionId) {
+        sessionId = await ensureEngineSession();
+        if (!sessionId) {
+          addSystemMessage('⚔️ Rules engine unreachable — cannot roll initiative.');
+          return;
+        }
+        setCombatSessionId(sessionId);
+      }
+      const resp = await fetch('/api/v1/engine/combat/begin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!resp.ok) {
+        addSystemMessage(`⚔️ Begin combat rejected by the engine (HTTP ${resp.status}).`);
+        return;
+      }
+      const data = await resp.json();
+      const order: CombatantEntry[] = Array.isArray(data.order) ? data.order : [];
+      const round = Number(data.round ?? 1);
+      setCombat({ in_combat: true, round, turn_index: Number(data.turn_index ?? 0), order });
+      setRoundNumber(round || 1);
+      setCurrentTurnIndex(Number(data.turn_index ?? 0));
+      const first = order[0];
+      if (first) setSelectedTokenId(first.entity_id);
+      addSystemMessage(
+        first
+          ? `⚔️ Initiative rolled! ${first.name} acts first with ${first.initiative_total}.`
+          : '⚔️ Combat begun with no combatants tracked.'
+      );
+    } catch {
+      addSystemMessage('⚔️ Begin combat failed — rules engine unreachable.');
+    } finally {
+      setIsCombatBusy(false);
+    }
+  };
+
+  const handleEndCombat = async () => {
+    if (userRole === 'spectator') {
+      addSystemMessage('🚫 Spectator view: ending combat is a GM action.');
+      return;
+    }
+    setIsCombatBusy(true);
+    try {
+      if (combatSessionId) {
+        const resp = await fetch('/api/v1/engine/combat/end', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: combatSessionId }),
+        });
+        if (!resp.ok) {
+          addSystemMessage(`⚔️ End combat rejected by the engine (HTTP ${resp.status}).`);
+          return;
+        }
+        const data = await resp.json();
+        addSystemMessage(`🏁 Combat ended after ${data.rounds_fought ?? '?'} round(s).`);
+      } else {
+        addSystemMessage('🏁 Combat ended.');
+      }
+    } catch {
+      addSystemMessage('🏁 Combat ended locally (engine unreachable).');
+    } finally {
+      setCombat(IDLE_COMBAT_SNAPSHOT);
+      setRoundNumber(1);
+      setCurrentTurnIndex(0);
+      setIsCombatBusy(false);
+    }
+  };
+
   const handleNextTurn = () => {
-    const nextIndex = (currentTurnIndex + 1) % tokens.length;
+    const orderLen = combat.order.length > 0 ? combat.order.length : tokens.length;
+    if (orderLen === 0) return;
+    const nextIndex = (currentTurnIndex + 1) % orderLen;
     if (nextIndex === 0) {
       setRoundNumber((r) => r + 1);
     }
     setCurrentTurnIndex(nextIndex);
-    setSelectedTokenId(tokens[nextIndex].id);
-    globalSpatialAudio.setListenerPosition(tokens[nextIndex].x, tokens[nextIndex].y);
-    addSystemMessage(`Turn passed to ${tokens[nextIndex].name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
+    const activeId = combat.order[nextIndex]?.entity_id ?? tokens[nextIndex]?.id;
+    if (activeId) setSelectedTokenId(activeId);
+    const anchor = tokens.find((t) => t.id === activeId) ?? tokens[0];
+    if (anchor) globalSpatialAudio.setListenerPosition(anchor.x, anchor.y);
+    const name =
+      combat.order[nextIndex]?.name ?? tokens[nextIndex]?.name ?? 'the next combatant';
+    addSystemMessage(`Turn passed to ${name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
+    // Keep the engine's turn cursor converging (fire-and-forget; the poll
+    // reconciles authoritative round/turn when we are not the actor).
+    if (combat.in_combat && combatSessionId) {
+      void fetch('/api/v1/engine/turn-next', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: combatSessionId }),
+      }).then(() => refreshCombatState());
+    }
   };
 
   // SSE Stream Narrative Reader
@@ -1226,13 +1387,19 @@ export function App() {
                   absent from turn order too (not merely invisible on map). */}
               <InitiativeTracker
                 tokens={visibleTokens}
-                currentTurnIndex={currentTurnIndex}
                 onNextTurn={handleNextTurn}
                 onSelectToken={(id) => setSelectedTokenId(id)}
                 selectedTokenId={selectedTokenId}
-                roundNumber={roundNumber}
+                roundNumber={combat.round || roundNumber}
                 isCollapsed={isLeftDockCollapsed}
                 onToggleCollapse={() => setIsLeftDockCollapsed(!isLeftDockCollapsed)}
+                inCombat={combat.in_combat}
+                combatOrder={combat.order}
+                activeEntityId={combat.order[combat.turn_index]?.entity_id ?? null}
+                isGm={userRole === 'gm'}
+                isCombatBusy={isCombatBusy}
+                onBeginCombat={() => void handleBeginCombat()}
+                onEndCombat={() => void handleEndCombat()}
               />
 
               {/* Center Tactical Canvas */}

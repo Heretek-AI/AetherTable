@@ -2374,3 +2374,177 @@ async fn move_without_adjacent_armed_enemies_omits_opportunity_attack() {
     let body: serde_json::Value = test::read_body_json(res).await;
     assert!(body.get("opportunity_attack").is_none(), "{}", body);
 }
+
+// --- Initiative combat lifecycle (/combat/begin, /combat/end) ----------------
+
+#[actix_web::test]
+async fn combat_begin_rolls_order_and_end_clears_it() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+
+    // Create session + spawn three combatants with distinct DEX scores.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Initiative"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    for (id, name) in [(Uuid::new_v4(), "High Dex"), (Uuid::new_v4(), "Low Dex"), (Uuid::new_v4(), "Mid Dex")] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(entity_json(id, name, 20, 12, 3, "1d8+1"))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Begin combat.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "COMBAT_BEGAN");
+    assert_eq!(body["in_combat"], true);
+    assert_eq!(body["round"], 1);
+    let order = body["order"].as_array().expect("order array");
+    assert_eq!(order.len(), 3, "one entry per entity");
+    for entry in order {
+        assert!(entry["entity_id"].is_string());
+        assert!(entry["name"].is_string());
+        // d20 + DEX mod bounds: every total is 1..=20 plus a -5..+5 DEX modifier.
+        let total = entry["initiative_total"].as_i64().unwrap();
+        assert!((0..=25).contains(&total), "total {} out of bounds", total);
+        assert!(entry["dexterity"].as_i64().is_some());
+    }
+    // Order is non-increasing in initiative total.
+    let totals: Vec<i64> = order.iter().map(|e| e["initiative_total"].as_i64().unwrap()).collect();
+    let mut sorted = totals.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(totals, sorted, "initiative order must descend");
+
+    // The authoritative snapshot now carries the same order.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let snap: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(snap["combat"]["in_combat"], true);
+    assert_eq!(snap["combat"]["round"], 1);
+    let stored_order = snap["combat"]["order"].as_array().expect("stored order");
+    assert_eq!(stored_order.len(), 3);
+    assert_eq!(
+        stored_order.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>(),
+        order.iter().map(|e| e["entity_id"].as_str().unwrap()).collect::<Vec<_>>(),
+        "snapshot order matches the reported roll"
+    );
+
+    // End combat clears everything.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/end", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "COMBAT_ENDED");
+
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let snap: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    assert_eq!(snap["combat"]["in_combat"], false);
+    assert_eq!(snap["combat"]["round"], 0);
+    assert_eq!(snap["combat"]["order"].as_array().unwrap().len(), 0);
+
+    // Combat can be re-opened afterwards.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(auth)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn combat_begin_on_empty_board_is_rejected() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let auth = bearer(&token);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Empty"}))
+        .to_request();
+    let body: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Ending on an empty board is still fine (idempotent clear).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/end", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Unknown session → 404.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/end", Uuid::new_v4()))
+        .insert_header(auth)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn spectator_cannot_begin_or_end_combat() {
+    let app = test_app().await;
+    let gm_auth = bearer(&sign_token("gm-1", TEST_SECRET));
+    let spectator_auth = bearer(&sign_token_with_role("watcher", "spectator", TEST_SECRET));
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(gm_auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "RBAC"}))
+        .to_request();
+    let body: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let hero_id = Uuid::new_v4();
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(entity_json(hero_id, "Hero", 20, 14, 4, "1d8+2"))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    for route in ["combat/begin", "combat/end"] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/{}/{}", session_id, route.split('/').next().unwrap(), route.split('/').nth(1).unwrap()))
+            .insert_header(spectator_auth.clone())
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{} must 403 spectators", route);
+    }
+
+    // Unauthenticated calls are rejected by the middleware.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::UNAUTHORIZED);
+}
