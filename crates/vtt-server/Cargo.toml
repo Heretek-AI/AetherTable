@@ -2,6 +2,7 @@
 name = "vtt-server"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "High-Performance Unified Actix-Web Server for AI-Native VTT Engine"
 
 [dependencies]

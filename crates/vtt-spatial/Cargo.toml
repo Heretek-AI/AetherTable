@@ -2,6 +2,7 @@
 name = "vtt-spatial"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Spatial Geometry, Pathfinding, SIMD/Bresenham LoS and Zone Graphs"
 
 [dependencies]

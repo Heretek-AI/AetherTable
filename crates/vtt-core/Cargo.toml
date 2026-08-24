@@ -2,6 +2,7 @@
 name = "vtt-core"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Authoritative Headless Deterministic Rules Engine for AI-Native VTT"
 
 [dependencies]

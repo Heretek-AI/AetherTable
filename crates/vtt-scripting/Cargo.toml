@@ -2,6 +2,7 @@
 name = "vtt-scripting"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Dual Scripting Architecture: Sandboxed Wasmtime Fuel-Metered & Rhai Story Engines"
 
 [dependencies]
