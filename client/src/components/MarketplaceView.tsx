@@ -1,23 +1,27 @@
 import React, { useState } from 'react';
 import {
   ShoppingBag,
-  Download,
-  Sparkles,
-  Star,
-  Shield,
-  Layers,
   Plus,
   Search,
   Check,
-  Package,
   Wand2,
-  Skull,
-  ExternalLink,
-  Tag,
-  Flame,
-  ArrowRight,
+  Star,
+  FlaskConical,
 } from 'lucide-react';
-import { globalAudio } from '../render/audio_manager';
+
+/**
+ * PREVIEW SURFACE — not wired to any payment or distribution backend.
+ *
+ * There is no purchase, checkout, or entitlement endpoint in this repository
+ * (the orchestrator exposes no stripe/payment/checkout/billing routes, and no
+ * bundle download/install API exists). Everything shown here is illustrative
+ * sample content:
+ *   - Prices are sample list prices; nothing can be bought.
+ *   - Ratings and review counts are sample data, not real reviews.
+ *   - No "installed" state is tracked or claimed — nothing is downloaded and
+ *     no ownership is asserted.
+ *   - The Homebrew Forge form does not persist anything.
+ */
 
 interface CampaignBundleItem {
   id: string;
@@ -26,35 +30,31 @@ interface CampaignBundleItem {
   levelRange: string;
   rating: number;
   reviewsCount: number;
+  /** Sample list price shown for illustration only — nothing is purchasable. */
   price: string;
-  isFree?: boolean;
-  isInstalled?: boolean;
   coverGradient: string;
   description: string;
   features: string[];
 }
 
 interface MarketplaceViewProps {
+  /**
+   * Retained for call-site compatibility. Never invoked: there is no install
+   * or purchase backend, so this surface must not imply a completed install.
+   */
   onInstallBundle?: (bundleId: string) => void;
-  onLaunchHomebrew?: (homebrewItem: any) => void;
 }
 
-export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
-  onInstallBundle,
-  onLaunchHomebrew,
-}) => {
+export const MarketplaceView: React.FC<MarketplaceViewProps> = () => {
   const [activeTab, setActiveTab] = useState<'marketplace' | 'homebrew_studio'>('marketplace');
   const [searchQuery, setSearchQuery] = useState('');
-  const [installedBundles, setInstalledBundles] = useState<string[]>(['vane_1042']);
 
-  // Homebrew Studio State
+  // Homebrew Studio State (form values only — never persisted anywhere)
   const [hbName, setHbName] = useState('Void Golem Titan');
-  const [hbType, setHbType] = useState<'monster' | 'spell'>('monster');
   const [hbCr, setHbCr] = useState('9');
   const [hbHp, setHbHp] = useState('178');
   const [hbAc, setHbAc] = useState('18');
   const [hbAction, setHbAction] = useState('Void Siphon: 4d10+5 Necrotic Damage');
-  const [hbCreatedSuccess, setHbCreatedSuccess] = useState(false);
 
   const bundles: CampaignBundleItem[] = [
     {
@@ -65,7 +65,6 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
       rating: 4.9,
       reviewsCount: 142,
       price: 'Included (Core)',
-      isFree: true,
       coverGradient: 'from-amber-600 to-rose-900',
       description: 'Storm the corrupted crypts of the Baron, solve socket-carved dungeon puzzles, and defeat the Orc Warlord.',
       features: ['12 Tactical Battlemaps', '6 Pre-Built Tokens', 'Dynamic LoS Walls', 'WFC Procedural Vaults'],
@@ -108,21 +107,6 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
     },
   ];
 
-  const handleInstall = (id: string) => {
-    if (!installedBundles.includes(id)) {
-      setInstalledBundles([...installedBundles, id]);
-      globalAudio.playTurnAdvance();
-      if (onInstallBundle) onInstallBundle(id);
-    }
-  };
-
-  const handleSaveHomebrew = (e: React.FormEvent) => {
-    e.preventDefault();
-    globalAudio.playDiceRoll();
-    setHbCreatedSuccess(true);
-    setTimeout(() => setHbCreatedSuccess(false), 2000);
-  };
-
   const filteredBundles = bundles.filter(
     (b) =>
       b.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -146,9 +130,13 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
                 <span className="vtt-badge">
                   D&D 5E Compatible
                 </span>
+                <span className="vtt-badge font-mono font-bold" title="No payment or install backend exists in this build.">
+                  PREVIEW — NOT PURCHASABLE
+                </span>
               </div>
               <p className="text-xs text-[var(--rp-parchment-300)] mt-1 font-prose max-w-2xl">
-                Install premium pre-built adventures or forge custom homebrew monsters and spells with auto-calculated mechanics.
+                Browse a sample catalog of adventures or sketch homebrew monsters and spells.
+                This is a preview surface — nothing here is purchasable, downloadable, or saved.
               </p>
             </div>
           </div>
@@ -176,6 +164,17 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
       {/* Main Tab Content */}
       {activeTab === 'marketplace' && (
         <div className="space-y-4">
+          {/* Honesty banner: this catalog is sample content with no commerce backend. */}
+          <div className="vtt-glass-panel rounded-xl p-3 border border-amber-500/40 flex items-start space-x-2.5">
+            <FlaskConical className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-xs font-prose text-[var(--rp-parchment-200)] leading-relaxed">
+              <span className="font-bold text-amber-300">Sample catalog — not wired to a payment provider; nothing can be bought.</span>{' '}
+              Every listing, price, rating, and review count below is illustrative sample data.
+              No purchase, download, or install flow exists in this build, so no "installed" or
+              "owned" state is shown for any bundle.
+            </p>
+          </div>
+
           {/* Search Bar */}
           <div className="flex items-center space-x-3">
             <div className="relative flex-1">
@@ -193,7 +192,6 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
           {/* Bundle Catalog Cards Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {filteredBundles.map((bundle) => {
-              const isInstalled = installedBundles.includes(bundle.id);
               return (
                 <div
                   key={bundle.id}
@@ -232,22 +230,18 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
                   </div>
 
                   <div className="p-4 bg-tavern-bg border-t border-tavern-border flex items-center justify-between">
-                    <span className="text-sm font-bold text-tavern-accent font-prose">{bundle.price}</span>
+                    <span
+                      className="text-sm font-bold text-tavern-accent font-prose"
+                      title="Illustrative sample price only — no purchase flow exists."
+                    >
+                      {bundle.price}
+                    </span>
 
-                    {isInstalled ? (
-                      <span className="vtt-badge vtt-badge-success">
-                        <Check className="w-3.5 h-3.5" />
-                        Bundle Installed
-                      </span>
-                    ) : (
-                      <button
-                        onClick={() => handleInstall(bundle.id)}
-                        className="vtt-btn vtt-btn-primary text-xs cursor-pointer"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>1-Click Install (.vttbundle)</span>
-                      </button>
-                    )}
+                    {/* No install/purchase action is offered: nothing can be bought or downloaded,
+                        so the card must not imply an owned or installed bundle. */}
+                    <span className="vtt-badge" title="Not wired to a payment provider — nothing can be bought">
+                      Sample Listing
+                    </span>
                   </div>
                 </div>
               );
@@ -258,11 +252,23 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
 
       {/* Homebrew Forge Studio Tab */}
       {activeTab === 'homebrew_studio' && (
-        <form onSubmit={handleSaveHomebrew} className="vtt-card-elevated rounded-2xl p-6 space-y-4 max-w-2xl">
+        <form
+          onSubmit={(e) => e.preventDefault()}
+          className="vtt-card-elevated rounded-2xl p-6 space-y-4 max-w-2xl"
+        >
           <h2 className="vtt-section-header text-lg pb-3">
             <Wand2 className="w-5 h-5 shrink-0" />
             <span>Homebrew Monster & Spell Forge</span>
           </h2>
+
+          <div className="vtt-glass-panel rounded-xl p-3 border border-amber-500/40 flex items-start space-x-2.5">
+            <FlaskConical className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-xs font-prose text-[var(--rp-parchment-200)] leading-relaxed">
+              <span className="font-bold text-amber-300">Preview only.</span> This form is not wired
+              to a compendium or storage backend — nothing you enter here is saved or published.
+              Values are held in local component state and reset when you leave this view.
+            </p>
+          </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1">
@@ -318,13 +324,19 @@ export const MarketplaceView: React.FC<MarketplaceViewProps> = ({
             />
           </div>
 
-          <button
-            type="submit"
-            className="vtt-btn vtt-btn-primary cursor-pointer"
-          >
-            {hbCreatedSuccess ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-            <span>{hbCreatedSuccess ? 'Homebrew Entity Saved to Compendium!' : 'Save & Publish Homebrew Entity'}</span>
-          </button>
+          {/* Disabled: no persistence backend exists, so this must not claim a save/publish. */}
+          <div className="flex items-center space-x-3">
+            <button
+              type="button"
+              disabled
+              aria-disabled="true"
+              className="vtt-btn vtt-btn-primary opacity-50 cursor-not-allowed"
+              title="Not wired to a storage backend — nothing can be saved or published."
+            >
+              <Plus className="w-4 h-4" />
+              <span>Save &amp; Publish (Unavailable in Preview)</span>
+            </button>
+          </div>
         </form>
       )}
     </div>
