@@ -190,6 +190,9 @@ export function App() {
   // fall back to the engine's LWW JSON relay (tokens only, solo-safe).
   const syncClientRef = useRef<VttCrdtSyncClient | null>(null);
   const yjsClientRef = useRef<YjsCrdtClient | null>(null);
+  // State mirror of the ref so TacticalCanvas re-renders with fog/presence
+  // once the Yjs client exists (refs alone don't trigger renders).
+  const [yjsClient, setYjsClient] = useState<YjsCrdtClient | null>(null);
   // Real peer cursors from CRDT awareness. Starts empty and stays empty while
   // alone or on the legacy relay — no fabricated stand-in cursors.
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
@@ -208,6 +211,7 @@ export function App() {
       // honestly empty on this transport.
       setRemoteCursors([]);
       yjsClientRef.current = null;
+      setYjsClient(null);
       const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
       client.connect();
       syncClientRef.current = client;
@@ -224,6 +228,7 @@ export function App() {
     const yjs = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
     yjs.connect();
     yjsClientRef.current = yjs;
+    setYjsClient(yjs);
     // Stamp the signed-in identity into awareness so peers see who this cursor is.
     yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
     syncClientRef.current = {
@@ -261,6 +266,7 @@ export function App() {
       setRemoteCursors([]);
       yjs.destroy();
       yjsClientRef.current = null;
+      setYjsClient(null);
       syncClientRef.current = null;
     };
   }, []);
@@ -1123,6 +1129,7 @@ export function App() {
                   currentUser={currentUser}
                   remoteCursors={remoteCursors}
                   onLocalCursorMove={handleLocalCursorMove}
+                  syncClient={yjsClient}
                   activePing={activePing}
                   walls={customWalls}
                   particleFXRef={particleFXRef}

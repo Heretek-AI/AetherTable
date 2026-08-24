@@ -272,8 +272,18 @@ export class YjsCrdtClient {
   }
 
   /**
-   * Fog layers keyed per owner (e.g. userId / role), stored as bitmasks.
-   * Yjs guarantees conflict-free convergence of concurrent layer edits.
+   * Fog layers keyed per owner, stored as bitmasks over the grid.
+   *
+   * CONVENTION (mirrored by render/fog_overlay.ts and TacticalCanvas):
+   *   - Layer id `user:<userId>`; GMs keep no layer (omniscient).
+   *   - Flat Uint8Array, row-major: cell = y*gridWidth + x,
+   *     bit (mask[cell >> 3] >> (cell & 7)) & 1; SET = REVEALED.
+   *   - Reveal is monotonic (bits never cleared), so concurrent edits from
+   *     DIFFERENT owners merge conflict-free. Note the Y.Map stores whole
+   *     arrays per key: two devices writing the SAME user's layer resolve
+   *     last-writer-wins for that layer — per-owner keying is what keeps
+   *     cross-player merges conflict-free.
+   *   - Missing/short mask reads as fully unrevealed.
    */
   public setFogLayer(layerId: string, mask: Uint8Array): void {
     this.fog.set(layerId, mask);
@@ -287,6 +297,34 @@ export class YjsCrdtClient {
     const observer = () => {
       const mask = this.getFogLayer(layerId);
       if (mask) cb(mask);
+    };
+    this.fog.observe(observer);
+    return () => {
+      this.fog.unobserve(observer);
+    };
+  }
+
+  /** Layer ids currently present in the `fog` map (e.g. `user:<userId>`). */
+  public getFogLayerIds(): string[] {
+    return Array.from(this.fog.keys());
+  }
+
+  /**
+   * Observe EVERY fog layer at once — local writes, remote reveals merged in
+   * by the CRDT, and layers appearing for the first time. Fires immediately
+   * with the current snapshot (one call per existing layer) so late
+   * subscribers see exploration that happened before they mounted, then again
+   * on each subsequent change.
+   */
+  public observeFogLayers(cb: (layerId: string, mask: Uint8Array) => void): () => void {
+    const emit = (layerId: string) => {
+      const mask = this.getFogLayer(layerId);
+      if (mask) cb(layerId, mask);
+    };
+    // Initial snapshot for already-present layers.
+    this.getFogLayerIds().forEach(emit);
+    const observer = (event: Y.YMapEvent<Uint8Array>) => {
+      event.keysChanged.forEach(emit);
     };
     this.fog.observe(observer);
     return () => {

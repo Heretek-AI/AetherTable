@@ -19,10 +19,19 @@ import {
 import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
 import { RaycastLighting, Point } from '../render/raycast_lighting';
+import {
+  ensureFogMask,
+  fogLayerIdForUser,
+  renderFogOverlay,
+  revealCellsInsidePolygon,
+  unionFogMasks,
+  FOG_LAYER_PREFIX,
+} from '../render/fog_overlay';
 import { WeatherEffectsManager, WeatherType } from '../render/weather_effects';
 import { PixiBoard } from '../render/pixi_board';
 import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
+import type { YjsCrdtClient } from '../sync/yjs_doc_client';
 import { User } from '../types/auth';
 
 export interface Token {
@@ -57,6 +66,13 @@ interface TacticalCanvasProps {
   walls?: { x: number; y: number }[];
   particleFXRef?: React.MutableRefObject<ParticleFXManager | null>;
   diceBoxRef?: React.MutableRefObject<DiceBox3D | null>;
+  /**
+   * CRDT client backing fog-of-war. When absent (no Yjs transport wired by the
+   * app shell) NO fog renders and nothing is written — an honest empty state,
+   * never a fabricated default mask. Fog mask conventions are documented in
+   * render/fog_overlay.ts.
+   */
+  syncClient?: YjsCrdtClient | null;
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
@@ -80,6 +96,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   ],
   particleFXRef,
   diceBoxRef,
+  syncClient = null,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -109,6 +126,75 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   const internalDiceBox = useRef<DiceBox3D>(new DiceBox3D());
   const raycastLighting = useRef<RaycastLighting>(new RaycastLighting());
   const weatherEffects = useRef<WeatherEffectsManager>(new WeatherEffectsManager());
+
+  // --- Fog of war (CRDT-backed) -------------------------------------------
+  // Overlay canvas for explored/unexplored darkening; the EFFECTIVE mask it
+  // renders is refreshed by fog observers + local LoS seeding below. It lives
+  // in a ref (not state) because the render loop repaints every frame anyway.
+  const fogCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const effectiveFogMaskRef = useRef<Uint8Array | null>(null);
+  const lastFogSeedAtRef = useRef(0);
+  /** Local LoS → own-layer reveal writes are throttled to ~1 write/second. */
+  const FOG_SEED_INTERVAL_MS = 1000;
+
+  // GMs/admins (and anonymous solo sessions — same authority precedent as the
+  // token click handler above) are omniscient: no fog is rendered or written.
+  const fogOmniscient =
+    !currentUser || currentUser.role === 'admin' || currentUser.role === 'gm';
+
+  /**
+   * Effective fog mask for the LOCAL perspective. Convention (full contract in
+   * render/fog_overlay.ts):
+   *   - omniscient viewer            → null (no fog at all)
+   *   - own `user:<id>` layer exists → that layer (complement drawn dark)
+   *   - no own layer yet             → union of other players' shared layers
+   *                                     (party exploration memory); an empty
+   *                                     union means fully-fogged.
+   * Returns null whenever there is no CRDT client: no synced fog state means
+   * nothing is fabricated locally.
+   */
+  const computeEffectiveFogMask = (): Uint8Array | null => {
+    if (!syncClient || fogOmniscient) return null;
+    const cells = gridWidth * gridHeight;
+    const neededBytes = Math.ceil(cells / 8);
+    if (currentUser) {
+      const ownId = fogLayerIdForUser(currentUser.id);
+      const own = syncClient.getFogLayer(ownId);
+      if (own) return ensureFogMask(own, gridWidth, gridHeight);
+      // No own mask yet: fall through to party-shared memory.
+    }
+    const peerMasks = syncClient
+      .getFogLayerIds()
+      .filter((id) => id.startsWith(FOG_LAYER_PREFIX))
+      .map((id) => syncClient.getFogLayer(id));
+    return unionFogMasks(peerMasks, neededBytes);
+  };
+
+  // Live updates: remote reveals (and our own echoed writes) merged into the
+  // Y.Doc refresh the effective mask immediately — other players' exploration
+  // appears on the next frame without any polling.
+  useEffect(() => {
+    if (!syncClient) {
+      effectiveFogMaskRef.current = null;
+      return;
+    }
+    const refresh = () => {
+      effectiveFogMaskRef.current = computeEffectiveFogMask();
+    };
+    const unobserveAll = syncClient.observeFogLayers(refresh);
+    if (currentUser) {
+      const unobserveOwn = syncClient.observeFogLayer(fogLayerIdForUser(currentUser.id), refresh);
+      return () => {
+        unobserveAll();
+        unobserveOwn();
+      };
+    }
+    refresh();
+    return unobserveAll;
+    // computeEffectiveFogMask closes over syncClient/user/grid; the primitive
+    // deps below cover every input it reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncClient, currentUser?.id, currentUser?.role, gridWidth, gridHeight]);
 
   // Physics dice (three.js + ammo.wasm) landing on SERVER-determined faces,
   // falling back to the 2D canvas tumble when WASM assets are unavailable.
@@ -186,10 +272,12 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
     let animId: number;
     const fxCanvas = fxCanvasRef.current;
     const lightCanvas = lightingCanvasRef.current;
+    const fogCanvas = fogCanvasRef.current;
     if (!fxCanvas || !lightCanvas) return;
 
     const fxCtx = fxCanvas.getContext('2d');
     const lightCtx = lightCanvas.getContext('2d');
+    const fogCtx = fogCanvas ? fogCanvas.getContext('2d') : null;
     if (!fxCtx || !lightCtx) return;
 
     const renderLoop = () => {
@@ -259,12 +347,76 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
       }
       // 'gm_omniscient' leaves the lighting layer unmasked (full sight)
 
+      // 3. CRDT fog-of-war overlay: darken every cell the local perspective
+      // has not explored yet. No syncClient → mask is null → canvas is simply
+      // cleared (honest absence of fog state, never a fabricated default).
+      if (fogCtx) {
+        renderFogOverlay(fogCtx, {
+          mask: effectiveFogMaskRef.current,
+          gridWidth,
+          gridHeight,
+          cellSize,
+        });
+      }
+
+      // 4. Write path: seed OUR layer's revealed bits from the same LoS
+      // polygons the lighting pass just drew, so explored area genuinely
+      // accumulates per player through the Y.Doc and merges across the table.
+      // Throttled to ~1 write/second; only fires when something new was seen.
+      if (syncClient && !fogOmniscient && currentUser && visionPerspective !== 'gm_omniscient') {
+        const nowMs = performance.now();
+        if (nowMs - lastFogSeedAtRef.current >= FOG_SEED_INTERVAL_MS) {
+          lastFogSeedAtRef.current = nowMs;
+          const seedSources: Point[] =
+            visionPerspective === 'party'
+              ? tokens
+                  .filter((t) => t.isPlayer)
+                  .map((t) => ({
+                    x: (t.x + 0.5) * cellSize,
+                    y: (t.y + 0.5) * cellSize,
+                  }))
+              : (() => {
+                  const active = tokens.find((t) => t.id === selectedTokenId) || tokens[0];
+                  return active
+                    ? [{ x: (active.x + 0.5) * cellSize, y: (active.y + 0.5) * cellSize }]
+                    : [];
+                })();
+
+          if (seedSources.length > 0) {
+            const ownLayerId = fogLayerIdForUser(currentUser.id);
+            const ownMask = ensureFogMask(syncClient.getFogLayer(ownLayerId), gridWidth, gridHeight);
+            let changed = false;
+            seedSources.forEach((source) => {
+              const poly = raycastLighting.current.computeVisibilityPolygon(source, lightRadius);
+              changed =
+                revealCellsInsidePolygon(ownMask, gridWidth, gridHeight, cellSize, poly) || changed;
+            });
+            if (changed) {
+              syncClient.setFogLayer(ownLayerId, ownMask);
+              effectiveFogMaskRef.current = computeEffectiveFogMask();
+            }
+          }
+        }
+      }
+
       animId = requestAnimationFrame(renderLoop);
     };
 
     renderLoop();
     return () => cancelAnimationFrame(animId);
-  }, [tokens, selectedTokenId, visionPerspective, tokenLightMode, gridWidth, gridHeight]);
+  }, [
+    tokens,
+    selectedTokenId,
+    visionPerspective,
+    tokenLightMode,
+    gridWidth,
+    gridHeight,
+    cellSize,
+    syncClient,
+    fogOmniscient,
+    currentUser,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ]);
 
   const isWall = (x: number, y: number) => {
     return walls.some((w) => w.x === x && w.y === y);
@@ -778,6 +930,18 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             height={gridHeight * cellSize}
             className="absolute inset-0 pointer-events-none"
             style={{ zIndex: 'var(--z-tokens)' }}
+          />
+
+          {/* Fog-of-war overlay: darkens unexplored cells for the local
+              perspective (CRDT-backed via syncClient). Sits one rung above the
+              lighting mask so explored-but-unlit cells keep their dim glow
+              while never-explored cells hide tokens and terrain alike. */}
+          <canvas
+            ref={fogCanvasRef}
+            width={gridWidth * cellSize}
+            height={gridHeight * cellSize}
+            className="absolute inset-0 pointer-events-none"
+            style={{ zIndex: 'calc(var(--z-tokens) + 1)' }}
           />
 
           {/* 3D Dice & WebGL Particle FX Overlay Canvas — fx rung. Was z-40,
