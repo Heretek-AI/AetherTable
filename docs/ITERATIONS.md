@@ -7,17 +7,17 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 ## Backlog
 
 ### Phase 3 — Client truth sweep
-- [ ] 3.1 Yjs awareness protocol → real remote cursors (replace hardcoded props)
-- [ ] 3.2 Render fog-of-war layers from the CRDT fog API (currently zero callers)
-- [ ] 3.3 CharacterSheet derives modifiers from scores + wires listCharacters API
+- [x] 3.1 Yjs awareness protocol → real remote cursors (replace hardcoded props)
+- [x] 3.2 Render fog-of-war layers from the CRDT fog API (currently zero callers)
+- [x] 3.3 CharacterSheet derives modifiers from scores + wires listCharacters API
 - [x] 3.4 Honor Silero VAD speech events; delete canned fake utterances
 - [x] 3.5 X-card rewinds local client scene state (not just server call)
 - [ ] 3.6 Dead code removal: App.tsx duplicate sync block, audio_vad_pipeline.ts,
       ui/safety_xcard.ts, LiteLLMCircuitBreakerGateway
 - [ ] 3.7 Remove unused y-indexeddb dep or wire it; drop committed dist artifacts
-- [ ] 3.8 AnalyticsView/AdminDashboard fetch real endpoints or are labeled DEMO
+- [x] 3.8 AnalyticsView/AdminDashboard fetch real endpoints or are labeled DEMO
 - [x] 3.9 LobbyView seats come from lobby member API (no hardcoded roster)
-- [ ] 3.10 Client sends auth tokens on all API calls (headers, not query strings)
+- [x] 3.10 Client sends auth tokens on all API calls (headers, not query strings)
 - [x] 3.11 WebGPU preference option for Pixi init (env-gated)
 - [x] 3.12 manualChunks splitting; kill >500 kB chunk warnings
 
@@ -27,7 +27,7 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [x] 4.3 Heal/rest endpoint in vtt-server; wire death-save tally reset
 - [x] 4.4 Multi-term dice expressions ("2d6+1d4+3") in vtt-core DiceEngine
 - [x] 4.5 Real loot tables replacing seed % 100 arithmetic
-- [ ] 4.6 Neo4j-backed epistemic graph (driver optional; in-memory fallback)
+- [x] 4.6 Neo4j-backed epistemic graph (driver optional; in-memory fallback)
 - [ ] 4.7 Qdrant-backed lore/compendium RAG lookup (optional; fallback offline)
 - [x] 4.8 LLM-assisted intent classification with keyword fallback (.env LLM)
 - [x] 4.9 Degraded marker on SSE narrative fallback frames
@@ -36,17 +36,17 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [x] 4.12 Faction GOAP planner upgrade (plan search over action preconditions)
 
 ### Phase 5 — Productization & gameplay
-- [ ] 5.1 Agent-driven campaign simulation: synthetic players register → lobby →
+- [x] 5.1 Agent-driven campaign simulation: synthetic players register → lobby →
       deploy → play via /api/v1/agent/turn against .env LLM endpoint
-- [ ] 5.2 LLM traffic observability for 5.1 (JSONL log assertions in tests)
+- [x] 5.2 LLM traffic observability for 5.1 (JSONL log assertions in tests)
 - [ ] 5.3 Campaign setup wizard flow (rule version, levels, invite codes)
 - [ ] 5.4 Starter adventure bundle (Sunken Crypt of Karas) as .vttbundle
 - [ ] 5.5 Thematic atmosphere presets (UI palette + ambience mapping)
 - [ ] 5.6 Initiative order tracker (engine state + HUD)
 - [ ] 5.7 Spectator/broadcast view filters secret DM data
 - [ ] 5.8 Short-rest / long-rest resource recovery endpoint + UI hook
-- [ ] 5.9 Opportunity attack auto-prompt on movement provocation
-- [ ] 5.10 Session replay export (event log → portable JSON)
+- [x] 5.9 Opportunity attack auto-prompt on movement provocation
+- [x] 5.10 Session replay export (event log → portable JSON)
 
 ### Continuous
 - [ ] R1 Research iterations: OSS scan (github/firecrawl/context7) → adopt a
@@ -71,6 +71,21 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 12 | — | Heal/rest gateway proxies with identity forwarding; strict request models; 8 tests | 4527774 | pytest ✓ |
 | 13 | 4.12 | Genuine GOAP planner for factions: STRIPS actions, uniform-cost A*, deterministic, legacy fallback preserved; 19 tests | 50fe903 | pytest ✓ |
 | 14 | 4.5 | Weighted thematic loot tables (3 themes, rarity weights, tier multipliers) replacing seed%100; 8 tests incl. distribution sanity | b42d5a8 | cargo ✓ |
+| 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy | 0a182da | all ✓ |
+| 16 | A1-fix | Audit remediation: LONG_REST rewind arm; HEALED clears death-save baselines | b3fda63 | cargo ✓ |
+| 17 | 3.8 | Honest analytics/admin views on live /metrics proxy; fabricated cards removed/badged | 8ac9980 | all ✓ |
+| 18 | 3.1 | Real remote cursors via Yjs awareness protocol; hardcoded peers deleted | a41d778 | tsc ✓ |
+| 19 | wire-up | classify_with_llm wired into turn flow (safety precedence, kill-switch, provenance) | 39609ae | pytest ✓ |
+| 20 | wire-up | Fail-forward tiers surface in check/save responses with seeded d20s | 97f36f7 | cargo ✓ |
+| 21 | 5.1+5.2 | Agent-driven campaign simulation harness (LLM decisions, identity-forwarded proxies) | b4913c6 | pytest ✓ |
+| 22 | honesty | LLM error logs carry exception types; first LIVE sim run vs llm.heretek.one (endpoint down → honest fallback) | see log | pytest+live ✓ |
+| 23 | 3.3 | Live character sheet: shared character_math.ts, listCharacters wiring, zero fabricated stats | eb866b5 | tsc ✓ |
+| 24 | social | Disposition engine integrated into campaign sim: stances in prompts/reports, deterministic timestamps | b4baa54 | pytest ✓ |
+| 25 | 3.2 | Fog-of-war rendered from CRDT layers: LoS-seeded reveal, party merge, no-Yjs = no fog | 694c637 | tsc+vite ✓ |
+| 26 | 5.10 | Session replay export as downloadable JSON with payload-derived summaries | 9a75612 | pytest ✓ |
+| 27 | 4.11 | Automatic SRD concentration checks on damage (both hooks, CONCENTRATION_BROKEN ledger) | b0868dc | cargo ✓ |
+| 28 | 3.10+4.6 | Auth-header migration (header-first, ?token= back-compat); Neo4j-backed epistemic graph via HTTP Cypher, honest fallback | 2e97376 | all ✓ |
+| 29 | 5.9 | OA provocation surfaced on move responses without auto-execution | ed04c26 | cargo ✓ |
 | 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy; 9 tests | 0a182da | cargo+pytest ✓ |
 | 16 | A1-fix | Audit remediation: LONG_REST rewind arm, HEALED clears death-save baselines; 4 red-first tests | b3fda63 | cargo ✓ |
 | 17 | 3.8 | Honest analytics/admin: live /metrics proxy, offline "—", DEMO badges, fabricated cards removed | 8ac9980 | all ✓ |
