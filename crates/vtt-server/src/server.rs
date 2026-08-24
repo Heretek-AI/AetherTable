@@ -936,6 +936,20 @@ async fn resolve_attack(
                 );
                 let seq = event.sequence_id;
 
+                // SRD automation (backlog 4.11): damage that lands on a still-
+                // conscious concentrating target triggers a server-side CON
+                // save — one per damage instance.
+                let damage_amounts: Vec<i32> =
+                    result.damage_instances.iter().map(|d| d.amount).collect();
+                let conc_checks = roll_concentration_checks(
+                    &mut session,
+                    session_id,
+                    req.attacker_id,
+                    req.target_id,
+                    &damage_amounts,
+                    &mut dice,
+                );
+
                 let mut body = serde_json::to_value(&result).unwrap_or_default();
                 body["action_name"] = serde_json::json!(attack.name);
                 body["effective_target_ac"] = serde_json::json!(effective_ac);
@@ -947,6 +961,20 @@ async fn resolve_attack(
                     body["reaction_interrupt"] =
                         serde_json::json!({"type": "shield", "ac_bonus": 5});
                 }
+                // Additive back-compat: present only when a check was triggered.
+                match conc_checks.len() {
+                    0 => {}
+                    1 => {
+                        body["concentration_check"] =
+                            serde_json::to_value(&conc_checks[0]).unwrap_or_default();
+                    }
+                    _ => {
+                        body["concentration_check"] =
+                            serde_json::to_value(&conc_checks[0]).unwrap_or_default();
+                        body["concentration_checks"] =
+                            serde_json::to_value(&conc_checks).unwrap_or_default();
+                    }
+                }
                 body["event_sequence"] = serde_json::json!(seq);
                 HttpResponse::Ok().json(body)
             }
@@ -957,6 +985,93 @@ async fn resolve_attack(
     }
 }
 
+// --- Damage-triggered concentration automation (backlog 4.11) -----------------
+
+/// One server-side damage-triggered concentration save, serialized additively
+/// into action responses as `concentration_check` when a check was triggered.
+///
+/// The DC math lives in vtt-core (`ActionResolver::resolve_concentration_check`:
+/// SRD CON save vs DC = max(10, damage / 2)); the engine owns the roll so no
+/// client ever supplies the outcome.
+#[derive(Debug, Clone, Serialize)]
+struct ConcentrationCheckOutcome {
+    dc: i32,
+    total: i32,
+    passed: bool,
+    broken: bool,
+}
+
+/// Runs the SRD concentration automation for every damage instance that just
+/// landed on `target_id`.
+///
+/// Rules enforced here:
+/// - zero/negative damage never triggers a save;
+/// - an unconscious or dead target never saves (the spell ends by other
+///   means — incapacitation — not through this path);
+/// - each damage instance gets its OWN check, re-reading the entity between
+///   instances because a failed earlier save may already have ended the spell;
+/// - a failed save clears the concentration and appends one
+///   `CONCENTRATION_BROKEN` ledger event `{target_id, spell_id, dc, total}`.
+fn roll_concentration_checks(
+    session: &mut GameSession,
+    session_id: Uuid,
+    actor_id: Uuid,
+    target_id: Uuid,
+    damage_instances: &[i32],
+    dice: &mut DiceEngine,
+) -> Vec<ConcentrationCheckOutcome> {
+    let campaign_id = session.campaign_id;
+    let mut outcomes = Vec::new();
+
+    for &damage in damage_instances {
+        if damage <= 0 {
+            continue;
+        }
+
+        // Snapshot candidacy + CON modifier first; the mutable half happens
+        // below so the borrow of `entities` is not held across the mutation.
+        let (is_candidate, con_mod, active_spell) = match session.entities.get(&target_id) {
+            Some(t) => (
+                t.is_conscious && !t.is_dead && t.concentration.is_some(),
+                t.abilities.modifier(Ability::Constitution),
+                t.concentration.as_ref().map(|c| c.spell_id.clone()),
+            ),
+            None => break,
+        };
+        if !is_candidate {
+            continue;
+        }
+
+        // Session dice only — the client never chooses the save roll.
+        let natural = dice.roll_d20();
+        let (passed, total, dc) =
+            ActionResolver::resolve_concentration_check(natural, con_mod, damage);
+        let broken = !passed;
+
+        if broken {
+            if let Some(t) = session.entities.get_mut(&target_id) {
+                RulesEvaluator::end_concentration(t, "FAILED_CONCENTRATION_SAVE");
+            }
+            session.ledger.append_event(
+                session_id,
+                campaign_id,
+                actor_id,
+                "CONCENTRATION_BROKEN",
+                serde_json::json!({
+                    "target_id": target_id.to_string(),
+                    "spell_id": active_spell.unwrap_or_default(),
+                    "dc": dc,
+                    "total": total,
+                }),
+            );
+        }
+
+        outcomes.push(ConcentrationCheckOutcome { dc, total, passed, broken });
+    }
+
+    outcomes
+}
+
 /// Applies damage that the ENGINE already rolled. The request references a
 /// prior ATTACK_RESOLVED ledger event; the applied amount is taken from that
 /// event's payload, never from the request body.
@@ -965,6 +1080,10 @@ async fn resolve_attack(
 pub struct ApplyDamageReq {
     pub target_id: Uuid,
     pub source_event_sequence: u64,
+    /// Optional deterministic seed pinning the concentration save (if one is
+    /// triggered). Additive and defaulted — pre-existing callers are unaffected.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 async fn apply_damage(
@@ -1054,12 +1173,32 @@ async fn apply_damage(
             }),
         );
 
-        HttpResponse::Ok().json(serde_json::json!({
+        // SRD automation (backlog 4.11): applied damage challenges an active
+        // concentration exactly like freshly-rolled attack damage.
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+        let conc_checks = roll_concentration_checks(
+            &mut session,
+            session_id,
+            source_event.actor_id,
+            req.target_id,
+            &[rolled_damage],
+            &mut dice,
+        );
+        let mut body = serde_json::json!({
             "status": "DAMAGE_APPLIED",
             "amount": rolled_damage,
             "hp_remaining": hp_rem,
             "instant_death": instant_death
-        }))
+        });
+        if let Some(check) = conc_checks.first() {
+            // Additive back-compat: present only when a check was triggered.
+            body["concentration_check"] = serde_json::to_value(check).unwrap_or_default();
+        }
+
+        HttpResponse::Ok().json(body)
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
     }

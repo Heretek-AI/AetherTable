@@ -1668,3 +1668,497 @@ async fn save_auto_fail_forces_critical_failure_tier() {
     assert_eq!(body["tier"], "critical_failure");
     assert!(body.get("cost_suggestion").is_none());
 }
+
+// --- Auto concentration checks on damage (backlog 4.11) -----------------------
+//
+// SRD: when a concentrating creature takes damage, it must make a CON save
+// against DC = max(10, damage / 2) or lose concentration. The engine rolls
+// this server-side from the session dice; clients only observe the outcome.
+
+/// The shared test-service type, spelled out at every use site (mirrors
+/// `post_actions` above; `impl Trait` in type aliases is not stable Rust).
+macro_rules! test_app_ty {
+    () => {
+        &impl Service<
+            actix_http::Request,
+            Response = ServiceResponse<EitherBody<BoxBody>>,
+            Error = actix_web::Error,
+        >
+    };
+}
+
+async fn spawn_entity(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+    entity: serde_json::Value,
+) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(token))
+        .set_json(entity)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "spawn failed: {:?}",
+        test::read_body(res).await
+    );
+}
+
+async fn session_snapshot(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+) -> serde_json::Value {
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(bearer(token))
+        .to_request();
+    test::read_body_json(test::call_service(app, req).await).await
+}
+
+async fn caster_concentration<'a>(
+    snap: &'a serde_json::Value,
+    caster_id: Uuid,
+) -> &'a serde_json::Value {
+    &snap["entities"][&caster_id.to_string()]["concentration"]
+}
+
+async fn attack(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+    attacker_id: Uuid,
+    target_id: Uuid,
+    seed: u64,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({
+            "attacker_id": attacker_id,
+            "target_id": target_id,
+            "action_index": 0,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    (status, body)
+}
+
+async fn advance_turn(app: test_app_ty!(), token: &str, session_id: Uuid) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/turn/next", session_id))
+        .insert_header(bearer(token))
+        .to_request();
+    assert_eq!(test::call_service(app, req).await.status(), StatusCode::OK);
+}
+
+/// Builds a session with a concentrating wizard (CON 14 → +2 save modifier,
+/// plenty of HP so repeated hits never drop it) and a golem that always hits
+/// for `2d6+8` (damage 10..=20 → concentration DC is always exactly 10).
+/// Returns (app, token, session_id, caster_id, golem_id).
+async fn concentration_fixture() -> (
+    impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    String,
+    Uuid,
+    Uuid,
+    Uuid,
+) {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let caster_id = Uuid::new_v4();
+    let mut caster = entity_json(caster_id, "Conc Wizard", 200, 10, 2, "1d4");
+    caster["spell_slots_remaining"] = serde_json::json!({"1": 99});
+    spawn_entity(&app, &token, session_id, caster).await;
+
+    // attack_bonus 20 vs AC 10: every seed hits; damage 2d6+8 ∈ [10, 20].
+    let golem_id = Uuid::new_v4();
+    spawn_entity(
+        &app,
+        &token,
+        session_id,
+        entity_json(golem_id, "Golem", 100, 12, 20, "2d6+8"),
+    )
+    .await;
+
+    // Concentrate on a harmless, damage-less level-1 spell via the normal
+    // cast-spell flow.
+    let hold_person = serde_json::json!({
+        "spell": {
+            "spell_id": "hold_person", "name": "Hold Person", "level": 1,
+            "school": "Enchantment", "casting_time": "1 action", "range_feet": 60,
+            "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+            "verbal_component": true, "somatic_component": true,
+            "material_component_desc": null, "save_attribute": null,
+            "damage_formula": null, "damage_type": null,
+            "duration_rounds": 10, "is_concentration": true, "is_ritual": false
+        },
+        "caster_id": caster_id,
+        "cast_level": 1
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+        .insert_header(bearer(&token))
+        .set_json(hold_person)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "concentration cast must resolve");
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["result"]["concentration_started"], true);
+
+    (app, token, session_id, caster_id, golem_id)
+}
+
+fn break_events(snap: &serde_json::Value) -> Vec<&serde_json::Value> {
+    snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == "CONCENTRATION_BROKEN")
+        .collect()
+}
+
+/// Auto-check fires on attack damage with exact SRD DC math, and across a
+/// deterministic seed scan BOTH outcomes occur: failed saves break the spell
+/// (and ledger CONCENTRATION_BROKEN), passed saves keep it standing.
+#[actix_web::test]
+async fn auto_concentration_check_fires_on_attack_damage_with_srd_dc_math() {
+    let (app, token, session_id, caster_id, golem_id) = concentration_fixture().await;
+
+    let mut breaks_seen = 0usize;
+    let mut survives_seen = 0usize;
+    let mut concentrating = true;
+
+    for seed in 1..=200u64 {
+        // Each attack costs the Action; refresh the round between swings.
+        if seed > 1 {
+            advance_turn(&app, &token, session_id).await;
+        }
+        // Re-concentrate after every break (slots are plentiful).
+        if !concentrating {
+            advance_turn(&app, &token, session_id).await;
+            let req = test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+                .insert_header(bearer(&token))
+                .set_json(serde_json::json!({
+                    "spell": {
+                        "spell_id": "hold_person", "name": "Hold Person", "level": 1,
+                        "school": "Enchantment", "casting_time": "1 action", "range_feet": 60,
+                        "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+                        "verbal_component": true, "somatic_component": true,
+                        "material_component_desc": null, "save_attribute": null,
+                        "damage_formula": null, "damage_type": null,
+                        "duration_rounds": 10, "is_concentration": true, "is_ritual": false
+                    },
+                    "caster_id": caster_id,
+                    "cast_level": 1
+                }))
+                .to_request();
+            assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+            concentrating = true;
+        }
+
+        let (status, body) = attack(&app, &token, session_id, golem_id, caster_id, seed).await;
+        if status != StatusCode::OK || body["is_hit"] != true {
+            continue; // miss — no damage, no check
+        }
+
+        // Every hit against a concentrating target MUST carry the check.
+        let check = body
+            .get("concentration_check")
+            .expect("hit on concentrating target must include concentration_check");
+        let dmg = body["total_damage"].as_i64().unwrap();
+        let dc = check["dc"].as_i64().unwrap();
+        let total = check["total"].as_i64().unwrap();
+
+        // SRD DC math: max(10, damage / 2).
+        assert_eq!(dc, std::cmp::max(10, dmg / 2), "DC must be max(10, dmg/2)");
+        // total is the d20 plus the CON modifier (+2 at CON 14).
+        assert_eq!(
+            check["passed"].as_bool().unwrap(),
+            total >= dc,
+            "passed must equal total >= dc"
+        );
+
+        if check["broken"].as_bool().unwrap() {
+            breaks_seen += 1;
+            concentrating = false;
+            // State: concentration cleared server-side.
+            let snap = session_snapshot(&app, &token, session_id).await;
+            assert!(
+                caster_concentration(&snap, caster_id).await.is_null(),
+                "failed save must clear concentration"
+            );
+            // Ledger: one CONCENTRATION_BROKEN with the full audit payload.
+            let events = break_events(&snap);
+            assert_eq!(
+                events.len(),
+                breaks_seen,
+                "exactly one CONCENTRATION_BROKEN per failed save"
+            );
+            let ev = events.last().expect("broken check must ledger an event");
+            assert_eq!(ev["payload"]["target_id"], caster_id.to_string());
+            assert_eq!(ev["payload"]["spell_id"], "hold_person");
+            assert_eq!(ev["payload"]["dc"], dc);
+            assert_eq!(ev["payload"]["total"], total);
+        } else {
+            survives_seen += 1;
+            let snap = session_snapshot(&app, &token, session_id).await;
+            assert_eq!(
+                caster_concentration(&snap, caster_id).await["spell_id"],
+                "hold_person",
+                "passed save must keep the spell up"
+            );
+        }
+
+        if breaks_seen > 0 && survives_seen > 0 {
+            break;
+        }
+    }
+
+    assert!(breaks_seen > 0, "seed scan must exercise the broken branch");
+    assert!(survives_seen > 0, "seed scan must exercise the maintained branch");
+
+    // The trailing re-cast (if any) means the last snapshot state is not
+    // necessarily "concentrating"; only the event count is asserted here.
+    let snap = session_snapshot(&app, &token, session_id).await;
+    assert_eq!(
+        break_events(&snap).len() as usize,
+        breaks_seen,
+        "ledger holds exactly one CONCENTRATION_BROKEN per observed failure"
+    );
+}
+
+/// A passed save keeps concentration and must NOT ledger a break event even
+/// though damage landed.
+#[actix_web::test]
+async fn passed_concentration_save_maintains_spell_without_break_event() {
+    let (app, token, session_id, caster_id, golem_id) = concentration_fixture().await;
+
+    let mut found_pass = false;
+    for seed in 1..=200u64 {
+        let (status, body) = attack(&app, &token, session_id, golem_id, caster_id, seed).await;
+        if status != StatusCode::OK || body["is_hit"] != true {
+            advance_turn(&app, &token, session_id).await;
+            continue;
+        }
+        let check = body.get("concentration_check").expect("check must fire");
+        if check["passed"] == true && check["broken"] == false {
+            found_pass = true;
+            break;
+        }
+        // Failed save: re-establish concentration before scanning further.
+        advance_turn(&app, &token, session_id).await;
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+            .insert_header(bearer(&token))
+            .set_json(serde_json::json!({
+                "spell": {
+                    "spell_id": "hold_person", "name": "Hold Person", "level": 1,
+                    "school": "Enchantment", "casting_time": "1 action", "range_feet": 60,
+                    "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+                    "verbal_component": true, "somatic_component": true,
+                    "material_component_desc": null, "save_attribute": null,
+                    "damage_formula": null, "damage_type": null,
+                    "duration_rounds": 10, "is_concentration": true, "is_ritual": false
+                },
+                "caster_id": caster_id,
+                "cast_level": 1
+            }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+    assert!(found_pass, "some seeded hit must be saved");
+
+    let snap = session_snapshot(&app, &token, session_id).await;
+    assert!(break_events(&snap).is_empty());
+    assert_eq!(caster_concentration(&snap, caster_id).await["spell_id"], "hold_person");
+}
+
+/// No concentration, no check: the additive response field must stay absent
+/// (back-compat) on both the attack path and the apply-damage path.
+#[actix_web::test]
+async fn no_concentration_check_when_target_not_concentrating() {
+    let app = test_app().await;
+    let token = sign_token("gm-1", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let hero_id = Uuid::new_v4();
+    spawn_entity(
+        &app,
+        &token,
+        session_id,
+        entity_json(hero_id, "Hero", 40, 10, 20, "2d6+8"),
+    )
+    .await;
+    let orc_id = Uuid::new_v4();
+    spawn_entity(
+        &app,
+        &token,
+        session_id,
+        entity_json(orc_id, "Orc", 100, 10, 3, "1d6"),
+    )
+    .await;
+
+    let (status, body) = attack(&app, &token, session_id, hero_id, orc_id, 1).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["is_hit"], true, "golem-grade bonus must hit AC 10");
+    assert!(
+        body.get("concentration_check").is_none(),
+        "additive field must be absent without concentration"
+    );
+
+    // apply_damage path: equally silent.
+    let seq = body["event_sequence"].as_u64().unwrap();
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "target_id": orc_id,
+            "source_event_sequence": seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let dmg_body: serde_json::Value = test::read_body_json(res).await;
+    assert!(
+        dmg_body.get("concentration_check").is_none(),
+        "apply_damage must not fabricate a check without concentration"
+    );
+    assert!(break_events(&session_snapshot(&app, &token, session_id).await).is_empty());
+}
+
+/// The standalone /damage endpoint runs the same auto-check: a failing CON
+/// save there also breaks the spell and ledgers the event, and each damage
+/// application gets its own independent check.
+#[actix_web::test]
+async fn apply_damage_endpoint_triggers_auto_concentration_check() {
+    let (app, token, session_id, caster_id, golem_id) = concentration_fixture().await;
+
+    // Land a hit whose attack-path save PASSES so concentration survives for
+    // the explicit /damage call.
+    let mut seq_and_amount = None;
+    for seed in 1..=200u64 {
+        let (status, body) = attack(&app, &token, session_id, golem_id, caster_id, seed).await;
+        if status != StatusCode::OK || body["is_hit"] != true {
+            advance_turn(&app, &token, session_id).await;
+            continue;
+        }
+        let check = body.get("concentration_check").expect("check must fire");
+        if check["passed"] == true {
+            seq_and_amount =
+                Some((body["event_sequence"].as_u64().unwrap(), body["total_damage"].as_i64().unwrap()));
+            break;
+        }
+        // Broken by the hit itself — rebuild and keep scanning.
+        advance_turn(&app, &token, session_id).await;
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+            .insert_header(bearer(&token))
+            .set_json(serde_json::json!({
+                "spell": {
+                    "spell_id": "hold_person", "name": "Hold Person", "level": 1,
+                    "school": "Enchantment", "casting_time": "1 action", "range_feet": 60,
+                    "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+                    "verbal_component": true, "somatic_component": true,
+                    "material_component_desc": null, "save_attribute": null,
+                    "damage_formula": null, "damage_type": null,
+                    "duration_rounds": 10, "is_concentration": true, "is_ritual": false
+                },
+                "caster_id": caster_id,
+                "cast_level": 1
+            }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+    let (seq, amount) = seq_and_amount.expect("must find a surviving hit");
+
+    // A natural-1 CON save (total 3) fails any DC the SRD can produce here.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "target_id": caster_id,
+            "source_event_sequence": seq,
+            "seed": seed_producing_roll(1)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let check = body.get("concentration_check").expect("check must fire on applied damage");
+    assert_eq!(check["dc"], std::cmp::max(10, amount / 2));
+    assert_eq!(check["passed"], false);
+    assert_eq!(check["broken"], true);
+
+    let snap = session_snapshot(&app, &token, session_id).await;
+    assert!(caster_concentration(&snap, caster_id).await.is_null());
+    let events = break_events(&snap);
+    assert_eq!(events.len(), 1, "exactly one break from the /damage save");
+    assert_eq!(events[0]["payload"]["target_id"], caster_id.to_string());
+    assert_eq!(events[0]["payload"]["spell_id"], "hold_person");
+    assert_eq!(events[0]["payload"]["dc"], std::cmp::max(10, amount / 2));
+    assert_eq!(events[0]["payload"]["total"], 3);
+
+    // Second damage application (its own event, its own check): re-concentrate
+    // first, then replay the same source event — the new check must fire again.
+    advance_turn(&app, &token, session_id).await;
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "spell": {
+                "spell_id": "hold_person", "name": "Hold Person", "level": 1,
+                "school": "Enchantment", "casting_time": "1 action", "range_feet": 60,
+                "area_of_effect_shape": null, "area_of_effect_size_feet": null,
+                "verbal_component": true, "somatic_component": true,
+                "material_component_desc": null, "save_attribute": null,
+                "damage_formula": null, "damage_type": null,
+                "duration_rounds": 10, "is_concentration": true, "is_ritual": false
+            },
+            "caster_id": caster_id,
+            "cast_level": 1
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "target_id": caster_id,
+            "source_event_sequence": seq,
+            "seed": seed_producing_roll(20)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let check = body.get("concentration_check").expect("second application must check too");
+    assert_eq!(check["total"], 22, "nat 20 + CON 14 modifier (+2)");
+    assert_eq!(check["passed"], true);
+    assert_eq!(check["broken"], false);
+
+    let snap = session_snapshot(&app, &token, session_id).await;
+    assert_eq!(
+        caster_concentration(&snap, caster_id).await["spell_id"],
+        "hold_person",
+        "second, passed save maintains the spell"
+    );
+    assert_eq!(
+        break_events(&snap).len(),
+        1,
+        "no additional break event for the passed save"
+    );
+}
