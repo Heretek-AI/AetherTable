@@ -12,9 +12,10 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [x] 3.3 CharacterSheet derives modifiers from scores + wires listCharacters API
 - [x] 3.4 Honor Silero VAD speech events; delete canned fake utterances
 - [x] 3.5 X-card rewinds local client scene state (not just server call)
-- [ ] 3.6 Dead code removal: App.tsx duplicate sync block, audio_vad_pipeline.ts,
-      ui/safety_xcard.ts, LiteLLMCircuitBreakerGateway
-- [ ] 3.7 Remove unused y-indexeddb dep or wire it; drop committed dist artifacts
+- [x] 3.6 Dead code removal: App.tsx duplicate sync block, audio_vad_pipeline.ts,
+      ui/safety_xcard.ts, LiteLLMCircuitBreakerGateway (iteration 1)
+- [x] 3.7 Remove unused y-indexeddb dep or wire it; drop committed dist artifacts
+      (wired as IndexedDB persistence for Y.Doc rooms, iteration 1)
 - [x] 3.8 AnalyticsView/AdminDashboard fetch real endpoints or are labeled DEMO
 - [x] 3.9 LobbyView seats come from lobby member API (no hardcoded roster)
 - [x] 3.10 Client sends auth tokens on all API calls (headers, not query strings)
@@ -28,7 +29,7 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [x] 4.4 Multi-term dice expressions ("2d6+1d4+3") in vtt-core DiceEngine
 - [x] 4.5 Real loot tables replacing seed % 100 arithmetic
 - [x] 4.6 Neo4j-backed epistemic graph (driver optional; in-memory fallback)
-- [ ] 4.7 Qdrant-backed lore/compendium RAG lookup (optional; fallback offline)
+- [x] 4.7 Qdrant-backed lore/compendium RAG lookup (optional; fallback offline) (iteration 32)
 - [x] 4.8 LLM-assisted intent classification with keyword fallback (.env LLM)
 - [x] 4.9 Degraded marker on SSE narrative fallback frames
 - [x] 4.10 Engine-tier rate limiting (actix-governor)
@@ -39,19 +40,21 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 - [x] 5.1 Agent-driven campaign simulation: synthetic players register → lobby →
       deploy → play via /api/v1/agent/turn against .env LLM endpoint
 - [x] 5.2 LLM traffic observability for 5.1 (JSONL log assertions in tests)
-- [ ] 5.3 Campaign setup wizard flow (rule version, levels, invite codes)
-- [ ] 5.4 Starter adventure bundle (Sunken Crypt of Karas) as .vttbundle
-- [ ] 5.5 Thematic atmosphere presets (UI palette + ambience mapping)
-- [ ] 5.6 Initiative order tracker (engine state + HUD)
-- [ ] 5.7 Spectator/broadcast view filters secret DM data
-- [ ] 5.8 Short-rest / long-rest resource recovery endpoint + UI hook
+- [x] 5.3 Campaign setup wizard flow (rule version, levels, invite codes) (iteration 47)
+- [x] 5.4 Starter adventure bundle (Sunken Crypt of Karas) as .vttbundle (iteration 30)
+- [x] 5.5 Thematic atmosphere presets (UI palette + ambience mapping) (iterations 33, 63, 84)
+- [x] 5.6 Initiative order tracker (engine state + HUD) (iterations 36-37 engine lifecycle; 92 HUD/boss bar)
+- [x] 5.7 Spectator/broadcast view filters secret DM data (iterations 31, 52, 57, 73)
+- [x] 5.8 Short-rest / long-rest resource recovery endpoint + UI hook (iterations 9, 12, 39, 42)
 - [x] 5.9 Opportunity attack auto-prompt on movement provocation
 - [x] 5.10 Session replay export (event log → portable JSON)
 
 ### Continuous
-- [ ] R1 Research iterations: OSS scan (github/firecrawl/context7) → adopt a
+- [x] R1 Research iterations: OSS scan (github/firecrawl/context7) → adopt a
       technique or dependency; document in iteration notes
-- [ ] A1 Independent audit sweeps via subagent after every ~10 iterations
+      (iters 6, 41, 50 + PeerJS note at iters 43/49; actix-governor rejected by cargo-deny at 35)
+- [x] A1 Independent audit sweeps via subagent after every ~10 iterations
+      (6 sweeps run; remediations at iterations 16, 44-46+48, 65-67, 70, 78, 84)
 
 ## Log
 
@@ -108,15 +111,7 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 50 | P10 | Roll20 character importer: researched schema, campaign envelope, honest accounting; 26 tests | see log | pytest ✓ |
 
 ### R1 research notes
-- Iteration 42 window: PeerJS (13.4k★) + peerjs-server (4.7k★) selected as the OSS path to replace the emoji-mock video mesh; SkyOffice (1.3k★) is the architectural reference. Queued as backlog item.
-| 15 | — | X-card response carries post-rewind GameSession snapshot; /engine/session-state read proxy; 9 tests | 0a182da | cargo+pytest ✓ |
-| 16 | A1-fix | Audit remediation: LONG_REST rewind arm, HEALED clears death-save baselines; 4 red-first tests | b3fda63 | cargo ✓ |
-| 17 | 3.8 | Honest analytics/admin: live /metrics proxy, offline "—", DEMO badges, fabricated cards removed | 8ac9980 | all ✓ |
-| 18 | 3.1 | Real remote cursors via Yjs awareness; hardcoded peers deleted; honest empty on fallback | a41d778 | tsc ✓ |
-| 19 | wire-up | classify_with_llm wired into turn flow: safety precedence, kill-switch, provenance fields; 8 tests | 39609ae | pytest ✓ |
-| 20 | wire-up | Fail-forward tiers (margin/tier/cost_suggestion) surface in check/save responses; seeded d20s; 5 tests | 97f36f7 | cargo ✓ |
-| 21 | 5.1+5.2 | Agent-driven campaign simulation harness: LLM decisions via custom endpoint, identity-forwarded proxies, counted-metrics reports; 13 mocked tests | b4913c6 | pytest ✓ |
-| 22 | honesty | LLM error logs record exception types (httpx timeouts stringified to ""); live e2e sim run verified vs llm.heretek.one — endpoint unreachable from network, harness fell back honestly, all actions accepted | see git log | pytest ✓ |
+- Iteration 42 window: PeerJS (13.4k★) + peerjs-server (4.7k★) selected as the OSS path to replace the emoji-mock video mesh; SkyOffice (1.3k★) is the architectural reference. Delivered at iterations 43 and 49.
 
 
 | 51 | P10-wire | Roll20 import endpoint: auth'd, owner-scoped persistence, deliberate Foundry 501 stub | 24e0d1c | pytest ✓ |
@@ -129,8 +124,8 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 61-62 | SLA | Honest latency measurement harness: rules 0.39ms p50, spatial 0.35ms, intent 1.10ms — all PASS | 1409e3b | measured ✓ |
 | 63 | sync | Atmosphere sync over CRDT relay with documented LWW convergence | 1939bb1 | tsc ✓ |
 | 64 | gameplay | Grapple/shove contested actions end-to-end with reach/RBAC/economy gates | 708db19 | cargo ✓ |
-| 65-66 | A4-fix | Gate-integrity skips; wizard export header-auth; clipboard honesty; token-move ownership gate; hidden-delta parity; cursor cap | c3b3f78/9db3e48 | all ✓ |
-| 67 | A5-fix | Roll20 honesty seam: unparsable speed warns+None, identity fields neutral-empty with warnings | 682228c | pytest ✓ |
+| 65-66 | A3-fix | Third-audit remediation: gate-integrity skips; wizard export header-auth; clipboard honesty (c3b3f78); relay WS findings — token-move ownership gate, hidden-delta parity, cursor cap (9db3e48) | c3b3f78/9db3e48 | all ✓ |
+| 67 | A3-fix | Third-audit web finding: Roll20 honesty seam — unparsable speed warns+None, identity fields neutral-empty with warnings | 682228c | pytest ✓ |
 | 68-70 | honesty | Empty-SSE ≠ completed turn; SLA rows disclose keyword-vs-LLM; WITHHELD can't read green | de7d011 | pytest ✓ |
 | 71-72 | combat+fix | Combat maneuvers UI panel; Ready action e2e; deploy speed crash + clamp disclosure | 133d15b/511c627 | all ✓ |
 | 73 | P9 | Broadcast viewport mirrors spectator-filtered board only | fde0035 | tsc ✓ |
@@ -152,6 +147,23 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 > will see different (still deterministic per seed) output — this was not
 > disclosed when iteration 79 landed.
 | 80 | P5-depth | Concordia social-dialogue phase in campaign sim with norms enforcement + stance shifts; 11 tests | 7a104a7 | pytest ✓ |
+| 81 | tests | vitest unit suite for deterministic pure modules (character_math SRD tables, encounter XP budget, viewport sync, atmospheres); 66→69 tests | 2f8e978 | vitest ✓ |
+| 82 | sim-depth | Dynasty engine: multi-generation lineages, alliances, prestige; seed output pinned unchanged; 12 red-first tests (suite 539) | dac7f36 | pytest ✓ |
+| 83 | gateway | Role-enforced handout persistence (create/update with owner + role checks); 8 red-first tests (suite 547) | 1a36cb6 | pytest ✓ |
+| 84 | A6-fix | Sixth-audit remediation: per-test rate-limit isolation (suite green 3x), real SRD hit-die table in computedHP, scripted social phase force-pins no LLM gateway, dynasty tautology replaced, ambience drift guard; vitest 69, build 13.3s | 703f5c1 | pytest×3+vitest ✓ |
+| 85 | gateway | GM campaign autosave from live engine state, fail-closed role check before persist; 4 red-first tests (suite 551) | d9c3973 | pytest ✓ |
+| 86 | client | Compendium demo fallback data purged; cross-section search added | 028d33a | tsc+vite ✓ |
+| 87 | client | Lore assertion panel on the epistemic graph (LorePanel + lore_store API) | 01be577 | tsc+vite ✓ |
+| 88 | client | WFC studio generates real maps via engine proxy; fabricated previews deleted | eb66fe1 | tsc+vite ✓ |
+| 89 | client | Dynasty view on real endpoints; fabrications removed | 695f403 | tsc+vite ✓ |
+| 90 | client | Quest journal on the parametrized quest engine (quest_store API + modal rebuild) | 9b1d29c | tsc+vite ✓ |
+| 91 | client | Marketplace/subscription surfaces labeled previews; no purchasable fiction | cea6ff1 | tsc+vite ✓ |
+| 92 | client | Boss health bar + initiative HUD driven by real engine state | 9b77c3c | tsc+vite ✓ |
+
+> Gates note: rows 86-92 are client-only diffs recorded against the loop's
+> standard `npm run build` gate; build re-verified green (4.18s, zero TS
+> diagnostics) at loop close-out alongside cargo/pytest/vitest runs below.
+
 
 ### Iteration-80 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, recall 23/23, trust boundary held.
@@ -159,3 +171,72 @@ ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, recall 23/23, trust boun
 
 ### Iteration-50 milestone gate
 ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall 20/20, trust boundary held. Suite: 399 passed / 2 skipped.
+
+## Loop Summary (iterations 1-92)
+
+All 92 iterations have a log row above; every row's commit hash was cross-checked
+against `git log` at close-out. Category totals count each iteration once by its
+dominant deliverable; the six audit sweeps' remediation iterations are tracked
+separately so they are not double-bucketed.
+
+### Totals by category (81 feature/hygiene iterations + 11 audit-remediation = 92)
+
+| Category | Count | Iterations |
+|---|---|---|
+| Engine gameplay depth (vtt-core/engine/spatial/wfc) | 19 | 3, 6, 9, 14, 15, 20, 27, 29, 35, 36-37, 40, 42, 64, 68-69, 71-72, 74 |
+| Gateway honesty + auth (python server + Rust relay trust boundary) | 10 | 5, 12, 22, 26, 28, 51, 52, 57, 83, 85 |
+| Client truth sweep | 26 | 1, 4, 7, 8, 11, 17, 18, 23, 25, 31, 33, 39, 43, 47, 49, 63, 73, 75, 76, 86-92 |
+| Simulation AI (campaign sim, NPC agents, LLM routing/RAG) | 15 | 2, 10, 13, 19, 21, 24, 32, 34, 38, 54, 55, 56, 79, 80, 82 |
+| Infra, tests, docs, content pipeline | 11 | 30, 41, 50, 53, 58-60, 61-62, 77, 81 |
+| Independent-audit remediations | 11 | 16 (A1); 44, 45, 46, 48 (A2); 65, 66, 67 (A3); 70 (A4 notes); 78 (A5); 84 (A6) |
+
+### Independent audits
+
+Six subagent audit sweeps ran (~every 10 iterations). Every sweep produced real
+findings that were remediated red-first: A1 rewind-replay gaps (it. 16), A2
+unauthenticated session-state read + ledger bypass + character IDOR + shared rate
+budget (it. 44-46, hygiene at 48), A3 gate integrity / wizard export auth /
+clipboard honesty / token-move ownership / hidden-delta parity / cursor cap /
+Roll20 handoff fabrication (it. 65-67), A4 small honesty notes incl. empty-SSE ≠
+completed turn and WITHHELD SLA rows (it. 70), A5 six findings incl. Help-promise
+burn, under-level casts, GM-only monster spawns (it. 78), A6 gate reliability +
+test claim-laundering (it. 84). A5 also flagged "zero client tests", closed by the
+vitest suite at it. 81.
+
+### Test-count trajectory
+
+| Point | Cargo (workspace) | Pytest | Client |
+|---|---|---|---|
+| Loop start (CLAUDE.md baseline) | ~163 | ~444 collected | none (build/tsc only) |
+| It. 50 milestone gate | — | 399 passed / 2 skipped | — |
+| It. 78 | all suites green | 496 | tsc |
+| It. 84 | — | 547 x3 consecutive green | vitest 69, build 13.3s |
+| Close-out (measured 2026-08-24) | **235 passed** / 0 failed across 18 suites | **551 passed**, 22 skipped | **vitest 69 passed** (4 files); `npm run build` green in 4.18s |
+
+Benchmark gates at it. 50 and it. 80: MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall
+at target, trust boundary held. SLA harness (it. 62): rules 0.39ms p50, spatial
+~0.35ms, intent keyword 1.10ms — all PASS against stated budgets.
+
+### Known remaining limits (documented, deliberately not done)
+
+- **Quest routes have no server-side auth**: `POST /api/v1/quest/generate`,
+  `GET /api/v1/quest/active` and `POST /api/v1/quest/concordia-negotiate` take no
+  token dependency (`python/vtt_orchestrator/server.py`, quest route block) —
+  unlike handouts/campaign autosave, which enforce `_require_auth`. Generated
+  quest graphs also live only in gateway process memory (`global_quest_generator`/
+  `active_campaign_quest`), so they do not survive a restart.
+- **Per-seat WS delivery nuances**: relay fan-out is per-frame role-filtered
+  (`broadcast_if`), not per-seat projected; e.g. hidden-token movement deltas go
+  to GM peers as a class (it. 66 parity policy), not recomputed per recipient.
+- **No atmosphere write policy at the relay**: atmosphere state syncs over the
+  CRDT relay with client-side LWW convergence (it. 63); the Rust relay applies no
+  role/ownership validation to atmosphere writes.
+- **Video mesh NAT traversal unsolved**: PeerJS runs on default signaling/ICE with
+  no TURN/STUN servers configured — symmetric-NAT pairs may fail to connect;
+  failure states surface honestly but are not fixed.
+- **Compendium damage coverage 73/352**: the conservative extraction pipeline (it.
+  77) enriches 73 of 352 spells and warns instead of guessing on the rest.
+- **Rate-limit test isolation was structural**: the shared auth bucket caused
+  nondeterministic suite reds until it. 84 added per-test window clearing; the
+  buckets themselves remain process-local (no distributed limiter).
+
