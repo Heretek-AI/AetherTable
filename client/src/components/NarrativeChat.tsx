@@ -62,6 +62,8 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const [activeChannel, setActiveChannel] = useState<ChatChannel>('all');
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
+  const [isSpeechActive, setIsSpeechActive] = useState(false);
+  const [vadReady, setVadReady] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -79,24 +81,29 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const toggleRecording = async () => {
     if (!isRecording) {
       setIsRecording(true);
+      setIsSpeechActive(false);
+      setVadReady(false);
       globalAudio.playTurnAdvance();
-      await globalVoiceCapture.startRecording({
+      const started = await globalVoiceCapture.startRecording({
         onVolumeUpdate: (volume) => setVoiceVolume(volume),
+        // Real Silero VAD speech events — drive an honest indicator only.
+        onSpeechStart: () => setIsSpeechActive(true),
+        onSpeechEnd: () => setIsSpeechActive(false),
       });
+      if (!started) {
+        // Microphone inaccessible — do not pretend a session is live.
+        setIsRecording(false);
+        setVoiceVolume(0);
+      } else {
+        setVadReady(globalVoiceCapture.isUsingNeuralVad());
+      }
     } else {
       setIsRecording(false);
+      setIsSpeechActive(false);
       globalVoiceCapture.stopRecording();
       setVoiceVolume(0);
-      globalAudio.playDiceRoll();
-
-      // Dispatch spoken declaration
-      const voiceUtterances = [
-        "I charge forward with my greataxe raised and strike at the warlord!",
-        "I cast Shield as a reaction to deflect the incoming missile!",
-        "I examine the ancient runes carved into the sarcophagus lid.",
-      ];
-      const randomUtterance = voiceUtterances[Math.floor(Math.random() * voiceUtterances.length)];
-      onSendMessage(randomUtterance, activeChannel);
+      // No transcription backend exists in this client, so a recorded segment
+      // produces NO chat text. Never fabricate utterances on the player's behalf.
     }
   };
 
@@ -264,15 +271,52 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
 
       {/* Message Input & Action Bar */}
       <form onSubmit={handleSend} className="p-2 border-t border-tavern-border bg-tavern-surface/80 flex items-center gap-2">
-        <button
-          type="button"
-          onClick={toggleRecording}
-          className={`vtt-btn ${isRecording ? 'vtt-btn-danger' : 'vtt-btn-secondary'}`}
-          style={{ padding: '0.45rem' }}
-          title={isRecording ? 'Stop Recording' : 'Push-to-Talk (Microphone Ingestion)'}
-        >
-          {isRecording ? <MicOff className="w-4 h-4 animate-pulse" /> : <Mic className="w-4 h-4" />}
-        </button>
+        <div className="relative flex items-center">
+          {/* Live volume ring driven by real mic amplitude (RMS meter). */}
+          {isRecording && (
+            <span
+              aria-hidden="true"
+              className="absolute inset-0 rounded-full pointer-events-none transition-[box-shadow] duration-100"
+              style={{
+                boxShadow: `0 0 0 2px color-mix(in srgb, var(--state-danger) ${Math.min(voiceVolume, 100)}%, transparent)`,
+              }}
+            />
+          )}
+          <button
+            type="button"
+            onClick={toggleRecording}
+            className={`vtt-btn ${isRecording ? 'vtt-btn-danger' : 'vtt-btn-secondary'}`}
+            style={{ padding: '0.45rem' }}
+            title={
+              isRecording
+                ? vadReady
+                  ? 'Stop Recording (Silero VAD active)'
+                  : 'Stop Recording (amplitude-only mode — no speech detection)'
+                : 'Push-to-Talk (Microphone Ingestion)'
+            }
+          >
+            {isRecording ? <MicOff className="w-4 h-4 animate-pulse" /> : <Mic className="w-4 h-4" />}
+          </button>
+        </div>
+
+        {isRecording && (
+          <span
+            className={`text-[10px] font-semibold uppercase tracking-wide ${
+              isSpeechActive ? 'text-[var(--state-success)]' : 'opacity-60'
+            }`}
+            role="status"
+            aria-live="polite"
+          >
+            {isSpeechActive ? (
+              <>
+                <Volume2 className="w-3 h-3 inline mr-1" />
+                Speaking…
+              </>
+            ) : (
+              'Listening…'
+            )}
+          </span>
+        )}
 
         <input
           type="text"
