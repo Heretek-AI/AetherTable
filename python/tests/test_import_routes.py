@@ -220,6 +220,86 @@ def test_roll20_import_skips_unnamed_and_reports_warnings(player):
     assert [c["name"] for c in body["characters"]] == ["Thorin"]
 
 
+# --- Honest identity handling: no fabricated defaults ----------------------------------
+
+def test_roll20_export_lacking_identity_fields_warns_and_persists_neutral(player):
+    """An export with no class/level/race/background/alignment attribs must
+    NOT be persisted as an invented fighter/Human/Soldier — the response
+    warnings name every missing field, and storage holds neutral values."""
+    doc = _thorin()
+    doc["name"] = "Blank Slate"
+    doc["attribs"] = [
+        a for a in doc["attribs"]
+        if a["name"] not in {"class", "level", "race", "background", "alignment"}
+    ]
+    resp = client.post(
+        "/api/v1/import/roll20",
+        params={"token": player["token"]},
+        json={"character_json": doc},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    warnings = " || ".join(body["warnings"]).lower()
+    for field in ("class", "level", "race", "background", "alignment"):
+        assert field in warnings, f"no warning naming {field!r}: {body['warnings']}"
+
+    record = client.get(
+        f"/api/v1/characters/{body['characters'][0]['character_id']}",
+        params={"token": player["token"]},
+    ).json()
+    # Neutral values, never invented identities.
+    assert record["character_class"] == ""
+    data = record["data"]
+    assert data["character_class"] == ""
+    assert data["race"] == ""
+    assert data["background"] == ""
+    assert data["alignment"] == ""
+    assert record["level"] == 1  # allowed default, but warned about above
+
+
+def test_roll20_export_with_class_does_not_invent_or_warn_identity(player):
+    """Present identity fields flow through unchanged with no substitution
+    warning — the honesty warnings only fire for genuinely absent fields."""
+    resp = client.post(
+        "/api/v1/import/roll20",
+        params={"token": player["token"]},
+        json={"character_json": _thorin()},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["imported"] == 1
+    joined = " ".join(body["warnings"]).lower()
+    for field in ("class", "race", "background", "alignment"):
+        assert f"{field} not present" not in joined
+
+
+def test_roll20_unparsable_speed_warns_without_fabricating_30(player):
+    """A movement string the importer cannot reduce to feet ('walk 30 ft.')
+    must surface as a warning and never be silently replaced by the
+    create-route default of 30 as if the sheet had said so."""
+    doc = _thorin()
+    doc["name"] = "Slow Walker"
+    doc["attribs"] = [
+        _attr("speed", "walk 30 ft.") if a["name"] == "speed" else a
+        for a in doc["attribs"]
+    ]
+    resp = client.post(
+        "/api/v1/import/roll20",
+        params={"token": player["token"]},
+        json={"character_json": doc},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    warnings = " || ".join(body["warnings"]).lower()
+    assert "unparsable" in warnings and "speed" in warnings
+
+    record = client.get(
+        f"/api/v1/characters/{body['characters'][0]['character_id']}",
+        params={"token": player["token"]},
+    ).json()
+    assert record["data"]["speed"] != 30  # nothing fabricated as authoritative
+
+
 # --- Foundry preview: deliberate 501 stub ---------------------------------------------
 
 def test_foundry_preview_is_deliberate_501_contract(player):

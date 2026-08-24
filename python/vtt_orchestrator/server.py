@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Literal, Optional
+from typing import Dict, Any, List, Literal, Optional, Tuple
 
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
@@ -2642,36 +2642,81 @@ def _import_text(value: Any, default: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else default
 
 
-def _projected_to_character_payload(projected: Dict[str, Any]) -> Dict[str, Any]:
+def _projected_to_character_payload(
+    projected: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
     """Map one importer projection onto the EXISTING storage payload shape
     served by POST /api/v1/characters (CharacterCreateRequest).
 
-    Missing values fall back to that route's exact defaults rather than being
-    fabricated as plausible-looking stats; every such substitution was already
-    emitted as a warning by the importer and is surfaced again in the import
-    response envelope, so nothing is silently invented.
+    Identity fields are NEVER invented here: an absent class/race/background/
+    alignment persists as an empty string (not a plausible-sounding
+    "fighter"/"Human") and is reported in the returned substitution warnings,
+    which the route merges into its response envelope. A missing level falls
+    back to the storage floor of 1 — allowed because level must be a positive
+    int — but only WITH a warning naming it.
+
+    Numeric combat stats keep that route's defaults when the importer found
+    nothing (the importer already emits a per-field "missing core stat"
+    warning for each of them). Speed is the exception where a default would
+    fabricate gameplay data: when the importer could not reduce movement text
+    to feet, speed is persisted as None rather than silently becoming 30.
+
+    Returns ``(payload, substitution_warnings)``; the caller prefixes them
+    with the character name and surfaces them in the import response.
 
     max_hp/temp_hp have no slot in the current storage shape and are dropped
     here (documented lossiness of this iteration, not a silent guess).
     """
-    klass = str(_import_text(projected.get("character_class"), "fighter")).lower()
+    warnings: List[str] = []
+
+    klass = (projected.get("character_class") or "").strip()
+    if not klass:
+        warnings.append("class not present in export; left empty")
+    race = (projected.get("race") or "").strip()
+    if not race:
+        warnings.append("race not present in export; left empty")
+    background = (projected.get("background") or "").strip()
+    if not background:
+        warnings.append("background not present in export; left empty")
+    alignment = (projected.get("alignment") or "").strip()
+    if not alignment:
+        warnings.append("alignment not present in export; left empty")
+
+    level_raw = projected.get("level")
+    if isinstance(level_raw, bool) or not isinstance(level_raw, (int, float)):
+        warnings.append(f"level not present in export; defaulted to 1 (got {level_raw!r})")
+    level = min(20, max(1, _import_int(level_raw, 1)))
+
     abilities_raw = projected.get("abilities") or {}
-    return {
+    speed_raw = projected.get("speed")
+    if isinstance(speed_raw, bool) or not isinstance(speed_raw, (int, float)):
+        # The importer passed unparsable movement text through verbatim and
+        # warned; persisting 30 would turn that guess into authoritative data.
+        warnings.append(
+            f"speed not determinable from export ({speed_raw!r}); stored as null "
+            "instead of inventing a default"
+        )
+        speed: Any = None
+    else:
+        speed = int(speed_raw)
+
+    payload = {
         "name": projected["name"],
-        "character_class": klass,
-        "level": min(20, max(1, _import_int(projected.get("level"), 1))),
-        "race": _import_text(projected.get("race"), "Human"),
-        "background": _import_text(projected.get("background"), "Soldier"),
-        "alignment": _import_text(projected.get("alignment"), "Neutral Good"),
+        "character_class": klass.lower(),
+        "level": level,
+        "race": race,
+        "background": background,
+        "alignment": alignment,
         "abilities": {
             key: _import_int(abilities_raw.get(key), 10) for key in _ABILITY_ORDER
         },
         "hp": _import_int(projected.get("hp"), 12),
         "ac": _import_int(projected.get("ac"), 16),
-        "speed": _import_int(projected.get("speed"), 30),
+        "speed": speed,
         "features": [],
         "spells": [],
     }
+    return payload, warnings
 
 
 @app.post("/api/v1/import/roll20")
@@ -2734,10 +2779,12 @@ async def import_roll20(
 
     persisted: List[Dict[str, Any]] = []
     for projected in projected_list:
-        record = await storage_backend.create_character(
-            user_id, _projected_to_character_payload(projected)
-        )
+        payload, substitution_warnings = _projected_to_character_payload(projected)
+        record = await storage_backend.create_character(user_id, payload)
         warnings.extend(f"{projected['name']}: {w}" for w in projected.get("warnings", []))
+        warnings.extend(
+            f"{projected['name']}: {w}" for w in substitution_warnings
+        )
         persisted.append({
             "character_id": record["character_id"],
             "name": record["name"],

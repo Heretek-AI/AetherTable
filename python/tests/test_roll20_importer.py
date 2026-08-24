@@ -251,6 +251,39 @@ class TestUnmappedAccounting:
         assert "strength" not in out["unmapped"]
 
 
+# --- Speed projection honesty -----------------------------------------------------------
+
+
+class TestSpeedProjection:
+    def test_unparsable_speed_passes_through_with_warning(self):
+        """A movement string the regex cannot reduce to feet ('walk 30 ft.')
+        is passed through verbatim AND surfaced as an unparsable-speed
+        warning — never silently handed downstream as if authoritative."""
+        doc = thorin()
+        for attr in doc["attribs"]:
+            if attr["name"] == "speed":
+                attr["current"] = "walk 30 ft."
+        out = Roll20CharacterImporter().import_character(doc)
+
+        assert out["speed"] == "walk 30 ft."
+        assert any(
+            "unparsable" in w.lower() and "speed" in w.lower()
+            for w in out["warnings"]
+        )
+
+    def test_empty_speed_value_still_warns(self):
+        doc = thorin()
+        for attr in doc["attribs"]:
+            if attr["name"] == "speed":
+                attr["current"] = "   "
+        out = Roll20CharacterImporter().import_character(doc)
+        assert any("speed" in w.lower() for w in out["warnings"])
+
+    def test_numeric_and_ft_suffixed_speeds_stay_warning_free(self):
+        assert Roll20CharacterImporter().import_character(thorin())["warnings"] == []
+        assert Roll20CharacterImporter().import_character(brann())["warnings"] == []
+
+
 # --- Missing core stats: warnings, never defaults --------------------------------------
 
 
@@ -269,6 +302,20 @@ class TestMissingCoreStats:
         assert "'ac'" in warned
         assert "'speed'" in warned
         assert "'wisdom'" in warned
+
+    def test_garbage_value_does_not_suppress_missing_core_stat_warning(self):
+        """The dedup heuristic must only suppress against real 'missing core
+        stat' warnings — a garbage-value warning quoting the same label is
+        not a substitute for the missing-stat notice."""
+        doc = thorin()
+        for attr in doc["attribs"]:
+            if attr["name"] == "strength":
+                attr["current"] = "mighty"
+        out = Roll20CharacterImporter().import_character(doc)
+
+        assert out["abilities"]["STR"] is None
+        assert any("non-numeric value for 'strength'" in w for w in out["warnings"])
+        assert any("missing core stat 'strength'" in w for w in out["warnings"])
 
     def test_missing_hp_reports_both_halves(self):
         doc = thorin()

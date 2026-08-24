@@ -49,7 +49,9 @@ Mapping decisions (documented conventions, never silent guesses):
   attribute name with no projection lands in the sorted ``unmapped`` list;
   duplicate attribute names keep the FIRST occurrence and warn.
 - Speed strings like ``"30 ft."`` normalize to integer feet; anything else
-  passes through untouched rather than defaulting.
+  passes through untouched (never defaulted) AND emits an
+  ``unparsable_speed`` warning so the raw text can never masquerade as
+  authoritative movement data.
 
 Fail-loud contract: anything that is not a recognizable Roll20 export
 (non-mapping scalar, object with neither ``attribs`` nor ``characters``,
@@ -157,20 +159,27 @@ def _coerce_number(raw: Any) -> Optional[Any]:
     return None
 
 
-def _project_speed(raw: Any) -> Any:
-    """Numeric feet for clean values ('30', '30 ft.'); otherwise pass the raw
-    string through untouched — never guess a default speed."""
+def _project_speed(raw: Any) -> Tuple[Optional[Any], bool]:
+    """Numeric feet for clean values ('30', '30 ft.'); anything else passes
+    through untouched rather than guessing a default speed — but with
+    ``parsed_ok=False`` so the caller ALWAYS warns about the passthrough
+    instead of letting an unparsable string masquerade as authoritative data.
+
+    Returns ``(value, parsed_ok)``: parsed_ok=True means value is integer
+    feet; parsed_ok=False means the raw text was kept verbatim (or None when
+    there was no text at all).
+    """
     if isinstance(raw, bool):
-        return None
+        return None, False
     if isinstance(raw, (int, float)):
-        return int(raw)
+        return int(raw), True
     if isinstance(raw, str):
         match = _SPEED_FT_RE.match(raw)
         if match:
-            return int(match.group(1))
+            return int(match.group(1)), True
         stripped = raw.strip()
-        return stripped or None
-    return None
+        return (stripped or None), False
+    return None, False
 
 
 class Roll20CharacterImporter:
@@ -354,17 +363,26 @@ class Roll20CharacterImporter:
                 continue
             raw = entries[src].get("current")
             if dst == "speed":
-                projected = _project_speed(raw)
-                if projected is None:
-                    warnings.append(f"non-numeric value for '{src}': {raw!r}")
-                    continue
+                projected, parsed_ok = _project_speed(raw)
+                if not parsed_ok:
+                    # Unparsable movement text passes through verbatim, but it
+                    # must never look authoritative: warn every time.
+                    warnings.append(
+                        f"unparsable_speed: value for '{src}' ({raw!r}) does not "
+                        "read as a number of feet; kept verbatim"
+                    )
                 out[dst] = projected
                 continue
             number = _coerce_number(raw)
             if number is None:
                 warnings.append(f"non-numeric value for '{src}': {raw!r}")
                 continue
-            out[dst] = int(number)
+            value = int(number)
+            if value != number:
+                warnings.append(
+                    f"non-integer value for '{src}': {raw!r}; truncated to {value}"
+                )
+            out[dst] = value
 
     def _apply_hit_points(
         self,
@@ -503,10 +521,13 @@ class Roll20CharacterImporter:
         warnings = out["warnings"]
         for canon in _ABILITIES:
             label = _ABILITY_LABELS[canon]
-            if out["abilities"][canon] is None and not any(
-                f"'{label}'" in w for w in warnings
-            ):
-                warnings.append(f"missing core stat '{label}'")
+            missing_marker = f"missing core stat '{label}'"
+            # Dedup ONLY against the exact missing-stat notice. A garbage-value
+            # warning that merely quotes the label ("non-numeric value for
+            # 'strength': 'mighty'") does NOT cover the fact that the score is
+            # absent, so the missing-stat warning still fires.
+            if out["abilities"][canon] is None and missing_marker not in warnings:
+                warnings.append(missing_marker)
         if out["ac"] is None:
             warnings.append("missing core stat 'ac'")
         if out["speed"] is None:
