@@ -98,6 +98,14 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 40 | gameplay | SRD exhaustion levels enforced automatically (speed/HP halving, death at 6); long-rest hook exported | c205e02 | cargo ✓ |
 | 41 | P10 | Foundry module importer (researched schema, NDJSON packs, unmapped-field accounting, fail-loud); 25 tests | 6db2419 | pytest ✓ |
 | 42 | wire-up | Rest endpoint sheds exhaustion via take_long_rest_effects; HP to post-rest effective max; 3 red-first tests | see log | cargo ✓ |
+| 43 | P9-real | Real PeerJS video mesh replaces emoji mock: signaling service in compose, live <video> tiles, honest degradation states | cd9722b | tsc+vite ✓ |
+| 44 | A2-fix | Gateway remediation: session-state requires auth (HIGH), ledger redaction shared with replay policy, character IDOR closed | 7f592fe | pytest ✓ |
+| 45 | A2-fix | Engine remediation: action rate-budget shared across scopes; rewind combat-phase + exhaustion arms | 2d9ddd5 | cargo ✓ |
+| 46 | A2-fix | X-card snapshot role-projected for players; all-provoker OA detail array | b8510fe | cargo ✓ |
+| 47 | 5.3 | Guided campaign wizard: 4 steps, real invite code, starter-adventure catalog, no fabricated success | 0b180e0 | tsc ✓ |
+| 48 | A2-hygiene | Rate windows bounded at 100k keys; NPC interaction magnitude capped (0,10] | fb42d43 | pytest ✓ |
+| 49 | P9 | Spatial audio follows board tokens: HRTF sources per peer, identity binding, neutral pin for unmapped | 5779948 | tsc ✓ |
+| 50 | P10 | Roll20 character importer: researched schema, campaign envelope, honest accounting; 26 tests | see log | pytest ✓ |
 
 ### R1 research notes
 - Iteration 42 window: PeerJS (13.4k★) + peerjs-server (4.7k★) selected as the OSS path to replace the emoji-mock video mesh; SkyOffice (1.3k★) is the architectural reference. Queued as backlog item.
@@ -110,3 +118,6 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 | 21 | 5.1+5.2 | Agent-driven campaign simulation harness: LLM decisions via custom endpoint, identity-forwarded proxies, counted-metrics reports; 13 mocked tests | b4913c6 | pytest ✓ |
 | 22 | honesty | LLM error logs record exception types (httpx timeouts stringified to ""); live e2e sim run verified vs llm.heretek.one — endpoint unreachable from network, harness fell back honestly, all actions accepted | see git log | pytest ✓ |
 
+
+### Iteration-50 milestone gate
+ALL BENCHMARKS PASSED — MCR 100%, HCI 1.0, AFPR 0.0%, auditor recall 20/20, trust boundary held. Suite: 399 passed / 2 skipped.
