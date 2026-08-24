@@ -1,0 +1,664 @@
+"""Agent-driven campaign simulation (backlog item 5.1 / 5.2).
+
+N synthetic ``CampaignSimPlayer``s walk the exact same surface a real client
+does — auth signup/login (HMAC tokens), lobby create/join/launch, character
+create/deploy (RBAC-owned engine entities), then T rounds of turns executed
+through the SAME authenticated orchestrator proxy endpoints with ``?token=``
+forwarding each player's identity to the engine's RBAC layer.
+
+Turn decisions come from the configured custom LLM endpoint
+(``LLM_API``/``LLM_KEY``/``LLM_MODEL``) via the existing
+``routing.llm_client.LLMStreamingGateway.complete_json`` so every call lands in
+the shared JSONL log. Model output is parsed defensively; anything malformed,
+unknown, or unavailable falls back to a deterministic scripted policy FOR THAT
+TURN while still counting the attempt. With no key configured the whole run is
+tagged ``mode: "scripted"`` and never touches the network.
+
+The report fabricates nothing: every number in it is counted from observed
+proxy responses.
+
+Importable API only — no HTTP routes are added this iteration. To run live:
+
+    # 1. authoritative engine:      cargo run -p vtt-server
+    # 2. orchestrator gateway:     cd python && PYTHONPATH=python uvicorn \
+    #                              vtt_orchestrator.server:app --port 8000
+    # 3. the sim (reads .env):     PYTHONPATH=python python -m \
+    #                              vtt_orchestrator.simulation.campaign_sim \
+    #                              --players 3 --rounds 4
+"""
+
+import asyncio
+import json
+import os
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from ..routing.llm_client import LLMConfig, LLMStreamingGateway
+
+ORCHESTRATOR_URL = os.environ.get(
+    "ORCHESTRATOR_URL",
+    f"http://localhost:{os.environ.get('ORCHESTRATOR_PORT', '8000')}",
+)
+
+DEFAULT_PASSWORD = "dice-dice-dice"
+
+VALID_ACTIONS = ("attack", "move", "check")
+
+
+class CampaignSimError(Exception):
+    """Raised when the table cannot even be set up (precondition failure)."""
+
+
+# ---------------------------------------------------------------------------
+# Thin authenticated HTTP surface against the orchestrator
+# ---------------------------------------------------------------------------
+
+class _OrchestratorHTTP:
+    """httpx wrapper for one simulated player's calls into the gateway.
+
+    ``transport`` is injectable so tests can run the REAL FastAPI app through
+    an in-process ASGI transport while only the outbound legs (engine, LLM)
+    are faked.
+    """
+
+    def __init__(self, base_url: Optional[str] = None, transport=None):
+        self.base_url = (base_url or ORCHESTRATOR_URL).rstrip("/")
+        self._transport = transport
+        self.requests: List[Dict[str, Any]] = []
+
+    async def request(self, method, path, json_body=None, params=None):
+        async with httpx.AsyncClient(base_url=self.base_url, transport=self._transport) as client:
+            resp = await client.request(method, path, json=json_body, params=params)
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"raw": resp.text[:500]}
+        record = {
+            "method": method, "path": path,
+            "status": resp.status_code, "body": body,
+        }
+        self.requests.append(record)
+        return record
+
+
+def _rejection_reason(body: Any) -> str:
+    """Pulls an honest reason string out of an error payload (FastAPI wraps
+    engine rejections as {"detail": {...}})."""
+    detail = body.get("detail", body) if isinstance(body, dict) else body
+    if isinstance(detail, dict):
+        for key in ("reason", "error", "code", "message"):
+            if detail.get(key):
+                return str(detail[key])
+        return json.dumps(detail)[:120]
+    return str(detail)[:120] if detail else "UNKNOWN"
+
+
+def _degraded_flag(body: Any) -> bool:
+    """True when a response body honestly declares itself degraded."""
+    return isinstance(body, dict) and bool(body.get("degraded"))
+
+
+# ---------------------------------------------------------------------------
+# One synthetic player
+# ---------------------------------------------------------------------------
+
+class CampaignSimPlayer:
+    """A synthetic seat at the table: identity, lobby membership, a persisted
+    character deployed as an owned entity, and the ability to take turns."""
+
+    def __init__(
+        self,
+        name: str,
+        index: int,
+        *,
+        base_url: Optional[str] = None,
+        transport=None,
+        password: str = DEFAULT_PASSWORD,
+        role: str = "player",
+        email: Optional[str] = None,
+    ):
+        self.name = name
+        self.index = index
+        self.password = password
+        # Host (seat 0) signs up as GM so it can spawn the encounter target.
+        self.role = role
+        # Unique per-run address by default; pass a fixed email to exercise the
+        # login-instead-of-signup path.
+        self.email = email or f"sim-{name}-{uuid.uuid4().hex[:10]}@campaign-sim.test"
+        self.http = _OrchestratorHTTP(base_url=base_url, transport=transport)
+        self.token: Optional[str] = None
+        self.user_id: Optional[str] = None
+        self.display_name = name.title()
+        self.lobby_id: Optional[str] = None
+        self.invite_code: Optional[str] = None
+        self.character_id: Optional[str] = None
+        self.entity_id: Optional[str] = None
+        self.is_host = False
+
+    # -- lifecycle ----------------------------------------------------------
+
+    async def authenticate(self) -> None:
+        """Signup on a fresh address, login when the email already exists."""
+        signup = await self.http.request("POST", "/api/v1/auth/signup",
+                                         {"email": self.email, "username": self.name,
+                                          "display_name": self.display_name,
+                                          "password": self.password, "role": self.role})
+        if signup["status"] == 200:
+            self._adopt_auth(signup["body"])
+            return
+        if signup["status"] == 409:
+            login = await self.http.request("POST", "/api/v1/auth/login",
+                                            {"email": self.email, "password": self.password})
+            if login["status"] != 200:
+                raise CampaignSimError(f"{self.name}: login failed: {login['body']}")
+            self._adopt_auth(login["body"])
+            return
+        raise CampaignSimError(f"{self.name}: signup failed ({signup['status']}): {signup['body']}")
+
+    def _adopt_auth(self, body: Dict[str, Any]) -> None:
+        self.token = body["token"]
+        self.user_id = body["user"]["id"]
+        self.role = body["user"].get("role", self.role)
+
+    async def host_table(self, table_name: str) -> None:
+        created = await self.authed("POST", "/api/v1/lobbies", {"name": table_name})
+        if created["status"] != 200:
+            raise CampaignSimError(f"lobby create failed: {created['body']}")
+        lobby = created["body"]
+        self.lobby_id = lobby["lobby_id"]
+        self.invite_code = lobby["invite_code"]
+        self.is_host = True
+
+    async def join_table(self, lobby_id: str, invite_code: str) -> None:
+        joined = await self.authed("POST", f"/api/v1/lobbies/{lobby_id}/join",
+                                   {"invite_code": invite_code})
+        if joined["status"] != 200:
+            raise CampaignSimError(f"{self.name}: join failed: {joined['body']}")
+        self.lobby_id = lobby_id
+        self.invite_code = invite_code
+
+    async def launch_table(self) -> str:
+        launched = await self.authed("POST", f"/api/v1/lobbies/{self.lobby_id}/launch")
+        if launched["status"] != 200:
+            raise CampaignSimError(f"lobby launch failed: {launched['body']}")
+        return launched["body"]["session_id"]
+
+    async def deploy_character(self, session_id: Optional[str] = None, klass: str = "fighter") -> str:
+        session_id = session_id or self._session_id
+        created = await self.authed("POST", "/api/v1/characters", {
+            "name": self.display_name, "character_class": klass, "level": 3,
+            "hp": 28, "ac": 16, "speed": 30,
+        })
+        if created["status"] != 200:
+            raise CampaignSimError(f"{self.name}: character create failed: {created['body']}")
+        self.character_id = created["body"]["character_id"]
+        deployed = await self.authed(
+            "POST", f"/api/v1/characters/{self.character_id}/deploy",
+            {"session_id": session_id, "x": 4.0 + self.index, "y": 4.0},
+        )
+        if deployed["status"] != 200:
+            raise CampaignSimError(f"{self.name}: deploy failed: {deployed['body']}")
+        self.entity_id = deployed["body"].get("entity_id") or self.character_id
+        return self.entity_id
+
+    async def spawn_encounter_target(self, session_id: str) -> str:
+        """Host/GM spawns a durable hostile dummy so player actions have a
+        legal reference-only target (ids only — no client math)."""
+        dummy_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "sim-training-dummy"))
+        entity = {
+            "id": dummy_id,
+            "compendium_id": "monster_training_dummy",
+            "name": "Training Dummy",
+            "is_player": False,
+            "current_hp": 500, "max_hp": 500, "temp_hp": 0,
+            "ac": 13,
+            "speed_feet": 0.0,
+            "position": [8.0, 8.0, 0.0],
+            "zone_id": "Zone_Default",
+            "abilities": {"strength": 10, "dexterity": 10, "constitution": 10,
+                          "intelligence": 10, "wisdom": 10, "charisma": 10},
+            "conditions": [],
+            "action_budget": {"action": False, "bonus_action": False, "reaction": False,
+                              "movement_remaining_feet": 0.0, "free_object_interaction": False},
+            "spell_slots_remaining": {},
+            "attacks": [],
+            "resistances": [], "vulnerabilities": [], "immunities": [],
+            "inventory": {"items": {}},
+            "is_conscious": True, "is_dead": False, "is_visible": True,
+        }
+        spawned = await self.authed("POST", "/api/v1/engine/spawn",
+                                    {"session_id": session_id, "entity": entity})
+        if spawned["status"] != 200:
+            raise CampaignSimError(f"dummy spawn failed: {spawned['body']}")
+        return spawned["body"].get("entity_id") or dummy_id
+
+    # -- turn-time reads ------------------------------------------------------
+
+    async def observe_session(self) -> Dict[str, Any]:
+        """Authoritative snapshot via the read proxy, caller token forwarded."""
+        state = await self.authed("POST", "/api/v1/engine/session-state",
+                                  {"session_id": self._session_id})
+        if state["status"] != 200:
+            raise CampaignSimError(f"{self.name}: session-state failed: {state['body']}")
+        return parse_snapshot(state["body"])
+
+    # -- action execution -----------------------------------------------------
+
+    async def execute(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """One action through the SAME proxy endpoints real clients use."""
+        action = decision["action"]
+        session_id = self._session_id
+        if action == "attack":
+            record = await self.authed("POST", "/api/v1/engine/attack", {
+                "session_id": session_id,
+                "attacker_id": self.entity_id,
+                "target_id": decision["target_id"],
+                "action_index": int(decision.get("action_index", 0)),
+            })
+        elif action == "move":
+            record = await self.authed("POST", "/api/v1/engine/move", {
+                "session_id": session_id,
+                "entity_id": self.entity_id,
+                "x": float(decision["x"]),
+                "y": float(decision["y"]),
+            })
+        elif action == "check":
+            record = await self.authed("POST", "/api/v1/engine/check", {
+                "modifier": int(decision.get("modifier", 1)),
+                "dc": int(decision.get("dc", 12)),
+            })
+        else:  # defensive: decisions are validated upstream, never trust them twice
+            return {"attempted": False, "accepted": False, "rejected": True,
+                    "rejection_reason": "INVALID_ACTION", "response_status": None,
+                    "degraded": False}
+
+        accepted = record["status"] < 400
+        body = record["body"]
+        rejected = not accepted or (isinstance(body, dict) and body.get("ok") is False)
+        return {
+            "attempted": True,
+            "accepted": accepted and not rejected,
+            "rejected": rejected,
+            "rejection_reason": None if not rejected else _rejection_reason(body),
+            "response_status": record["status"],
+            "outcome": body if accepted else None,
+            "degraded": _degraded_flag(body),
+        }
+
+    # -- plumbing -------------------------------------------------------------
+
+    async def authed(self, method: str, path: str, json_body: Optional[Dict[str, Any]] = None):
+        """One ?token=-authenticated call, exactly like the browser client."""
+        if self.token is None:
+            raise CampaignSimError(f"{self.name}: not authenticated")
+        return await self.http.request(method, path, json_body, params={"token": self.token})
+
+    @property
+    def _session_id(self) -> str:
+        if getattr(self, "_sid", None) is None:
+            raise CampaignSimError(f"{self.name}: no active session")
+        return self._sid
+
+    def bind_session(self, session_id: str) -> None:
+        self._sid = session_id
+
+
+# ---------------------------------------------------------------------------
+# Snapshot parsing + decision policies
+# ---------------------------------------------------------------------------
+
+def parse_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Defensive projection of the raw engine GET-session payload into just
+    what a decision needs. Never invents values it cannot see."""
+    entities = []
+    for entity_id, entity in (raw.get("entities") or {}).items():
+        if not isinstance(entity, dict):
+            continue
+        entities.append({
+            "id": entity.get("id", entity_id),
+            "name": entity.get("name", "Unknown"),
+            "hp": _as_int(entity.get("current_hp")),
+            "max_hp": _as_int(entity.get("max_hp")),
+            "ac": _as_int(entity.get("ac")),
+            "position": entity.get("position") if isinstance(entity.get("position"), list) else None,
+            "is_player": bool(entity.get("is_player", False)),
+            "owner_player_id": entity.get("owner_player_id"),
+            "is_dead": bool(entity.get("is_dead", False)),
+            "is_visible": bool(entity.get("is_visible", True)),
+        })
+    return {"entities": entities}
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def scripted_decision(player: CampaignSimPlayer, snapshot: Dict[str, Any], round_no: int) -> Dict[str, Any]:
+    """Deterministic fallback policy — no RNG anywhere:
+
+    round % 3 == 0 -> Perception-style check; badly hurt -> retreat move;
+    even rounds -> reposition move; otherwise attack the lowest-id living
+    hostile; with no legal target left, fall back to a check.
+    """
+    own = next((e for e in snapshot["entities"] if e["id"] == player.entity_id), None)
+    if round_no % 3 == 0 or own is None:
+        return {"action": "check"}
+    hostiles = sorted(
+        (
+            e for e in snapshot["entities"]
+            if e["id"] != player.entity_id and not e["is_dead"] and not e["is_player"]
+        ),
+        key=lambda e: str(e["id"]),
+    )
+    if not hostiles:
+        return {"action": "check"}
+    if own["hp"] is not None and own["max_hp"] and own["hp"] <= own["max_hp"] * 0.25:
+        pos = own["position"] or [5.0, 5.0]
+        return {"action": "move", "x": float(pos[0]) - 5.0, "y": float(pos[1]) - 5.0}
+    if round_no % 2 == 0:
+        target_pos = hostiles[0]["position"] or [8.0, 8.0]
+        own_pos = own["position"] or [4.0, 4.0]
+        step_x = 2.0 if float(target_pos[0]) >= float(own_pos[0]) else -2.0
+        return {"action": "move",
+                "x": float(own_pos[0]) + step_x,
+                "y": float(own_pos[1])}
+    return {"action": "attack", "target_id": hostiles[0]["id"]}
+
+
+SYSTEM_PROMPT = (
+    "You are one player at a D&D-style virtual tabletop, taking exactly one "
+    "turn. Reply ONLY with a single JSON object, no prose, of the form: "
+    '{"action": "attack" | "move" | "check", '
+    '"target_id": "<enemy entity id, required for attack>", '
+    '"x": <number>, "y": <number>, '
+    '"reason": "<one short sentence>"}'
+)
+
+
+def build_decision_prompts(snapshot: Dict[str, Any], player: CampaignSimPlayer) -> tuple:
+    own = next((e for e in snapshot["entities"] if e["id"] == player.entity_id), {})
+    view = [
+        {k: e[k] for k in ("id", "name", "hp", "ac", "is_player", "is_dead")}
+        for e in snapshot["entities"]
+    ]
+    user_prompt = (
+        "Battlefield state:\n"
+        + json.dumps({"you": own, "entities": view}, default=str)
+        + "\nChoose your single action as JSON per the schema."
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+def validate_decision(parsed: Any) -> tuple:
+    """Returns (decision_dict_or_None, fallback_reason_or_None).
+
+    Defensive by design: model output is untrusted input.
+    """
+    if not isinstance(parsed, dict):
+        return None, "malformed_llm_output"
+    action = parsed.get("action")
+    if not isinstance(action, str) or action.lower() not in VALID_ACTIONS:
+        return None, f"unknown_action:{action!r}"
+    action = action.lower()
+    decision: Dict[str, Any] = {"action": action}
+    if action == "attack":
+        target = parsed.get("target_id")
+        if not isinstance(target, str) or not target.strip():
+            return None, "missing_attack_target"
+        decision["target_id"] = target.strip()
+    elif action == "move":
+        x, y = _coerce_coord(parsed.get("x")), _coerce_coord(parsed.get("y"))
+        if x is None or y is None:
+            return None, "malformed_move_coordinates"
+        decision.update(x=x, y=y)
+    decision["reason"] = str(parsed.get("reason", ""))[:200]
+    return decision, None
+
+
+def _coerce_coord(value: Any) -> Optional[float]:
+    try:
+        coord = float(value)
+    except (TypeError, ValueError):
+        return None
+    if coord != coord or coord in (float("inf"), float("-inf")):  # NaN/inf guard
+        return None
+    return coord
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+class CampaignSimulation:
+    """Drives N players through setup, then T rounds of LLM- or policy-driven
+    turns, accounting every attempt honestly."""
+
+    def __init__(
+        self,
+        players: int = 2,
+        rounds: int = 3,
+        *,
+        llm_gateway: Optional[LLMStreamingGateway] = None,
+        mode: Optional[str] = None,
+        base_url: Optional[str] = None,
+        transport=None,
+        table_name: str = "Campaign Sim Table",
+    ):
+        if players < 1:
+            raise ValueError("players must be >= 1")
+        if rounds < 1:
+            raise ValueError("rounds must be >= 1")
+        self.players_n = players
+        self.rounds_n = rounds
+        self.table_name = table_name
+        self.gateway = llm_gateway or LLMStreamingGateway(LLMConfig())
+        # Explicit mode wins; otherwise auto-detect from gateway config.
+        self.mode = mode or ("llm" if not self.gateway.config.is_mock else "scripted")
+        self._base_url = base_url
+        self._transport = transport
+
+    async def run(self) -> Dict[str, Any]:
+        started_wall = time.time()
+        started = time.perf_counter()
+        report: Dict[str, Any] = {
+            "mode": self.mode,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_wall)),
+            "players_configured": self.players_n,
+            "rounds_requested": self.rounds_n,
+            "lobby_id": None,
+            "engine_session_id": None,
+            "totals": {
+                "turns": 0,
+                "actions_attempted": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "rejection_reasons": {},
+                "llm_calls_made": 0,
+                "llm_decisions_accepted": 0,
+                "llm_fallbacks": 0,
+                "degraded_flags_seen": 0,
+            },
+            "per_player": [],
+            "rounds": [],
+            "errors": [],
+        }
+
+        players = [
+            CampaignSimPlayer(
+                f"sim-player-{i}", i,
+                base_url=self._base_url, transport=self._transport,
+                role="gm" if i == 0 else "player",
+            )
+            for i in range(self.players_n)
+        ]
+
+        try:
+            await self._setup(players, report)
+        except CampaignSimError as exc:
+            report["errors"].append(str(exc))
+            report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+            return report  # honest partial report instead of invented progress
+
+        try:
+            for round_no in range(1, self.rounds_n + 1):
+                round_entry = {"round": round_no, "turns": []}
+                for player in players:
+                    turn = await self._take_turn(player, round_no)
+                    round_entry["turns"].append(turn)
+                    self._account(turn, report)
+                report["rounds"].append(round_entry)
+        except CampaignSimError as exc:
+            report["errors"].append(f"aborted mid-run: {exc}")
+
+        report["per_player"] = [self._player_summary(p, report) for p in players]
+        report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return report
+
+    # -- phases -------------------------------------------------------------
+
+    async def _setup(self, players: List[CampaignSimPlayer], report: Dict[str, Any]) -> None:
+        for player in players:
+            await player.authenticate()
+
+        host = players[0]
+        await host.host_table(self.table_name)
+        report["lobby_id"] = host.lobby_id
+        for guest in players[1:]:
+            await guest.join_table(host.lobby_id, host.invite_code)
+
+        session_id = await host.launch_table()
+        report["engine_session_id"] = session_id
+        for player in players:
+            player.bind_session(session_id)
+            await player.deploy_character()
+        await host.spawn_encounter_target(session_id)
+
+    async def _take_turn(self, player: CampaignSimPlayer, round_no: int) -> Dict[str, Any]:
+        snapshot = await player.observe_session()
+        decision, source, fallback_reason, llm_used = await self._decide(player, snapshot, round_no)
+        result = await player.execute(decision)
+        return {
+            "round": round_no,
+            "player": player.name,
+            "entity_id": player.entity_id,
+            "decision_source": source,
+            "fallback_reason": fallback_reason,
+            "reason": decision.get("reason"),
+            "action": decision["action"],
+            "requested": {k: v for k, v in decision.items() if k != "reason"},
+            "attempted": result["attempted"],
+            "accepted": result["accepted"],
+            "rejected": result["rejected"],
+            "rejection_reason": result["rejection_reason"],
+            "response_status": result["response_status"],
+            "degraded": result["degraded"],
+            "llm_called": llm_used,
+        }
+
+    async def _decide(self, player, snapshot, round_no):
+        """LLM decision with per-turn deterministic fallback, or scripted mode.
+
+        Returns (decision, source, fallback_reason|None, llm_was_called).
+        """
+        if self.mode != "llm":
+            return scripted_decision(player, snapshot, round_no), "scripted", None, False
+
+        system_prompt, user_prompt = build_decision_prompts(snapshot, player)
+        parsed = await self.gateway.complete_json(system_prompt, user_prompt)
+        decision, problem = validate_decision(parsed)
+        if decision is None:
+            reason = problem if parsed is not None else "llm_unavailable_or_unparseable"
+            fallback = scripted_decision(player, snapshot, round_no)
+            fallback["reason"] = f"scripted fallback ({reason})"
+            return fallback, "llm_fallback", reason, True
+        return decision, "llm", None, True
+
+    # -- accounting -----------------------------------------------------------
+
+    def _account(self, turn: Dict[str, Any], report: Dict[str, Any]) -> None:
+        totals = report["totals"]
+        totals["turns"] += 1
+        if turn["attempted"]:
+            totals["actions_attempted"] += 1
+        if turn["accepted"]:
+            totals["accepted"] += 1
+        if turn["rejected"]:
+            totals["rejected"] += 1
+            reason = turn["rejection_reason"] or "UNKNOWN"
+            totals["rejection_reasons"][reason] = totals["rejection_reasons"].get(reason, 0) + 1
+        if turn["llm_called"]:
+            totals["llm_calls_made"] += 1
+            if turn["decision_source"] == "llm":
+                totals["llm_decisions_accepted"] += 1
+            else:
+                totals["llm_fallbacks"] += 1
+        if turn["degraded"]:
+            totals["degraded_flags_seen"] += 1
+
+    def _player_summary(self, player: CampaignSimPlayer, report: Dict[str, Any]) -> Dict[str, Any]:
+        turns = [t for r in report["rounds"] for t in r["turns"] if t["player"] == player.name]
+        return {
+            "name": player.name,
+            "user_id": player.user_id,
+            "character_id": player.character_id,
+            "entity_id": player.entity_id,
+            "role": player.role,
+            "actions_attempted": sum(1 for t in turns if t["attempted"]),
+            "accepted": sum(1 for t in turns if t["accepted"]),
+            "rejected": sum(1 for t in turns if t["rejected"]),
+            "turns_taken": len(turns),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+def run_simulation(players: int = 2, rounds: int = 3, **kwargs) -> Dict[str, Any]:
+    """Synchronous entry point. Returns the counted report — no invented numbers."""
+    return asyncio.run(CampaignSimulation(players=players, rounds=rounds, **kwargs).run())
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Minimal .env loader so the __main__ runner sees LLM_API/LLM_KEY/LLM_MODEL
+    without requiring python-dotenv."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the agent-driven campaign simulation")
+    parser.add_argument("--players", type=int, default=2)
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--env", default=".env")
+    args = parser.parse_args()
+
+    load_dotenv(args.env)
+    gateway = LLMStreamingGateway(LLMConfig())
+    print(
+        f"[campaign-sim] endpoint={gateway.config.base_url} "
+        f"model={gateway.config.model} "
+        f"mode={'llm' if not gateway.config.is_mock else 'scripted'}",
+    )
+    report = run_simulation(
+        players=args.players,
+        rounds=args.rounds,
+        llm_gateway=gateway,
+    )
+    print(json.dumps(report, indent=2, default=str))
