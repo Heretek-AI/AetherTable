@@ -66,13 +66,16 @@ PYTHONPATH=python python3 -m vtt_orchestrator.compendium.srd_importer
 * **`crates/vtt-core/`**: D&D 5e SRD 5.1 rules, 15 conditions, attack & saving throw resolvers, concentration checks, death save state machine, 4-tier task resolution.
 * **`crates/vtt-spatial/`**: Bresenham LoS raycasting, half/three-quarters/total cover, A* pathfinding.
 * **`crates/vtt-wfc/`**: Wave Function Collapse procedural map & dungeon synthesis.
-* **`crates/vtt-crdt-sync/`**: Real-time Yjs CRDT relay server.
-* **`crates/vtt-scripting/`**: Sandboxed Rhai and Wasmtime (50k fuel cap) execution engines.
-* **`python/vtt_orchestrator/auditor/`**: `PreCommitAuditorAgent` and `DiagnosticRetryController`.
+* **`crates/vtt-crdt-sync/`**: Real-time Yjs CRDT relay server (default transport via HMAC-authenticated upgrade; falls back to the engine LWW relay).
+* **`crates/vtt-scripting/`**: Sandboxed Rhai and Wasmtime execution engines with an absolute 1,000,000-fuel ceiling (`MAX_FUEL_CEILING`; client-requested limits are clamped, never raised) and a max-operation cap on Rhai.
+* **`crates/vtt-server/`**: Actix-Web authoritative gateway: HMAC session tokens + RBAC, `/ws/sessions/{id}/sync` relay, snapshot persistence, and sliding-window rate limits (`ratelimit.rs`: script 10/min, action 120/min, read 600/min).
+* **`python/vtt_orchestrator/auditor/`**: `PreCommitAuditorAgent` and `DiagnosticRetryController` (audits against live engine state before streaming).
+* **`python/vtt_orchestrator/lore/`**: 3-tier epistemic graph (in-memory default, optional Neo4j projection via `NEO4J_ENABLED=1`) & paradox detection.
+* **`python/vtt_orchestrator/agents/`**: Multi-agent DM hierarchy and LLM tool-calling agent (`tool_agent.py`, OpenAI-compatible endpoints via `.env`).
 * **`python/vtt_orchestrator/simulation/`**: `DynastyEngine` (noble houses) & `EmpiricalPlaytester`.
-* **`python/vtt_orchestrator/compendium/`**: `SRDImporter`, `BundlePackager` (`.vttbundle`), `HomebrewParser`.
-* **`client/src/render/`**: `spatial_audio.ts` (3D stereo panners, distance gain), `webrtc_mesh.ts`.
-* **`client/src/components/`**: `AudioMixerModal.tsx` (2D radar), `BundleManagerView.tsx`, `DynastyView.tsx`.
+* **`python/vtt_orchestrator/compendium/`**: `SRDImporter`, `BundlePackager` (`.vttbundle` import/export), `HomebrewParser` (fail-loud).
+* **`client/src/render/`**: `spatial_audio.ts` (HRTF panners, distance gain), `webrtc_mesh.ts` (PeerJS video/voice mesh), `voice_capture.ts` (Silero VAD), `fog_overlay.ts`.
+* **`client/src/components/`**: `AudioMixerModal.tsx` (2D radar), `BundleManagerView.tsx`, `DynastyView.tsx`, `LobbyView.tsx`, `VideoMeshTiles.tsx`.
 
 ---
 
