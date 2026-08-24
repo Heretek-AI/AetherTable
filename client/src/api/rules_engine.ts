@@ -503,6 +503,257 @@ export async function engineHelp(params: {
   );
 }
 
+/* --- Spellbook: live compendium + authoritative cast-spell pipeline -------
+ *
+ * The grimoire list is read from the gateway's SRD compendium
+ * (GET /api/v1/compendium/spells); casting posts through the cast-spell
+ * proxy (POST /api/v1/engine/cast-spell, token Query param) into vtt-core's
+ * slot ledger, upcast ladder and concentration lifecycle. Nothing here
+ * invents spell statistics: fields the compendium does not carry (damage
+ * formula/type, save attribute) are sent as null so the engine — not the
+ * browser — decides every number, and a fetch failure is surfaced as an
+ * empty state rather than a hardcoded spell list.
+ */
+
+/** Verbatim shape of one record from GET /api/v1/compendium/spells. */
+export interface EngineCompendiumSpell {
+  id: string;
+  name: string;
+  level: number;
+  school: string;
+  casting_time: string;
+  range: string;
+  components: string;
+  material_components_costly?: boolean;
+  duration: string;
+  concentration?: boolean;
+  ritual?: boolean;
+  classes?: string[];
+  description?: string;
+  /** The SRD's own "At Higher Levels" text; empty string when none. */
+  upcast?: string;
+}
+
+/**
+ * GET the SRD spell compendium through the orchestrator. Returns null when
+ * the gateway is unreachable or answers non-OK — callers must render an
+ * honest empty state instead of substituting local data.
+ */
+export async function fetchCompendiumSpells(
+  limit = 400,
+): Promise<{ total: number; spells: EngineCompendiumSpell[] } | null> {
+  try {
+    const resp = await fetch(`/api/v1/compendium/spells?limit=${limit}`);
+    if (!resp.ok) return null;
+    const payload = (await resp.json()) as {
+      total?: number;
+      spells?: EngineCompendiumSpell[];
+    };
+    if (!Array.isArray(payload.spells)) return null;
+    return { total: payload.total ?? payload.spells.length, spells: payload.spells };
+  } catch {
+    console.warn('Compendium unreachable; spellbook has nothing to show.');
+    return null;
+  }
+}
+
+/** Verbatim mirror of vtt_core::rules::SpellDefinition (all fields required
+ * by its serde derive — omitting any makes the engine reject with a 422). */
+export interface EngineSpellDefinition {
+  spell_id: string;
+  name: string;
+  level: number;
+  school: string;
+  casting_time: string;
+  range_feet: number;
+  area_of_effect_shape: null;
+  area_of_effect_size_feet: null;
+  verbal_component: boolean;
+  somatic_component: boolean;
+  material_component_desc: string | null;
+  save_attribute: null;
+  damage_formula: string | null;
+  damage_type: string | null;
+  duration_rounds: number;
+  is_concentration: boolean;
+  is_ritual: boolean;
+}
+
+/**
+ * Map a LIVE compendium record onto the engine's SpellDefinition. Every value
+ * is derived from the fetched record itself:
+ *   - `range_feet` is the first integer in the compendium `range` string,
+ *     0 when it is non-numeric ("Self", "Touch") — the engine requires the
+ *     field but never enforces it, so this is display metadata only.
+ *   - V/S components come from the components string; a parenthetical after
+ *     "M" becomes material_component_desc.
+ *   - Fields the SRD fixture genuinely lacks (save attribute, damage formula
+ *     and type) stay null: the engine then resolves the cast honestly as a
+ *     zero-damage slot expenditure rather than the client guessing dice.
+ *   - `duration_rounds` stays 0 — the compendium stores prose durations
+ *     ("Concentration, up to 1 minute") that cannot be converted without
+ *     inventing a ruling.
+ */
+export function compendiumSpellToEngineDefinition(
+  spell: EngineCompendiumSpell,
+): EngineSpellDefinition {
+  const rangeMatch = /(\d+)/.exec(spell.range ?? '');
+  const comps = spell.components ?? '';
+  const materialDesc = /\bM\b\s*\(([^)]*)\)/.exec(comps);
+  return {
+    spell_id: spell.id,
+    name: spell.name,
+    level: spell.level,
+    school: spell.school,
+    casting_time: spell.casting_time,
+    range_feet: rangeMatch ? parseInt(rangeMatch[1], 10) : 0,
+    area_of_effect_shape: null,
+    area_of_effect_size_feet: null,
+    verbal_component: /\bV\b/.test(comps),
+    somatic_component: /\bS\b/.test(comps),
+    material_component_desc: materialDesc ? materialDesc[1] : null,
+    save_attribute: null,
+    damage_formula: null,
+    damage_type: null,
+    duration_rounds: 0,
+    is_concentration: spell.concentration === true,
+    is_ritual: spell.ritual === true,
+  };
+}
+
+/** Verbatim body of vtt-core's CastSpellResult, unwrapped from the gateway's
+ * `{result, target_was_present}` envelope. Quoted verbatim in the UI. */
+export interface EngineCastSpellOutcome {
+  caster_id: string;
+  target_id: string | null;
+  spell_id: string;
+  /** The slot the ladder actually spent (exact level first, then upward). */
+  slot_level_used: number;
+  damage_total: number;
+  target_hp_remaining: number | null;
+  concentration_started: boolean;
+  counterspelled: boolean;
+}
+
+/**
+ * Cast through the authoritative pipeline. The engine spends the slot itself,
+ * walks the upcast ladder, starts/replaces concentration and applies damage;
+ * refusals arrive as machine codes inside SPELL_REJECTED (NO_SPELL_SLOTS,
+ * INVALID_SLOT_LEVEL, COMPONENT_UNAVAILABLE_VERBAL, CASTER_NOT_FOUND, …).
+ */
+export async function engineCastSpell(params: {
+  sessionId: string;
+  casterId: string;
+  targetId?: string;
+  spell: EngineSpellDefinition;
+  castLevel: number;
+}): Promise<EngineActionOutcome<EngineCastSpellOutcome>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  const outcome = await engineActionPost<{
+    result?: EngineCastSpellOutcome;
+    target_was_present?: boolean;
+  }>(
+    `/api/v1/engine/cast-spell?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      caster_id: params.casterId,
+      target_id: params.targetId,
+      spell: params.spell,
+      cast_level: Math.max(0, Math.min(9, Math.floor(params.castLevel))),
+    },
+  );
+  if (outcome.kind !== 'applied') return outcome;
+  const envelope: { result?: EngineCastSpellOutcome } | null = outcome.data;
+  if (!envelope || typeof envelope !== 'object' || !envelope.result) {
+    // A 2xx without the documented envelope is a gateway contract break —
+    // surfaced as such rather than guessed into a fake success.
+    return {
+      kind: 'rejected',
+      status: 502,
+      code: 'MALFORMED_CAST_RESPONSE',
+      message: 'cast-spell proxy answered without a result payload',
+    };
+  }
+  return { kind: 'applied', data: envelope.result };
+}
+
+/** One projected session entity as the Spellbook may see it. Slot ledger and
+ * concentration are present ONLY when the role projection shows this caller
+ * their own sheet (or they view as GM/admin) — absence means unverified, not
+ * zero, and callers must not treat it as either. */
+export interface EngineSpellbookEntity {
+  id: string;
+  name?: string;
+  is_player: boolean;
+  is_dead?: boolean;
+  current_hp?: number;
+  /** Spell-slot level -> remaining count, when the projection exposes it. */
+  spell_slots_remaining?: Record<string, number>;
+  /** Active concentration ({spell_id, started_round}) when present. */
+  concentration?: { spell_id?: string; started_round?: number } | null;
+}
+
+function toSpellbookEntity(key: string, e: Record<string, unknown>): EngineSpellbookEntity {
+  const rawSlots = e.spell_slots_remaining;
+  let slots: Record<string, number> | undefined;
+  if (rawSlots && typeof rawSlots === 'object') {
+    slots = {};
+    for (const [level, count] of Object.entries(rawSlots as Record<string, unknown>)) {
+      if (typeof count === 'number') slots[level] = count;
+    }
+  }
+  const rawConc = e.concentration;
+  return {
+    id: typeof e.id === 'string' ? e.id : key,
+    name: typeof e.name === 'string' ? e.name : undefined,
+    is_player: e.is_player === true,
+    is_dead: e.is_dead === true,
+    current_hp: typeof e.current_hp === 'number' ? e.current_hp : undefined,
+    spell_slots_remaining: slots,
+    concentration:
+      rawConc && typeof rawConc === 'object'
+        ? {
+            spell_id:
+              typeof (rawConc as Record<string, unknown>).spell_id === 'string'
+                ? ((rawConc as Record<string, unknown>).spell_id as string)
+                : undefined,
+            started_round:
+              typeof (rawConc as Record<string, unknown>).started_round === 'number'
+                ? ((rawConc as Record<string, unknown>).started_round as number)
+                : undefined,
+          }
+        : undefined,
+  };
+}
+
+/**
+ * Pull the full projected roster for caster/target picking plus the caster's
+ * own sheet (slots + concentration). Uses the existing authenticated
+ * session-state read proxy; the projection decides what this caller sees.
+ */
+export async function engineSessionRoster(
+  sessionId: string,
+): Promise<EngineActionOutcome<EngineSpellbookEntity[]>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  const outcome = await engineActionPost<{
+    entities?: Record<string, Record<string, unknown>>;
+  }>(`/api/v1/engine/session-state?token=${encodeURIComponent(token)}`, {
+    session_id: sessionId,
+  });
+  if (outcome.kind === 'applied') {
+    const map = outcome.data.entities ?? {};
+    return {
+      kind: 'applied',
+      data: Object.entries(map)
+        .filter(([, e]) => e && typeof e === 'object')
+        .map(([key, e]) => toSpellbookEntity(key, e)),
+    };
+  }
+  return outcome;
+}
+
 /**
  * Read the caller-projected entity roster for a session through the gateway's
  * read proxy. Hidden entities are filtered out for players by the projection
