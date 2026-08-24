@@ -51,14 +51,16 @@ async fn test_app() -> impl Service<
         secret: Arc::new(TEST_SECRET.to_string()),
     });
     let state = actix_web::web::Data::new(vtt_server::AppState::new());
+    // Rate-limit behavior has its own dedicated suite (tests/rate_limiting.rs).
+    // These mechanic tests burst far past realistic per-IP play rates (seed
+    // scans of 200+ attacks), so they run against the exact same route set but
+    // with quotas raised out of the way.
+    let limits = vtt_server::RateLimits::explicit(1_000_000, 1_000_000, 1_000_000);
     test::init_service(
         App::new()
             .wrap(AuthMiddleware { verifier })
             .app_data(state)
-            .route("/health", actix_web::web::get().to(|| async {
-                actix_web::HttpResponse::Ok().finish()
-            }))
-            .configure(vtt_server::configure_app),
+            .configure(move |cfg| vtt_server::configure_app_with(cfg, &limits)),
     )
     .await
 }

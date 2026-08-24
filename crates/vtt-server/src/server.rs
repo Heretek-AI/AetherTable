@@ -2225,41 +2225,101 @@ async fn room_presence(data: web::Data<AppState>, path: web::Path<String>) -> im
 
 // --- App assembly ------------------------------------------------------------
 
-/// Registers all routes. Shared between `main` and the integration tests so
-/// tests exercise exactly the production configuration.
+/// Registers all routes with env-tuned rate limits (`VTT_SCRIPT_RATE`,
+/// `VTT_ACTION_RATE`, `VTT_READ_RATE`). Shared between `main` and integration
+/// tests so tests exercise exactly the production route set.
 pub fn configure_app(cfg: &mut web::ServiceConfig) {
+    let limits = crate::ratelimit::RateLimits::from_env();
+    configure_app_with(cfg, &limits);
+}
+
+/// Route registration with EXPLICIT quotas — dependency-injected variant used
+/// by tests to pin deterministic limits (see `tests/rate_limiting.rs`).
+///
+/// Bucket topology (all per client IP, 60 s sliding windows):
+/// - `/health`, `/metrics`, `/ws/sessions/{id}/sync`: UNMETERED (ops probes
+///   and the sync channel must never throttle).
+/// - `/api/v1` outer scope: generous READ bucket — safety net over everything,
+///   including read-only `/rooms/{id}/presence`.
+/// - `/api/v1/scripts/*`: strict SCRIPT bucket — wasm compile / Rhai
+///   evaluation run attacker-controlled programs, so that work is metered.
+/// - Mutation/compute subtrees (`/actions`, `/spatial`, `/maps`,
+///   `/sessions/{id}`): moderate ACTION bucket. The session snapshot GET lives
+///   inside the action bucket by construction (same URL prefix as the
+///   mutations); polling one table faster than ~2 req/s per IP is not a
+///   legitimate pattern.
+pub fn configure_app_with(
+    cfg: &mut web::ServiceConfig,
+    limits: &crate::ratelimit::RateLimits,
+) {
+    use crate::ratelimit::{Bucket, RateLimit, RateLimitFilter};
+
+    let wrap = |bucket| RateLimitFilter::new(RateLimit::new(limits, bucket));
+    let read = wrap(Bucket::Read);
+    // One shared store per bucket: clones of a filter count against the SAME
+    // per-IP window, so /actions/check and /spatial/los share the moderate
+    // budget rather than each getting their own.
+    let action = || wrap(Bucket::Action);
+    let script = wrap(Bucket::Script);
+
     cfg.route("/health", web::get().to(health_check))
         .route("/metrics", web::get().to(get_metrics))
         .route("/ws/sessions/{id}/sync", web::get().to(ws_sync))
         .service(
-        web::scope("/api/v1")
-            .route("/sessions", web::post().to(create_session))
-            .route("/sessions/{id}", web::get().to(get_session))
-            .route("/sessions/{id}/restore", web::put().to(restore_session))
-            .route("/sessions/{id}/entities", web::post().to(add_entity))
-            .route("/sessions/{id}/entities/{eid}", web::delete().to(remove_entity))
-            .route("/sessions/{id}/map", web::put().to(set_session_map))
-            .route("/sessions/{id}/action/attack", web::post().to(resolve_attack))
-            .route("/sessions/{id}/action/cast-spell", web::post().to(resolve_cast_spell))
-            .route("/sessions/{id}/move", web::post().to(move_entity))
-            .route("/sessions/{id}/reactions/arm", web::post().to(arm_reaction))
-            .route("/sessions/{id}/turn/next", web::post().to(next_turn))
-            .route("/sessions/{id}/action/death-save", web::post().to(resolve_death_save))
-            .route("/sessions/{id}/damage", web::post().to(apply_damage))
-            .route("/sessions/{id}/heal", web::post().to(heal_entity))
-            .route("/sessions/{id}/rest", web::post().to(take_rest))
-            .route("/sessions/{id}/safety/x-card", web::post().to(trigger_safety_rewind))
-            .route("/ws/sessions/{id}/sync", web::get().to(ws_sync))
-            .route("/rooms/{id}/presence", web::get().to(room_presence))
-            .route("/actions/check", web::post().to(resolve_check))
-            .route("/actions/save", web::post().to(resolve_save))
-            .route("/actions/concentration", web::post().to(resolve_concentration))
-            .route("/spatial/los", web::post().to(compute_los))
-            .route("/spatial/path", web::post().to(compute_path))
-            .route("/maps/generate", web::post().to(generate_wfc_map))
-            .route("/scripts/wasm", web::post().to(execute_wasm_script))
-            .route("/scripts/rhai", web::post().to(execute_rhai_script)),
-    );
+            web::scope("/api/v1")
+                .wrap(read)
+                // Session creation is cheap + GM-gated; rides the read net.
+                .route("/sessions", web::post().to(create_session))
+                .service(
+                    web::scope("/scripts")
+                        .wrap(script)
+                        .route("/wasm", web::post().to(execute_wasm_script))
+                        .route("/rhai", web::post().to(execute_rhai_script)),
+                )
+                .service(
+                    web::scope("/actions")
+                        .wrap(action())
+                        .route("/check", web::post().to(resolve_check))
+                        .route("/save", web::post().to(resolve_save))
+                        .route("/concentration", web::post().to(resolve_concentration)),
+                )
+                .service(
+                    web::scope("/spatial")
+                        .wrap(action())
+                        .route("/los", web::post().to(compute_los))
+                        .route("/path", web::post().to(compute_path)),
+                )
+                .service(
+                    web::scope("/maps")
+                        .wrap(action())
+                        .route("/generate", web::post().to(generate_wfc_map)),
+                )
+                // Presence is a pure read: only the generous outer bucket.
+                .service(
+                    web::scope("/rooms")
+                        .route("/{id}/presence", web::get().to(room_presence)),
+                )
+                .service(
+                    web::scope("/sessions/{id}")
+                        .wrap(action())
+                        .route("", web::get().to(get_session))
+                        .route("/restore", web::put().to(restore_session))
+                        .route("/entities", web::post().to(add_entity))
+                        .route("/entities/{eid}", web::delete().to(remove_entity))
+                        .route("/map", web::put().to(set_session_map))
+                        .route("/action/attack", web::post().to(resolve_attack))
+                        .route("/action/cast-spell", web::post().to(resolve_cast_spell))
+                        .route("/move", web::post().to(move_entity))
+                        .route("/reactions/arm", web::post().to(arm_reaction))
+                        .route("/turn/next", web::post().to(next_turn))
+                        .route("/action/death-save", web::post().to(resolve_death_save))
+                        .route("/damage", web::post().to(apply_damage))
+                        .route("/heal", web::post().to(heal_entity))
+                        .route("/rest", web::post().to(take_rest))
+                        .route("/safety/x-card", web::post().to(trigger_safety_rewind))
+                        .route("/sync", web::get().to(ws_sync)),
+                ),
+        );
 }
 
 /// Strict origin policy: only origins listed in VTT_ALLOWED_ORIGINS may call
