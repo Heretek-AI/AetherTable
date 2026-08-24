@@ -10,6 +10,77 @@ from ..schemas.models import (
 )
 from ..lore.epistemic_graph import EpistemicLoreGraphManager
 
+# Natural-language predicates mapped to canon-graph relations. Used to derive
+# (subject, predicate, object) triples from the narrative itself so lore
+# continuity is checked even when no tool supplies them explicitly.
+_PREDICATE_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(?:possess\w*|wield\w*|carri\w*|hold\w*|own\w*)\b", re.IGNORECASE), "POSSESSES"),
+    (re.compile(r"\b(?:rules?|ruled|reign\w*|govern\w*)\b", re.IGNORECASE), "RULES"),
+    (re.compile(r"\b(?:attacks?|strikes?|slay\w*|fight\w*|murder\w*)\b", re.IGNORECASE), "ATTACKS"),
+    (re.compile(r"\bspeaks? with\b|\btalks? to\b|\bconverses? with\b", re.IGNORECASE), "SPEAKS_WITH"),
+    (re.compile(r"\bis alive\b|\bstill lives\b|\bwalks the earth\b", re.IGNORECASE), "IS_ALIVE"),
+    (re.compile(r"\bis intact\b|\bstill stands\b", re.IGNORECASE), "IS_INTACT"),
+    (re.compile(r"\bhouses? (?:a )?garrison\b", re.IGNORECASE), "HOUSES_GARRISON"),
+]
+
+# How far on either side of a predicate verb a known entity name may appear.
+_LORE_WINDOW_CHARS = 60
+
+
+def _extract_lore_triples(
+    proposed_narrative: str,
+    lore_graph: EpistemicLoreGraphManager,
+    engine_execution_payload: Dict[str, Any],
+) -> List[Tuple[str, str, str]]:
+    """Derives candidate (subject, predicate, object) triples from a draft.
+
+    Known canon node names are matched positionally against the narrative;
+    each predicate verb pairs its nearest preceding and following known
+    entities. Explicitly payload-supplied triples still take precedence.
+    """
+    explicit = (
+        engine_execution_payload.get("lore_subject_id"),
+        engine_execution_payload.get("lore_predicate"),
+        engine_execution_payload.get("lore_object_id"),
+    )
+    if all(explicit):
+        return [(explicit[0], explicit[1], explicit[2])]
+
+    lowered = proposed_narrative.lower()
+    mentions: List[Tuple[int, int, str]] = []  # (start, end, node_id)
+    for node in lore_graph.nodes.values():
+        name = node.get("name")
+        if not name:
+            continue
+        start = 0
+        while True:
+            idx = lowered.find(name.lower(), start)
+            if idx < 0:
+                break
+            mentions.append((idx, idx + len(name), node["id"]))
+            start = idx + len(name)
+
+    triples: List[Tuple[str, str, str]] = []
+    # Relations that can be asserted about one entity alone ("Oakhaven Keep
+    # still stands") pair the subject with itself.
+    _REFLEXIVE = {"IS_ALIVE", "IS_INTACT"}
+    for pattern, relation in _PREDICATE_PATTERNS:
+        for match in pattern.finditer(proposed_narrative):
+            before = [m for m in mentions if m[1] <= match.start()]
+            after = [m for m in mentions if m[0] >= match.end()]
+            if not before or (not after and relation not in _REFLEXIVE):
+                continue
+            subj = max(before, key=lambda m: m[1])
+            obj = min(after, key=lambda m: m[0]) if after else subj
+            if match.start() - subj[1] > _LORE_WINDOW_CHARS:
+                continue
+            if after and obj[0] - match.end() > _LORE_WINDOW_CHARS:
+                continue
+            if subj[2] == obj[2] and relation not in _REFLEXIVE:
+                continue
+            triples.append((subj[2], relation, obj[2]))
+    return triples
+
 
 class PreCommitAuditorAgent:
     """
@@ -82,12 +153,12 @@ class PreCommitAuditorAgent:
                     ))
                     break
 
-        # Vector 4: Lore & Temporal Continuity
-        subject_id = engine_execution_payload.get("lore_subject_id")
-        predicate = engine_execution_payload.get("lore_predicate")
-        object_id = engine_execution_payload.get("lore_object_id")
-
-        if subject_id and predicate and object_id:
+        # Vector 4: Lore & Temporal Continuity — triples are derived from the
+        # narrative itself (known canon entities + predicate verbs), with
+        # payload-supplied triples still honored as an override.
+        for subject_id, predicate, object_id in _extract_lore_triples(
+            proposed_narrative, self.lore_graph, engine_execution_payload
+        ):
             passed, reason, _ = self.lore_graph.query_paradox(subject_id, predicate, object_id)
             if not passed:
                 failures.append(ValidationFailure(
@@ -98,6 +169,7 @@ class PreCommitAuditorAgent:
                     diagnostic_message=reason,
                     corrective_constraint="Revise lore assertions to avoid contradicting existing canonical timeline."
                 ))
+                break
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 

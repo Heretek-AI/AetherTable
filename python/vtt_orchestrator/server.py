@@ -120,6 +120,11 @@ class NarrativeGenerateRequest(BaseModel):
     previous_entity_count: int = 4
     ingress_count: int = 0
     egress_count: int = 0
+    # When provided, the auditor reconciles the client's claims against LIVE
+    # engine state (entity counts, target HP/consciousness) instead of
+    # trusting this payload — see _engine_ground_truth.
+    engine_session_id: Optional[str] = None
+    target_entity_id: Optional[str] = None
 
 
 def extract_srd_context(text: str, limit: int = 2) -> List[Dict[str, Any]]:
@@ -201,6 +206,7 @@ class DynastyInjectRequest(BaseModel):
 
 class HomebrewParseRequest(BaseModel):
     markdown_text: str
+    strict: bool = False
 
 
 class CampaignExportBundleRequest(BaseModel):
@@ -290,6 +296,36 @@ def _caller_actor(token: str) -> Dict[str, str]:
     if payload is None:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
     return {"user_id": payload["user_id"], "role": payload.get("role", "player")}
+
+
+async def _engine_ground_truth(session_id: str) -> Dict[str, Any]:
+    """Fetches LIVE session state from the authoritative engine.
+
+    The Pre-Commit Auditor must reconcile client claims against this — never
+    audit numbers the client asserts alone. Raises EngineUnavailableError on
+    an unreachable engine; callers refuse to audit rather than fall back to
+    stale client claims.
+    """
+    raw = await engine_client.engine_request(
+        "GET", f"/api/v1/sessions/{engine_client._coerce_uuid(session_id)}"
+    )
+    entities = raw.get("entities", {})
+    return {"entity_count": len(entities), "entities": entities}
+
+
+def _live_target_state(
+    ground: Dict[str, Any], target_entity_id: str
+) -> Optional[Dict[str, Any]]:
+    """Extracts the auditor's lethality fields for one entity from live state."""
+    wanted = engine_client._coerce_uuid(target_entity_id)
+    for eid, entity in ground["entities"].items():
+        if eid == wanted or str(entity.get("name", "")).lower() == target_entity_id.lower():
+            return {
+                "target_hp_remaining": entity.get("current_hp", 0),
+                "target_is_conscious": entity.get("is_conscious", True),
+                "target_is_dead": entity.get("is_dead", False),
+            }
+    return None
 
 
 def _auth_response(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -1332,23 +1368,70 @@ def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/api/v1/homebrew/parse-markdown")
 def parse_homebrew_markdown(req: HomebrewParseRequest):
-    return global_homebrew_parser.parse_statblock(req.markdown_text)
+    parsed = global_homebrew_parser.parse_statblock(req.markdown_text)
+    if req.strict and not parsed["parse_ok"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unparseable statblock, missing core fields: {parsed['warnings']}",
+        )
+    return parsed
+
+
+async def _resolve_audit_inputs(req: NarrativeGenerateRequest) -> tuple[Dict[str, Any], int, int]:
+    """Reconciles the request against LIVE engine state when a session is named.
+
+    Returns (audited_payload, active_entity_count, previous_entity_count).
+    Without engine_session_id the client-supplied values pass through
+    unchanged (legacy/demo behavior). With one, the world inspector trusts
+    the engine: lethality fields come from the live entity, entity counts
+    come from the live snapshot, and a named-but-missing target is rejected
+    as a ghost entity.
+    """
+    if not req.engine_session_id:
+        return req.engine_execution_payload, req.active_entity_count, req.previous_entity_count
+
+    try:
+        ground = await _engine_ground_truth(req.engine_session_id)
+    except engine_client.EngineUnavailableError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "WORLD_INSPECTOR_UNAVAILABLE: engine unreachable — refusing to "
+                f"audit client-supplied claims ({exc})"
+            ),
+        )
+
+    audited_payload = dict(req.engine_execution_payload)
+    if req.target_entity_id:
+        target_state = _live_target_state(ground, req.target_entity_id)
+        if target_state is None:
+            raise HTTPException(
+                status_code=409,
+                detail="GHOST_ENTITY: named target does not exist in the live session",
+            )
+        audited_payload.update(target_state)
+
+    # Conservation is evaluated against the authoritative snapshot: the live
+    # entity count is the truth for both sides of the ledger equation.
+    return audited_payload, ground["entity_count"], ground["entity_count"]
 
 
 @app.post("/api/v1/narrative/generate")
 @app.post("/api/v1/orchestrator/turn")
-def execute_orchestrator_turn(req: NarrativeGenerateRequest):
+async def execute_orchestrator_turn(req: NarrativeGenerateRequest):
+    audited_payload, active_count, previous_count = await _resolve_audit_inputs(req)
+
     def dm_draft(ctx=None):
-        return dm_agent.generate_combat_draft(req.user_intent, req.engine_execution_payload, ctx)
+        return dm_agent.generate_combat_draft(req.user_intent, audited_payload, ctx)
 
     return retry_controller.run_turn_cycle(
         user_intent=req.user_intent,
         turn_index=req.turn_index,
         entity_id=req.entity_id,
-        engine_execution_payload=req.engine_execution_payload,
+        engine_execution_payload=audited_payload,
         dm_draft_generator=dm_draft,
-        active_entity_count=req.active_entity_count,
-        previous_entity_count=req.previous_entity_count,
+        active_entity_count=active_count,
+        previous_entity_count=previous_count,
         ingress_count=req.ingress_count,
         egress_count=req.egress_count,
     )
@@ -1357,75 +1440,93 @@ def execute_orchestrator_turn(req: NarrativeGenerateRequest):
 @app.post("/api/v1/narrative/stream")
 @app.post("/api/v1/orchestrator/narrative/stream")
 async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
+    # Ground-truth reconciliation happens BEFORE any token is emitted: when a
+    # session is named, the stream must be reachable and audited against live
+    # engine state, never the client's claims.
+    audited_payload, active_count, previous_count = await _resolve_audit_inputs(req)
+
     # Ground the narration in SRD 5.2 stat blocks whenever the player's
     # action names a known monster or spell.
     srd_facts = extract_srd_context(req.user_intent)
     raw_generator = streaming_gateway.stream_narrative(
         user_intent=req.user_intent,
-        engine_payload=req.engine_execution_payload,
+        engine_payload=audited_payload,
         context={"srd": srd_facts},
     )
 
     async def audited_stream():
         """Pre-commit invariant interception ON the streaming path.
 
-        Tokens are forwarded as they arrive, but completed sentences are
-        audited against the live engine payload. A genuine invariant
+        Tokens are HELD until the sentence they belong to has passed the
+        auditor — nothing reaches the client unaudited. A genuine invariant
         violation (e.g. narrated death of a still-breathing target) emits a
-        corrective system event and CUTS the stream — unaudited continuation
-        never reaches the client.
+        corrective system event and CUTS the stream; unaudited continuation
+        is never forwarded.
         """
         import json as _json
 
-        buffer = ""
+        pending = ""
 
         def audit(sentence: str) -> list:
             verdict = auditor.audit_proposal(
                 turn_index=req.turn_index,
                 entity_id=req.entity_id,
                 proposed_narrative=sentence,
-                engine_execution_payload=req.engine_execution_payload,
-                active_entity_count=req.active_entity_count,
-                previous_entity_count=req.previous_entity_count,
+                engine_execution_payload=audited_payload,
+                active_entity_count=active_count,
+                previous_entity_count=previous_count,
                 ingress_verified_count=req.ingress_count,
                 egress_verified_count=req.egress_count,
             )
             return list(verdict.failures)
 
+        def halt_frames(corrective: str):
+            yield "data: " + _json.dumps({
+                "token": f" [SYSTEM: narrative halted by Pre-Commit Auditor — {corrective}]",
+                "done": False,
+            }) + "\n\n"
+            yield "data: " + _json.dumps({"token": "", "done": True}) + "\n\n"
+
         async for chunk in raw_generator:
-            yield chunk
+            if not chunk.startswith("data: "):
+                continue
+            try:
+                frame = _json.loads(chunk[len("data: "):])
+            except (ValueError, TypeError):
+                continue
+            if frame.get("done"):
+                break
+            pending += frame.get("token", "")
 
-            # Extract the token text from the SSE frame to build the buffer.
-            if chunk.startswith("data: "):
-                try:
-                    frame = _json.loads(chunk[len("data: "):])
-                    buffer += frame.get("token", "")
-                except (ValueError, TypeError):
-                    pass
-
-            # Audit at sentence boundaries (oldest complete sentence first).
+            # Audit each completed sentence BEFORE releasing it.
             while True:
-                match = _SENTENCE_END_RE.search(buffer)
-                if match is None or match.end() >= len(buffer):
-                    # No fully-terminated sentence pending audit.
+                match = _SENTENCE_END_RE.search(pending)
+                if match is None:
                     break
-                sentence = buffer[:match.end()]
+                sentence = pending[:match.end()]
                 failures = audit(sentence)
                 if failures:
                     corrective = "; ".join(f.corrective_constraint for f in failures)
-                    payload = _json.dumps({
-                        "token": f" [SYSTEM: narrative halted by Pre-Commit Auditor — {corrective}]",
-                        "done": False,
-                    })
-                    yield f"data: {payload}\n\n"
-                    yield f"data: {_json.dumps({'token': '', 'done': True})}\n\n"
+                    for out in halt_frames(corrective):
+                        yield out
                     return
-                buffer = buffer[match.end():]
+                yield "data: " + _json.dumps({
+                    "token": sentence,
+                    "done": False,
+                }) + "\n\n"
+                pending = pending[match.end():]
 
-        # Final audit on any trailing fragment.
-        if buffer.strip():
-            if audit(buffer):
-                yield 'data: {"token": "", "done": true, "auditor_violation": true}\n\n'
+        # Final audit on the trailing (unterminated) fragment.
+        if pending.strip():
+            failures = audit(pending)
+            if failures:
+                corrective = "; ".join(f.corrective_constraint for f in failures)
+                for out in halt_frames(corrective):
+                    yield out
+                return
+            yield "data: " + _json.dumps({"token": pending, "done": False}) + "\n\n"
+
+        yield "data: " + _json.dumps({"token": "", "done": True}) + "\n\n"
 
     return StreamingResponse(
         audited_stream(),
