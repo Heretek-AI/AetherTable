@@ -1,111 +1,123 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   Swords,
-  Shield,
   Skull,
   Users,
   Plus,
   Trash2,
   Play,
-  CheckCircle,
   AlertTriangle,
-  Flame,
-  Zap,
   Sparkles,
   Search,
-  Filter,
-  ArrowRight,
   TrendingUp,
+  RefreshCw,
 } from 'lucide-react';
-import { Token } from './TacticalCanvas';
-
-interface MonsterRosterItem {
-  id: string;
-  name: string;
-  cr: string;
-  xp: number;
-  hp: number;
-  ac: number;
-  count: number;
-  color: string;
-  avatarIconType: string;
-}
+import {
+  ensureEngineSession,
+  engineSessionEntities,
+  type EngineActionOutcome,
+} from '../api/rules_engine';
+import {
+  fetchCompendiumMonsters,
+  spawnMonsterToEngine,
+  crToXp,
+  partyThresholds,
+  encounterMultiplier,
+  parsePrimarySpeedFeet,
+  type CompendiumMonster,
+} from '../api/encounter_store';
 
 interface EncounterBuilderViewProps {
-  onLaunchEncounter: (monsters: Omit<Token, 'id' | 'x' | 'y'>[], customPositions?: { x: number; y: number }[]) => void;
+  /**
+   * Legacy callback retained only so App.tsx keeps compiling. The builder no
+   * longer fabricates local board tokens: spawning goes exclusively through
+   * the authoritative engine proxy, and spawned entities appear on the table
+   * via the existing session-state snapshot polling. This prop is NOT called.
+   */
+  onLaunchEncounter?: unknown;
+  /**
+   * Current authoritative engine session id (same pattern as CharacterSheet's
+   * maneuverSessionId: an explicit prop wins, otherwise the builder lazily
+   * reuses/creates this client's session via ensureEngineSession()).
+   */
+  engineSessionId?: string | null;
 }
 
-// D&D 5e SRD XP Thresholds by Character Level [Easy, Medium, Hard, Deadly]
-const XP_THRESHOLDS_BY_LEVEL: Record<number, [number, number, number, number]> = {
-  1: [25, 50, 75, 100],
-  2: [50, 100, 150, 200],
-  3: [75, 150, 225, 400],
-  4: [125, 250, 375, 500],
-  5: [250, 500, 750, 1100],
-  6: [300, 600, 900, 1400],
-  7: [350, 750, 1100, 1700],
-  8: [450, 900, 1400, 2100],
-  9: [550, 1100, 1600, 2400],
-  10: [600, 1200, 1900, 2800],
-  11: [800, 1600, 2400, 3600],
-  12: [1000, 2000, 3000, 4500],
-  13: [1100, 2200, 3400, 5100],
-  14: [1250, 2500, 3800, 5700],
-  15: [1400, 2800, 4300, 6400],
-  16: [1600, 3200, 4800, 7200],
-  17: [2000, 3900, 5900, 8800],
-  18: [2100, 4200, 6300, 9500],
-  19: [2400, 4900, 7300, 10900],
-  20: [2800, 5700, 8500, 12700],
-};
+/** One roster line: a real compendium stat block plus how many to spawn. */
+interface RosterEntry {
+  monster: CompendiumMonster;
+  count: number;
+}
 
-const COMPENDIUM_MONSTER_PRESETS: Omit<MonsterRosterItem, 'count'>[] = [
-  { id: 'orc_warlord', name: 'Orc Warlord', cr: '4', xp: 1100, hp: 58, ac: 16, color: '#dc2626', avatarIconType: 'boss' },
-  { id: 'goblin_scout', name: 'Goblin Scout', cr: '1/4', xp: 50, hp: 12, ac: 14, color: '#f59e0b', avatarIconType: 'scout' },
-  { id: 'shadow_drake', name: 'Shadow Drake', cr: '3', xp: 700, hp: 45, ac: 15, color: '#8b5cf6', avatarIconType: 'boss' },
-  { id: 'iron_golem', name: 'Iron Golem Sentry', cr: '5', xp: 1800, hp: 90, ac: 18, color: '#64748b', avatarIconType: 'boss' },
-  { id: 'cult_fanatic', name: 'Cult Fanatic', cr: '2', xp: 450, hp: 33, ac: 13, color: '#9333ea', avatarIconType: 'caster' },
-  { id: 'skeleton_archer', name: 'Skeleton Archer', cr: '1/4', xp: 50, hp: 13, ac: 13, color: '#cbd5e1', avatarIconType: 'scout' },
-  { id: 'young_red_dragon', name: 'Young Red Dragon', cr: '10', xp: 5900, hp: 178, ac: 18, color: '#b91c1c', avatarIconType: 'boss' },
-  { id: 'ogre_berserker', name: 'Ogre Berserker', cr: '2', xp: 450, hp: 59, ac: 11, color: '#ea580c', avatarIconType: 'fighter' },
-];
+type SpawnRowOutcome =
+  | { kind: 'applied'; label: string; entityId?: string }
+  | { kind: 'rejected'; label: string; status: number; code: string | null; message: string | null };
 
-export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLaunchEncounter }) => {
+export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ engineSessionId }) => {
+  /* --- Live compendium state -------------------------------------------- */
+  const [monsters, setMonsters] = useState<CompendiumMonster[]>([]);
+  const [compendiumLoading, setCompendiumLoading] = useState(true);
+  const [compendiumError, setCompendiumError] = useState<string | null>(null);
+
+  const loadCompendium = useCallback(async () => {
+    setCompendiumLoading(true);
+    setCompendiumError(null);
+    const result = await fetchCompendiumMonsters();
+    if (result.kind === 'ok') {
+      setMonsters(result.monsters);
+    } else {
+      setMonsters([]);
+      setCompendiumError(result.message);
+    }
+    setCompendiumLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void loadCompendium();
+  }, [loadCompendium]);
+
+  /* --- Encounter assembly (session-scoped in memory ONLY — there is no
+   *     encounter-save endpoint server-side, so nothing here is persisted) --- */
   const [partySize, setPartySize] = useState<number>(4);
   const [partyLevel, setPartyLevel] = useState<number>(5);
-  const [roster, setRoster] = useState<MonsterRosterItem[]>([
-    { id: 'orc_warlord', name: 'Orc Warlord', cr: '4', xp: 1100, hp: 58, ac: 16, count: 1, color: '#dc2626', avatarIconType: 'boss' },
-    { id: 'goblin_scout', name: 'Goblin Scout', cr: '1/4', xp: 50, hp: 12, ac: 14, count: 2, color: '#f59e0b', avatarIconType: 'scout' },
-  ]);
+  const [roster, setRoster] = useState<RosterEntry[]>([]);
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [encounterLaunched, setEncounterLaunched] = useState<boolean>(false);
 
-  // Calculate Party Thresholds
-  const thresholds = useMemo(() => {
-    const base = XP_THRESHOLDS_BY_LEVEL[partyLevel] || XP_THRESHOLDS_BY_LEVEL[5];
-    return {
-      easy: base[0] * partySize,
-      medium: base[1] * partySize,
-      hard: base[2] * partySize,
-      deadly: base[3] * partySize,
-    };
-  }, [partySize, partyLevel]);
+  /* --- Spawn plumbing ------------------------------------------------------ */
+  const [spawning, setSpawning] = useState(false);
+  const [spawnResults, setSpawnResults] = useState<SpawnRowOutcome[]>([]);
+  /** Engine-confirmed entity count from a READ of projected session state. */
+  const [confirmedEntityCount, setConfirmedEntityCount] = useState<number | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
 
-  // Calculate Total Raw XP and Adjusted XP with Multiplier
-  const totalMonsters = useMemo(() => roster.reduce((sum, item) => sum + item.count, 0), [roster]);
-  const rawXp = useMemo(() => roster.reduce((sum, item) => sum + item.xp * item.count, 0), [roster]);
+  /* --- Party thresholds & budget ------------------------------------------ */
+  // Formula (see encounter_store.ts): threshold_x = per_char_threshold(level, x)
+  // × party_size; adjusted_xp = round(raw_xp × multiplier(creature_count));
+  // difficulty compares adjusted_xp against the four thresholds.
+  const thresholds = useMemo(() => partyThresholds(partyLevel, partySize), [partyLevel, partySize]);
 
-  const multiplier = useMemo(() => {
-    if (totalMonsters <= 1) return 1.0;
-    if (totalMonsters === 2) return 1.5;
-    if (totalMonsters >= 3 && totalMonsters <= 6) return 2.0;
-    if (totalMonsters >= 7 && totalMonsters <= 10) return 2.5;
-    return 3.0;
-  }, [totalMonsters]);
+  const totalCreatures = useMemo(
+    () => roster.reduce((sum, entry) => sum + entry.count, 0),
+    [roster],
+  );
 
+  const unmappedCrCount = useMemo(
+    () => roster.filter((entry) => crToXp(entry.monster.challenge_rating) === null).length,
+    [roster],
+  );
+
+  const rawXp = useMemo(
+    () =>
+      roster.reduce((sum, entry) => {
+        const xp = crToXp(entry.monster.challenge_rating);
+        return sum + (xp ?? 0) * entry.count;
+      }, 0),
+    [roster],
+  );
+
+  const multiplier = useMemo(() => encounterMultiplier(totalCreatures), [totalCreatures]);
   const adjustedXp = useMemo(() => Math.round(rawXp * multiplier), [rawXp, multiplier]);
 
-  // Determine Encounter Difficulty
   const difficulty = useMemo(() => {
     if (adjustedXp === 0) return { label: 'Trivial', badge: 'vtt-badge' };
     if (adjustedXp < thresholds.medium) return { label: 'Easy', badge: 'vtt-badge vtt-badge-success' };
@@ -114,71 +126,119 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
     return { label: 'Deadly', badge: 'vtt-badge vtt-badge-danger font-black tracking-widest' };
   }, [adjustedXp, thresholds]);
 
-  const handleAddMonster = (preset: Omit<MonsterRosterItem, 'count'>) => {
+  /* --- Roster editing ------------------------------------------------------- */
+  const handleAddMonster = (monster: CompendiumMonster) => {
     setRoster((prev) => {
-      const existing = prev.find((item) => item.id === preset.id);
+      const existing = prev.find((entry) => entry.monster.id === monster.id);
       if (existing) {
-        return prev.map((item) =>
-          item.id === preset.id ? { ...item, count: item.count + 1 } : item
+        return prev.map((entry) =>
+          entry.monster.id === monster.id ? { ...entry, count: entry.count + 1 } : entry,
         );
       }
-      return [...prev, { ...preset, count: 1 }];
+      return [...prev, { monster, count: 1 }];
     });
   };
 
   const handleUpdateCount = (id: string, delta: number) => {
     setRoster((prev) =>
       prev
-        .map((item) => (item.id === id ? { ...item, count: Math.max(0, item.count + delta) } : item))
-        .filter((item) => item.count > 0)
+        .map((entry) => (entry.monster.id === id ? { ...entry, count: Math.max(0, entry.count + delta) } : entry))
+        .filter((entry) => entry.count > 0),
     );
   };
 
   const handleRemoveMonster = (id: string) => {
-    setRoster((prev) => prev.filter((item) => item.id !== id));
+    setRoster((prev) => prev.filter((entry) => entry.monster.id !== id));
   };
 
-  const handleDeployToTabletop = () => {
-    const tokensToDeploy: Omit<Token, 'id' | 'x' | 'y'>[] = [];
-    const customPositions: { x: number; y: number }[] = [];
+  /* --- Spawning -------------------------------------------------------------
+   * Every selected copy goes to the engine one at a time. The engine's verdict
+   * (or its machine rejection code, quoted verbatim — FORBIDDEN_ROLE,
+   * OWNERSHIP_CLAIM_FORBIDDEN, …) is the only thing shown. NO optimistic board
+   * mutation happens here: after spawning we issue a plain read of the
+   * projected session state so the GM sees what the ENGINE actually reports;
+   * tokens reach the shared tabletop through the existing snapshot polling.
+   */
+  const handleSpawnToTable = async () => {
+    if (spawning || roster.length === 0) return;
+    setSpawning(true);
+    setSnapshotError(null);
 
-    let currentX = 9;
-    let currentY = 3;
+    let sessionId: string | null = null;
+    try {
+      sessionId = engineSessionId ?? (await ensureEngineSession());
+    } catch (err) {
+      sessionId = null;
+      console.warn('Engine session resolution failed.', err);
+    }
 
-    roster.forEach((item) => {
-      for (let i = 0; i < item.count; i++) {
-        tokensToDeploy.push({
-          name: item.count > 1 ? `${item.name} #${i + 1}` : item.name,
-          hp: item.hp,
-          maxHp: item.hp,
-          ac: item.ac,
-          color: item.color,
-          isPlayer: false,
-          avatarIconType: item.avatarIconType,
-          elevationFeet: 0,
+    if (!sessionId) {
+      setSpawnResults([
+        {
+          kind: 'rejected',
+          label: 'Encounter',
+          status: 0,
+          code: 'ENGINE_UNREACHABLE',
+          message: 'No authoritative engine session could be created or found — nothing was spawned.',
+        },
+      ]);
+      setSpawning(false);
+      return;
+    }
+
+    const results: SpawnRowOutcome[] = [];
+    // Deterministic placement grid (engine coordinates); the engine owns the
+    // authoritative position once spawned.
+    let gridX = 9;
+    let gridY = 3;
+
+    for (const entry of roster) {
+      for (let i = 1; i <= entry.count; i++) {
+        const suffix = entry.count > 1 ? String(i) : '';
+        const outcome = await spawnMonsterToEngine({
+          sessionId,
+          monster: entry.monster,
+          position: [gridX, gridY, 0],
+          labelSuffix: suffix,
         });
+        results.push(describeOutcome(outcome, entry.monster.name, suffix));
 
-        customPositions.push({ x: currentX, y: currentY });
-        currentY += 2;
-        if (currentY > 9) {
-          currentY = 3;
-          currentX += 2;
+        gridY += 2;
+        if (gridY > 9) {
+          gridY = 3;
+          gridX += 2;
         }
       }
-    });
+    }
 
-    onLaunchEncounter(tokensToDeploy, customPositions);
-    setEncounterLaunched(true);
-    setTimeout(() => setEncounterLaunched(false), 3000);
+    setSpawnResults(results);
+    setSpawning(false);
+
+    // Confirmation read (never a mutation): ask the gateway's projected
+    // session-state proxy what entities the engine now reports.
+    const snapshot = await engineSessionEntities(sessionId);
+    if (snapshot.kind === 'applied') {
+      setConfirmedEntityCount(snapshot.data.length);
+    } else {
+      setConfirmedEntityCount(null);
+      setSnapshotError(describeRejection(snapshot));
+    }
   };
 
-  const filteredPresets = COMPENDIUM_MONSTER_PRESETS.filter((m) =>
-    m.name.toLowerCase().includes(searchTerm.toLowerCase()) || m.cr.includes(searchTerm)
-  );
+  const filteredMonsters = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return monsters;
+    return monsters.filter(
+      (m) =>
+        m.name.toLowerCase().includes(term) ||
+        String(m.challenge_rating).includes(term) ||
+        (m.creature_type ?? '').toLowerCase().includes(term),
+    );
+  }, [monsters, searchTerm]);
 
   return (
     <div className="space-y-6">
-      {/* Hero Banner (D&D Beyond Style) */}
+      {/* Hero Banner */}
       <div className="vtt-glass-panel rounded-xl p-6 relative overflow-hidden">
         <div className="absolute -right-6 -bottom-6 w-40 h-40 bg-amber-500/5 rounded-full blur-3xl pointer-events-none" />
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
@@ -191,40 +251,46 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
                 <h2 className="vtt-engraved text-2xl font-bold tracking-wide">
                   Encounter Builder &amp; XP Budget
                 </h2>
-                <span className="vtt-badge font-mono">
-                  D&D 5e SRD 5.1
-                </span>
+                <span className="vtt-badge font-mono">D&amp;D 5e SRD 5.1</span>
               </div>
               <p className="text-xs text-parchment-aged/70 mt-1">
-                Calculate tactical combat difficulty thresholds, assemble monster rosters, and launch live encounters onto the tactical tabletop.
+                Compose encounters from the live SRD compendium, check the XP budget against your party&apos;s
+                thresholds, and spawn each creature into the current authoritative engine session.
               </p>
             </div>
           </div>
 
-          {/* Action Deploy Button */}
           <button
-            onClick={handleDeployToTabletop}
-            disabled={roster.length === 0}
+            onClick={handleSpawnToTable}
+            disabled={spawning || roster.length === 0}
             className="vtt-btn vtt-btn-danger px-5 py-3 uppercase tracking-wider active:scale-95 disabled:opacity-40 cursor-pointer"
           >
-            {encounterLaunched ? (
+            {spawning ? (
               <>
-                <CheckCircle className="w-4 h-4 text-emerald-300" />
-                <span>Encounter Deployed to Tabletop!</span>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                <span>Spawning…</span>
               </>
             ) : (
               <>
                 <Play className="w-4 h-4 fill-white" />
-                <span>Launch Encounter on Tabletop</span>
+                <span>Spawn {totalCreatures > 0 ? `${totalCreatures} ` : ''}to Table</span>
               </>
             )}
           </button>
         </div>
+        {/* Honest scoping disclosure: no backend encounter-save exists. */}
+        <p className="text-[11px] text-parchment-aged/60 mt-3 flex items-start gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0 text-amber-400/80" />
+          <span>
+            Encounters are assembled <strong>in memory for this session only</strong> — the orchestrator has no
+            encounter-save endpoint yet, so builds are not persisted anywhere. Spawned creatures exist only in the
+            engine session they were spawned into.
+          </span>
+        </p>
       </div>
 
-      {/* Grid Layout: Party Config & XP Scorecard (Top) + Monster Roster & Compendium (Bottom) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left Column: Party Config & Difficulty Scorecard (4 cols) */}
+        {/* Left column */}
         <div className="lg:col-span-4 space-y-6">
           {/* Party Configuration */}
           <div className="vtt-surface rounded-xl p-5 shadow-xl">
@@ -232,7 +298,6 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
               <Users className="w-4 h-4 text-tavern-accent" />
               Party Configuration
             </h3>
-
             <div className="space-y-4 text-xs">
               <div>
                 <label className="text-parchment-aged/90 font-semibold block mb-1.5">
@@ -252,7 +317,6 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
                   </span>
                 </div>
               </div>
-
               <div>
                 <label className="text-parchment-aged/90 font-semibold block mb-1.5">
                   Average Party Level ({partyLevel}):
@@ -274,19 +338,16 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
             </div>
           </div>
 
-          {/* XP & Difficulty Scorecard */}
+          {/* Difficulty Gauge */}
           <div className="vtt-surface rounded-xl p-5 shadow-xl space-y-4">
             <div className="flex items-center justify-between border-b border-tavern-border pb-3">
               <h3 className="vtt-section-header text-sm font-bold">
                 <TrendingUp className="w-4 h-4 text-tavern-accent" />
                 Difficulty Gauge
               </h3>
-              <span className={difficulty.badge}>
-                {difficulty.label}
-              </span>
+              <span className={difficulty.badge}>{difficulty.label}</span>
             </div>
 
-            {/* XP Breakdown */}
             <div className="grid grid-cols-2 gap-3 text-center">
               <div className="p-3 bg-black/40 border border-tavern-border rounded-lg shadow-inner">
                 <div className="text-[11px] font-semibold text-parchment-aged/80">Total Raw XP</div>
@@ -297,11 +358,19 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
                 <div className="text-lg font-bold font-mono text-amber-400">{adjustedXp.toLocaleString()} XP</div>
               </div>
             </div>
+            {unmappedCrCount > 0 && (
+              <p className="text-[11px] text-amber-400/90 flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                <span>
+                  {unmappedCrCount} roster entr{unmappedCrCount === 1 ? 'y has' : 'ies have'} a challenge rating
+                  outside the known CR→XP table; those contribute 0 XP rather than a guessed value.
+                </span>
+              </p>
+            )}
 
-            {/* Threshold Meters */}
             <div className="space-y-2 pt-2 border-t border-tavern-border text-xs">
               <div className="text-[11px] font-bold text-parchment-aged/80 uppercase tracking-wider mb-1">
-                Party Thresholds ({partySize} PCs Level {partyLevel}):
+                Party Thresholds ({partySize} PCs Level {partyLevel}) — per-character SRD values × party size:
               </div>
               <div className="flex justify-between py-1 px-2.5 bg-black/30 rounded border border-tavern-border/60">
                 <span className="text-[color:var(--state-success)] font-semibold">Easy</span>
@@ -321,20 +390,63 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
               </div>
             </div>
           </div>
+
+          {/* Engine confirmation (read-only snapshot result) */}
+          {(spawnResults.length > 0 || confirmedEntityCount !== null || snapshotError) && (
+            <div className="vtt-surface rounded-xl p-5 shadow-xl space-y-3">
+              <h3 className="vtt-section-header text-sm font-bold border-b border-tavern-border pb-3">
+                <Skull className="w-4 h-4 text-[color:var(--state-danger)]" />
+                Last Spawn Report
+              </h3>
+              {confirmedEntityCount !== null && (
+                <p className="text-xs text-parchment-aged/85">
+                  The engine&apos;s session-state read now reports{' '}
+                  <span className="font-mono font-bold text-emerald-300">{confirmedEntityCount}</span> visible
+                  entities. Board updates arrive through the normal snapshot poll — nothing was drawn locally here.
+                </p>
+              )}
+              {snapshotError && (
+                <p className="text-xs text-[color:var(--state-danger)] flex items-start gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  <span>Could not confirm post-spawn state: {snapshotError}</span>
+                </p>
+              )}
+              {spawnResults.length > 0 && (
+                <ul className="space-y-1.5 max-h-48 overflow-y-auto vtt-scrollbar pr-1 text-[11px]">
+                  {spawnResults.map((row, idx) => (
+                    <li key={`${row.label}-${idx}`} className="flex flex-col gap-0.5 py-1 border-b border-tavern-border/40 last:border-0">
+                      <span className={row.kind === 'applied' ? 'text-emerald-300' : 'text-[color:var(--state-danger)] font-semibold'}>
+                        {row.kind === 'applied' ? (
+                          <>{row.label} spawned{row.entityId ? ` (${row.entityId.slice(0, 8)}…)` : ''}</>
+                        ) : (
+                          <>{row.label} REFUSED — HTTP {row.status}{row.code ? ` ${row.code}` : ''}{row.message ? ` — ${row.message}` : ''}</>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
 
-        {/* Right Column: Active Monster Roster & Compendium Quick Picker (8 cols) */}
+        {/* Right column */}
         <div className="lg:col-span-8 space-y-6">
-          {/* Active Monster Roster */}
+          {/* Roster */}
           <div className="vtt-surface rounded-xl p-5 shadow-xl">
             <div className="flex items-center justify-between border-b border-tavern-border pb-3 mb-4">
               <h3 className="vtt-section-header text-sm font-bold">
                 <Skull className="w-4 h-4 text-[color:var(--state-danger)]" />
-                Active Monster Roster ({totalMonsters} Creatures)
+                Active Monster Roster ({totalCreatures} Creatures)
               </h3>
               {roster.length > 0 && (
                 <button
-                  onClick={() => setRoster([])}
+                  onClick={() => {
+                    setRoster([]);
+                    setSpawnResults([]);
+                    setConfirmedEntityCount(null);
+                    setSnapshotError(null);
+                  }}
                   className="text-xs text-[color:var(--state-danger)] hover:opacity-80 flex items-center space-x-1 cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
@@ -345,134 +457,217 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ onLa
 
             {roster.length === 0 ? (
               <div className="p-8 text-center border border-dashed border-tavern-border rounded-lg text-parchment-aged/50 text-xs">
-                No monsters added to this encounter yet. Select creatures from the compendium below.
+                No monsters added to this encounter yet. Select creatures from the live compendium below.
               </div>
             ) : (
               <div className="space-y-2.5">
-                {roster.map((item) => (
-                  <div
-                    key={item.id}
-                    className="flex items-center justify-between gap-3 p-3 vtt-surface rounded-lg shadow-sm"
-                  >
-                    <div className="flex items-center space-x-3 min-w-0">
-                      <div
-                        className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs text-white border shadow shrink-0"
-                        style={{ backgroundColor: item.color }}
-                      >
-                        {item.name.charAt(0)}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="vtt-statblock-nameplate text-sm">{item.name}</div>
-                        {/* Compact official-book attribute strip (CR · HP · AC · XP) */}
-                        <dl className="vtt-statblock-attr mt-1 inline-flex items-center gap-3 rounded-sm px-2 py-0.5 text-[11px]">
-                          <div className="flex items-baseline gap-1">
-                            <dt className="vtt-attr-label text-[10px]">CR</dt>
-                            <dd className="vtt-attr-value font-mono">{item.cr}</dd>
-                          </div>
-                          <div className="flex items-baseline gap-1">
-                            <dt className="vtt-attr-label text-[10px]">HP</dt>
-                            <dd className="vtt-attr-value font-mono">{item.hp}</dd>
-                          </div>
-                          <div className="flex items-baseline gap-1">
-                            <dt className="vtt-attr-label text-[10px]">AC</dt>
-                            <dd className="vtt-attr-value font-mono">{item.ac}</dd>
-                          </div>
-                          <div className="flex items-baseline gap-1">
-                            <dt className="vtt-attr-label text-[10px]">XP</dt>
-                            <dd className="vtt-attr-value font-mono">{item.xp}</dd>
-                          </div>
-                        </dl>
-                      </div>
-                    </div>
-
-                    {/* Quantity Stepper */}
-                    <div className="flex items-center space-x-2 shrink-0">
-                      <div className="flex items-center space-x-1 bg-black/50 border border-tavern-border rounded-lg p-1">
-                        <button
-                          onClick={() => handleUpdateCount(item.id, -1)}
-                          className="w-6 h-6 flex items-center justify-center text-parchment-aged/70 hover:text-parchment-aged hover:bg-black/30 rounded font-bold cursor-pointer"
-                        >
-                          -
-                        </button>
-                        <span className="w-6 text-center font-mono font-bold text-xs text-amber-400">
-                          {item.count}
-                        </span>
-                        <button
-                          onClick={() => handleUpdateCount(item.id, 1)}
-                          className="w-6 h-6 flex items-center justify-center text-parchment-aged/70 hover:text-parchment-aged hover:bg-black/30 rounded font-bold cursor-pointer"
-                        >
-                          +
-                        </button>
+                {roster.map((entry) => {
+                  const xp = crToXp(entry.monster.challenge_rating);
+                  return (
+                    <div
+                      key={entry.monster.id}
+                      className="flex items-center justify-between gap-3 p-3 vtt-surface rounded-lg shadow-sm"
+                    >
+                      <div className="flex items-center space-x-3 min-w-0">
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs text-white border shadow shrink-0 bg-slate-700">
+                          {entry.monster.name.charAt(0)}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="vtt-statblock-nameplate text-sm truncate">{entry.monster.name}</div>
+                          <dl className="vtt-statblock-attr mt-1 inline-flex items-center gap-3 rounded-sm px-2 py-0.5 text-[11px]">
+                            <div className="flex items-baseline gap-1">
+                              <dt className="vtt-attr-label text-[10px]">CR</dt>
+                              <dd className="vtt-attr-value font-mono">{entry.monster.challenge_rating}</dd>
+                            </div>
+                            <div className="flex items-baseline gap-1">
+                              <dt className="vtt-attr-label text-[10px]">HP</dt>
+                              <dd className="vtt-attr-value font-mono">{entry.monster.hp ?? '?'}</dd>
+                            </div>
+                            <div className="flex items-baseline gap-1">
+                              <dt className="vtt-attr-label text-[10px]">AC</dt>
+                              <dd className="vtt-attr-value font-mono">{entry.monster.ac ?? '?'}</dd>
+                            </div>
+                            <div className="flex items-baseline gap-1">
+                              <dt className="vtt-attr-label text-[10px]">XP</dt>
+                              <dd className="vtt-attr-value font-mono">{xp ?? 'n/a'}</dd>
+                            </div>
+                            {typeof entry.monster.speed === 'string' && parsePrimarySpeedFeet(entry.monster.speed) !== null && (
+                              <div className="flex items-baseline gap-1">
+                                <dt className="vtt-attr-label text-[10px]">SPD</dt>
+                                <dd className="vtt-attr-value font-mono">{parsePrimarySpeedFeet(entry.monster.speed)}ft</dd>
+                              </div>
+                            )}
+                          </dl>
+                        </div>
                       </div>
 
-                      <button
-                        onClick={() => handleRemoveMonster(item.id)}
-                        className="p-1.5 text-parchment-aged/50 hover:text-[color:var(--state-danger)] rounded hover:bg-black/30 transition-colors cursor-pointer"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      <div className="flex items-center space-x-2 shrink-0">
+                        <div className="flex items-center space-x-1 bg-black/50 border border-tavern-border rounded-lg p-1">
+                          <button
+                            onClick={() => handleUpdateCount(entry.monster.id, -1)}
+                            aria-label={`Remove one ${entry.monster.name}`}
+                            className="w-6 h-6 flex items-center justify-center text-parchment-aged/70 hover:text-parchment-aged hover:bg-black/30 rounded font-bold cursor-pointer"
+                          >
+                            -
+                          </button>
+                          <span className="w-6 text-center font-mono font-bold text-xs text-amber-400">{entry.count}</span>
+                          <button
+                            onClick={() => handleUpdateCount(entry.monster.id, 1)}
+                            aria-label={`Add one ${entry.monster.name}`}
+                            className="w-6 h-6 flex items-center justify-center text-parchment-aged/70 hover:text-parchment-aged hover:bg-black/30 rounded font-bold cursor-pointer"
+                          >
+                            +
+                          </button>
+                        </div>
+                        <button
+                          onClick={() => handleRemoveMonster(entry.monster.id)}
+                          aria-label={`Remove ${entry.monster.name}`}
+                          className="p-1.5 text-parchment-aged/50 hover:text-[color:var(--state-danger)] rounded hover:bg-black/30 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
 
-          {/* Quick Compendium Monster Browser */}
+          {/* Live compendium picker */}
           <div className="vtt-surface rounded-xl p-5 shadow-xl">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-tavern-border pb-3 mb-4">
               <h3 className="vtt-section-header text-sm font-bold">
                 <Sparkles className="w-4 h-4 text-tavern-accent" />
-                SRD Monster Bestiary
+                SRD Monster Bestiary{!compendiumLoading && !compendiumError ? ` (${filteredMonsters.length}/${monsters.length})` : ''}
               </h3>
 
-              {/* Search Bar */}
               <div className="relative w-full sm:w-64">
                 <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-parchment-aged/50 pointer-events-none" />
                 <input
                   type="text"
-                  placeholder="Filter monsters by name or CR..."
+                  placeholder="Filter by name, CR, or type..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  className="vtt-input w-full pl-8 text-xs"
+                  disabled={compendiumLoading || !!compendiumError}
+                  className="vtt-input w-full pl-8 text-xs disabled:opacity-50"
                 />
               </div>
             </div>
 
-            {/* Monster Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-72 overflow-y-auto vtt-scrollbar pr-1">
-              {filteredPresets.map((preset) => (
-                <div
-                  key={preset.id}
-                  onClick={() => handleAddMonster(preset)}
-                  className="flex items-center justify-between p-3 bg-black/30 hover:bg-black/45 border border-tavern-border hover:border-amber-500/50 rounded-lg cursor-pointer transition-all group shadow-sm"
-                >
-                  <div className="flex items-center space-x-2.5 min-w-0">
-                    <div
-                      className="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs text-white shadow-sm shrink-0"
-                      style={{ backgroundColor: preset.color }}
-                    >
-                      {preset.name.charAt(0)}
-                    </div>
-                    <div>
-                      <div className="text-xs font-bold text-parchment-aged group-hover:text-amber-200 transition-colors">
-                        {preset.name}
-                      </div>
-                      <div className="text-[10px] text-parchment-aged/70">
-                        CR {preset.cr} · {preset.hp} HP · {preset.xp} XP
-                      </div>
-                    </div>
-                  </div>
+            {compendiumLoading && (
+              <div className="p-8 text-center text-parchment-aged/60 text-xs flex items-center justify-center gap-2">
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                Loading stat blocks from the live compendium…
+              </div>
+            )}
 
-                  <button className="p-1 text-parchment-aged/70 group-hover:text-amber-400 bg-tavern-bg group-hover:bg-amber-950/50 border border-tavern-border group-hover:border-amber-600/50 rounded transition-colors">
-                    <Plus className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-            </div>
+            {!compendiumLoading && compendiumError && (
+              <div className="p-6 border border-dashed border-[color:var(--state-danger)]/40 rounded-lg text-center space-y-3">
+                <p className="text-xs text-[color:var(--state-danger)] flex items-center justify-center gap-2">
+                  <AlertTriangle className="w-4 h-4" />
+                  {compendiumError}
+                </p>
+                <p className="text-[11px] text-parchment-aged/60">
+                  Showing no monsters rather than invented ones. Retry when the service is back.
+                </p>
+                <button
+                  onClick={() => void loadCompendium()}
+                  className="vtt-btn vtt-btn-secondary px-3 py-1.5 text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Retry</span>
+                </button>
+              </div>
+            )}
+
+            {!compendiumLoading && !compendiumError && filteredMonsters.length === 0 && (
+              <div className="p-8 text-center border border-dashed border-tavern-border rounded-lg text-parchment-aged/50 text-xs">
+                No compendium monster matches “{searchTerm}”.
+              </div>
+            )}
+
+            {!compendiumLoading && !compendiumError && filteredMonsters.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-72 overflow-y-auto vtt-scrollbar pr-1">
+                {filteredMonsters.map((monster) => {
+                  const xp = crToXp(monster.challenge_rating);
+                  return (
+                    <div
+                      key={monster.id}
+                      onClick={() => handleAddMonster(monster)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => e.key === 'Enter' && handleAddMonster(monster)}
+                      className="flex items-center justify-between p-3 bg-black/30 hover:bg-black/45 border border-tavern-border hover:border-amber-500/50 rounded-lg cursor-pointer transition-all group shadow-sm"
+                    >
+                      <div className="flex items-center space-x-2.5 min-w-0">
+                        <div className="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs text-white shadow-sm shrink-0 bg-slate-700 group-hover:bg-amber-900 transition-colors">
+                          {monster.name.charAt(0)}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold text-parchment-aged group-hover:text-amber-200 transition-colors truncate">
+                            {monster.name}
+                          </div>
+                          <div className="text-[10px] text-parchment-aged/70 truncate">
+                            CR {monster.challenge_rating} · {monster.hp ?? '?'} HP · {monster.ac ?? '?'} AC ·{' '}
+                            {xp !== null ? `${xp.toLocaleString()} XP` : 'XP n/a'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        aria-label={`Add ${monster.name} to roster`}
+                        className="p-1 text-parchment-aged/70 group-hover:text-amber-400 bg-tavern-bg group-hover:bg-amber-950/50 border border-tavern-border group-hover:border-amber-600/50 rounded transition-colors"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>
     </div>
   );
 };
+
+/* --- Verbatim outcome rendering ------------------------------------------- */
+
+function describeOutcome(
+  outcome: Awaited<ReturnType<typeof spawnMonsterToEngine>>,
+  monsterName: string,
+  suffix: string,
+): SpawnRowOutcome {
+  const label = suffix ? `${monsterName} #${suffix}` : monsterName;
+  if (outcome.kind === 'applied') {
+    return { kind: 'applied', label, entityId: outcome.data.entity_id };
+  }
+  if (outcome.kind === 'rejected') {
+    return {
+      kind: 'rejected',
+      label,
+      status: outcome.status,
+      code: outcome.code,
+      message: outcome.message,
+    };
+  }
+  return {
+    kind: 'rejected',
+    label,
+    status: 0,
+    code: 'ENGINE_UNREACHABLE',
+    message: 'The engine did not answer — this creature was NOT spawned.',
+  };
+}
+
+/** Human-readable verbatim quote of any rules-engine rejection union. */
+function describeRejection(outcome: EngineActionOutcome<unknown>): string {
+  if (outcome.kind === 'rejected') {
+    return `HTTP ${outcome.status}${outcome.code ? ` ${outcome.code}` : ''}${
+      outcome.message ? ` — ${outcome.message}` : ''
+    }`;
+  }
+  return 'the gateway/engine could not be reached.';
+}
