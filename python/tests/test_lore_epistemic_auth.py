@@ -185,7 +185,9 @@ class TestGmPromotionRules:
 
 class TestUnauthenticatedStillRefused:
     def test_missing_token_still_rejected(self):
+        # Migrated to _require_auth: anonymous callers get an honest 401
+        # rather than a validation error about a missing query param.
         resp = client.post(
             "/api/v1/lore/assert", json=_assert_payload(_fresh_triple("anon"))
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 401

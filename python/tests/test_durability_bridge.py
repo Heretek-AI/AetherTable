@@ -105,11 +105,13 @@ def test_bundle_import_hydrates_engine_session(gm_token):
 
 
 def test_bundle_import_requires_auth():
+    # Route migrated to _require_auth: an anonymous caller gets an honest 401
+    # rather than a misleading 422 about a missing `token` query param.
     resp = client.post(
         "/api/v1/campaign/import-bundle",
         json={"bundle_b64": "AAAA", "session_name": "x"},
     )
-    assert resp.status_code == 422, "missing token must fail validation"
+    assert resp.status_code == 401, "missing token must be rejected with 401"
 
 
 def test_corrupt_bundle_rejected(gm_token):

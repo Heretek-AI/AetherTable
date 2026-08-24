@@ -505,7 +505,10 @@ async def auth_login(req: AuthLoginRequest):
 
 
 @app.get("/api/v1/auth/session")
-async def auth_session(token: str = Query(...)):
+async def auth_session(token: str = Depends(_require_auth)):
+    # Header-first auth (Bearer), ?token= back-compat — this route previously
+    # declared ``token: str = Query(...)``, which rejected header-only callers
+    # at validation and put tokens in URLs.
     user_id = _require_user_id(token)
     record = await storage_backend.get_user_by_id(user_id)
     if record is None:
@@ -1086,15 +1089,50 @@ async def engine_metrics(token: str = Depends(_require_auth)):
 
 class EnginePersistRequest(BaseModel):
     session_id: str
+    # DEPRECATED and ignored: ownership is now taken from the VERIFIED session
+    # token, never from a client-supplied body field (any caller could claim
+    # any owner). Kept in the schema so old payloads still validate.
     owner_user_id: Optional[str] = None
 
 
+async def _durability_bridge_gate(actor: Dict[str, Any], session_id: str) -> None:
+    """Authorization for the durability bridge (persist/hydrate).
+
+    These routes bind whole-session snapshots to storage and overwrite live
+    engine state on restore — not bystander operations. The model mirrors the
+    x-card rewind gate exactly:
+
+    * gm/admin tokens may bridge any session.
+    * Any other authenticated caller must be a member of a lobby bound to that
+      engine session (the gateway's own roster data; see
+      ``_caller_is_session_participant``).
+    * Sessions with NO lobby binding fail CLOSED to staff only, because there
+      is no roster proving a player's standing.
+    """
+    if actor.get("role", "") in ("gm", "admin"):
+        return
+    if await _caller_is_session_participant(actor["user_id"], session_id):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "BRIDGE_FORBIDDEN: only GMs or members of a lobby bound to this "
+            f"session may persist or restore it ({session_id})."
+        ),
+    )
+
+
 @app.post("/api/v1/engine-session/persist")
-async def persist_engine_session(req: EnginePersistRequest):
+async def persist_engine_session(req: EnginePersistRequest, token: str = Depends(_require_auth)):
+    # Auth + authz run BEFORE the engine fetch so an unauthorized caller gets
+    # an honest 401/403 even when the engine is down.
+    actor = _caller_actor(token)
+    await _durability_bridge_gate(actor, req.session_id)
     raw = await _engine_call(
         engine_client.engine_request("GET", f"/api/v1/sessions/{req.session_id}")
     )
-    await storage_backend.save_engine_snapshot(req.session_id, req.owner_user_id, raw)
+    # Ownership is recorded from the verified identity, never the request body.
+    await storage_backend.save_engine_snapshot(req.session_id, actor["user_id"], raw)
     return {
         "status": "PERSISTED",
         "session_id": req.session_id,
@@ -1108,7 +1146,9 @@ class EngineHydrateRequest(BaseModel):
 
 
 @app.post("/api/v1/engine-session/hydrate")
-async def hydrate_engine_session(req: EngineHydrateRequest):
+async def hydrate_engine_session(req: EngineHydrateRequest, token: str = Depends(_require_auth)):
+    actor = _caller_actor(token)
+    await _durability_bridge_gate(actor, req.session_id)
     snapshot = await storage_backend.load_engine_snapshot(req.session_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="No persisted snapshot for this session")
@@ -1251,7 +1291,9 @@ async def get_character(character_id: str, token: str = Depends(_require_auth)):
 
 
 @app.delete("/api/v1/characters/{character_id}")
-async def delete_character(character_id: str, token: str = Query(...)):
+async def delete_character(character_id: str, token: str = Depends(_require_auth)):
+    # Migrated off ``token: str = Query(...)`` — header-only clients failed
+    # validation, and the query string leaked tokens into logs/history.
     user_id = _require_user_id(token)
     ok = await storage_backend.delete_character(character_id, user_id)
     if not ok:
@@ -2478,8 +2520,11 @@ def export_starter_adventure(key: str, token: str = Depends(_require_auth)):
 
 
 @app.post("/api/v1/campaign/import-bundle")
-async def import_campaign_bundle(req: BundleImportRequest, token: str = Query(...)):
+async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(_require_auth)):
     # Importing a world mutates shared state — authenticated users only.
+    # Migrated off ``token: str = Query(...)`` (header-only callers failed
+    # validation; anonymous callers now get an honest 401 instead of a
+    # misleading 422 "missing query param").
     _require_user_id(token)
     import base64 as _b64
 
@@ -2871,7 +2916,7 @@ async def _caller_is_session_participant(user_id: str, engine_session_id: str) -
 @app.post("/api/v1/lore/assert")
 def assert_lore(
     assertion: LoreAssertionPayload,
-    token: str = Query(..., description="HMAC session token"),
+    token: str = Depends(_require_auth),
 ):
     """Commit or stage a lore assertion under the Pillar-7 epistemic ladder.
 

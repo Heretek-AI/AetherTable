@@ -82,7 +82,7 @@ def test_lore_assertion_requires_auth(fresh_account):
         "epistemic_tier": "SUBJECTIVE_RUMOR",
     }
     anon = client.post("/api/v1/lore/assert", json=payload)
-    assert anon.status_code == 422, "missing token query param must fail validation"
+    assert anon.status_code == 401, "missing token must be rejected with 401"
 
     login = client.post(
         "/api/v1/auth/login",
