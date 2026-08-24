@@ -40,9 +40,9 @@ impl RhaiNarrativeEngine {
         // Deterministic SplitMix64 counter — same seed => same dice sequence.
         let rng_state = AtomicU64::new(seed);
         engine.register_fn("roll_d6", move |count: i64| -> Result<i64, Box<EvalAltResult>> {
-            if count < 0 || count > 1000 {
+            if !(0..=1000).contains(&count) {
                 return Err(Box::new(EvalAltResult::ErrorArithmetic(
-                    format!("roll_d6 count {} out of bounds (0..=1000)", count).into(),
+                    format!("roll_d6 count {} out of bounds (0..=1000)", count),
                     Position::NONE,
                 )));
             }

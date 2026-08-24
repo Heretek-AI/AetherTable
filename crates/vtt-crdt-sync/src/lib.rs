@@ -9,7 +9,10 @@
 pub mod crdt;
 pub mod relay;
 
-pub use crdt::{CrdtSyncMessage, FogOfWarMask, RoomCrdtState, TokenTransform, UserCursor, VectorClock};
+pub use crdt::{
+    CrdtSyncMessage, FogOfWarMask, RoomCrdtState, SnapshotToken, SyncSnapshot, TokenTransform,
+    UserCursor, VectorClock,
+};
 pub use relay::CrdtRelayHub;
 
 #[cfg(test)]

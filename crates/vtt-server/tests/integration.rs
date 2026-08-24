@@ -264,7 +264,9 @@ async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
     // seed that hits by scanning a few deterministic seeds.
     let mut event_sequence = None;
     let mut total_damage = 0i64;
-    for seed in 1..=50u64 {
+    // Single iteration: the first deterministic seed decides hit-or-miss
+    // (a miss still spends the Action, so there is nothing to scan).
+    if let Some(seed) = (1..=50u64).next() {
         let req = test::TestRequest::post()
             .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
             .insert_header(auth.clone())
@@ -287,8 +289,6 @@ async fn authoritative_attack_rejects_client_math_and_enforces_budget() {
                     event_sequence = body["event_sequence"].as_u64();
                     total_damage = body["total_damage"].as_i64().unwrap_or(0);
                 }
-                // A miss still spends the Action, so stop scanning seeds.
-                break;
             }
             StatusCode::CONFLICT => panic!("seed {}: unexpected economy block: {}", seed, body),
             other => panic!("seed {}: unexpected status {}: {}", seed, other, body),
@@ -1120,8 +1120,9 @@ async fn rewind_past_heal_restores_prior_hp() {
     }
 
     // Damage the hero via a seeded attack + engine-provenance damage commit.
+    // (Single iteration: the first deterministic seed decides hit-or-miss.)
     let mut post_damage_hp = None;
-    for seed in 1..=50u64 {
+    if let Some(seed) = (1..=50u64).next() {
         let req = test::TestRequest::post()
             .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
             .insert_header(auth.clone())
@@ -1133,20 +1134,18 @@ async fn rewind_past_heal_restores_prior_hp() {
         let res = test::call_service(&app, req).await;
         assert_eq!(res.status(), StatusCode::OK);
         let attack: serde_json::Value = test::read_body_json(res).await;
-        if attack["is_hit"].as_bool() != Some(true) {
-            break;
+        if attack["is_hit"].as_bool() == Some(true) {
+            let seq = attack["event_sequence"].as_u64().unwrap();
+            let req = test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+                .insert_header(auth.clone())
+                .set_json(serde_json::json!({"target_id": hero_id, "source_event_sequence": seq}))
+                .to_request();
+            let res = test::call_service(&app, req).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let dmg: serde_json::Value = test::read_body_json(res).await;
+            post_damage_hp = Some(dmg["hp_remaining"].as_i64().unwrap());
         }
-        let seq = attack["event_sequence"].as_u64().unwrap();
-        let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/sessions/{}/damage", session_id))
-            .insert_header(auth.clone())
-            .set_json(serde_json::json!({"target_id": hero_id, "source_event_sequence": seq}))
-            .to_request();
-        let res = test::call_service(&app, req).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let dmg: serde_json::Value = test::read_body_json(res).await;
-        post_damage_hp = Some(dmg["hp_remaining"].as_i64().unwrap());
-        break;
     }
     let post_damage_hp = post_damage_hp.expect("seeded hit must land and apply damage");
     assert!(post_damage_hp < 30);
@@ -1912,10 +1911,10 @@ async fn session_snapshot(
     test::read_body_json(test::call_service(app, req).await).await
 }
 
-async fn caster_concentration<'a>(
-    snap: &'a serde_json::Value,
+async fn caster_concentration(
+    snap: &serde_json::Value,
     caster_id: Uuid,
-) -> &'a serde_json::Value {
+) -> &serde_json::Value {
     &snap["entities"][&caster_id.to_string()]["concentration"]
 }
 

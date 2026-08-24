@@ -163,13 +163,15 @@ fn may_control_entity(entity_owner: Option<&String>, role: Role, user_id: &str) 
     }
 }
 
-/// One live WebSocket peer plus the verified identity of its connection.
+/// One live WebSocket peer plus the verified role of its connection.
 /// Role travels WITH the registration so fan-out can be filtered per frame —
 /// client-side spectator filtering protects rendering, not the wire.
+/// (Identity is stamped onto outgoing frames where needed — e.g. cursors —
+/// at send time from the connection's own auth context, so no peer field
+/// retains it.)
 struct PeerConnection {
     socket: actix_ws::Session,
     role: Role,
-    user_id: String,
 }
 
 /// Live WebSocket peer registry per room. The CrdtRelayHub merges state
@@ -187,7 +189,7 @@ impl PeerRegistry {
         }
     }
 
-    fn join(&self, room_id: &str, session: &actix_ws::Session, role: Role, user_id: &str) -> u64 {
+    fn join(&self, room_id: &str, session: &actix_ws::Session, role: Role) -> u64 {
         let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         self.rooms
             .entry(room_id.to_string())
@@ -197,7 +199,6 @@ impl PeerRegistry {
                 PeerConnection {
                     socket: session.clone(),
                     role,
-                    user_id: user_id.to_string(),
                 },
             );
         peer_id
@@ -2190,7 +2191,7 @@ async fn trigger_safety_rewind(
         // is projected by caller role before it leaves the engine — non-GMs
         // get public board tokens only and never see hidden NPCs' stat blocks.
         let snapshot = project_snapshot_for_role(
-            serde_json::to_value(&*session).unwrap_or_else(|_| serde_json::Value::Null),
+            serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
             role,
             &identity.user_id,
         );
@@ -2314,24 +2315,35 @@ fn token_is_hidden(data: &AppState, room_id: &str, token_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Delivery policy for fog layers toward a SPECTATOR connection.
+/// Recomputes the party-merged fog view for SPECTATOR peers from the layers
+/// currently retained in the relay hub (relay-audit structural limit #1).
 ///
-/// Layer ids are "fog:{user_id}" for per-user private layers (the same
-/// convention the ingress ownership check enforces); any other id is treated
-/// as owner-less and party-shared. A spectator may therefore receive only:
-/// its OWN layer's updates, or shared layers. What it can never receive is
-/// another user's private reveal history.
+/// Delivery policy, replacing the old "spectators get fewer frames" rule:
 ///
-/// Note what this deliberately does NOT do: compose a party-merged view.
-/// Merging several users' masks into one union polygon set is a payload
-/// transform the frame format cannot express — the server would have to
-/// rewrite `revealedPolygons`, which no current message type supports. So
-/// spectators simply get fewer frames rather than a merged one.
-fn spectator_may_see_fog_layer(layer_id: &str, viewer_user_id: &str) -> bool {
-    match layer_id.strip_prefix("fog:") {
-        Some(owner) => owner == viewer_user_id,
-        None => true,
-    }
+/// - Layer ids are "fog:{user_id}" for per-user private layers; any other id
+///   is owner-less and party-shared. Previously a spectator could receive
+///   only its own layer plus shared ones and simply MISSED every other user's
+///   reveals, because composing masks into one union polygon set requires
+///   rewriting frame payloads. Now the hub state IS rewritten on each fog
+///   change into ONE merged layer (`party-explored`, see
+///   `merge_fog_layers`) whose polygons are the concatenation-union of every
+///   retained layer — spectators see accumulated party exploration without
+///   per-player reveal HISTORY or ATTRIBUTION.
+///
+/// - What still never crosses the wire to a spectator is an individual
+///   layer's IDENTITY: no "fog:{user_id}" id, no per-layer versioning. The
+///   reveal GEOMETRY itself becomes the party's shared map state by design —
+///   that aggregation is exactly what a spectator at the table is entitled
+///   to watch.
+///
+/// The merge is recomputed from retained hub state AFTER the triggering
+/// update was retained, so the frame a spectator receives always includes the
+/// geometry that caused it. Returns `None` when nothing has been explored
+/// yet, in which case spectators get no frame (there is no map state to show).
+fn party_merged_spectator_fog(data: &AppState, room_id: &str) -> Option<FogOfWarMask> {
+    let hub_room = data.crdt_hub.get_or_create_room(room_id);
+    let state = hub_room.read();
+    vtt_crdt_sync::crdt::merge_fog_layers(state.fog_masks.values())
 }
 
 /// Parses a browser-shaped FogUpdate frame into the CRDT model. The relay hub
@@ -2364,13 +2376,16 @@ fn parse_fog_mask(value: &serde_json::Value, layer_id: &str) -> Option<FogOfWarM
 ///   visibility lives (`project_snapshot_for_role` semantics): non-GM peers
 ///   never see hidden entities. Positions overlay any accepted CRDT transform
 ///   so moved tokens appear where play left them, not at spawn points.
-/// - Fog layers apply `spectator_may_see_fog_layer`: spectators get their own
-///   private layer plus owner-less shared layers; GMs/players get everything.
+/// - Fog follows `party_merged_spectator_fog` semantics: spectators get ONE
+///   party-merged layer (`party-explored`) covering everything the hub has
+///   retained; GMs/players get every individual layer.
 fn build_initial_snapshot(
     data: &AppState,
     room_id: &str,
     role: Role,
-    user_id: &str,
+    // Retained on the signature so call sites stay symmetric across roles;
+    // spectator fog projection is now aggregate, not per-viewer.
+    _user_id: &str,
 ) -> CrdtSyncMessage {
     let hub_room = data.crdt_hub.get_or_create_room(room_id);
     let state = hub_room.read();
@@ -2422,12 +2437,17 @@ fn build_initial_snapshot(
         }
     }
 
-    let fog_layers: Vec<vtt_crdt_sync::FogOfWarMask> = state
-        .fog_masks
-        .values()
-        .filter(|fog| role != Role::Spectator || spectator_may_see_fog_layer(&fog.layer_id, user_id))
-        .cloned()
-        .collect();
+    // Relay-audit structural limit #1: the snapshot applies the SAME fog
+    // delivery policy as live fan-out — spectators receive a single
+    // party-merged layer recomputed from retained state, never a list of
+    // individual per-user layers.
+    let fog_layers: Vec<vtt_crdt_sync::FogOfWarMask> = if role == Role::Spectator {
+        vtt_crdt_sync::crdt::merge_fog_layers(state.fog_masks.values())
+            .into_iter()
+            .collect()
+    } else {
+        state.fog_masks.values().cloned().collect()
+    };
 
     CrdtSyncMessage::SyncStep2(SyncSnapshot {
         room_id: room_id.to_string(),
@@ -2546,7 +2566,7 @@ async fn ws_sync(
     let snapshot = build_initial_snapshot(&data, &room_id, role, &identity.user_id);
     send_initial_snapshot(&mut session, &snapshot).await;
 
-    let peer_id = data.peers.join(&room_id, &session, role, &identity.user_id);
+    let peer_id = data.peers.join(&room_id, &session, role);
     let hub = Arc::clone(&data.crdt_hub);
     let peers = Arc::clone(&data.peers);
     let app_state = data.clone();
@@ -2555,8 +2575,8 @@ async fn ws_sync(
     actix_web::rt::spawn(async move {
         while let Some(Ok(msg)) = msg_stream.next().await {
             match msg {
-                Message::Text(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(mut value) => {
+                Message::Text(text) => {
+                    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
                         match value.get("type").and_then(|t| t.as_str()) {
                             Some("TokenUpdate") => {
                                 // Ingress RBAC mirrors every mutating HTTP
@@ -2615,18 +2635,44 @@ async fn ws_sync(
                                             layer_id
                                         ),
                                     }
-                                    // Delivery RBAC: spectators receive their
-                                    // own layers and owner-less shared layers,
-                                    // but never another user's private fog.
+                                    // Delivery, split by role:
+                                    //
+                                    // GM/player peers keep receiving the raw
+                                    // individual layer exactly as before —
+                                    // per-user layers are how each player's
+                                    // client tracks its own reveal history.
                                     peers
                                         .broadcast_if(&rid, peer_id, &text, |peer| {
                                             peer.role != Role::Spectator
-                                                || spectator_may_see_fog_layer(
-                                                    &layer_id,
-                                                    &peer.user_id,
-                                                )
                                         })
                                         .await;
+                                    // Spectator peers instead receive ONE
+                                    // party-merged frame (relay-audit
+                                    // structural limit #1): the union of all
+                                    // retained layers under a single owner-less
+                                    // id ("party-explored"), recomputed AFTER
+                                    // the update above was retained so this
+                                    // change's own geometry is included. No
+                                    // "fog:{user_id}" id or per-layer version
+                                    // ever reaches a spectator.
+                                    if let Some(merged) = party_merged_spectator_fog(&app_state, &rid)
+                                    {
+                                        match serde_json::to_string(&CrdtSyncMessage::FogUpdate(
+                                            merged,
+                                        )) {
+                                            Ok(merged_text) => {
+                                                peers
+                                                    .broadcast_if(&rid, peer_id, &merged_text, |peer| {
+                                                        peer.role == Role::Spectator
+                                                    })
+                                                    .await;
+                                            }
+                                            Err(e) => log::warn!(
+                                                "Failed to serialize party-merged fog frame: {}",
+                                                e
+                                            ),
+                                        }
+                                    }
                                 } else {
                                     log::warn!(
                                         "Dropped FogUpdate from {} for foreign layer '{}'",
@@ -2668,8 +2714,7 @@ async fn ws_sync(
                             _ => {}
                         }
                     }
-                    Err(_) => {}
-                },
+                }
                 Message::Ping(bytes) => {
                     let _ = session.pong(&bytes).await;
                 }
@@ -2678,7 +2723,10 @@ async fn ws_sync(
             }
         }
         peers.leave(&rid, peer_id);
-        let _ = session.close(None);
+        // Intentionally not awaited: the task is ending anyway and the close
+        // frame is best-effort. `drop` (rather than `let _ =`) makes the
+        // immediate-drop explicit for clippy::let_underscore_future.
+        drop(session.close(None));
     });
 
     response

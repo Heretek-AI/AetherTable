@@ -188,7 +188,7 @@ fn clamp_damage_expression(expr: &str) -> Result<String, String> {
     let count: u32 = count_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
     let sides: u32 = sides_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
     let capped_count = count.min(MAX_SPELL_DICE_COUNT);
-    let capped_sides = sides.min(MAX_SPELL_DIE_SIDES).max(1);
+    let capped_sides = sides.clamp(1, MAX_SPELL_DIE_SIDES);
     if count > MAX_SPELL_DICE_COUNT || sides > MAX_SPELL_DIE_SIDES {
         // Silently clamped counts would be dishonest — reject instead.
         return Err(format!(
@@ -383,6 +383,11 @@ impl RulesEvaluator {
         })
     }
 
+    // Allowed: the full attack pipeline is inherently a wide, positional
+    // domain signature (SRD attack resolution needs every one of these
+    // inputs); wrapping them in a params struct would only obscure the
+    // deterministic engine API.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_attack(
         dice: &mut DiceEngine,
         attacker_id: Uuid,
@@ -632,6 +637,9 @@ impl RulesEvaluator {
         (final_hp.max(-max_hp), final_temp_hp, is_instant_death)
     }
 
+    // Allowed: same rationale as `resolve_attack` — a positional SRD
+    // saving-throw pipeline whose inputs are all genuinely required.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_saving_throw(
         dice: &mut DiceEngine,
         target_id: Uuid,

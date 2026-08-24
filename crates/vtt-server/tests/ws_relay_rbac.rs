@@ -8,8 +8,11 @@
 //!   while GM and player peers keep receiving their transforms;
 //! - spectators cannot inject token moves (mirrors FORBIDDEN_ROLE on every
 //!   mutating HTTP route);
-//! - per-user fog layers (`fog:{user_id}`) are not delivered to other users'
-//!   spectator connections; owner-less/shared layers reach everyone.
+//! - spectators receive ONE party-merged fog layer (`party-explored`) whose
+//!   polygons are the union of every layer retained in the relay hub — never
+//!   the individual per-user layers themselves (relay-audit structural limit
+//!   #1), while GM/player peers keep receiving each individual layer as-is;
+//! - the initial `SyncStep2` snapshot serves spectators the same merged view.
 //!
 //! The tests drive a REAL server over real sockets (actix `test::start` +
 //! tokio-tungstenite clients) so the assertion is about bytes on the wire,
@@ -355,8 +358,149 @@ async fn spectator_cannot_inject_token_moves() {
     );
 }
 
+// --- Party-merged fog for spectators ------------------------------------------
+//
+// Relay-audit structural limit #1: composing users' masks into one unioned
+// polygon set requires rewriting frame payloads — until now spectators got
+// FEWER frames rather than a merged one (they saw only their own layer plus
+// owner-less shared layers). These tests pin the fix: on every accepted
+// FogUpdate the relay recomputes ONE merged layer ("party-explored") from all
+// layers currently retained in the hub and delivers that single frame to every
+// spectator peer, while GM/player peers keep receiving the individual layer.
+
 #[actix_web::test]
-async fn private_fog_layers_do_not_reach_other_users_spectators() {
+async fn spectator_receives_single_party_merged_fog_frame() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+
+    // GM reveals one region on its OWN private layer.
+    send_json(
+        &mut gm,
+        serde_json::json!({
+            "type": "FogUpdate",
+            "payload": {"layerId": "fog:gm-1",
+                        "revealedPolygons": [[[2.0, 2.0], [4.0, 2.0], [4.0, 4.0]]],
+                        "version": 3}
+        }),
+    )
+    .await;
+
+    let frame = next_delta_frame(&mut spectator, 1500)
+        .await
+        .expect("spectator must receive a party-merged fog frame");
+    let value: serde_json::Value = serde_json::from_str(&frame).expect("frame must be JSON");
+    assert_eq!(value["type"].as_str(), Some("FogUpdate"), "{}", frame);
+    assert_eq!(
+        value["payload"]["layerId"].as_str(),
+        Some("party-explored"),
+        "the frame must be the SINGLE merged layer, not an individual one: {}",
+        frame
+    );
+    assert!(
+        !frame.contains("fog:gm-1"),
+        "merged frames must never carry another user's private layer id: {}",
+        frame
+    );
+    assert_eq!(
+        value["payload"]["revealedPolygons"][0][0],
+        serde_json::json!([2.0, 2.0]),
+        "merged polygons must contain the GM's revealed geometry: {}",
+        frame
+    );
+
+    // Exactly ONE frame per fog change: no echo of the raw layer follows.
+    let extra = next_delta_frame(&mut spectator, 400).await;
+    assert!(
+        extra.is_none(),
+        "spectator must receive a SINGLE merged frame per change, got {:?}",
+        extra
+    );
+}
+
+#[actix_web::test]
+async fn second_users_fog_layer_merges_into_party_view_while_players_keep_individual_layers() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut player =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+
+    let layer_a = serde_json::json!({
+        "type": "FogUpdate",
+        "payload": {"layerId": "fog:gm-1",
+                    "revealedPolygons": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
+                    "version": 2}
+    });
+    let layer_b = serde_json::json!({
+        "type": "FogUpdate",
+        "payload": {"layerId": "fog:player-a",
+                    "revealedPolygons": [[[5.0, 5.0], [6.0, 5.0], [6.0, 6.0]]],
+                    "version": 7}
+    });
+
+    // First user reveals region A.
+    send_json(&mut gm, layer_a.clone()).await;
+
+    // PLAYER peers still receive the individual layer as before.
+    let player_frame = next_delta_frame(&mut player, 1500).await;
+    assert!(
+        player_frame.as_deref().map(|f| f.contains("fog:gm-1")).unwrap_or(false),
+        "player peers must keep receiving individual layers unchanged, got {:?}",
+        player_frame
+    );
+
+    // ...while the spectator sees only the merged view of it.
+    let spectator_frame = next_delta_frame(&mut spectator, 1500)
+        .await
+        .expect("spectator must receive the merged frame for the first layer");
+    assert!(
+        !spectator_frame.contains("fog:gm-1") && spectator_frame.contains("party-explored"),
+        "spectator must see the merged layer id, not the individual one: {}",
+        spectator_frame
+    );
+
+    // A SECOND user reveals region B on their own private layer.
+    send_json(&mut player, layer_b.clone()).await;
+
+    let gm_frame = next_delta_frame(&mut gm, 1500).await;
+    assert!(
+        gm_frame.as_deref().map(|f| f.contains("fog:player-a")).unwrap_or(false),
+        "GM peers must keep receiving individual layers unchanged, got {:?}",
+        gm_frame
+    );
+
+    let spectator_frame = next_delta_frame(&mut spectator, 1500)
+        .await
+        .expect("spectator must receive the merged frame for the second layer");
+    let value: serde_json::Value =
+        serde_json::from_str(&spectator_frame).expect("frame must be JSON");
+    let polygons = &value["payload"]["revealedPolygons"];
+    // Hub layers live in a map, so merged order is unspecified — assert as a
+    // SET: both users' geometry present in one frame.
+    let origins: Vec<&serde_json::Value> = (0..polygons.as_array().map_or(0, Vec::len))
+        .map(|i| &polygons[i][0])
+        .collect();
+    assert!(
+        origins.contains(&&serde_json::json!([0.0, 0.0])),
+        "merged view must retain user A's geometry: {}",
+        spectator_frame
+    );
+    assert!(
+        origins.contains(&&serde_json::json!([5.0, 5.0])),
+        "second user's layer must merge into the same party view: {}",
+        spectator_frame
+    );
+}
+
+#[actix_web::test]
+async fn private_layer_geometry_merges_for_spectators_without_identity_leak() {
     let (app, table) = start_table().await;
     let session_id = seed_hidden_and_visible_entities(&app).await;
 
@@ -365,18 +509,37 @@ async fn private_fog_layers_do_not_reach_other_users_spectators() {
     let mut spectator_b =
         connect_ws(&table, session_id, &sign_token_with_role("watcher-b", "spectator")).await;
 
-    // Player A writes THEIR fog layer.
-    let fog = serde_json::json!({
-        "type": "FogUpdate",
-        "payload": {"layerId": "fog:player-a", "revealedPolygons": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]], "version": 1}
-    });
-    send_json(&mut player, fog).await;
+    // Player A writes THEIR private fog layer.
+    send_json(
+        &mut player,
+        serde_json::json!({
+            "type": "FogUpdate",
+            "payload": {"layerId": "fog:player-a",
+                        "revealedPolygons": [[[3.0, 3.0], [4.0, 3.0], [4.0, 4.0]]],
+                        "version": 9}
+        }),
+    )
+    .await;
 
-    let spectator_frame = next_delta_frame(&mut spectator_b, 400).await;
+    // The spectator receives the accumulated party exploration — but as ONE
+    // owner-less merged layer. What must never leak is the per-user LAYER
+    // IDENTITY (`fog:player-a`), which is what attributed reveal history to a
+    // specific user on the wire.
+    let frame = next_delta_frame(&mut spectator_b, 1500)
+        .await
+        .expect("spectator must receive the party-merged exploration");
     assert!(
-        spectator_frame.is_none(),
-        "spectators must not receive other users' private fog layers, got {:?}",
-        spectator_frame
+        !frame.contains("fog:player-a"),
+        "private layer ids must never appear in a spectator's frames, got {}",
+        frame
+    );
+    let value: serde_json::Value = serde_json::from_str(&frame).expect("frame must be JSON");
+    assert_eq!(value["payload"]["layerId"].as_str(), Some("party-explored"));
+    assert_eq!(
+        value["payload"]["revealedPolygons"][0][0],
+        serde_json::json!([3.0, 3.0]),
+        "the revealed geometry itself is the party's shared map state: {}",
+        frame
     );
 }
 
@@ -489,22 +652,23 @@ async fn initial_snapshot_precedes_broadcast_deltas_for_new_peers() {
 }
 
 #[actix_web::test]
-async fn initial_snapshot_applies_fog_delivery_rules() {
+async fn initial_snapshot_serves_spectators_the_party_merged_fog_view() {
     let (app, table) = start_table().await;
     let session_id = seed_hidden_and_visible_entities(&app).await;
 
-    // GM seeds one PRIVATE layer and one SHARED layer before the spectator
-    // connects — the snapshot must apply the same delivery policy as live
-    // FogUpdate fan-out.
+    // GM seeds two distinct layers (one private per-user layer, one shared)
+    // before the spectator connects — the snapshot must serve the same merged
+    // view live fan-out does, not a list of individual layers.
     let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
-    for layer in ["fog:gm-1", "party-explored"] {
+    for (layer, origin) in [("fog:gm-1", [0.0, 0.0]), ("party-shared", [7.0, 7.0])] {
         send_json(
             &mut gm,
             serde_json::json!({
                 "type": "FogUpdate",
                 "payload": {"layerId": layer,
-                            "revealedPolygons": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
-                            "version": 1}
+                            "revealedPolygons": [[origin, [origin[0] + 1.0, origin[1]],
+                                                  [origin[0] + 1.0, origin[1] + 1.0]]],
+                            "version": 4}
             }),
         )
         .await;
@@ -516,14 +680,28 @@ async fn initial_snapshot_applies_fog_delivery_rules() {
     let snapshot = read_initial_snapshot(&mut spectator).await;
     let layers = snapshot_fog_layer_ids(&snapshot);
 
-    assert!(
-        layers.iter().any(|l| l == "party-explored"),
-        "shared layers must appear in the snapshot, got {:?}",
+    assert_eq!(
+        layers,
+        vec!["party-explored".to_string()],
+        "spectator snapshots must contain exactly ONE party-merged fog layer, got {:?}",
         layers
     );
+
+    // The merged layer carries BOTH layers' geometry (union by concatenation;
+    // hub map order is unspecified so assert as a set).
+    let polygons = &snapshot["fogLayers"][0]["revealedPolygons"];
+    assert_eq!(polygons.as_array().map(Vec::len), Some(2));
+    let origins: Vec<&serde_json::Value> = (0..2).map(|i| &polygons[i][0]).collect();
+    assert!(origins.contains(&&serde_json::json!([0.0, 0.0])));
+    assert!(origins.contains(&&serde_json::json!([7.0, 7.0])));
+
+    // GMs keep receiving every individual layer.
+    let mut gm2 = connect_ws(&table, session_id, &sign_token_with_role("gm-2", "gm")).await;
+    let gm_snapshot = read_initial_snapshot(&mut gm2).await;
+    let gm_layers = snapshot_fog_layer_ids(&gm_snapshot);
     assert!(
-        !layers.iter().any(|l| l == "fog:gm-1"),
-        "another user's private fog layer must NEVER appear in the snapshot, got {:?}",
-        layers
+        gm_layers.contains(&"fog:gm-1".to_string()) && gm_layers.contains(&"party-shared".to_string()),
+        "GM snapshots must keep listing individual layers, got {:?}",
+        gm_layers
     );
 }

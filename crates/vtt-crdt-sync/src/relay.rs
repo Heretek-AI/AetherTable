@@ -51,6 +51,10 @@ impl CrdtRelayHub {
             CrdtSyncMessage::Heartbeat { timestamp_ms } => {
                 Some(CrdtSyncMessage::Heartbeat { timestamp_ms })
             }
+            // SyncStep1/SyncStep2 are handshake frames, not room deltas:
+            // they carry no state to merge and are never fanned out by the
+            // hub. The WS layer answers SyncStep1 with a role-projected
+            // SyncStep2 directly to the requesting peer.
             _ => None,
         }
     }

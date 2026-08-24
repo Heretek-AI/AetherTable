@@ -197,7 +197,7 @@ fn test_srd_3d_elevation_and_fall_damage() {
 
     // Falling 30ft results in 3d6 bludgeoning damage
     let (dmg_30ft, is_prone) = vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 30.0, None);
-    assert!(dmg_30ft >= 3 && dmg_30ft <= 18);
+    assert!((3..=18).contains(&dmg_30ft));
     assert!(is_prone);
 
     // Acrobatics save DC 15 lands on feet (not prone)
@@ -389,9 +389,9 @@ fn test_srd_concentration_state_serialization_roundtrip() {
     }"#;
     let legacy: EntityState = serde_json::from_str(json).expect("legacy JSON deserializes");
     assert!(legacy.concentration.is_none());
-    assert!(serde_json::to_string(&legacy)
+    assert!(!serde_json::to_string(&legacy)
         .expect("serializes")
-        .contains("\"concentration\"") == false);
+        .contains("\"concentration\""));
 
     let mut concentrated = legacy.clone();
     concentrated.concentration = Some(ConcentrationState {

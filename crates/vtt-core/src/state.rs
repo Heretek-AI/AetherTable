@@ -345,6 +345,9 @@ impl EntityState {
 }
 
 impl EntityState {
+    // Allowed: 8-arg constructor, one arg per struct field — a params
+    // struct would just re-list the same fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Uuid,
         compendium_id: String,
@@ -1060,10 +1063,10 @@ impl GameSession {
             return Err("INGRESS_NON_FINITE_COORDINATES".to_string());
         }
         match ing.ingress_type {
-            IngressType::Teleportation | IngressType::PortalDoor | IngressType::Burrowing => {
-                if ing.source_point == ing.target_point {
-                    return Err("INGRESS_DEGENERATE_TRANSIT".to_string());
-                }
+            IngressType::Teleportation | IngressType::PortalDoor | IngressType::Burrowing
+                if ing.source_point == ing.target_point =>
+            {
+                return Err("INGRESS_DEGENERATE_TRANSIT".to_string());
             }
             _ => {}
         }

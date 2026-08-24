@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// orchestrator's `/api/v1/engine-session/hydrate` endpoint pushing persisted
 /// snapshots into `PUT /sessions/{id}/restore`. This module owns incremental
 /// event durability only.
-
+///
 /// Idempotent DDL mirroring database/postgres/02_event_sourcing_and_session_schema.sql.
 /// Executed statement-by-statement: Postgres forbids multiple commands in a
 /// single prepared statement, which is what sqlx uses internally.

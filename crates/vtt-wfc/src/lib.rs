@@ -80,13 +80,25 @@ impl DungeonGenerator {
             Ok(res) => res,
             Err(_) => {
                 let mut grid = vec![vec![TileType::Floor; self.width]; self.height];
-                for x in 0..self.width {
-                    grid[0][x] = TileType::Wall;
-                    grid[self.height - 1][x] = TileType::Wall;
+                // Wall the four borders: top and bottom rows in full, then
+                // the left and right edge of every row.
+                if let Some((top, rest)) = grid.split_first_mut() {
+                    for cell in top.iter_mut() {
+                        *cell = TileType::Wall;
+                    }
+                    if let Some(bottom) = rest.last_mut() {
+                        for cell in bottom.iter_mut() {
+                            *cell = TileType::Wall;
+                        }
+                    }
                 }
-                for y in 0..self.height {
-                    grid[y][0] = TileType::Wall;
-                    grid[y][self.width - 1] = TileType::Wall;
+                for row in grid.iter_mut() {
+                    if let Some(left) = row.first_mut() {
+                        *left = TileType::Wall;
+                    }
+                    if let Some(right) = row.last_mut() {
+                        *right = TileType::Wall;
+                    }
                 }
                 return DungeonMap {
                     width: self.width,
@@ -388,10 +400,10 @@ mod tests {
                     }
                 }
             }
-            for y in 0..map.height {
-                for x in 0..map.width {
+            for (y, (row, seen_row)) in map.grid.iter().zip(seen.iter()).enumerate() {
+                for (x, (cell, reached)) in row.iter().zip(seen_row.iter()).enumerate() {
                     assert!(
-                        !is_walkable(map.grid[y][x]) || seen[y][x],
+                        !is_walkable(*cell) || *reached,
                         "seed {}: unreachable walkable cell at ({},{})",
                         seed,
                         x,

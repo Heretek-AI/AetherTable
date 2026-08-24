@@ -150,23 +150,12 @@ impl Condition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DeathSaveState {
     pub successes: u8,
     pub failures: u8,
     pub is_stabilized: bool,
     pub is_dead: bool,
-}
-
-impl Default for DeathSaveState {
-    fn default() -> Self {
-        Self {
-            successes: 0,
-            failures: 0,
-            is_stabilized: false,
-            is_dead: false,
-        }
-    }
 }
 
 impl DeathSaveState {

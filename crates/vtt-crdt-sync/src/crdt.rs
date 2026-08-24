@@ -40,6 +40,54 @@ pub struct FogOfWarMask {
     pub version: u64,
 }
 
+/// The owner-less layer id under which the relay serves its single
+/// party-merged fog view to spectator peers (relay-audit structural limit #1).
+pub const PARTY_MERGED_FOG_LAYER_ID: &str = "party-explored";
+
+/// Merges several fog layers into ONE party-merged mask for spectator
+/// delivery.
+///
+/// # Geometry honesty: this union is LIST CONCATENATION, not geometric ops
+///
+/// The merged mask's `revealed_polygons` is simply every input layer's polygon
+/// list concatenated, in iteration order, duplicates and overlaps included.
+/// There is NO polygon boolean algebra here — no geometric union, no
+/// simplification, no hole punching. That is deliberate and CORRECT for this
+/// domain: fog-of-war reveal is ADDITIVE rendering. A client paints every
+/// revealed polygon as visible area, so overlapping polygons compose exactly
+/// like their geometric union would (`A ∪ B = paint(A); paint(B)`), while any
+/// difference/clipping pass would burn CPU on a result indistinguishable on
+/// screen.
+///
+/// The corollary constraint: concatenation semantics are valid ONLY while all
+/// participants treat reveal as monotone-additive. If a layer ever carried
+/// subtractive semantics (re-hide / exclusion zones), naive concatenation
+/// would over-reveal — such frames must NOT be fed through this merge.
+///
+/// Returns `None` when the inputs contain no geometry at all, so callers can
+/// distinguish "nothing explored yet" from an empty merged layer. The merged
+/// `version` is the max across inputs: a best-effort monotonically non-
+/// decreasing watermark (per-layer versions are client-authored, so it is
+/// advisory ordering, not a strict Lamport clock).
+pub fn merge_fog_layers<'a>(
+    layers: impl IntoIterator<Item = &'a FogOfWarMask>,
+) -> Option<FogOfWarMask> {
+    let mut merged_polygons: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut version = 0u64;
+    for layer in layers {
+        merged_polygons.extend(layer.revealed_polygons.iter().cloned());
+        version = version.max(layer.version);
+    }
+    if merged_polygons.is_empty() {
+        return None;
+    }
+    Some(FogOfWarMask {
+        layer_id: PARTY_MERGED_FOG_LAYER_ID.to_string(),
+        revealed_polygons: merged_polygons,
+        version,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum CrdtSyncMessage {
@@ -132,5 +180,56 @@ impl RoomCrdtState {
 
     pub fn update_fog(&mut self, fog: FogOfWarMask) {
         self.fog_masks.insert(fog.layer_id.clone(), fog);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mask(layer_id: &str, version: u64, polygons: &[(f32, f32)]) -> FogOfWarMask {
+        FogOfWarMask {
+            layer_id: layer_id.to_string(),
+            revealed_polygons: vec![polygons.to_vec()],
+            version,
+        }
+    }
+
+    #[test]
+    fn merge_is_list_concatenation_with_max_version_watermark() {
+        let a = mask("fog:user-a", 2, &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]);
+        let b = mask("fog:user-b", 7, &[(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)]);
+
+        let merged = merge_fog_layers([&a, &b]).expect("two non-empty layers must merge");
+
+        assert_eq!(merged.layer_id, PARTY_MERGED_FOG_LAYER_ID);
+        // Concatenation preserves every input polygon in order — overlaps
+        // included, because reveal rendering is additive.
+        assert_eq!(merged.revealed_polygons.len(), 2);
+        assert_eq!(merged.revealed_polygons[0], a.revealed_polygons[0]);
+        assert_eq!(merged.revealed_polygons[1], b.revealed_polygons[0]);
+        // Watermark = max across inputs, never an input's own id.
+        assert_eq!(merged.version, 7);
+    }
+
+    #[test]
+    fn merge_returns_none_when_no_layer_has_geometry() {
+        assert!(merge_fog_layers(std::iter::empty()).is_none());
+        let empty = FogOfWarMask {
+            layer_id: "fog:user-a".to_string(),
+            revealed_polygons: Vec::new(),
+            version: 4,
+        };
+        assert!(merge_fog_layers([&empty]).is_none());
+    }
+
+    #[test]
+    fn merged_output_serializes_as_a_plain_camel_case_fog_frame() {
+        let a = mask("fog:user-a", 3, &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]);
+        let merged = merge_fog_layers([&a]).expect("non-empty layer must merge");
+        let json = serde_json::to_value(CrdtSyncMessage::FogUpdate(merged)).unwrap();
+        assert_eq!(json["type"], "FogUpdate");
+        assert_eq!(json["payload"]["layerId"], PARTY_MERGED_FOG_LAYER_ID);
+        assert!(json["payload"]["revealedPolygons"].is_array());
     }
 }

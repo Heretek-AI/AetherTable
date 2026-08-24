@@ -1164,7 +1164,7 @@ fn test_exhaustion_serialization_round_trip_and_legacy_payload_back_compat() {
     // Old payloads predate any dedicated exhaustion representation: a
     // serialized entity whose condition list carries no Exhaustion entry
     // deserializes cleanly at level 0 (nothing new was added to the schema).
-    let legacy_json = serde_json::to_value(&hero("legacy", 30, 15)).unwrap();
+    let legacy_json = serde_json::to_value(hero("legacy", 30, 15)).unwrap();
     let legacy: EntityState = serde_json::from_value(legacy_json).unwrap();
     assert_eq!(legacy.exhaustion_level(), 0);
     assert!(!legacy.has_disadvantage_on_checks());
