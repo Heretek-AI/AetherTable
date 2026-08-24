@@ -27,7 +27,10 @@ use vtt_core::{
     Ability, ActionResolver, CheckOutcomeTier, Condition, CostSuggestion, DiceEngine,
     GameSession, RulesEvaluator, SessionMap,
 };
-use vtt_crdt_sync::{CrdtRelayHub, CrdtSyncMessage, TokenTransform, VectorClock};
+use vtt_crdt_sync::{
+    CrdtRelayHub, CrdtSyncMessage, FogOfWarMask, SnapshotToken, SyncSnapshot, TokenTransform,
+    VectorClock,
+};
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
 use vtt_spatial::{
     AStarPathfinder, CoverCalculator, CoverType, GridCollisionMap, TerrainOverlay, Vector3,
@@ -2331,6 +2334,122 @@ fn spectator_may_see_fog_layer(layer_id: &str, viewer_user_id: &str) -> bool {
     }
 }
 
+/// Parses a browser-shaped FogUpdate frame into the CRDT model. The relay hub
+/// must RETAIN fog state (not merely fan it out) — otherwise there is nothing
+/// to put into a SyncStep2 initial snapshot for late joiners.
+fn parse_fog_mask(value: &serde_json::Value, layer_id: &str) -> Option<FogOfWarMask> {
+    let payload = value.get("payload")?;
+    let polygons = payload
+        .get("revealedPolygons")
+        .or_else(|| payload.get("revealed_polygons"))?;
+    let revealed_polygons: Vec<Vec<(f32, f32)>> = serde_json::from_value(polygons.clone()).ok()?;
+    let version = payload.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(FogOfWarMask {
+        layer_id: layer_id.to_string(),
+        revealed_polygons,
+        version,
+    })
+}
+
+/// Builds the `SyncStep2` initial-state frame for one newly connected peer.
+///
+/// Relay-audit structural limit #4: until now a peer that joined mid-session
+/// received deltas only and started from an empty board. This closes that gap:
+/// after the WS handshake (and again on any client-sent `SyncStep1` resync
+/// request) the peer gets ONE snapshot frame holding exactly what its
+/// authenticated role is entitled to, then deltas flow as before.
+///
+/// Entitlement mirrors the live-delivery rules already enforced on fan-out:
+/// - Tokens come from the AUTHORITATIVE session roster — that is where
+///   visibility lives (`project_snapshot_for_role` semantics): non-GM peers
+///   never see hidden entities. Positions overlay any accepted CRDT transform
+///   so moved tokens appear where play left them, not at spawn points.
+/// - Fog layers apply `spectator_may_see_fog_layer`: spectators get their own
+///   private layer plus owner-less shared layers; GMs/players get everything.
+fn build_initial_snapshot(
+    data: &AppState,
+    room_id: &str,
+    role: Role,
+    user_id: &str,
+) -> CrdtSyncMessage {
+    let hub_room = data.crdt_hub.get_or_create_room(room_id);
+    let state = hub_room.read();
+
+    // CRDT token ids are name-hash-derived (see accept_token_update), so an
+    // accepted transform is matched back to its entity by the same hash.
+    let live_transform = |name: &str| {
+        let key = fnv1a_hash(name);
+        state
+            .token_transforms
+            .values()
+            .find(|t| t.vector_clock.client_id == key)
+    };
+
+    let mut tokens = Vec::new();
+    if let Some(session_lock) = Uuid::parse_str(room_id).ok().and_then(|id| data.sessions.get(&id))
+    {
+        let session = session_lock.read();
+        for entity in session.entities.values() {
+            if !role.is_gm() && !entity.is_visible {
+                continue; // hidden from everyone but GM/admin
+            }
+            let token = match live_transform(&entity.name) {
+                Some(t) => SnapshotToken {
+                    token_name: entity.name.clone(),
+                    x: t.x,
+                    y: t.y,
+                    z: t.z,
+                    rotation: t.rotation,
+                    scale: t.scale,
+                    elevation: t.elevation,
+                    sequence: t.vector_clock.sequence,
+                },
+                // Never moved over the relay: fall back to the engine's
+                // authored position with sequence 0 so ANY future delta wins
+                // LWW against it.
+                None => SnapshotToken {
+                    token_name: entity.name.clone(),
+                    x: entity.position.0,
+                    y: entity.position.1,
+                    z: entity.position.2,
+                    rotation: 0.0,
+                    scale: 1.0,
+                    elevation: 0.0,
+                    sequence: 0,
+                },
+            };
+            tokens.push(token);
+        }
+    }
+
+    let fog_layers: Vec<vtt_crdt_sync::FogOfWarMask> = state
+        .fog_masks
+        .values()
+        .filter(|fog| role != Role::Spectator || spectator_may_see_fog_layer(&fog.layer_id, user_id))
+        .cloned()
+        .collect();
+
+    CrdtSyncMessage::SyncStep2(SyncSnapshot {
+        room_id: room_id.to_string(),
+        tokens,
+        fog_layers,
+    })
+}
+
+/// Serialize + deliver the initial snapshot to one peer's socket. Failures are
+/// logged but never fatal: a peer that misses its snapshot degrades to today's
+/// delta-only behavior rather than being disconnected.
+async fn send_initial_snapshot(session: &mut actix_ws::Session, frame: &CrdtSyncMessage) {
+    match serde_json::to_string(frame) {
+        Ok(text) => {
+            if let Err(e) = session.text(text).await {
+                log::warn!("Failed to deliver SyncStep2 snapshot: {}", e);
+            }
+        }
+        Err(e) => log::warn!("Failed to serialize SyncStep2 snapshot: {}", e),
+    }
+}
+
 /// Normalize the browser's camelCase TokenUpdate payload into the CRDT
 /// model, validate the movement, and run LWW arbitration; true means
 /// "accept & relay".
@@ -2419,6 +2538,14 @@ async fn ws_sync(
     };
 
     let mut session = session;
+
+    // Initial-state sync (relay-audit structural limit #4): the snapshot is
+    // built and written BEFORE the peer joins the fan-out registry. That
+    // ordering is the whole contract — a delta broadcast can never overtake
+    // the snapshot on this socket, so clients may apply it blindly.
+    let snapshot = build_initial_snapshot(&data, &room_id, role, &identity.user_id);
+    send_initial_snapshot(&mut session, &snapshot).await;
+
     let peer_id = data.peers.join(&room_id, &session, role, &identity.user_id);
     let hub = Arc::clone(&data.crdt_hub);
     let peers = Arc::clone(&data.peers);
@@ -2473,6 +2600,21 @@ async fn ws_sync(
                                 let owned_by_sender =
                                     layer_id == format!("fog:{}", identity.user_id);
                                 if owned_by_sender || role.is_gm() {
+                                    // Retain the layer in CRDT state so future
+                                    // SyncStep2 initial snapshots can serve it
+                                    // to peers that connect later.
+                                    match parse_fog_mask(&value, &layer_id) {
+                                        Some(mask) => {
+                                            hub.handle_incoming_message(
+                                                &rid,
+                                                CrdtSyncMessage::FogUpdate(mask),
+                                            );
+                                        }
+                                        None => log::warn!(
+                                            "FogUpdate for layer '{}' not parseable; relayed but not retained",
+                                            layer_id
+                                        ),
+                                    }
                                     // Delivery RBAC: spectators receive their
                                     // own layers and owner-less shared layers,
                                     // but never another user's private fog.
@@ -2508,9 +2650,21 @@ async fn ws_sync(
                                     .broadcast(&rid, peer_id, &value.to_string())
                                     .await;
                             }
-                            Some("Heartbeat") | Some("SyncStep1") => {
+                            Some("Heartbeat") => {
                                 let _ = session.text(text.clone()).await;
                             }
+                            // Resync request: instead of echoing the caller's
+                            // own state vector back, answer with the same
+                            // entitlement-scoped snapshot a new connection
+                            // receives.
+                            Some("SyncStep1") => {
+                                let resync =
+                                    build_initial_snapshot(&app_state, &rid, role, &identity.user_id);
+                                send_initial_snapshot(&mut session, &resync).await;
+                            }
+                            // Server-to-peer frame; a client sending one has
+                            // nothing the room needs. Dropped, never fanned out.
+                            Some("SyncStep2") => {}
                             _ => {}
                         }
                     }

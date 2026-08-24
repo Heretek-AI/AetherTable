@@ -33,6 +33,7 @@ pub struct UserCursor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct FogOfWarMask {
     pub layer_id: String,
     pub revealed_polygons: Vec<Vec<(f32, f32)>>,
@@ -42,12 +43,55 @@ pub struct FogOfWarMask {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum CrdtSyncMessage {
+    /// Peer → relay: "here is what I already have" (state vector). The relay
+    /// answers with a fresh `SyncStep2` snapshot so late/reconnecting peers
+    /// can resynchronize on demand, not only at connect time.
     SyncStep1 { state_vector: HashMap<u64, u64> },
-    SyncStep2 { update_bytes: Vec<u8> },
+    /// Relay → peer: initial-state snapshot (role-projected). This is the
+    /// frame a newly connected peer receives right after the handshake;
+    /// deltas (`TokenUpdate` / `FogUpdate` / `CursorAwareness`) flow after it
+    /// exactly as before. Newtype over `SyncSnapshot` so the wire payload IS
+    /// the snapshot (`payload` = `SyncSnapshot`), with no extra nesting level.
+    SyncStep2(SyncSnapshot),
     TokenUpdate(TokenTransform),
     CursorAwareness(UserCursor),
     FogUpdate(FogOfWarMask),
     Heartbeat { timestamp_ms: u64 },
+}
+
+/// One board token inside a `SyncStep2` initial-state snapshot.
+///
+/// The token is keyed by its entity DISPLAY NAME because that is the relay's
+/// wire key everywhere else (`tokenId` on `TokenUpdate` frames): the CRDT's
+/// internal `token_id` UUID is an fnv1a hash of the name and therefore not
+/// reversible into something a client can echo back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotToken {
+    pub token_name: String,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub rotation: f32,
+    pub scale: f32,
+    pub elevation: f32,
+    /// LWW watermark of the last accepted transform for this token
+    /// (0 = never moved since the room was created).
+    pub sequence: u64,
+}
+
+/// The full entitlement-scoped state of one room, sent to a peer as a single
+/// `SyncStep2` frame. The RELAY decides what belongs in here per the peer's
+/// authenticated role — hidden entities are excluded for non-GM peers and fog
+/// layers follow delivery rules — so the snapshot is safe to apply blindly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSnapshot {
+    pub room_id: String,
+    /// Role-projected board tokens.
+    pub tokens: Vec<SnapshotToken>,
+    /// Fog layers this peer may receive under live-delivery rules.
+    pub fog_layers: Vec<FogOfWarMask>,
 }
 
 #[derive(Debug, Clone, Default)]

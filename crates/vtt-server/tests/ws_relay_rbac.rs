@@ -135,6 +135,75 @@ async fn next_frame(
     }
 }
 
+/// Reads frames until an APPLICATION frame arrives, i.e. anything that is
+/// not the role-projected `SyncStep2` initial-state snapshot every new peer
+/// now receives right after the WS handshake. `None` on timeout/silence —
+/// same contract as `next_frame`.
+async fn next_delta_frame(
+    stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    timeout_ms: u64,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let frame = next_frame(stream, remaining.as_millis() as u64).await?;
+        let is_snapshot = serde_json::from_str::<serde_json::Value>(&frame)
+            .ok()
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "SyncStep2")
+            })
+            .unwrap_or(false);
+        if !is_snapshot {
+            return Some(frame);
+        }
+    }
+}
+
+/// Reads the post-handshake initial-state snapshot frame, asserting it IS a
+/// `SyncStep2` frame, and returns its parsed payload.
+async fn read_initial_snapshot(
+    stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) -> serde_json::Value {
+    let frame = next_frame(stream, 1500)
+        .await
+        .expect("newly connected peer must receive a SyncStep2 snapshot frame");
+    let value: serde_json::Value =
+        serde_json::from_str(&frame).expect("snapshot frame must be valid JSON");
+    assert_eq!(
+        value["type"].as_str(),
+        Some("SyncStep2"),
+        "first application frame must be the initial-state snapshot, got {}",
+        frame
+    );
+    value["payload"].clone()
+}
+
+fn snapshot_token_names(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot["tokens"]
+        .as_array()
+        .map(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|t| t["tokenName"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_fog_layer_ids(snapshot: &serde_json::Value) -> Vec<String> {
+    snapshot["fogLayers"]
+        .as_array()
+        .map(|layers| {
+            layers
+                .iter()
+                .filter_map(|l| l["layerId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn token_update(token_name: &str, x: f64, y: f64) -> serde_json::Value {
     serde_json::json!({
         "type": "TokenUpdate",
@@ -223,14 +292,14 @@ async fn hidden_token_transform_never_reaches_spectator_but_reaches_player() {
     // GM moves the HIDDEN orc.
     send_json(&mut gm, token_update("Orc", 5.0, 5.0)).await;
 
-    let player_frame = next_frame(&mut player, 1500).await;
+    let player_frame = next_delta_frame(&mut player, 1500).await;
     assert!(
         player_frame.as_deref().map(|f| f.contains("Orc")).unwrap_or(false),
         "player peer must receive hidden-token transforms, got {:?}",
         player_frame
     );
 
-    let spectator_frame = next_frame(&mut spectator, 400).await;
+    let spectator_frame = next_delta_frame(&mut spectator, 400).await;
     assert!(
         spectator_frame.is_none(),
         "spectator peer must NOT receive hidden-token transforms, got {:?}",
@@ -252,7 +321,7 @@ async fn visible_token_transform_reaches_every_role() {
     send_json(&mut gm, token_update("Hero", 7.0, 3.0)).await;
 
     for (role, stream) in [("player", &mut player), ("spectator", &mut spectator)] {
-        let frame = next_frame(stream, 1500).await;
+        let frame = next_delta_frame(stream, 1500).await;
         assert!(
             frame.as_deref().map(|f| f.contains("Hero")).unwrap_or(false),
             "{} peer must receive visible-token transforms, got {:?}",
@@ -276,9 +345,9 @@ async fn spectator_cannot_inject_token_moves() {
     // The spectator tries to move the GM's hidden orc anyway.
     send_json(&mut spectator, token_update("Orc", 99.0, 99.0)).await;
 
-    let gm_frame = next_frame(&mut gm, 400).await;
+    let gm_frame = next_delta_frame(&mut gm, 400).await;
     assert!(gm_frame.is_none(), "GM must not receive spectator-injected moves, got {:?}", gm_frame);
-    let player_frame = next_frame(&mut player, 400).await;
+    let player_frame = next_delta_frame(&mut player, 400).await;
     assert!(
         player_frame.is_none(),
         "players must not receive spectator-injected moves, got {:?}",
@@ -303,7 +372,7 @@ async fn private_fog_layers_do_not_reach_other_users_spectators() {
     });
     send_json(&mut player, fog).await;
 
-    let spectator_frame = next_frame(&mut spectator_b, 400).await;
+    let spectator_frame = next_delta_frame(&mut spectator_b, 400).await;
     assert!(
         spectator_frame.is_none(),
         "spectators must not receive other users' private fog layers, got {:?}",
@@ -329,7 +398,7 @@ async fn ownerless_shared_fog_layers_reach_every_role() {
     });
     send_json(&mut gm, fog).await;
 
-    let spectator_frame = next_frame(&mut spectator, 1500).await;
+    let spectator_frame = next_delta_frame(&mut spectator, 1500).await;
     assert!(
         spectator_frame
             .as_deref()
@@ -337,5 +406,124 @@ async fn ownerless_shared_fog_layers_reach_every_role() {
             .unwrap_or(false),
         "ownerless shared layers must still fan out to spectators, got {:?}",
         spectator_frame
+    );
+}
+
+// --- Initial-state sync (SyncStep2) -------------------------------------------
+//
+// Relay-audit structural limit #4: "the relay has no initial-state sync
+// message at all — a newly connected peer gets deltas only". These tests pin
+// the fix: after the WS handshake the server sends ONE SyncStep2 snapshot
+// frame containing exactly what that peer's role is entitled to, BEFORE any
+// broadcast delta can reach it.
+
+#[actix_web::test]
+async fn initial_snapshot_shows_spectator_only_visible_board_tokens() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+
+    let snapshot = read_initial_snapshot(&mut spectator).await;
+    let names = snapshot_token_names(&snapshot);
+    assert!(
+        names.iter().any(|n| n == "Hero"),
+        "snapshot must include visible board tokens, got {:?}",
+        names
+    );
+    assert!(
+        !names.iter().any(|n| n == "Orc"),
+        "snapshot must EXCLUDE hidden entities from spectators, got {:?}",
+        names
+    );
+}
+
+#[actix_web::test]
+async fn initial_snapshot_includes_hidden_entities_for_gm() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+
+    let snapshot = read_initial_snapshot(&mut gm).await;
+    let names = snapshot_token_names(&snapshot);
+    assert!(
+        names.iter().any(|n| n == "Hero") && names.iter().any(|n| n == "Orc"),
+        "GM snapshot must include hidden AND visible entities, got {:?}",
+        names
+    );
+}
+
+#[actix_web::test]
+async fn initial_snapshot_precedes_broadcast_deltas_for_new_peers() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+
+    // The delta is already in flight while the spectator is handshaking; the
+    // snapshot frame must STILL arrive first.
+    send_json(&mut gm, token_update("Hero", 7.0, 3.0)).await;
+
+    let first = next_frame(&mut spectator, 1500)
+        .await
+        .expect("spectator must receive the snapshot");
+    let first_value: serde_json::Value =
+        serde_json::from_str(&first).expect("frame must be JSON");
+    assert_eq!(
+        first_value["type"].as_str(),
+        Some("SyncStep2"),
+        "the FIRST application frame must be the snapshot, not a delta: {}",
+        first
+    );
+
+    let second = next_delta_frame(&mut spectator, 1500).await;
+    assert!(
+        second.as_deref().map(|f| f.contains("Hero")).unwrap_or(false),
+        "after the snapshot the live delta must flow as today, got {:?}",
+        second
+    );
+}
+
+#[actix_web::test]
+async fn initial_snapshot_applies_fog_delivery_rules() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    // GM seeds one PRIVATE layer and one SHARED layer before the spectator
+    // connects — the snapshot must apply the same delivery policy as live
+    // FogUpdate fan-out.
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    for layer in ["fog:gm-1", "party-explored"] {
+        send_json(
+            &mut gm,
+            serde_json::json!({
+                "type": "FogUpdate",
+                "payload": {"layerId": layer,
+                            "revealedPolygons": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
+                            "version": 1}
+            }),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+    let snapshot = read_initial_snapshot(&mut spectator).await;
+    let layers = snapshot_fog_layer_ids(&snapshot);
+
+    assert!(
+        layers.iter().any(|l| l == "party-explored"),
+        "shared layers must appear in the snapshot, got {:?}",
+        layers
+    );
+    assert!(
+        !layers.iter().any(|l| l == "fog:gm-1"),
+        "another user's private fog layer must NEVER appear in the snapshot, got {:?}",
+        layers
     );
 }
