@@ -65,6 +65,8 @@ interface NavbarProps {
   onOpenHandouts?: () => void;
   onOpenQuestJournal?: () => void;
   onOpenCampaignSaves?: () => void;
+  /** Opens the guided New Campaign wizard (GOALS.md Pillar 2). */
+  onOpenCampaignWizard?: () => void;
   onToggleVideoMesh?: () => void;
   onOpenStreamerHUD?: () => void;
   onOpenSubscription?: () => void;
@@ -90,6 +92,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenHandouts,
   onOpenQuestJournal,
   onOpenCampaignSaves,
+  onOpenCampaignWizard,
   onToggleVideoMesh,
   onOpenStreamerHUD,
   onOpenSubscription,
@@ -452,6 +455,22 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {activeDropdown === 'tools' && (
             <div className="absolute right-0 top-11 w-60 vtt-glass-panel rounded-xl shadow-2xl p-1.5 animate-fadeIn space-y-1 font-mono text-xs" style={{ zIndex: 'var(--z-popover)' }}>
+              {onOpenCampaignWizard && (
+                <button
+                  onClick={() => {
+                    onOpenCampaignWizard();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
+                >
+                  <Wand2 className="w-4 h-4 text-amber-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">New Campaign</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Guided setup wizard &amp; invite code</div>
+                  </div>
+                </button>
+              )}
+
               {onOpenCampaignSaves && (
                 <button
                   onClick={() => {

@@ -56,6 +56,7 @@ const VideoMeshTiles = lazy(() => import('./components/VideoMeshTiles').then((m)
 const BossHealthBar = lazy(() => import('./components/BossHealthBar').then((m) => ({ default: m.BossHealthBar })));
 const CampaignSaveModal = lazy(() => import('./components/CampaignSaveModal').then((m) => ({ default: m.CampaignSaveModal })));
 const ShortcutsModal = lazy(() => import('./components/ShortcutsModal').then((m) => ({ default: m.ShortcutsModal })));
+const CampaignWizardModal = lazy(() => import('./components/CampaignWizardModal').then((m) => ({ default: m.CampaignWizardModal })));
 
 /** Themed loading placeholder shown while a lazily-split view/modal chunk loads. */
 const ChunkFallback = ({ label }: { label: string }) => (
@@ -73,6 +74,8 @@ import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSessi
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
+import type { Lobby } from './api/lobby_store';
+import type { CampaignWizardConfig } from './components/CampaignWizardModal';
 import { listSaves, loadCampaign } from './api/campaign_store';
 import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
@@ -122,6 +125,9 @@ export function App() {
   const [isHandoutsOpen, setIsHandoutsOpen] = useState(false);
   const [isQuestJournalOpen, setIsQuestJournalOpen] = useState(false);
   const [isCampaignSavesOpen, setIsCampaignSavesOpen] = useState(false);
+  // Guided New Campaign wizard (GOALS.md Pillar 2) — completes only after a
+  // real lobby comes back from POST /api/v1/lobbies.
+  const [isCampaignWizardOpen, setIsCampaignWizardOpen] = useState(false);
   const [isVideoMeshVisible, setIsVideoMeshVisible] = useState(true);
   const [isStreamerHUDOpen, setIsStreamerHUDOpen] = useState(false);
   const [activeMapLayer, setActiveMapLayer] = useState<MapLayerType>('tokens');
@@ -188,6 +194,7 @@ export function App() {
           [isHandoutsOpen, () => setIsHandoutsOpen(false)],
           [isQuestJournalOpen, () => setIsQuestJournalOpen(false)],
           [isCampaignSavesOpen, () => setIsCampaignSavesOpen(false)],
+          [isCampaignWizardOpen, () => setIsCampaignWizardOpen(false)],
           [isStreamerHUDOpen, () => setIsStreamerHUDOpen(false)],
           [isAudioMixerOpen, () => setIsAudioMixerOpen(false)],
           [isJukeboxOpen, () => setIsJukeboxOpen(false)],
@@ -215,6 +222,7 @@ export function App() {
     isHandoutsOpen,
     isQuestJournalOpen,
     isCampaignSavesOpen,
+    isCampaignWizardOpen,
     isStreamerHUDOpen,
     isAudioMixerOpen,
     isJukeboxOpen,
@@ -1171,6 +1179,31 @@ export function App() {
     setCurrentView('tabletop');
   };
 
+  /**
+   * New Campaign wizard completion — fires ONLY after a real lobby was created
+   * server-side. Applies the wizard's selections where real mechanisms exist:
+   * campaign title state and the local atmosphere preset. Rule version / party
+   * size / starting level have no server field yet (the lobby API takes just a
+   * name), so they are acknowledged in chat rather than silently dropped.
+   */
+  const handleCampaignWizardComplete = (
+    _lobby: Lobby,
+    config: CampaignWizardConfig,
+    loadAdventureKey: string | null
+  ) => {
+    setCampaignTitle(config.name);
+    if (config.atmosphereId !== atmosphereId) setAtmosphereId(config.atmosphereId);
+    addSystemMessage(
+      `Campaign "${config.name}" created — invite code shared in the wizard. ` +
+        `Config: ${config.ruleVersion === 'srd_5_2' ? 'SRD 5.2' : 'SRD 5.1'}, ` +
+        `${config.partySize} seats, start level ${config.startingLevel}` +
+        (loadAdventureKey ? `, starter adventure "${loadAdventureKey}" selected` : '') +
+        '.'
+    );
+    setIsCampaignWizardOpen(false);
+    setCurrentView('lobby');
+  };
+
   const handleInjectDynastyLore = (houseName: string, text: string) => {
     addSystemMessage(`DYNASTY LORE ASSERTED: ${text}`);
     setMessages((prev) => [
@@ -1336,6 +1369,7 @@ export function App() {
         onSelectAtmosphere={setAtmosphereId}
         canManageAtmosphere={userRole === 'gm'}
                 onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
+        onOpenCampaignWizard={guardGmSurface('the New Campaign wizard', () => setIsCampaignWizardOpen(true))}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
         onOpenMapEditor={guardGmSurface('the Map & Hidden-Info Layer editor', () => setIsMapEditorOpen(true))}
         onOpenHandouts={guardGmSurface('the Handouts Vault', () => setIsHandoutsOpen(true))}
@@ -1559,6 +1593,16 @@ export function App() {
         getSnapshot={getCampaignSnapshot}
         onLoadSnapshot={applyCampaignSnapshot}
       />
+
+      {/* Guided New Campaign Wizard (GOALS.md Pillar 2) — completes only on a
+          real created lobby; failures surface inline inside the wizard. */}
+      {isCampaignWizardOpen && (
+        <CampaignWizardModal
+          isOpen={isCampaignWizardOpen}
+          onClose={() => setIsCampaignWizardOpen(false)}
+          onComplete={handleCampaignWizardComplete}
+        />
+      )}
 
       {/* Streamer Broadcast HUD Modal — userRole is passed (not duplicated)
           so the modal REPORTS the live privacy posture instead of keeping its
