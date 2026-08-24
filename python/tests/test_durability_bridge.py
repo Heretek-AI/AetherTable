@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator.routing import engine_client
+from vtt_orchestrator.routing.engine_client import EngineUnavailableError
 from vtt_orchestrator.server import app
 
 client = TestClient(app)
@@ -23,12 +24,18 @@ def gm_token(request):
 
 
 def _spawn_ok(token: str) -> str:
-    created = engine_client.engine_request_sync(
-        "POST",
-        "/api/v1/sessions",
-        {"campaign_id": "00000000-0000-0000-0000-000000000003",
-         "session_name": "Durability Test"},
-    )
+    # Direct engine call: raises EngineUnavailableError (wrapping
+    # httpx.ConnectError) BEFORE any gateway status code exists to inspect,
+    # so a downstream `if resp.status_code == 502` guard would be dead code.
+    try:
+        created = engine_client.engine_request_sync(
+            "POST",
+            "/api/v1/sessions",
+            {"campaign_id": "00000000-0000-0000-0000-000000000003",
+             "session_name": "Durability Test"},
+        )
+    except EngineUnavailableError:
+        pytest.skip("engine not running")
     session_id = created["session_id"]
     resp = client.post(
         "/api/v1/engine-session/persist",

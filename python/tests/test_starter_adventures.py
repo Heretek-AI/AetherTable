@@ -215,12 +215,36 @@ def test_export_route_requires_token():
     key = starter_adventures.KARAS_KEY
 
     missing = client.post(f"/api/v1/adventures/starter/{key}/export")
-    assert missing.status_code == 422  # FastAPI: required query param absent
+    assert missing.status_code == 401  # _require_auth: no header, no query token
 
     invalid = client.post(
         f"/api/v1/adventures/starter/{key}/export", params={"token": "garbage.token"}
     )
     assert invalid.status_code == 401
+
+
+def test_export_route_accepts_authorization_header():
+    """The wizard sends only an Authorization header — the route must accept it.
+
+    Regression guard: this route used to declare ``token: str = Query(...)``,
+    so every header-only request died with a 422 before auth ever ran.
+    """
+    user = _signup("header_export_bot")
+    key = starter_adventures.KARAS_KEY
+
+    resp = client.post(
+        f"/api/v1/adventures/starter/{key}/export",
+        headers={"Authorization": f"Bearer {user['token']}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "application/zip"
+    assert resp.content.startswith(b"PK")
+
+    unknown = client.post(
+        "/api/v1/adventures/starter/not_an_adventure/export",
+        headers={"Authorization": f"Bearer {user['token']}"},
+    )
+    assert unknown.status_code == 404
 
 
 def test_export_route_returns_importable_bundle():

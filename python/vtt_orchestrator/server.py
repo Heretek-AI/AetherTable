@@ -1893,8 +1893,14 @@ def list_starter_bundles():
 
 
 @app.post("/api/v1/adventures/starter/{key}/export")
-def export_starter_adventure(key: str, token: str = Query(...)):
+def export_starter_adventure(key: str, token: str = Depends(_require_auth)):
     """Build a starter adventure on demand and return its .vttbundle archive.
+
+    Auth matches the rest of the migrated gateway: the HMAC session token is
+    taken from the Authorization header first ("Bearer <token>"), with the
+    legacy ?token= query param as back-compat fallback. (This route previously
+    declared ``token: str = Query(...)``, so the wizard's header-only request
+    could never pass validation.)
 
     Layouts come from the engine's WFC when reachable, else the documented
     seeded fallback (provenance recorded inside adventure.json)."""

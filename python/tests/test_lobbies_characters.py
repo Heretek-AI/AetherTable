@@ -136,6 +136,9 @@ def test_character_persistence_and_deploy(host, guest):
 
     # Deploy spawns an OWNED entity (RBAC-bound).
     session = client.post("/api/v1/engine/session", params={"token": host["token"]}, json={})
+    if session.status_code == 502:
+        pytest.skip("engine not running")
+    assert session.status_code == 200, session.text
     deploy = client.post(
         f"/api/v1/characters/{record['character_id']}/deploy",
         params={"token": host["token"]},

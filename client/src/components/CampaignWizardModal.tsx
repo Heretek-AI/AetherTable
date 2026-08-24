@@ -110,7 +110,23 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createdLobby, setCreatedLobby] = useState<Lobby | null>(null);
-  const [copiedCode, setCopiedCode] = useState(false);
+  /**
+   * Honest clipboard feedback: 'copied' only after
+   * navigator.clipboard.writeText RESOLVES, 'failed' when it rejects or is
+   * unavailable (insecure context / no permission), so we never fabricate a
+   * success the user cannot verify.
+   */
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const scheduleCopyStateReset = (state: 'idle' | 'copied' | 'failed', ms: number) => {
+    if (copyResetTimerRef.current !== null) clearTimeout(copyResetTimerRef.current);
+    setCopyState(state);
+    copyResetTimerRef.current = setTimeout(() => {
+      copyResetTimerRef.current = null;
+      setCopyState('idle');
+    }, ms);
+  };
 
   // Starter-adventure catalog (real GET /api/v1/adventures/starter). Null =
   // fetch failed / still loading; we never fabricate entries to fill the list.
@@ -158,7 +174,11 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
     setCreating(false);
     setCreateError(null);
     setCreatedLobby(null);
-    setCopiedCode(false);
+    if (copyResetTimerRef.current !== null) {
+      clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+    setCopyState('idle');
     setWantAdventure(false);
     setSelectedAdventureKey(null);
     setDownloadError(null);
@@ -187,11 +207,20 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
     setCreating(false);
   };
 
-  const handleCopyInvite = () => {
+  const handleCopyInvite = async () => {
     if (!createdLobby) return;
-    navigator.clipboard.writeText(createdLobby.invite_code);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
+    // Clipboard API is unavailable on insecure origins and can reject on
+    // permission denial — both must surface as failure, not fake success.
+    if (!navigator.clipboard?.writeText) {
+      scheduleCopyStateReset('failed', 4000);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(createdLobby.invite_code);
+      scheduleCopyStateReset('copied', 2000);
+    } catch {
+      scheduleCopyStateReset('failed', 4000);
+    }
   };
 
   /**
@@ -351,10 +380,22 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
               <button
                 onClick={handleCopyInvite}
                 className="vtt-btn vtt-btn-primary px-3 shrink-0"
-                title="Copy invite code to clipboard"
+                title={
+                  copyState === 'failed'
+                    ? 'Clipboard access was denied or unavailable — select the code and press Ctrl+C'
+                    : 'Copy invite code to clipboard'
+                }
               >
-                {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                <span>{copiedCode ? 'Copied' : 'Copy'}</span>
+                {copyState === 'copied' && <Check className="w-4 h-4" />}
+                {copyState === 'idle' && <Copy className="w-4 h-4" />}
+                {copyState === 'failed' && <AlertTriangle className="w-4 h-4" />}
+                <span>
+                  {copyState === 'copied'
+                    ? 'Copied'
+                    : copyState === 'failed'
+                      ? 'Press Ctrl+C'
+                      : 'Copy'}
+                </span>
               </button>
             </div>
           </div>
