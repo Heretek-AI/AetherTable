@@ -70,3 +70,49 @@ def test_homebrew_markdown_parser():
     assert len(creature["actions"]) >= 1
     assert creature["actions"][0]["name"] == "Bite"
     assert creature["actions"][0]["to_hit"] == "+5"
+
+
+def test_homebrew_parser_fails_loud_not_fabricates():
+    """Phase-2 regression: unparseable input used to silently produce a
+    combat-ready fake (AC 14 / HP 30 / invented 'Claw Strike')."""
+    parser = HomebrewMarkdownParser()
+    creature = parser.parse_statblock("just some random prose, no statblock here")
+
+    assert creature["parse_ok"] is False
+    assert set(creature["warnings"]) >= {
+        "unparsed_field:name", "unparsed_field:ac",
+        "unparsed_field:hp", "unparsed_field:abilities", "unparsed_field:actions",
+    }
+    # No combat-ready fabrications.
+    for field in ("name", "ac", "hp", "max_hp"):
+        assert creature[field] is None
+    assert creature["actions"] == []
+
+
+def test_homebrew_parser_partial_parse_reports_missing_fields():
+    parser = HomebrewMarkdownParser()
+    creature = parser.parse_statblock(
+        """
+        ### Half Statblock
+        > * **Armor Class** 15
+        """
+    )
+    assert creature["ac"] == 15
+    assert creature["parse_ok"] is False
+    assert "unparsed_field:hp" in creature["warnings"]
+
+
+def test_homebrew_parse_endpoint_strict_mode():
+    from fastapi.testclient import TestClient
+    from vtt_orchestrator.server import app
+
+    client = TestClient(app)
+    body = {"markdown_text": "no statblock"}
+
+    lenient = client.post("/api/v1/homebrew/parse-markdown", json=body)
+    assert lenient.status_code == 200
+    assert lenient.json()["parse_ok"] is False
+
+    strict = client.post("/api/v1/homebrew/parse-markdown", json={**body, "strict": True})
+    assert strict.status_code == 422
+    assert "unparsed_field:hp" in strict.json()["detail"]
