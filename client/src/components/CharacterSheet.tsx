@@ -14,6 +14,10 @@ import {
   Crosshair,
   Skull,
   Eye,
+  Hand,
+  Footprints,
+  Wind,
+  HeartPulse,
   Heart,
   Moon,
   Sun,
@@ -26,10 +30,22 @@ import { Token } from './TacticalCanvas';
 import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
 import {
   EngineActionOutcome,
+  EngineEntitySummary,
+  EngineGrappleResult,
   EngineHealResult,
+  EngineShoveResult,
+  EngineStandardActionResult,
+  EngineStabilizeResult,
   ensureEngineSession,
+  engineDash,
+  engineDisengage,
+  engineDodge,
+  engineGrapple,
   engineHeal,
   engineRest,
+  engineSessionEntities,
+  engineShove,
+  engineStabilize,
 } from '../api/rules_engine';
 import {
   ABILITY_KEYS,
@@ -150,11 +166,59 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     setHealAmount(activeToken ? Math.max(0, Math.floor(activeToken.maxHp) - Math.floor(activeToken.hp)) : 0);
   }, [activeToken?.id]);
 
+  /* --- Combat maneuvers (grapple/shove/dodge/dash/disengage/stabilize) -----
+   * Same discipline as Authoritative Recovery: intents go to the engine, its
+   * verdict (or machine rejection code) is quoted verbatim, nothing is applied
+   * locally. Targets come from the engine's PROJECTED session state — for a
+   * player that is board-token facts only (no HP/AC on other creatures), so
+   * "downed ally" is only detectable where current_hp is present.
+   */
+  const [maneuverSessionId, setManeuverSessionId] = useState<string | null>(null);
+  const [maneuverTargets, setManeuverTargets] = useState<EngineEntitySummary[] | null>(null);
+  const [targetsUnreachable, setTargetsUnreachable] = useState(false);
+  const [targetId, setTargetId] = useState('');
+  const [defenderSkill, setDefenderSkill] = useState<'athletics' | 'acrobatics'>('athletics');
+  const [shoveEffect, setShoveEffect] = useState<'prone' | 'push_5ft'>('prone');
+  const [maneuverBusy, setManeuverBusy] = useState<
+    'grapple' | 'shove' | 'dodge' | 'dash' | 'disengage' | 'stabilize' | null
+  >(null);
+  const [maneuverFeedback, setManeuverFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
+
   /** Explicit prop wins; otherwise lazily reuse/create this client's session. */
   const resolveEngineSession = async (): Promise<string | null> => {
     if (engineSessionId) return engineSessionId;
     return ensureEngineSession();
   };
+
+  // Resolve the authoritative session (and the projected target roster) once a
+  // bound character exists. Without both, the panel does not render at all —
+  // maneuver buttons must never fire blind.
+  useEffect(() => {
+    let cancelled = false;
+    setManeuverSessionId(null);
+    setManeuverTargets(null);
+    setTargetId('');
+    if (!ownsBoundCharacter) return undefined;
+    resolveEngineSession().then(async (sessionId) => {
+      if (cancelled || !sessionId) return;
+      setManeuverSessionId(sessionId);
+      const outcome = await engineSessionEntities(sessionId);
+      if (cancelled) return;
+      if (outcome.kind !== 'applied') {
+        setTargetsUnreachable(true);
+        return;
+      }
+      const roster = outcome.data.filter((e) => e.id !== activeToken?.id && !e.is_dead);
+      setManeuverTargets(roster);
+      // Default the picker to the first visible hostile in engine state.
+      const hostile = roster.find((e) => !e.is_player);
+      setTargetId(hostile ? hostile.id : roster[0]?.id ?? '');
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownsBoundCharacter, activeToken?.id, engineSessionId]);
 
   /** Turns one outcome union into honest inline feedback. Never throws. */
   const describeOutcome = (
@@ -170,6 +234,124 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     }
     return { tone: 'ok', text: `Engine confirms ${outcome.data.hp_remaining}/${maxHp} HP remaining.` };
   };
+
+  /** Rejection/unreachable half shared by every maneuver feedback string. */
+  const describeManeuverRejection = (
+    outcome: Exclude<EngineActionOutcome<unknown>, { kind: 'applied' }>,
+  ): { tone: 'ok' | 'error'; text: string } => {
+    if (outcome.kind === 'unreachable') {
+      return { tone: 'error', text: 'Rules engine unreachable — no maneuver was resolved.' };
+    }
+    const label = outcome.code
+      ? `${outcome.code}${outcome.message ? `: ${outcome.message}` : ''}`
+      : outcome.message || `HTTP ${outcome.status}`;
+    return { tone: 'error', text: `Rejected by the engine — ${label}` };
+  };
+
+  const grappleFeedback = (r: EngineGrappleResult): string =>
+    `Engine grapple — attacker d20 ${r.attacker_natural_roll} (total ${r.attacker_total}) vs defender d20 ${r.defender_natural_roll} (${r.defender_skill}, total ${r.defender_total}) → ${
+      r.success ? 'GRAPPLED' : 'escaped'
+    }` +
+    (r.applied_condition ? `, condition applied: ${r.applied_condition}` : '') +
+    (typeof r.escape_dc === 'number' ? `, escape DC ${r.escape_dc}` : '') +
+    `, margin ${r.margin ?? '?'} · ledger event_sequence ${r.event_sequence ?? '?'}.`;
+
+  const shoveFeedback = (r: EngineShoveResult): string =>
+    `Engine shove (${r.shove_effect}) — attacker d20 ${r.attacker_natural_roll} (total ${r.attacker_total}) vs defender d20 ${r.defender_natural_roll} (total ${r.defender_total}) → ${
+      r.success ? r.shove_effect === 'prone' ? 'knocked PRONE' : 'PUSHED 5 ft' : 'resisted'
+    }` +
+    (Array.isArray(r.pushed_to) ? `, pushed_to [${r.pushed_to.join(', ')}]` : '') +
+    `, margin ${r.margin ?? '?'} · ledger event_sequence ${r.event_sequence ?? '?'}.`;
+
+  const standardFeedback = (
+    action: 'dodge' | 'dash' | 'disengage',
+    r: EngineStandardActionResult,
+  ): string => {
+    if (action === 'dodge') {
+      return `Engine dodge confirmed — dodge_until_next_turn=${String(r.dodge_until_next_turn)} · event_sequence ${r.event_sequence ?? '?'}.`;
+    }
+    if (action === 'disengage') {
+      return `Engine disengage confirmed — disengaged_until_next_turn=${String(r.disengaged_until_next_turn)} · event_sequence ${r.event_sequence ?? '?'}.`;
+    }
+    return `Engine dash confirmed — dashed_this_turn=${String(r.dashed_this_turn)}, movement_remaining_feet ${r.movement_remaining_feet ?? '?'} · event_sequence ${r.event_sequence ?? '?'}.`;
+  };
+
+  const stabilizeFeedback = (r: EngineStabilizeResult): string =>
+    `Engine Medicine check — d20 ${r.natural_roll}${typeof r.medicine_modifier === 'number' ? formatModifier(r.medicine_modifier) : ''} = ${r.total ?? '?'} vs DC ${r.dc ?? 10} → ${
+      r.success ? 'STABILIZED' : 'not stabilized'
+    } (successes ${r.successes_after ?? '?'}/3, failures ${r.failures_after ?? '?'}) · event_sequence ${r.event_sequence ?? '?'}.`;
+
+  /** One flight per panel; every button disables while any maneuver is busy. */
+  const runManeuver = async (
+    kind: Exclude<typeof maneuverBusy, null>,
+    fire: () => Promise<EngineActionOutcome<EngineGrappleResult | EngineShoveResult | EngineStandardActionResult | EngineStabilizeResult>>,
+    describe: (data: never) => string,
+  ): Promise<void> => {
+    if (!activeToken || maneuverBusy) return;
+    setManeuverBusy(kind);
+    try {
+      const sessionId = await resolveEngineSession();
+      if (!sessionId) {
+        setManeuverFeedback({ tone: 'error', text: 'Rules engine unreachable — no maneuver was resolved.' });
+        return;
+      }
+      const outcome = await fire();
+      if (outcome.kind !== 'applied') {
+        setManeuverFeedback(describeManeuverRejection(outcome));
+        return;
+      }
+      setManeuverFeedback({ tone: 'ok', text: describe(outcome.data as never) });
+    } finally {
+      setManeuverBusy(null);
+    }
+  };
+
+  const handleGrapple = () =>
+    void runManeuver(
+      'grapple',
+      () =>
+        engineGrapple({
+          sessionId: maneuverSessionId!,
+          attackerId: activeToken!.id,
+          defenderId: targetId,
+          defenderSkill,
+        }),
+      (d: EngineGrappleResult) => grappleFeedback(d),
+    );
+
+  const handleShove = () =>
+    void runManeuver(
+      'shove',
+      () =>
+        engineShove({
+          sessionId: maneuverSessionId!,
+          attackerId: activeToken!.id,
+          defenderId: targetId,
+          shoveEffect,
+        }),
+      (d: EngineShoveResult) => shoveFeedback(d),
+    );
+
+  const handleSelfAction = (kind: 'dodge' | 'dash' | 'disengage') => {
+    const fire =
+      kind === 'dodge'
+        ? engineDodge
+        : kind === 'dash'
+        ? engineDash
+        : engineDisengage;
+    return void runManeuver(
+      kind,
+      () => fire({ sessionId: maneuverSessionId!, entityId: activeToken!.id }),
+      (d: EngineStandardActionResult) => standardFeedback(kind, d),
+    );
+  };
+
+  const handleStabilize = (healerId: string, dyingId: string) =>
+    void runManeuver(
+      'stabilize',
+      () => engineStabilize({ sessionId: maneuverSessionId!, healerId, targetId: dyingId }),
+      (d: EngineStabilizeResult) => stabilizeFeedback(d),
+    );
 
   const handleEngineHeal = async () => {
     if (!activeToken || recoveryBusy || missingHp <= 0 || healAmount <= 0) return;
@@ -540,6 +722,196 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                   }}
                 >
                   {recoveryFeedback.text}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Combat maneuvers — grapple/shove/dodge/dash/disengage/stabilize.
+            Rendered only when a character is bound AND an authoritative engine
+            session exists; every button sends an intent to the engine and
+            quotes its verbatim outcome or rejection code. No optimistic state:
+            conditions, movement and action economy change only engine-side. */}
+        {ownsBoundCharacter && maneuverSessionId && (
+          <div
+            className="rounded-md p-3 space-y-2"
+            style={{ border: `1px solid ${LEATHER_HAIRLINE}`, background: 'color-mix(in srgb, var(--parchment-paper-aged) 40%, transparent)' }}
+          >
+            <div className="vtt-section-header text-[11px]">Combat Maneuvers</div>
+
+            {/* Target picker — defaults to the first visible hostile in the
+                engine's projected session state. */}
+            <label className="flex items-center gap-2 text-xs font-prose" style={{ color: INK }}>
+              <span className="shrink-0">Target</span>
+              <select
+                value={targetId}
+                disabled={maneuverBusy !== null || !maneuverTargets}
+                onChange={(e) => setTargetId(e.target.value)}
+                aria-label="Maneuver target"
+                className="vtt-input flex-1 px-1.5 py-1 text-xs"
+                style={{ color: INK }}
+              >
+                {!maneuverTargets && <option value="">—</option>}
+                {(maneuverTargets ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name || t.id}
+                    {t.is_player ? '' : ' · hostile'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {targetsUnreachable && (
+              <p className="text-[10px] font-prose leading-snug" style={{ color: CRIMSON_TEXT }}>
+                Engine roster unreachable — targeted maneuvers are unavailable until it responds.
+              </p>
+            )}
+
+            {/* Contest choices: defender skill + shove effect */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-display uppercase tracking-widest shrink-0 w-20" style={{ color: CRIMSON_TEXT }}>
+                Grapple vs
+              </span>
+              {(['athletics', 'acrobatics'] as const).map((skill) => (
+                <button
+                  key={skill}
+                  type="button"
+                  onClick={() => setDefenderSkill(skill)}
+                  aria-pressed={defenderSkill === skill}
+                  title={`Defender contests with ${skill} (engine resolves both rolls)`}
+                  className={`transition cursor-pointer capitalize ${
+                    defenderSkill === skill ? 'vtt-badge-danger' : 'vtt-badge'
+                  }`}
+                >
+                  {skill}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-display uppercase tracking-widest shrink-0 w-20" style={{ color: CRIMSON_TEXT }}>
+                Shove to
+              </span>
+              <button
+                type="button"
+                onClick={() => setShoveEffect('prone')}
+                aria-pressed={shoveEffect === 'prone'}
+                className={`transition cursor-pointer ${shoveEffect === 'prone' ? 'vtt-badge-danger' : 'vtt-badge'}`}
+              >
+                Prone
+              </button>
+              <button
+                type="button"
+                onClick={() => setShoveEffect('push_5ft')}
+                aria-pressed={shoveEffect === 'push_5ft'}
+                className={`transition cursor-pointer ${shoveEffect === 'push_5ft' ? 'vtt-badge-danger' : 'vtt-badge'}`}
+              >
+                Push 5 ft
+              </button>
+            </div>
+
+            {/* Contested maneuvers against the picked target */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={handleGrapple}
+                disabled={maneuverBusy !== null || !targetId}
+                title="Contested Athletics grapple; spends your Action engine-side"
+                className="vtt-btn vtt-btn-secondary text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Hand className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                  {maneuverBusy === 'grapple' ? 'Grappling…' : 'Grapple'}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={handleShove}
+                disabled={maneuverBusy !== null || !targetId}
+                title={`Shove to ${shoveEffect === 'prone' ? 'knock prone' : 'push 5 ft'}; spends your Action engine-side`}
+                className="vtt-btn vtt-btn-secondary text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Footprints className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                  {maneuverBusy === 'shove' ? 'Shoving…' : 'Shove'}
+                </span>
+              </button>
+            </div>
+
+            {/* Self standard actions */}
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                { kind: 'dodge' as const, label: 'Dodge', busy: 'Dodging…', icon: <Shield className="w-3.5 h-3.5" style={{ color: 'var(--tavern-accent-deep)' }} /> },
+                { kind: 'dash' as const, label: 'Dash', busy: 'Dashing…', icon: <Footprints className="w-3.5 h-3.5" style={{ color: 'var(--tavern-accent-deep)' }} /> },
+                { kind: 'disengage' as const, label: 'Disengage', busy: 'Disengaging…', icon: <Wind className="w-3.5 h-3.5" style={{ color: 'var(--tavern-accent-deep)' }} /> },
+              ]).map(({ kind, label, busy, icon }) => (
+                <button
+                  key={kind}
+                  type="button"
+                  onClick={() => handleSelfAction(kind)}
+                  disabled={maneuverBusy !== null}
+                  title={`${label}: resolved and ledgered by the engine`}
+                  className="vtt-btn vtt-btn-secondary text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <span className="flex items-center justify-center gap-1" style={{ color: INK }}>
+                    {icon}
+                    {maneuverBusy === kind ? busy : label}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {/* Stabilize — offered only where the projected state shows a downed,
+                not-yet-dead ally (current_hp is only present on your own entity
+                or when viewing with GM privileges); the engine re-verifies every
+                dying gate anyway and refuses with its own code otherwise. */}
+            {(() => {
+              const downed = (maneuverTargets ?? []).filter(
+                (e) => e.is_player && e.current_hp !== undefined && e.current_hp <= 0 && !e.is_dead,
+              );
+              if (downed.length === 0) {
+                return (
+                  <p className="text-[10px] font-prose leading-snug" style={{ color: 'color-mix(in srgb, var(--parchment-ink) 60%, transparent)' }}>
+                    No downed allies visible in the engine state. (The Medicine check itself is always verified engine-side.)
+                  </p>
+                );
+              }
+              return (
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-display uppercase tracking-widest" style={{ color: CRIMSON_TEXT }}>
+                    Downed allies
+                  </span>
+                  {downed.map((ally) => (
+                    <button
+                      key={ally.id}
+                      type="button"
+                      onClick={() => handleStabilize(activeToken!.id, ally.id)}
+                      disabled={maneuverBusy !== null}
+                      title={`Medicine check to stabilize ${ally.name || ally.id} (within 5 ft required)`}
+                      className="vtt-btn vtt-btn-secondary w-full text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                        <HeartPulse className="w-3.5 h-3.5" style={{ color: 'var(--state-success)' }} />
+                        {maneuverBusy === 'stabilize' ? 'Stabilizing…' : `Stabilize ${ally.name || ally.id}`}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+
+            {/* Honest result / rejection readout — verbatim engine verdicts */}
+            <div aria-live="polite" className="min-h-[1rem]">
+              {maneuverFeedback && (
+                <p
+                  className="text-[11px] font-prose leading-snug break-words"
+                  style={{
+                    color:
+                      maneuverFeedback.tone === 'ok'
+                        ? 'var(--state-success)'
+                        : 'var(--state-danger)',
+                  }}
+                >
+                  {maneuverFeedback.text}
                 </p>
               )}
             </div>

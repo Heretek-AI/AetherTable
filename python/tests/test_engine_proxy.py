@@ -427,6 +427,178 @@ class TestHealRestProxyIdentity:
         assert payload["role"] == "player"
 
 
+class TestManeuverProxyIdentity:
+    """Identity forwarding + payload contract for the six combat-maneuver
+    proxies (POST /api/v1/engine/{grapple,shove,dodge,dash,disengage,stabilize}
+    -> engine POST /api/v1/sessions/{id}/action/{...}).
+
+    Contest math (rolls, modifiers, reach, action economy) is engine-owned; the
+    gateway forwards ids plus the caller's verified identity only. The engine's
+    optional deterministic `seed` is deliberately NOT forwardable — a client
+    could otherwise pin its own rolls."""
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token(
+            {"user_id": user_id, "role": role, "exp": _time.time() + 600}
+        )
+
+    SESSION_ID = "9f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    ROUTES = {
+        "grapple": {
+            "session_id": SESSION_ID,
+            "attacker_id": "thorin",
+            "defender_id": "orc-warlord",
+            "defender_skill": "athletics",
+        },
+        "shove": {
+            "session_id": SESSION_ID,
+            "attacker_id": "thorin",
+            "defender_id": "orc-warlord",
+            "shove_effect": "prone",
+        },
+        "dodge": {"session_id": SESSION_ID, "entity_id": "thorin"},
+        "dash": {"session_id": SESSION_ID, "entity_id": "thorin"},
+        "disengage": {"session_id": SESSION_ID, "entity_id": "thorin"},
+        "stabilize": {
+            "session_id": SESSION_ID,
+            "healer_id": "cleric",
+            "target_id": "dying-hero",
+        },
+    }
+
+    def _capture(self, monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_each_route_forwards_identity_path_and_payload_shape(self, monkeypatch):
+        for name, body in self.ROUTES.items():
+            captured = self._capture(monkeypatch, {"status": f"{name.upper()}_OK"})
+            resp = client.post(
+                f"/api/v1/engine/{name}",
+                params={"token": self._token("player-7", "player")},
+                json=body,
+            )
+            assert resp.status_code == 200, name
+            assert resp.json() == {"status": f"{name.upper()}_OK"}
+            assert captured["method"] == "POST", name
+            assert captured["path"] == (
+                f"/api/v1/sessions/{self.SESSION_ID}/action/{name}"
+            ), name
+            # Real caller identity reaches the engine RBAC, never the service
+            # principal.
+            assert captured["actor"] == {"user_id": "player-7", "role": "player"}, name
+            # Ids-only payload coerced to UUIDs like every other proxy. The
+            # session reference rides the PATH, not the body.
+            expected = {k: v for k, v in body.items() if k != "session_id"}
+            for key in ("attacker_id", "defender_id", "entity_id", "healer_id", "target_id"):
+                if key in expected:
+                    expected[key] = str(uuid.uuid5(uuid.NAMESPACE_URL, expected[key]))
+            assert captured["payload"] == expected, name
+            assert "seed" not in captured["payload"], name
+            monkeypatch.undo()
+
+    def test_gm_token_forwards_gm_role_on_grapple(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"success": True})
+        resp = client.post(
+            "/api/v1/engine/grapple",
+            params={"token": self._token("gm-1", "gm")},
+            json=self.ROUTES["grapple"],
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_missing_token_is_422_on_every_route(self):
+        for name, body in self.ROUTES.items():
+            resp = client.post(f"/api/v1/engine/{name}", json=body)
+            assert resp.status_code == 422, f"{name}: missing required token query param"
+
+    def test_invalid_token_is_401_on_every_route(self):
+        for name, body in self.ROUTES.items():
+            resp = client.post(
+                f"/api/v1/engine/{name}",
+                params={"token": "not.a.valid.token"},
+                json=body,
+            )
+            assert resp.status_code == 401, name
+
+    def test_extra_body_fields_are_rejected(self):
+        """Trust-inversion regression: no roll pins or seeds smuggled past the
+        maneuver proxies."""
+        token = self._token("gm-1", "gm")
+        smuggles = {
+            "grapple": {**self.ROUTES["grapple"], "attack_bonus": 999},
+            "grapple-seed": {**self.ROUTES["grapple"], "seed": 42},
+            "shove": {**self.ROUTES["shove"], "target_ac": -5},
+            "dodge": {**self.ROUTES["dodge"], "ac_override": 30},
+            "stabilize": {**self.ROUTES["stabilize"], "auto_success": True},
+        }
+        for case, body in smuggles.items():
+            name = "grapple" if case.startswith("grapple") else case.split("-")[0]
+            resp = client.post(
+                f"/api/v1/engine/{name}", params={"token": token}, json=body
+            )
+            assert resp.status_code == 422, case
+
+    def test_unknown_defender_skill_and_shove_effect_are_rejected(self, monkeypatch):
+        async def refuse(method, path, payload=None, *, actor=None):
+            raise AssertionError("engine must not be called for an invalid literal")
+
+        monkeypatch.setattr(engine_client, "engine_request", refuse)
+        token = self._token("gm-1", "gm")
+
+        bad_skill = {**self.ROUTES["grapple"], "defender_skill": "basket-weaving"}
+        assert client.post(
+            "/api/v1/engine/grapple", params={"token": token}, json=bad_skill
+        ).status_code == 422
+
+        bad_effect = {**self.ROUTES["shove"], "shove_effect": "yeet"}
+        assert client.post(
+            "/api/v1/engine/shove", params={"token": token}, json=bad_effect
+        ).status_code == 422
+
+    def test_engine_rejection_is_surfaced_verbatim(self, monkeypatch):
+        async def rejected(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(
+                409, '{"error": "OUT_OF_REACH", "message": "target beyond 5 ft"}'
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        resp = client.post(
+            "/api/v1/engine/stabilize",
+            params={"token": self._token("player-7", "player")},
+            json=self.ROUTES["stabilize"],
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "error": "OUT_OF_REACH",
+            "message": "target beyond 5 ft",
+        }
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        for name, body in self.ROUTES.items():
+            resp = client.post(
+                f"/api/v1/engine/{name}",
+                params={"token": self._token("gm-1", "gm")},
+                json=body,
+            )
+            assert resp.status_code == 502, name
+            assert "unreachable" in resp.json()["detail"].lower()
+
+
 class TestMetricsProxy:
     """GET /api/v1/engine/metrics — read-only telemetry proxy.
 

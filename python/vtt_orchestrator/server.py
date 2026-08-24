@@ -1358,6 +1358,154 @@ async def engine_rest(req: EngineRestRequest, token: str = Query(...)):
     )
 
 
+# --- Combat maneuver proxies ---------------------------------------------------
+# Grapple / shove / dodge / dash / disengage / stabilize. Same contract as every
+# other mutating proxy: ids-only Pydantic bodies with unknown fields refused,
+# caller identity forwarded so the engine's RBAC authorizes the real actor, and
+# the engine's verdict surfaced verbatim. The optional deterministic `seed` the
+# engine accepts is deliberately NOT forwarded — a client-chosen seed would let
+# callers pin their own rolls.
+
+
+class EngineGrappleRequest(BaseModel):
+    """Mirrors the engine's GrappleActionReq (deny_unknown_fields). The
+    defender picks their contested skill; every modifier resolves server-side."""
+
+    session_id: str
+    attacker_id: str
+    defender_id: str
+    defender_skill: Literal["athletics", "acrobatics"]
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineShoveRequest(BaseModel):
+    """Mirrors the engine's ShoveActionReq: attacker, defender, and the chosen
+    effect on success ("prone" | "push_5ft"). No math crosses the wire."""
+
+    session_id: str
+    attacker_id: str
+    defender_id: str
+    shove_effect: Literal["prone", "push_5ft"]
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineEntityActionRequest(BaseModel):
+    """Body for the self-targeting standard actions (dodge/dash/disengage):
+    only WHO acts — the action economy is engine-owned."""
+
+    session_id: str
+    entity_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineStabilizeRequest(BaseModel):
+    """Mirrors the engine's StabilizeActionReq: healer + dying target. Whether
+    the target is saveable (dying, not dead, not already stabilized) and the
+    Medicine DC are decided entirely by the engine."""
+
+    session_id: str
+    healer_id: str
+    target_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+def _maneuver_proxy(engine_path_suffix: str, payload: Dict[str, Any], actor: Dict[str, str]):
+    return _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(payload.pop('session_id'))}"
+            f"/action/{engine_path_suffix}",
+            payload,
+            actor=actor,
+        )
+    )
+
+
+@app.post("/api/v1/engine/grapple")
+async def engine_grapple(req: EngineGrappleRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "grapple",
+        {
+            "session_id": req.session_id,
+            "attacker_id": engine_client._coerce_uuid(req.attacker_id),
+            "defender_id": engine_client._coerce_uuid(req.defender_id),
+            "defender_skill": req.defender_skill,
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/shove")
+async def engine_shove(req: EngineShoveRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "shove",
+        {
+            "session_id": req.session_id,
+            "attacker_id": engine_client._coerce_uuid(req.attacker_id),
+            "defender_id": engine_client._coerce_uuid(req.defender_id),
+            "shove_effect": req.shove_effect,
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/dodge")
+async def engine_dodge(req: EngineEntityActionRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "dodge",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/dash")
+async def engine_dash(req: EngineEntityActionRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "dash",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/disengage")
+async def engine_disengage(req: EngineEntityActionRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "disengage",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/stabilize")
+async def engine_stabilize(req: EngineStabilizeRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "stabilize",
+        {
+            "session_id": req.session_id,
+            "healer_id": engine_client._coerce_uuid(req.healer_id),
+            "target_id": engine_client._coerce_uuid(req.target_id),
+        },
+        _caller_actor(token),
+    )
+
+
 class EngineSessionStateRequest(BaseModel):
     """Body of the GET-style read proxy below: only the session reference."""
     session_id: str

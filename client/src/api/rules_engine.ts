@@ -234,3 +234,227 @@ export async function engineRest(params: {
     },
   );
 }
+
+/* --- Combat maneuvers (grapple/shove/dodge/dash/disengage/stabilize) -------
+ *
+ * Same contract as heal/rest above: no local fallback, no optimistic state —
+ * the engine rolls the contests against server-side stat blocks and either
+ * applies them to its ledger or refuses with a machine code the UI quotes
+ * verbatim (ATTACKER_NOT_FOUND, OUT_OF_REACH, ACTION_ECONOMY_EXHAUSTED, …).
+ * The gateway routes declare `token: str = Query(...)`, so these calls append
+ * ?token= exactly like engineHeal/engineRest.
+ */
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/grapple. */
+export interface EngineGrappleResult {
+  attacker_id: string;
+  defender_id: string;
+  attacker_natural_roll: number;
+  attacker_total: number;
+  defender_natural_roll: number;
+  defender_total: number;
+  defender_skill: 'athletics' | 'acrobatics';
+  success: boolean;
+  applied_condition?: string | null;
+  escape_dc?: number;
+  winner_side?: string;
+  margin?: number;
+  distance_feet?: number;
+  event_sequence?: number;
+}
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/shove. */
+export interface EngineShoveResult {
+  attacker_id: string;
+  defender_id: string;
+  attacker_natural_roll: number;
+  attacker_total: number;
+  defender_natural_roll: number;
+  defender_total: number;
+  shove_effect: 'prone' | 'push_5ft';
+  success: boolean;
+  applied_condition?: string | null;
+  pushed_from?: number[];
+  pushed_to?: number[];
+  push_distance_feet?: number;
+  winner_side?: string;
+  margin?: number;
+  event_sequence?: number;
+}
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/{dodge|dash|disengage}
+ * (the three share one shape; each carries only its own flag plus movement). */
+export interface EngineStandardActionResult {
+  status?: string;
+  entity_id: string;
+  dodge_until_next_turn?: boolean;
+  disengaged_until_next_turn?: boolean;
+  dashed_this_turn?: boolean;
+  movement_remaining_feet?: number;
+  event_sequence?: number;
+}
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/stabilize. */
+export interface EngineStabilizeResult {
+  healer_id: string;
+  target_id: string;
+  natural_roll: number;
+  medicine_modifier?: number;
+  total?: number;
+  dc?: number;
+  success: boolean;
+  successes_after?: number;
+  failures_after?: number;
+  is_stabilized_after?: boolean;
+  event_sequence?: number;
+}
+
+/**
+ * One visible entity from the projected session state (POST
+ * /api/v1/engine/session-state). Mirrors the gateway's role projection: other
+ * players' and hostile entities expose only board-token facts (no HP/AC), so
+ * "downed" is only detectable when `current_hp` is present.
+ */
+export interface EngineEntitySummary {
+  id: string;
+  name?: string;
+  is_visible?: boolean;
+  is_player?: boolean;
+  is_dead?: boolean;
+  position?: number[];
+  /** Only present for YOUR OWN entity or when viewing as GM/admin. */
+  current_hp?: number;
+}
+
+/** Ask the engine to resolve a grapple contest (attacker spends their Action). */
+export async function engineGrapple(params: {
+  sessionId: string;
+  attackerId: string;
+  defenderId: string;
+  /** Defender's contested skill choice. */
+  defenderSkill: 'athletics' | 'acrobatics';
+}): Promise<EngineActionOutcome<EngineGrappleResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineGrappleResult>(
+    `/api/v1/engine/grapple?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      attacker_id: params.attackerId,
+      defender_id: params.defenderId,
+      defender_skill: params.defenderSkill,
+    },
+  );
+}
+
+/** Ask the engine to resolve a shove (prone or 5 ft push on success). */
+export async function engineShove(params: {
+  sessionId: string;
+  attackerId: string;
+  defenderId: string;
+  shoveEffect: 'prone' | 'push_5ft';
+}): Promise<EngineActionOutcome<EngineShoveResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineShoveResult>(
+    `/api/v1/engine/shove?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      attacker_id: params.attackerId,
+      defender_id: params.defenderId,
+      shove_effect: params.shoveEffect,
+    },
+  );
+}
+
+/** Dodge: attackers roll against this entity with disadvantage until its next turn. */
+export async function engineDodge(params: {
+  sessionId: string;
+  entityId: string;
+}): Promise<EngineActionOutcome<EngineStandardActionResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineStandardActionResult>(
+    `/api/v1/engine/dodge?token=${encodeURIComponent(token)}`,
+    { session_id: params.sessionId, entity_id: params.entityId },
+  );
+}
+
+/** Dash: double movement this turn, engine-side budget accounting. */
+export async function engineDash(params: {
+  sessionId: string;
+  entityId: string;
+}): Promise<EngineActionOutcome<EngineStandardActionResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineStandardActionResult>(
+    `/api/v1/engine/dash?token=${encodeURIComponent(token)}`,
+    { session_id: params.sessionId, entity_id: params.entityId },
+  );
+}
+
+/** Disengage: opportunity attacks are refused until the entity's next turn. */
+export async function engineDisengage(params: {
+  sessionId: string;
+  entityId: string;
+}): Promise<EngineActionOutcome<EngineStandardActionResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineStandardActionResult>(
+    `/api/v1/engine/disengage?token=${encodeURIComponent(token)}`,
+    { session_id: params.sessionId, entity_id: params.entityId },
+  );
+}
+
+/** Stabilize a dying ally with a Medicine check resolved by the engine. */
+export async function engineStabilize(params: {
+  sessionId: string;
+  healerId: string;
+  targetId: string;
+}): Promise<EngineActionOutcome<EngineStabilizeResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineStabilizeResult>(
+    `/api/v1/engine/stabilize?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      healer_id: params.healerId,
+      target_id: params.targetId,
+    },
+  );
+}
+
+/**
+ * Read the caller-projected entity roster for a session through the gateway's
+ * read proxy. Hidden entities are filtered out for players by the projection
+ * itself; we additionally drop any that still claim invisibility defensively.
+ */
+export async function engineSessionEntities(
+  sessionId: string,
+): Promise<EngineActionOutcome<EngineEntitySummary[]>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  const outcome = await engineActionPost<{
+    session_id: string;
+    entities?: Record<string, Record<string, unknown>>;
+  }>(`/api/v1/engine/session-state?token=${encodeURIComponent(token)}`, {
+    session_id: sessionId,
+  });
+  if (outcome.kind === 'applied') {
+    const map = outcome.data.entities ?? {};
+    const list: EngineEntitySummary[] = Object.entries(map)
+      .filter(([, e]) => e && typeof e === 'object')
+      .map(([key, e]) => ({
+        id: typeof e.id === 'string' ? e.id : key,
+        name: typeof e.name === 'string' ? e.name : undefined,
+        is_visible: e.is_visible !== false,
+        is_player: e.is_player === true,
+        is_dead: e.is_dead === true,
+        position: Array.isArray(e.position) ? (e.position as number[]) : undefined,
+        current_hp: typeof e.current_hp === 'number' ? e.current_hp : undefined,
+      }))
+      .filter((e) => e.is_visible);
+    return { kind: 'applied', data: list };
+  }
+  return outcome;
+}
