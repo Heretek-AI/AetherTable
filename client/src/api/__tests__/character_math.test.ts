@@ -9,6 +9,7 @@ import {
   ABILITY_KEYS,
   computedAC,
   computedHP,
+  HIT_DIE_BY_CLASS,
   formatModifier,
   getModifier,
   passivePerception,
@@ -153,20 +154,54 @@ describe('computedAC — unarmored defense variants', () => {
 });
 
 describe('computedHP', () => {
-  it('level 1 uses the hit-die max plus one CON application', () => {
-    expect(computedHP('Wizard', 1, 0)).toBe(8);
-    expect(computedHP('Barbarian', 1, 2)).toBe(14);
-    expect(computedHP('Fighter', 1, 1)).toBe(11);
+  // SRD "Hit Points — Hit Dice" per class: Barbarian d12; Fighter and
+  // Paladin d10; Bard, Cleric, Druid, Monk, Ranger, Rogue and Warlock d8;
+  // Sorcerer and Wizard d6. Level 1 HP is the die MAX + CON mod; each level
+  // beyond first adds the SRD take-the-average value (half the die, rounded
+  // up, i.e. floor(die/2) + 1) plus the CON mod again.
+  it('level 1 uses the correct class hit-die max plus one CON application', () => {
+    expect(computedHP('Wizard', 1, 0)).toBe(6);   // d6, not d8
+    expect(computedHP('Sorcerer', 1, 1)).toBe(7); // d6
+    expect(computedHP('Rogue', 1, 0)).toBe(8);    // d8
+    expect(computedHP('Cleric', 1, 2)).toBe(10);  // d8
+    expect(computedHP('Fighter', 1, 1)).toBe(11); // d10
+    expect(computedHP('Barbarian', 1, 2)).toBe(14); // d12
   });
 
-  it('grows by 6 per level beyond first plus CON per level', () => {
-    expect(computedHP('Wizard', 5, 2)).toBe(8 + 4 * 6 + 5 * 2);
+  it('covers every hit-die tier of the SRD class table', () => {
+    expect(HIT_DIE_BY_CLASS).toEqual({
+      Barbarian: 12,
+      Fighter: 10,
+      Paladin: 10,
+      Bard: 8,
+      Cleric: 8,
+      Druid: 8,
+      Monk: 8,
+      Ranger: 8,
+      Rogue: 8,
+      Warlock: 8,
+      Sorcerer: 6,
+      Wizard: 6,
+    });
+  });
+
+  it('grows by the per-class average (half die + 1) plus CON per level beyond first', () => {
+    // Wizard d6 -> +4/level; level 5, CON +2: 6 + 4*4 + 5*2 = 32.
+    expect(computedHP('Wizard', 5, 2)).toBe(6 + 4 * 4 + 5 * 2);
+    // Paladin d10 -> +6/level; level 3, CON -1: 10 + 2*6 - 3 = 19.
     expect(computedHP('Paladin', 3, -1)).toBe(10 + 2 * 6 + 3 * -1);
+    // Barbarian d12 -> +7/level; level 20, CON +5: 12 + 19*7 + 100 = 245.
+    expect(computedHP('Barbarian', 20, 5)).toBe(12 + 19 * 7 + 20 * 5);
   });
 
   it('treats level 0 / negative levels as level 1 rather than producing nonsense', () => {
-    expect(computedHP('Wizard', 0, 0)).toBe(8);
-    expect(computedHP('Wizard', -3, 1)).toBe(9);
+    expect(computedHP('Wizard', 0, 0)).toBe(6);
+    expect(computedHP('Wizard', -3, 1)).toBe(7); // 6 (die max) + 1 (CON)
+  });
+
+  it('falls back to the d8 median for an unrecognized class name', () => {
+    expect(computedHP('Mystic', 1, 0)).toBe(8);
+    expect(computedHP('', 1, 0)).toBe(8);
   });
 });
 

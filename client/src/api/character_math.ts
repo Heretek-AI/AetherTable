@@ -89,13 +89,32 @@ export function computedAC(characterClass: string, dexMod: number, conMod: numbe
   return 14 + Math.min(2, dexMod) + 2; // Scale Mail + Shield for Fighter/Paladin
 }
 
-/** Hit points at level: hit die max + 6/level average + CON mod per level. */
+/**
+ * Hit points at level: hit-die max at level 1, then the SRD average
+ * (half the die + 1) per level beyond first, plus CON mod per level.
+ *
+ * Hit dice per the SRD class table (5e SRD "Hit Points: Hit Dice"):
+ *   d12 Barbarian; d10 Fighter, Paladin; d8 Bard, Cleric, Druid, Monk,
+ *   Ranger, Rogue, Warlock; d6 Sorcerer, Wizard. Unknown classes fall back
+ * to the d8 median rather than guessing a tougher die.
+ */
+export const HIT_DIE_BY_CLASS: Record<string, number> = {
+  Barbarian: 12,
+  Fighter: 10,
+  Paladin: 10,
+  Bard: 8,
+  Cleric: 8,
+  Druid: 8,
+  Monk: 8,
+  Ranger: 8,
+  Rogue: 8,
+  Warlock: 8,
+  Sorcerer: 6,
+  Wizard: 6,
+};
+
 export function computedHP(characterClass: string, level: number, conMod: number): number {
-  const hitDieMax =
-    characterClass === 'Barbarian'
-      ? 12
-      : characterClass === 'Fighter' || characterClass === 'Paladin'
-      ? 10
-      : 8;
-  return hitDieMax + (Math.max(1, level) - 1) * 6 + conMod * Math.max(1, level);
+  const hitDie = HIT_DIE_BY_CLASS[characterClass] ?? 8;
+  const safeLevel = Math.max(1, level);
+  return hitDie + (safeLevel - 1) * (Math.floor(hitDie / 2) + 1) + conMod * safeLevel;
 }

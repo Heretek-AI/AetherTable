@@ -904,10 +904,18 @@ class CampaignSimulation:
         # coldly in the same breath it lands.
         stance_after = self._stance_toward(self.social_npc_id, actor_id, timestamp=ts)
 
+        # Network scope: ``respond_to`` falls back to the persona's OWN
+        # ctor-supplied gateway unless one is forced here, so a scripted run
+        # must always pin ``None`` — an LLM-gatewayed NPC injected via
+        # npc_registry would otherwise silently make upstream calls the sim
+        # reports as never happening. In LLM mode the persona's gateway is
+        # honored EXCEPT when this exchange's player utterance was norm-tainted
+        # and replaced by a scripted line: a tainted prompt reaches no model.
+        suppress_npc_llm = force_template or self.mode != "llm"
         try:
             result = await npc.respond_to(
                 actor_id, utterance, disposition_stance=stance_after, timestamp=ts,
-                **({"llm_gateway": None} if force_template else {}))
+                **({"llm_gateway": None} if suppress_npc_llm else {}))
         except Exception as exc:  # dialogue failure must never abort the run
             report["errors"].append(f"{player.name}: social exchange failed: {exc}")
             return None

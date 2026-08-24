@@ -144,19 +144,6 @@ class FakeEngine:
         return [c for c in self.calls if substring in c["path"]]
 
 
-@pytest.fixture(autouse=True)
-def _fresh_rate_limiter_windows():
-    """The orchestrator's in-process rate limiter keeps 60s sliding windows in
-    module state; a full test file issues far more than the auth bucket's
-    30 requests/minute through the shared ASGI app. Reset the windows around
-    every test so order and suite size can never starve later sims of setup."""
-    from vtt_orchestrator import server as server_module
-
-    server_module._rate_windows.clear()
-    yield
-    server_module._rate_windows.clear()
-
-
 @pytest.fixture()
 def fake_engine(monkeypatch):
     """Replaces the engine transport AND clears ambient LLM credentials so a
@@ -394,10 +381,39 @@ class TestLLMMode:
 
         monkeypatch.setattr(llm_client_module.httpx, "AsyncClient", _NeverClient)
 
-        report = run(players=2, rounds=2)
+        # The social NPC is injected WITH an LLM gateway of its own: scripted
+        # mode must pin llm_gateway=None on every respond_to call so the
+        # persona's own gateway can never leak an upstream call past the
+        # sim's "scripted never touches the network" guarantee.
+        class _RecordingReplyGateway:
+            """Records every call instead of raising — respond_to swallows
+            gateway exceptions by contract, so raising here would hide the
+            very leak this test exists to catch."""
+
+            def __init__(self):
+                self.calls = []
+
+            async def complete_json(self, system_prompt, user_prompt):
+                self.calls.append((system_prompt, user_prompt))
+                return {"reply": "The shrine remembers you."}
+
+        reply_gateway = _RecordingReplyGateway()
+        report = run(
+            players=2, rounds=2,
+            npc_registry={SOCIAL_NPC_ID: _make_npc(gateway=reply_gateway)},
+            social_npc_id=SOCIAL_NPC_ID,
+        )
 
         assert report["mode"] == "scripted"
         assert report["totals"]["llm_calls_made"] == 0
+        # Zero calls through the persona's own gateway — the sim pinned
+        # llm_gateway=None for the whole run.
+        assert reply_gateway.calls == []
+        # Every exchange still happened — answered by the deterministic
+        # template voice, never an upstream model.
+        socials = [e for r in report["rounds"] for e in r["social"]]
+        assert len(socials) == 4                       # 2 players x 2 rounds
+        assert all(e["reply_generator"] == "template" for e in socials)
 
 
 class _InstallNever:

@@ -87,13 +87,9 @@ class HealCapableEngine(FakeEngine):
         return await super().engine_request(method, path, payload, actor=actor)
 
 
-@pytest.fixture(autouse=True)
-def _fresh_rate_limiter_windows():
-    from vtt_orchestrator import server as server_module
-
-    server_module._rate_windows.clear()
-    yield
-    server_module._rate_windows.clear()
+# NOTE: the per-test ``_rate_windows`` reset used to live here as a local
+# autouse fixture; it now lives once in tests/conftest.py
+# (``_isolate_rate_limiter_windows``) so every module gets it for free.
 
 
 @pytest.fixture()

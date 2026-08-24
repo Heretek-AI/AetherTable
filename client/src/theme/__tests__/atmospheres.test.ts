@@ -6,6 +6,7 @@
  * atmosphereCss and the preset invariants are.
  */
 import { describe, expect, it } from 'vitest';
+import { AudioManager } from '../../render/audio_manager';
 import {
   applyAtmosphereToDocument,
   ATMOSPHERE_PRESETS,
@@ -16,6 +17,21 @@ import {
   normalizeAtmosphereId,
   REAL_AMBIENCE_TRACK_IDS,
 } from '../atmospheres';
+
+/**
+ * Source of truth: the track ids the soundscape engine can actually
+ * synthesize. AMBIENCE_RECIPES is private (an implementation detail of the
+ * engine), so the test reads it through a structural cast — the point is that
+ * the KNOWN-TRACKS list shipped by atmospheres.ts is validated against the
+ * engine here instead of being trusted as an independent copy.
+ */
+const ENGINE_AMBIENCE_TRACK_IDS = Object.keys(
+  (
+    AudioManager as unknown as {
+      AMBIENCE_RECIPES: Record<string, unknown>;
+    }
+  ).AMBIENCE_RECIPES,
+).sort();
 
 describe('normalizeAtmosphereId — junk handling', () => {
   it('passes through every shipped preset id', () => {
@@ -59,12 +75,23 @@ describe('preset data integrity', () => {
     }
   });
 
+  it('REAL_AMBIENCE_TRACK_IDS stays in lockstep with AudioManager.AMBIENCE_RECIPES', () => {
+    // Drift guard: atmospheres.ts carries a COPY of the engine's track ids.
+    // If the engine gains or loses a recipe without this list following, the
+    // honesty rule silently degrades — so the copy is checked against the
+    // engine's own (private) recipe table, not against itself.
+    expect([...REAL_AMBIENCE_TRACK_IDS].sort()).toEqual(ENGINE_AMBIENCE_TRACK_IDS);
+  });
+
   it('ambience bindings reference only track ids that exist in the engine', () => {
-    // The audio-honesty rule: no invented track ids, ever.
+    // The audio-honesty rule: no invented track ids, ever. The membership
+    // check runs against the ENGINE's recipe keys; isRealAmbienceTrack is the
+    // runtime guard production code relies on and is asserted to agree.
     for (const preset of ATMOSPHERE_PRESETS) {
       if (preset.ambienceTrackId !== undefined) {
-        expect(REAL_AMBIENCE_TRACK_IDS).toContain(preset.ambienceTrackId);
+        expect(ENGINE_AMBIENCE_TRACK_IDS).toContain(preset.ambienceTrackId);
         expect(isRealAmbienceTrack(preset.ambienceTrackId)).toBe(true);
+        expect(REAL_AMBIENCE_TRACK_IDS).toContain(preset.ambienceTrackId);
       }
     }
   });

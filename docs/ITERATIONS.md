@@ -142,6 +142,15 @@ full benchmark at milestones) → commit → push. GOALS.md re-reviewed every 10
 
 | 78 | A5-fix | Six findings: Help-promise burn, under-level casts, absurd-formula reject, GM-only monster spawns, honesty lows | 7271475 | all ✓ |
 | 79 | P8-fix | Quest engine parametrized: 3 theme tables, level scaling, length plans, coverage notes; 20 tests | e51bb2b | pytest ✓ |
+
+> **Iteration-79 honesty correction (2026-08-24):** the parametrized
+> `generate_campaign_quest` changed the DEFAULT quest output materially. Only
+> `quest_id` ("quest_iron_succession") and `summary` are preserved from the
+> pre-parametrization shape; node titles/prompts, layer composition, choices
+> and reward values are all regenerated from the theme tables now. Callers that
+> consumed any other field of the default quest against the old fixed content
+> will see different (still deterministic per seed) output — this was not
+> disclosed when iteration 79 landed.
 | 80 | P5-depth | Concordia social-dialogue phase in campaign sim with norms enforcement + stance shifts; 11 tests | 7a104a7 | pytest ✓ |
 
 ### Iteration-80 milestone gate

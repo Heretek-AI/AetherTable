@@ -127,12 +127,16 @@ def test_three_generation_lineage_compounds_across_extended_generations():
     assert IRON_WILL in gen5_heir.traits
     # Parent-pool traits flow down (spouse traits included in the pool).
     assert SILVER_TONGUE in gen4_heir.traits
-    assert IRON_WILL in gen5_heir.parent_ids or True  # lineage linkage checked below
 
-    gen4 = next(m for m in created if m.generation == 4 and m.parent_ids)
-    gen5 = next(m for m in created if m.generation == 5 and m.parent_ids)
-    assert gen5.parent_ids == [gen4.id]
-    assert gen4.spouse_id and gen5.spouse_id
+    # Lineage linkage: every extended generation descends from exactly ONE
+    # parent — the previous generation's blooded heir, never a married-in
+    # consort — and each heir is wed to its own generation's consort. (This
+    # replaced an earlier `... or True` tautology that asserted nothing.)
+    assert len(created) == 4
+    assert gen4_heir.parent_ids == ["house_compound_gen3_heir"]
+    assert gen5_heir.parent_ids == [gen4_heir.id]
+    assert gen4_heir.spouse_id == "house_compound_gen4_consort"
+    assert gen5_heir.spouse_id == "house_compound_gen5_consort"
 
 
 def test_mutation_introduces_new_trait_at_configured_rate():
@@ -199,7 +203,6 @@ def test_alliance_children_inherit_from_both_pools_per_dominance_weights():
     assert sun_child.id in [c for c in pact["children"]]
 
     # Marriage partners are cross-linked and both houses record the alliance.
-    sun_partner = engine.houses["house_sun"].members[-1].parent_ids
     assert pact["marriage"]["partners"][0] != pact["marriage"]["partners"][1]
     assert engine.houses["house_sun"].feuds["house_shade"].startswith("Allied")
     assert engine.houses["house_shade"].feuds["house_sun"].startswith("Allied")
