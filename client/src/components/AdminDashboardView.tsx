@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldAlert,
   Users,
@@ -19,6 +19,16 @@ import {
   Filter,
 } from 'lucide-react';
 import { User, UserRole, SubscriptionTier } from '../types/auth';
+import { fetchEngineMetrics } from '../api/engine_metrics';
+
+/* Badge marking content that has NO backend data source behind it. Rendered
+   wherever this console would otherwise present hardcoded sample values as
+   live platform telemetry. */
+const DemoBadge = ({ title }: { title: string }) => (
+  <span className="vtt-badge px-2 py-0.5 text-[10px]" title={title}>
+    DEMO DATA
+  </span>
+);
 
 /* Out-of-world (admin) palette: the dark tavern chrome carries amber gold-leaf,
    book crimson, forest and leather accents — never cold slate/purple. Bright
@@ -38,6 +48,27 @@ interface AdminDashboardViewProps {
 export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRoleFilter, setSelectedRoleFilter] = useState<string>('all');
+  // Only live signal available: engine /metrics via the orchestrator proxy.
+  const [engineMcr, setEngineMcr] = useState<number | null>(null);
+  const [engineLive, setEngineLive] = useState<boolean>(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const result = await fetchEngineMetrics();
+      if (cancelled) return;
+      if (result.status === 'live') {
+        setEngineMcr(result.metrics.mechanical_compliance_rate_pct);
+        setEngineLive(true);
+      } else {
+        setEngineMcr(null);
+        setEngineLive(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [platformUsers, setPlatformUsers] = useState<User[]>([
     {
@@ -155,58 +186,80 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
           </div>
 
           <div className="flex items-center space-x-2 font-mono text-xs">
-            <span className="vtt-badge vtt-badge-success px-3 py-1.5">
-              <Activity className="w-4 h-4 animate-pulse" style={{ color: C.forestBright }} />
-              Cluster Status: HEALTHY
-            </span>
+            {engineLive ? (
+              <span className="vtt-badge vtt-badge-success px-3 py-1.5">
+                <Activity className="w-4 h-4 animate-pulse" style={{ color: C.forestBright }} />
+                Engine: REACHABLE
+              </span>
+            ) : (
+              <span className="vtt-badge vtt-badge-danger px-3 py-1.5" title="GET /api/v1/engine/metrics did not answer">
+                <AlertTriangle className="w-4 h-4" />
+                Engine: UNREACHABLE
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Cluster Telemetry Stats */}
+      {/* Cluster Telemetry Stats — only the MCR card is backed by a real
+          endpoint (engine /metrics). The rest have no API yet and show "—". */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
           <div
-            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold flex items-center justify-between gap-1"
             style={{ color: C.leatherBright }}
           >
-            Total Registered Users
+            <span>Registered Users</span>
+            <DemoBadge title="No user-directory/listing endpoint exists; the previous count (1,420) was hardcoded fiction" />
           </div>
-          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>1,420</div>
-          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">+48 this week</div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>—</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">No directory API yet</div>
         </div>
 
         <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
           <div
-            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold flex items-center justify-between gap-1"
             style={{ color: C.leatherBright }}
           >
-            Active Multiplayer Rooms
+            <span>Active Rooms</span>
+            <DemoBadge title="No platform-wide room listing endpoint exists; the previous counts (42 rooms / 184 peers) were hardcoded fiction" />
           </div>
-          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.crimsonText }}>42 Rooms</div>
-          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">184 connected peers</div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.crimsonText }}>—</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">No fleet-wide room API yet</div>
         </div>
 
         <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
           <div
-            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold flex items-center justify-between gap-1"
             style={{ color: C.leatherBright }}
           >
-            Mechanical Compliance
+            <span>Mechanical Compliance</span>
+            {engineLive ? (
+              <span className="vtt-badge vtt-badge-success px-1.5 py-0.5 text-[9px]" title="Live value from engine GET /metrics via /api/v1/engine/metrics">
+                LIVE
+              </span>
+            ) : (
+              <DemoBadge title="Engine unreachable — no honest MCR reading to display" />
+            )}
           </div>
-          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.forestBright }}>100.0%</div>
-          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">MCR Invariant Active</div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.forestBright }}>
+            {engineLive && engineMcr !== null ? `${engineMcr.toFixed(1)}%` : '—'}
+          </div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">
+            {engineLive ? 'From engine /metrics' : 'Engine offline'}
+          </div>
         </div>
 
         <div className="p-4 vtt-card-elevated rounded-xl shadow-lg">
           <div
-            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold"
+            className="font-display text-[10px] uppercase tracking-[0.08em] font-semibold flex items-center justify-between gap-1"
             style={{ color: C.leatherBright }}
           >
-            Rust Hot-Path Latency
+            <span>Rust Hot-Path Latency</span>
+            <DemoBadge title="No latency instrumentation endpoint exists; the previous reading (8 ms) was hardcoded fiction. The design budget is < 10 ms." />
           </div>
-          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>8 ms</div>
-          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">Zero runtime allocations</div>
+          <div className="text-2xl font-prose font-bold mt-1" style={{ color: C.amber }}>—</div>
+          <div className="text-[10px] text-[color-mix(in_srgb,var(--rp-parchment-300)_60%,transparent)] mt-0.5">Design budget &lt; 10 ms (STATIC)</div>
         </div>
       </div>
 
@@ -221,6 +274,9 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
             >
               User Management &amp; Permissions Directory
             </h3>
+            {/* Honest labelling: this directory is a local sample — role/tier
+                edits mutate client state only and are never persisted. */}
+            <DemoBadge title="Sample accounts. No admin user-directory or RBAC-write API exists yet; edits below are local to this screen and are not persisted." />
           </div>
 
           <div className="flex items-center space-x-3">
@@ -316,13 +372,15 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = () => {
       <div className="vtt-surface rounded-xl p-5 shadow-lg space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
-            <Radio className="w-5 h-5 animate-pulse" style={{ color: C.crimsonText }} />
+            <Radio className="w-5 h-5" style={{ color: C.crimsonText }} />
             <h3
               className="font-display text-sm tracking-[0.05em]"
               style={{ color: C.amber }}
             >
-              Live Campaign Room Sessions
+              Campaign Room Sessions
             </h3>
+            {/* Honest labelling: no platform-wide room listing endpoint exists. */}
+            <DemoBadge title="Sample rooms. No platform-wide room listing endpoint exists; these entries are hardcoded fiction, not live sessions." />
           </div>
         </div>
 
