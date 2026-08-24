@@ -109,6 +109,48 @@ pub struct ConcentrationBreakResult {
     pub maintained: bool,
 }
 
+/// Tiered outcome of a d20 skill check under the fail-forward resolution
+/// model (GOALS.md Pillar 8). Instead of a bare pass/fail, every check lands
+/// in one of four bands based on the success margin `M = Roll − DC`:
+///
+/// | Band              | Margin            | Meaning                          |
+/// |-------------------|-------------------|----------------------------------|
+/// | CriticalSuccess   | `M >= +10`        | succeed with style               |
+/// | Success           | `0 <= M < +10`    | plain success                    |
+/// | SuccessAtCost     | `-5 <= M < 0`     | succeed, but pay a price         |
+/// | CriticalFailure   | `M < -5`          | fail, with consequences          |
+///
+/// Natural 20 / natural 1 convention:
+/// - A natural 20 lifts the tier one full band upward (capped at
+///   [`CheckOutcomeTier::CriticalSuccess`]). Because the lowest band it can
+///   reach is `SuccessAtCost`, a natural 20 always counts as a pass — even
+///   when the modifier leaves the raw margin deep below the DC.
+/// - A natural 1 drops the tier one full band downward (floored at
+///   [`CheckOutcomeTier::CriticalFailure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckOutcomeTier {
+    CriticalSuccess,
+    Success,
+    SuccessAtCost,
+    CriticalFailure,
+}
+
+/// Deterministic consequence suggested when a check resolves to
+/// [`CheckOutcomeTier::SuccessAtCost`] (see
+/// [`RulesEvaluator::suggest_cost`]). The engine only *suggests*; applying
+/// the cost remains the caller's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CostSuggestion {
+    /// The actor burns one inspiration charge.
+    InspirationLoss,
+    /// The scene's alert/progress clock advances by one tick.
+    AlertClockTick,
+    /// The actor picks up this condition until the end of their next turn.
+    Condition(Condition),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CastSpellResult {
     pub caster_id: Uuid,
@@ -250,6 +292,95 @@ impl RulesEvaluator {
             total,
             maintained: passed,
         }
+    }
+
+    /// Fail-forward skill-check resolution (GOALS.md Pillar 8).
+    ///
+    /// Takes an already-rolled d20 (`natural_roll`) plus the check modifier
+    /// and DC, and returns `(passed, margin, tier)` where
+    /// `margin = natural_roll + modifier − dc`.
+    ///
+    /// The margin arithmetic reuses the existing check math (`total` vs
+    /// `dc`, as resolved by [`RulesEvaluator::resolve_saving_throw`]). The
+    /// pass flag matches the binary threshold everywhere EXCEPT the costed
+    /// band `-5 <= M < 0`, which fail-forward deliberately promotes from
+    /// "miss" to a pass with a price (see [`RulesEvaluator::suggest_cost`]).
+    /// Natural 20/1 band adjustments are documented on [`CheckOutcomeTier`].
+    pub fn resolve_check_margin(
+        natural_roll: i32,
+        modifier: i32,
+        dc: i32,
+    ) -> (bool, i32, CheckOutcomeTier) {
+        let total = natural_roll + modifier;
+        let margin = total - dc;
+
+        let mut tier = if margin >= 10 {
+            CheckOutcomeTier::CriticalSuccess
+        } else if margin >= 0 {
+            CheckOutcomeTier::Success
+        } else if margin >= -5 {
+            CheckOutcomeTier::SuccessAtCost
+        } else {
+            CheckOutcomeTier::CriticalFailure
+        };
+
+        // Nat 20 lifts one band; nat 1 drops one band. Both clamp at the ends.
+        if natural_roll == 20 && tier != CheckOutcomeTier::CriticalSuccess {
+            tier = match tier {
+                CheckOutcomeTier::CriticalFailure => CheckOutcomeTier::SuccessAtCost,
+                CheckOutcomeTier::SuccessAtCost => CheckOutcomeTier::Success,
+                _ => CheckOutcomeTier::CriticalSuccess,
+            };
+        } else if natural_roll == 1 && tier != CheckOutcomeTier::CriticalFailure {
+            tier = match tier {
+                CheckOutcomeTier::CriticalSuccess => CheckOutcomeTier::Success,
+                CheckOutcomeTier::Success => CheckOutcomeTier::SuccessAtCost,
+                _ => CheckOutcomeTier::CriticalFailure,
+            };
+        }
+
+        // A tier is a pass unless it is CriticalFailure: SuccessAtCost still
+        // succeeds (at a price), which keeps this consistent with `total >= dc`
+        // for every non-adjusted roll.
+        let passed = tier != CheckOutcomeTier::CriticalFailure;
+
+        (passed, margin, tier)
+    }
+
+    /// Maps a fail-forward tier onto the pre-existing [`TaskOutcome`]
+    /// vocabulary so event payloads keep a single outcome enum.
+    pub fn tier_to_task_outcome(tier: CheckOutcomeTier) -> TaskOutcome {
+        match tier {
+            CheckOutcomeTier::CriticalSuccess => TaskOutcome::CriticalSuccess,
+            CheckOutcomeTier::Success => TaskOutcome::Success,
+            CheckOutcomeTier::SuccessAtCost => TaskOutcome::SuccessAtACost,
+            CheckOutcomeTier::CriticalFailure => TaskOutcome::CriticalFailure,
+        }
+    }
+
+    /// Deterministic cost suggestion for a `SuccessAtCost` margin.
+    ///
+    /// Returns `Some` only for margins in the costed-success band
+    /// `-5 <= M < 0`; the suggestion is derived purely from the shortfall
+    /// magnitude `|M|` — no RNG, so replays stay reproducible:
+    ///
+    /// - `|M| = 1`: [`CostSuggestion::InspirationLoss`] (a trivial fumble)
+    /// - `|M| = 2`: [`CostSuggestion::AlertClockTick`] (time/attention lost)
+    /// - odd `|M| >= 3`: [`CostSuggestion::Condition`] with `Prone`
+    ///   (physical overreach)
+    /// - even `|M| >= 4`: [`CostSuggestion::Condition`] with `Frightened`
+    ///   (a narrow escape that rattles the actor)
+    pub fn suggest_cost(margin: i32) -> Option<CostSuggestion> {
+        if !(-5..0).contains(&margin) {
+            return None;
+        }
+        let magnitude = margin.unsigned_abs();
+        Some(match magnitude {
+            1 => CostSuggestion::InspirationLoss,
+            2 => CostSuggestion::AlertClockTick,
+            m if m % 2 == 1 => CostSuggestion::Condition(Condition::Prone),
+            _ => CostSuggestion::Condition(Condition::Frightened),
+        })
     }
 
     pub fn resolve_attack(

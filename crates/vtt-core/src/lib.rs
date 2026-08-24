@@ -29,8 +29,8 @@ pub use modifier_graph::{
     ArmorClassCalculator, ModifierPriority, MulticlassSpellSlotMatrix, SpellcastingStats,
 };
 pub use rules::{
-    AttackRollResult, ConcentrationBreakResult, MonsterArchetype, RulesEvaluator,
-    SavingThrowResult, SpellDefinition,
+    AttackRollResult, CheckOutcomeTier, ConcentrationBreakResult, CostSuggestion,
+    MonsterArchetype, RulesEvaluator, SavingThrowResult, SpellDefinition,
 };
 pub use state::{
     ArmedReaction, AttackAction, ConditionTimer, ConcentrationState, EndOfTurnSave, EntityState,

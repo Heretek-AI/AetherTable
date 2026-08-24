@@ -430,6 +430,247 @@ fn test_safety_rewind_replays_death_save_tallies() {
     assert!(!restored.is_dead);
 }
 
+// ---------------------------------------------------------------------------
+// Fail-forward resolution engine (GOALS.md Pillar 8): non-binary skill-check
+// success margins M = Roll − DC.
+// ---------------------------------------------------------------------------
+
+use vtt_core::rules::{CheckOutcomeTier, CostSuggestion};
+use vtt_core::types::TaskOutcome;
+
+#[test]
+fn test_check_margin_critical_success_band() {
+    // M >= +10 → Critical Success.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(15, 5, 10).2,
+        CheckOutcomeTier::CriticalSuccess
+    );
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(20, 0, 10).2,
+        CheckOutcomeTier::CriticalSuccess
+    );
+    // Exactly +10 is the band boundary and belongs to critical success.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(12, 3, 5).2,
+        CheckOutcomeTier::CriticalSuccess
+    );
+}
+
+#[test]
+fn test_check_margin_standard_success_band() {
+    // 0 <= M < +10 → Standard Success.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(11, 0, 10).2,
+        CheckOutcomeTier::Success
+    );
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(10, 4, 5).2,
+        CheckOutcomeTier::Success
+    );
+}
+
+#[test]
+fn test_check_margin_success_at_cost_band() {
+    // -5 <= M < 0 → Success at a Cost.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(9, 0, 10).2,
+        CheckOutcomeTier::SuccessAtCost
+    );
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(6, 1, 10).2,
+        CheckOutcomeTier::SuccessAtCost
+    );
+    // M = -5 is the deepest costed success.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(7, 0, 12).2,
+        CheckOutcomeTier::SuccessAtCost
+    );
+}
+
+#[test]
+fn test_check_margin_critical_failure_band() {
+    // M < -5 → Critical Failure.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(4, 0, 10).2,
+        CheckOutcomeTier::CriticalFailure
+    );
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(1, 2, 9).2,
+        CheckOutcomeTier::CriticalFailure
+    );
+}
+
+#[test]
+fn test_check_margin_margin_value_matches_existing_math() {
+    // Margin is always Roll − DC with the same arithmetic the existing
+    // check/save math uses (total vs dc).
+    for (natural, modifier, dc) in [
+        (20, 5, 10),
+        (11, 0, 10),
+        (10, 4, 5),
+        (10, 0, 10),
+        (9, 0, 10),
+        (7, 0, 12),
+        (6, 0, 12),
+        (4, 0, 10),
+        (1, 2, 9),
+    ] {
+        let total = natural + modifier;
+        let (_, margin, _) = RulesEvaluator::resolve_check_margin(natural, modifier, dc);
+        assert_eq!(margin, total - dc, "nat {} +{} vs dc {}", natural, modifier, dc);
+    }
+}
+
+#[test]
+fn test_check_margin_pass_flag_outside_cost_band_matches_binary_threshold() {
+    // Outside the Success-at-a-Cost band the pass flag is identical to the
+    // existing binary check math (total >= dc).
+    for (natural, modifier, dc) in [
+        (20, 5, 10),
+        (11, 0, 10),
+        (10, 4, 5),
+        (10, 0, 10),
+        (6, 0, 12),
+        (4, 0, 10),
+        (1, 2, 9),
+    ] {
+        let total = natural + modifier;
+        let (passed, _, tier) = RulesEvaluator::resolve_check_margin(natural, modifier, dc);
+        assert_ne!(tier, CheckOutcomeTier::SuccessAtCost);
+        assert_eq!(
+            passed,
+            total >= dc,
+            "nat {} +{} vs dc {}",
+            natural,
+            modifier,
+            dc
+        );
+    }
+}
+
+#[test]
+fn test_check_margin_cost_band_still_counts_as_a_pass() {
+    // Fail-forward core: a narrow miss (-5 <= M < 0) succeeds at a price.
+    for (natural, modifier, dc) in [(9, 0, 10), (7, 0, 12), (8, -3, 10)] {
+        let (passed, margin, tier) = RulesEvaluator::resolve_check_margin(natural, modifier, dc);
+        assert_eq!(tier, CheckOutcomeTier::SuccessAtCost);
+        assert!((-5..0).contains(&margin));
+        assert!(passed, "costed successes must not be reported as failures");
+    }
+}
+
+#[test]
+fn test_nat20_bumps_tier_up_one_band() {
+    // Convention: a natural 20 lifts the outcome one full band upward,
+    // capped at Critical Success.
+    // M = +14 would already be Critical Success → stays there.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(20, 4, 10).2,
+        CheckOutcomeTier::CriticalSuccess
+    );
+    // M = +8 Standard Success → bumped to Critical Success.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(20, 3, 15).2,
+        CheckOutcomeTier::CriticalSuccess
+    );
+    // M = -2 Success at a Cost → bumped to Standard Success.
+    let (passed, _, tier) = RulesEvaluator::resolve_check_margin(20, 0, 22);
+    assert_eq!(tier, CheckOutcomeTier::Success);
+    assert!(passed);
+
+    // M = -9 Critical Failure → bumped to Success at a Cost, which PASSES:
+    // the nat 20 rescues an otherwise catastrophic roll.
+    let (passed, _, tier) = RulesEvaluator::resolve_check_margin(20, 0, 29);
+    assert_eq!(tier, CheckOutcomeTier::SuccessAtCost);
+    assert!(passed);
+}
+
+#[test]
+fn test_nat1_drops_tier_down_one_band() {
+    // Convention: a natural 1 drops the outcome one full band downward,
+    // floored at Critical Failure. It never flips a pass into a fail on its
+    // own beyond that single-band step.
+    // M = +14 Critical Success → dropped to Standard Success.
+    let (passed, _, tier) = RulesEvaluator::resolve_check_margin(1, 23, 10);
+    assert_eq!(tier, CheckOutcomeTier::Success);
+    assert!(passed);
+
+    // M = +8 Standard Success → dropped to Success at a Cost.
+    let (passed, _, tier) = RulesEvaluator::resolve_check_margin(1, 17, 10);
+    assert_eq!(tier, CheckOutcomeTier::SuccessAtCost);
+    assert!(passed);
+
+    // M = -2 Success at a Cost → dropped to Critical Failure (fails).
+    let (passed, _, tier) = RulesEvaluator::resolve_check_margin(1, 7, 10);
+    assert_eq!(tier, CheckOutcomeTier::CriticalFailure);
+    assert!(!passed);
+
+    // M = -9 is already Critical Failure → stays floored there.
+    assert_eq!(
+        RulesEvaluator::resolve_check_margin(1, 0, 15).2,
+        CheckOutcomeTier::CriticalFailure
+    );
+}
+
+#[test]
+fn test_tier_maps_onto_existing_task_outcome() {
+    // The new tiers must stay aligned with the pre-existing TaskOutcome enum
+    // so downstream event payloads can keep one vocabulary.
+    assert_eq!(
+        RulesEvaluator::tier_to_task_outcome(CheckOutcomeTier::CriticalSuccess),
+        TaskOutcome::CriticalSuccess
+    );
+    assert_eq!(
+        RulesEvaluator::tier_to_task_outcome(CheckOutcomeTier::Success),
+        TaskOutcome::Success
+    );
+    assert_eq!(
+        RulesEvaluator::tier_to_task_outcome(CheckOutcomeTier::SuccessAtCost),
+        TaskOutcome::SuccessAtACost
+    );
+    assert_eq!(
+        RulesEvaluator::tier_to_task_outcome(CheckOutcomeTier::CriticalFailure),
+        TaskOutcome::CriticalFailure
+    );
+}
+
+#[test]
+fn test_cost_suggestion_is_deterministic_per_margin_magnitude() {
+    // Documented derivation from |M| (the depth of the shortfall):
+    //   |M| = 1      → lose inspiration
+    //   |M| = 2      → alert clock ticks once
+    //   odd  |M| >= 3 → suggested Prone condition
+    //   even |M| >= 4 → suggested Frightened condition
+    assert_eq!(
+        RulesEvaluator::suggest_cost(-1),
+        Some(CostSuggestion::InspirationLoss)
+    );
+    assert_eq!(
+        RulesEvaluator::suggest_cost(-2),
+        Some(CostSuggestion::AlertClockTick)
+    );
+    assert_eq!(
+        RulesEvaluator::suggest_cost(-3),
+        Some(CostSuggestion::Condition(vtt_core::types::Condition::Prone))
+    );
+    assert_eq!(
+        RulesEvaluator::suggest_cost(-4),
+        Some(CostSuggestion::Condition(vtt_core::types::Condition::Frightened))
+    );
+    // Repeated calls are stable — no RNG anywhere in the suggestion hook.
+    assert_eq!(RulesEvaluator::suggest_cost(-3), RulesEvaluator::suggest_cost(-3));
+    assert_eq!(RulesEvaluator::suggest_cost(-5), RulesEvaluator::suggest_cost(-5));
+}
+
+#[test]
+fn test_cost_suggestion_only_applies_inside_success_at_cost_band() {
+    // Margins outside [-5, 0) carry no suggested cost.
+    assert_eq!(RulesEvaluator::suggest_cost(0), None);
+    assert_eq!(RulesEvaluator::suggest_cost(5), None);
+    assert_eq!(RulesEvaluator::suggest_cost(-6), None);
+    assert_eq!(RulesEvaluator::suggest_cost(-99), None);
+}
+
 /// Helper so the tuple literal reads cleanly in assertions above.
 trait IntoPosition {
     fn into_position(self) -> (f32, f32, f32);
