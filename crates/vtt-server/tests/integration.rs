@@ -2705,6 +2705,127 @@ async fn x_card_snapshot_projected_for_players_full_for_gm() {
     );
 }
 
+/// Audit finding (sibling of the x-card leak): `GET /api/v1/sessions/{id}`
+/// serialized the FULL GameSession to any authenticated caller, so spectators
+/// and non-owner players could read hidden NPCs' stat blocks/HP/attacks and
+/// `owner_player_id` markers straight off the HTTP route even though both the
+/// WS initial snapshot and the x-card response already project by role. The
+/// GET must apply `project_snapshot_for_role` exactly like those paths.
+#[actix_web::test]
+async fn get_session_projected_for_spectator_and_player_full_for_gm() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-2", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // Same table as the x-card projection test: a hero owned by player-2,
+    // a visible DM-controlled NPC, and a hidden NPC whose sheet must never
+    // reach a non-GM caller over any read path.
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let lurker_id = Uuid::new_v4();
+
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["owner_player_id"] = serde_json::json!("player-2");
+    let mut orc = entity_json(orc_id, "Board Orc", 20, 11, 3, "1d6+2");
+    orc["is_player"] = serde_json::json!(false);
+    let mut lurker = entity_json(lurker_id, "Hidden Lurker", 40, 17, 6, "2d8+4");
+    lurker["is_player"] = serde_json::json!(false);
+    lurker["is_visible"] = serde_json::json!(false);
+
+    for payload in [hero, orc, lurker] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    let fetch = |token: &str| {
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header(bearer(token))
+            .to_request()
+    };
+
+    // --- Player view: own sheet in full, visible NPC as board token, hidden dropped ---
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, fetch(&player)).await).await;
+    let entities = &body["entities"];
+    assert!(
+        entities.get(lurker_id.to_string()).is_none(),
+        "hidden NPC must be dropped from a player's session snapshot: {}",
+        body
+    );
+    let projected_orc = &entities[&orc_id.to_string()];
+    let mut fields: Vec<&str> = projected_orc
+        .as_object()
+        .expect("projected entity must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec!["id", "is_dead", "is_player", "is_visible", "name", "position"],
+        "visible unowned NPC must carry exactly the public board-token fields"
+    );
+    assert!(projected_orc["ac"].is_null());
+    assert!(projected_orc["current_hp"].is_null());
+    assert!(projected_orc["owner_player_id"].is_null());
+    // The caller's OWN entity keeps its full sheet (WS snapshot parity), so
+    // targeting flows that need ids/stats still work.
+    let own_hero = &entities[&hero_id.to_string()];
+    assert_eq!(own_hero["ac"], 14, "own sheet stays unredacted");
+    assert_eq!(own_hero["id"], json_str(&hero_id), "entity id preserved for targeting");
+
+    // --- Spectator view: every VISIBLE entity as a board token, nothing else ---
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, fetch(&spectator)).await).await;
+    let entities = &body["entities"];
+    assert!(
+        entities.get(lurker_id.to_string()).is_none(),
+        "hidden NPC must be dropped from a spectator's session snapshot"
+    );
+    for id in [orc_id, hero_id] {
+        let token_view = &entities[&id.to_string()];
+        let mut fields: Vec<&str> = token_view
+            .as_object()
+            .expect("projected entity must be an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            vec!["id", "is_dead", "is_player", "is_visible", "name", "position"],
+            "spectator must see only board-token fields for {}",
+            id
+        );
+        assert!(token_view["current_hp"].is_null() && token_view["ac"].is_null());
+    }
+    // Ownership markers never leave the engine on a spectator's watch.
+    assert!(
+        !serde_json::to_string(entities)
+            .unwrap()
+            .contains("owner_player_id"),
+        "spectator snapshot must not carry owner_player_id markers"
+    );
+
+    // --- GM view: the authoritative snapshot, hidden NPC included ---
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, fetch(&gm)).await).await;
+    let gm_entities = &body["entities"];
+    let lurker = &gm_entities[&lurker_id.to_string()];
+    assert_eq!(lurker["ac"], 17, "GM sees the hidden NPC's stat block");
+    assert_eq!(lurker["current_hp"], 40);
+    assert_eq!(lurker["owner_player_id"].as_str(), None, "hidden NPC is DM-controlled");
+    assert_eq!(gm_entities[&hero_id.to_string()]["owner_player_id"], "player-2");
+}
+
 /// MINOR audit finding: when a move provokes MORE THAN ONE adjacent armed
 /// enemy, the response must surface every provoked attacker in
 /// `opportunity_attacks_detail`, not just `.first()` — while keeping the
@@ -3045,7 +3166,7 @@ async fn setup_brawler_duel(
         Error = actix_web::Error,
     >,
 ) -> (String, Uuid, Uuid, Uuid) {
-    let token = sign_token("gm-brawler", TEST_SECRET);
+    let token = sign_token_with_role("gm-brawler", "gm", TEST_SECRET);
     let session_id = create_session_as(app, &token).await;
     let hero_id = Uuid::new_v4();
     let orc_id = Uuid::new_v4();
@@ -3168,7 +3289,7 @@ async fn grapple_is_seeded_deterministic_across_sessions() {
 #[actix_web::test]
 async fn shove_prone_knocks_target_down_and_push_5ft_moves_it() {
     let app = test_app().await;
-    let token = sign_token("gm-shove", TEST_SECRET);
+    let token = sign_token_with_role("gm-shove", "gm", TEST_SECRET);
 
     // --- Prone branch ---------------------------------------------------------
     let session_id = create_session_as(&app, &token).await;
@@ -3277,7 +3398,7 @@ async fn put_map(
 #[actix_web::test]
 async fn shove_push_payload_records_pre_and_post_push_position() {
     let app = test_app().await;
-    let token = sign_token("gm-push-ledger", TEST_SECRET);
+    let token = sign_token_with_role("gm-push-ledger", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     let orc_id = Uuid::new_v4();
@@ -3333,7 +3454,7 @@ async fn shove_push_payload_records_pre_and_post_push_position() {
 #[actix_web::test]
 async fn shove_push_into_wall_clamps_at_wall_but_still_wins_the_contest() {
     let app = test_app().await;
-    let token = sign_token("gm-push-wall", TEST_SECRET);
+    let token = sign_token_with_role("gm-push-wall", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     // Wall column at cell x=1 → world x in [5, 10).
     put_map(&app, &token, session_id, 32, 32, 5.0, vec![(1, 0), (1, 1), (1, 2)]).await;
@@ -3366,14 +3487,22 @@ async fn shove_push_into_wall_clamps_at_wall_but_still_wins_the_contest() {
 
     let snap = snapshot_as(&app, &token, session_id).await;
     let pos = &snap["entities"][orc_id.to_string()]["position"];
-    assert_eq!(pos[0], serde_json::json!(3.6), "no wall clipping");
+    // Positions are f32 in the engine; any response that routes state through
+    // a serde_json::Value projection (x-card snapshot, projected session GET)
+    // widens them to f64, so assert within epsilon instead of bit-exactly.
+    // The invariant under test is "no wall clipping": still at world x=3.6.
+    let px = pos[0].as_f64().unwrap();
+    assert!(
+        (px - 3.6).abs() < 1e-3,
+        "no wall clipping, got {px}"
+    );
     assert_eq!(pos[1], serde_json::json!(2.5));
 }
 
 #[actix_web::test]
 async fn shove_push_off_map_edge_clamps_at_bounds() {
     let app = test_app().await;
-    let token = sign_token("gm-push-edge", TEST_SECRET);
+    let token = sign_token_with_role("gm-push-edge", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     put_map(&app, &token, session_id, 32, 32, 5.0, vec![]).await;
 
@@ -3424,7 +3553,7 @@ async fn shove_push_refreshes_ws_movement_baseline_cache() {
     }
 
     let (app, state) = test_app_with_state().await;
-    let token = sign_token("gm-push-cache", TEST_SECRET);
+    let token = sign_token_with_role("gm-push-cache", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     put_map(&app, &token, session_id, 32, 32, 5.0, vec![]).await;
 
@@ -3519,7 +3648,7 @@ async fn contests_enforce_reach_rbac_and_payload_shape() {
     let app = test_app().await;
 
     // --- Out of reach (> 5 ft) -> 409, no state change. -----------------------
-    let token = sign_token("gm-reach", TEST_SECRET);
+    let token = sign_token_with_role("gm-reach", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     let far_id = Uuid::new_v4();
@@ -3682,7 +3811,7 @@ async fn contests_enforce_reach_rbac_and_payload_shape() {
 #[actix_web::test]
 async fn dodge_grants_attack_disadvantage_until_next_turn_refresh() {
     let app = test_app().await;
-    let token = sign_token("gm-dodge", TEST_SECRET);
+    let token = sign_token_with_role("gm-dodge", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     let orc_id = Uuid::new_v4();
@@ -3728,7 +3857,7 @@ async fn dodge_grants_attack_disadvantage_until_next_turn_refresh() {
 #[actix_web::test]
 async fn dash_adds_one_speed_once_per_turn_then_resets() {
     let app = test_app().await;
-    let token = sign_token("gm-dash", TEST_SECRET);
+    let token = sign_token_with_role("gm-dash", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     spawn(&app, &token, session_id, entity_json(hero_id, "Runner", 30, 14, 0, "1d4")).await;
@@ -3855,7 +3984,7 @@ async fn disengage_suppresses_opportunity_attack_provocation_until_refresh() {
 #[actix_web::test]
 async fn stabilize_attempt_tallies_successes_and_enforces_rbac_and_gates() {
     let app = test_app().await;
-    let token = sign_token("gm-stabilize", TEST_SECRET);
+    let token = sign_token_with_role("gm-stabilize", "gm", TEST_SECRET);
 
     // --- Happy path: existing tally 1S/1F -> successful check -> 2S/1F --------
     let session_id = create_session_as(&app, &token).await;
@@ -4083,7 +4212,7 @@ async fn stabilize_attempt_tallies_successes_and_enforces_rbac_and_gates() {
 #[actix_web::test]
 async fn ready_action_stores_description_spends_action_and_clears_on_refresh() {
     let app = test_app().await;
-    let token = sign_token("gm-ready", TEST_SECRET);
+    let token = sign_token_with_role("gm-ready", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
@@ -4826,7 +4955,7 @@ async fn help_enforces_rbac_reach_self_target_and_payload_shape() {
 #[actix_web::test]
 async fn offhand_attack_consumes_a_standing_help_promise() {
     let app = test_app().await;
-    let token = sign_token("gm-twf-help", TEST_SECRET);
+    let token = sign_token_with_role("gm-twf-help", "gm", TEST_SECRET);
     let session_id = create_session_as(&app, &token).await;
     let hero_id = Uuid::new_v4();
     let orc_id = Uuid::new_v4();

@@ -379,11 +379,28 @@ async fn create_session(
     }))
 }
 
-async fn get_session(data: web::Data<AppState>, path: web::Path<Uuid>) -> impl Responder {
+async fn get_session(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    identity: AuthIdentity,
+) -> impl Responder {
     let session_id = path.into_inner();
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let session = session_lock.read();
-        HttpResponse::Ok().json(&*session)
+        // AUDIT (MED): this route used to serialize the FULL GameSession to any
+        // authenticated caller, letting spectators and non-owner players read
+        // hidden NPCs' stat blocks/HP/attacks straight off HTTP even though the
+        // WS initial snapshot and x-card response already projected by role.
+        // Same projection here keeps all three read paths identical; entity ids
+        // survive (public_board_token always emits `id`), so targeting flows
+        // that need them keep working.
+        let role = Role::from_identity(&identity);
+        let snapshot = project_snapshot_for_role(
+            serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
+            role,
+            &identity.user_id,
+        );
+        HttpResponse::Ok().json(snapshot)
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
     }

@@ -269,3 +269,27 @@ at target, trust boundary held. SLA harness (it. 62): rules 0.39ms p50, spatial
   nondeterministic suite reds until it. 84 added per-test window clearing; the
   buckets themselves remain process-local (no distributed limiter).
 
+
+---
+
+# Loop 2 (2026-08-24) — Post-Loop Audit Remediation & Pillar Completion
+
+Seeded by the 2026-08-24 post-loop audit (~20 defects: trust-boundary holes,
+honesty tails, Pillar-4/9/11 gaps). Same cadence as Loop 1: TDD red-first →
+gates green → commit (`iteration N`) → push → row below. GOALS.md re-reviewed
+every 10 iterations; adversarial audit sweeps ~every 10.
+
+## Backlog
+
+### Phase 1 — Trust-boundary hotfixes
+- [ ] P1.1 GET /sessions/{id} role projection (hidden statblocks leak)
+- [ ] P1.2 Strict typed spawn schema; no gateway-side attack math at deploy
+- [ ] P1.3 Mandatory tokens on engine proxies + client token completion
+- [ ] P1.4 Server-assigned epistemic-tier progression
+- [ ] P1.5 Token-gate x-card + spotlight endpoints
+- [ ] P1.6 Server-seeded rolls; spectator-block script/map routes
+- [ ] P1.7 Exact PUBLIC_PATHS; Uuid-validate room_id; WS socket cap
+- [ ] P1.8 ledger_sequence migration reconciliation
+
+## Iteration log
+
