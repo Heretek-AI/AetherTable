@@ -1014,6 +1014,11 @@ async fn resolve_attack(
             attacker.position.2,
             target.position.2,
         );
+        // SRD Help: an ally's standing promise grants Advantage on THIS attack
+        // roll and is consumed exactly once. A hostile attacker never benefits
+        // (consume_help_advantage checks side parity) and leaves it standing.
+        let help_advantage = session.consume_help_advantage(req.attacker_id, req.target_id);
+        let advantage = advantage || (help_advantage && !disadvantage);
 
         let grid = build_collision_grid(&session.map);
         let attacker_pos = Vector3::new(attacker.position.0, attacker.position.1, attacker.position.2);
@@ -1125,6 +1130,7 @@ async fn resolve_attack(
                 body["cover"] = serde_json::json!(cover);
                 body["distance_feet"] = serde_json::json!(distance);
                 body["advantage"] = serde_json::json!(advantage);
+                body["help_advantage_consumed"] = serde_json::json!(help_advantage);
                 body["disadvantage"] = serde_json::json!(disadvantage);
                 if shield_interrupt {
                     body["reaction_interrupt"] =
@@ -1964,6 +1970,302 @@ async fn resolve_stabilize(
         let mut body = payload;
         body["event_sequence"] = serde_json::json!(event.sequence_id);
         HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+
+// --- Two-Weapon Fighting (bonus-action off-hand strike) -----------------------
+//
+// SRD 5e: after taking the Attack action with two Light weapons, one bonus-
+// action attack with the off-hand weapon — no POSITIVE ability modifier to
+// its damage. Contract matches every other combat endpoint: ids-only payload
+// (`deny_unknown_fields`), server-side stat blocks, seeded session dice,
+// Bonus-Action spend AFTER all validation passes, one OFFHAND_ATTACK ledger
+// event per resolution.
+//
+// DISCLOSED LIMITATION (weapon "light"): the SRD importer does not yet parse
+// weapon properties out of monster text, so `light` is an explicit opt-in flag
+// on each stat-block attack entry (`AttackAction::light`, serde-defaulted to
+// false). This endpoint therefore enforces BOTH budget (Bonus Action) and the
+// light requirement whenever the flag is present; a stat block that has not
+// declared its weapons Light is refused (`*_WEAPON_NOT_LIGHT`) rather than
+// silently permitted.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OffhandActionReq {
+    pub attacker_id: Uuid,
+    pub target_id: Uuid,
+    /// Index into the attacker's stat-block attack list for the OFF-HAND
+    /// weapon (the main-hand weapon defaults to index 0). Server-side only.
+    #[serde(default)]
+    pub offhand_index: usize,
+    /// Optional deterministic seed pinning the roll.
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+async fn resolve_offhand_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<OffhandActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let attacker = match session.entities.get(&req.attacker_id) {
+            Some(a) => a.clone(),
+            None => {
+                return reject(
+                    &data,
+                    404,
+                    "ATTACKER_NOT_FOUND",
+                    "attacker_id does not exist in this session",
+                )
+            }
+        };
+        if !may_control_entity(attacker.owner_player_id.as_ref(), role, &identity.user_id) {
+            return reject(
+                &data,
+                403,
+                "ENTITY_NOT_OWNED",
+                "you do not control the attacking entity",
+            );
+        }
+        let target = match session.entities.get(&req.target_id) {
+            Some(t) => t.clone(),
+            None => {
+                return reject(&data, 404, "TARGET_NOT_FOUND", "target_id does not exist in this session")
+            }
+        };
+
+        if !attacker.can_act() {
+            return reject(
+                &data,
+                409,
+                "ENTITY_CANNOT_ACT",
+                "attacker is unconscious, dead, or incapacitated",
+            );
+        }
+        if target.is_dead {
+            return reject(&data, 409, "TARGET_ALREADY_DEAD", "target has expired");
+        }
+        if attacker.id == target.id {
+            return reject(&data, 422, "SELF_ATTACK_INVALID", "attacker and target coincide");
+        }
+
+        // SRD Two-Weapon Fighting presupposes the Attack action was already
+        // taken this turn; the engine enforces that indirectly by requiring a
+        // spent Action here (a fresh turn means no Attack happened yet).
+        if attacker.action_budget.action {
+            return reject(
+                &data,
+                409,
+                "ATTACK_ACTION_REQUIRED",
+                "two-weapon fighting follows the Attack action, which has not been taken this turn",
+            );
+        }
+        // Bonus Action is checked now but spent only AFTER every other gate.
+        if !attacker.action_budget.bonus_action {
+            return reject(
+                &data,
+                409,
+                "BONUS_ACTION_ECONOMY_EXHAUSTED",
+                "the attacker has already used their Bonus Action this turn",
+            );
+        }
+
+        // Melee reach for an off-hand weapon swing.
+        let distance = attacker.distance_to_feet(&target);
+        if distance > CONTEST_REACH_FEET {
+            return reject(&data, 409, "OUT_OF_REACH", "an off-hand strike requires the target within 5 ft");
+        }
+
+        // Both weapons must be Light — server-side stat blocks decide.
+        let main_weapon = attacker.attack_for_index(0);
+        let offhand_weapon = attacker.attack_for_index(req.offhand_index);
+        if !main_weapon.light {
+            return reject(
+                &data,
+                422,
+                "MAIN_HAND_WEAPON_NOT_LIGHT",
+                "two-weapon fighting requires both weapons to have the Light property",
+            );
+        }
+        if !offhand_weapon.light {
+            return reject(
+                &data,
+                422,
+                "OFFHAND_WEAPON_NOT_LIGHT",
+                "the off-hand weapon must have the Light property",
+            );
+        }
+
+        // Spatial edges: condition-derived adv/dis (Help / Dodge / prone etc.
+        // apply to the off-hand swing exactly like any other attack).
+        let (advantage, disadvantage) = RulesEvaluator::edge_from_conditions(
+            &attacker,
+            &target,
+            distance,
+            attacker.position.2,
+            target.position.2,
+        );
+        // A standing Help promise consumed by THIS attack grants advantage.
+        let help_advantage = session.consume_help_advantage(req.attacker_id, req.target_id);
+        let advantage = advantage || (help_advantage && !disadvantage);
+
+        // All validations passed — spend the Bonus Action now.
+        if let Err(e) = session
+            .entities
+            .get_mut(&req.attacker_id)
+            .expect("checked above")
+            .spend_bonus_action()
+        {
+            return reject(&data, 409, &e, "bonus-action budget exhausted or entity incapable");
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+
+        let resolution = match ActionResolver::resolve_offhand_attack(
+            &mut dice,
+            &attacker,
+            &target,
+            &main_weapon,
+            &offhand_weapon,
+            target.ac,
+            advantage,
+            disadvantage,
+        ) {
+            Ok(r) => r,
+            Err(e) => return reject(&data, 400, "RESOLUTION_FAILED", &e),
+        };
+        let result = resolution.roll;
+
+        data.count_valid();
+        let campaign_id = session.campaign_id;
+        if let Some(t) = session.entities.get_mut(&req.target_id) {
+            t.current_hp = result.target_hp_remaining;
+            t.is_conscious = result.target_is_conscious;
+            t.is_dead = result.target_is_dead || result.target_hp_remaining <= -t.max_hp;
+        }
+        let event = session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.attacker_id,
+            "OFFHAND_ATTACK",
+            serde_json::json!({
+                "attacker_id": req.attacker_id.to_string(),
+                "target_id": req.target_id.to_string(),
+                "natural_roll": result.natural_roll,
+                "attack_roll": result.attack_roll,
+                "target_ac": target.ac,
+                "is_hit": result.is_hit,
+                "total_damage": result.total_damage,
+                "damage_expression_rolled": resolution.damage_expression_rolled,
+                "ability_mod_withheld_from_damage": resolution.ability_mod_withheld_from_damage,
+                "offhand_index": req.offhand_index,
+            }),
+        );
+
+        let mut body = serde_json::to_value(&result).unwrap_or_default();
+        body["action_name"] = serde_json::json!(offhand_weapon.name);
+        body["offhand_index"] = serde_json::json!(req.offhand_index);
+        body["damage_expression_rolled"] =
+            serde_json::json!(resolution.damage_expression_rolled);
+        body["ability_mod_withheld_from_damage"] =
+            serde_json::json!(resolution.ability_mod_withheld_from_damage);
+        body["help_advantage_consumed"] = serde_json::json!(help_advantage);
+        body["advantage"] = serde_json::json!(advantage);
+        body["disadvantage"] = serde_json::json!(disadvantage);
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+
+// --- Help action ---------------------------------------------------------------
+//
+// SRD 5e: spend your Action to give an ally Advantage on their next attack
+// roll against a creature within your reach. The promise lives ON THE TARGET
+// entity (`next_attacker_has_advantage_against` naming the helper), is
+// consumed by the first qualifying same-side attack (normal attacks AND the
+// off-hand strike both check it), and clears at the round refresh or on a
+// safety rewind past the HELP_ACTION event. Same contract as grapple/shove:
+// ids-only payload, attack-identical RBAC, Action spent only after every
+// validation passes, one HELP_ACTION ledger event per grant.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelpActionReq {
+    pub helper_id: Uuid,
+    pub target_entity_id: Uuid,
+}
+
+async fn resolve_help_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<HelpActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Attack-identical RBAC on the HELPER.
+        let owner = session
+            .entities
+            .get(&req.helper_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !session.entities.contains_key(&req.helper_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "helper_id does not exist in this session");
+        }
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control the helping entity");
+        }
+
+        // Core enforces reach, liveness, self-targeting and the action
+        // economy; a rejection changes nothing.
+        if let Err(e) = session.take_help(req.helper_id, req.target_entity_id) {
+            let status = match e.as_str() {
+                "ENTITY_NOT_FOUND" | "TARGET_NOT_FOUND" => 404u16,
+                "SELF_TARGET_INVALID" => 422,
+                _ => 409,
+            };
+            return reject(&data, status, &e, "help rejected by the rules engine");
+        }
+
+        data.count_valid();
+        let event_sequence = session.ledger.current_sequence;
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "HELP_GRANTED",
+            "helper_id": req.helper_id.to_string(),
+            "target_entity_id": req.target_entity_id.to_string(),
+            "next_attacker_has_advantage_against": req.helper_id.to_string(),
+            "event_sequence": event_sequence,
+        }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
     }
@@ -3828,6 +4130,8 @@ pub fn configure_app_with(
                         .route("/action/disengage", web::post().to(resolve_disengage))
                         .route("/action/ready", web::post().to(resolve_ready_action))
                         .route("/action/stabilize", web::post().to(resolve_stabilize))
+                        .route("/action/offhand", web::post().to(resolve_offhand_action))
+                        .route("/action/help", web::post().to(resolve_help_action))
                         .route("/action/cast-spell", web::post().to(resolve_cast_spell))
                         .route("/move", web::post().to(move_entity))
                         .route("/reactions/arm", web::post().to(arm_reaction))

@@ -470,6 +470,17 @@ class TestManeuverProxyIdentity:
             "healer_id": "cleric",
             "target_id": "dying-hero",
         },
+        "offhand": {
+            "session_id": SESSION_ID,
+            "attacker_id": "thorin",
+            "target_id": "orc-warlord",
+            "offhand_index": 1,
+        },
+        "help": {
+            "session_id": SESSION_ID,
+            "helper_id": "bard",
+            "target_entity_id": "orc-warlord",
+        },
     }
 
     def _capture(self, monkeypatch, response):
@@ -503,7 +514,15 @@ class TestManeuverProxyIdentity:
             # Ids-only payload coerced to UUIDs like every other proxy. The
             # session reference rides the PATH, not the body.
             expected = {k: v for k, v in body.items() if k != "session_id"}
-            for key in ("attacker_id", "defender_id", "entity_id", "healer_id", "target_id"):
+            for key in (
+                "attacker_id",
+                "defender_id",
+                "entity_id",
+                "healer_id",
+                "helper_id",
+                "target_id",
+                "target_entity_id",
+            ):
                 if key in expected:
                     expected[key] = str(uuid.uuid5(uuid.NAMESPACE_URL, expected[key]))
             assert captured["payload"] == expected, name
@@ -544,6 +563,12 @@ class TestManeuverProxyIdentity:
             "shove": {**self.ROUTES["shove"], "target_ac": -5},
             "dodge": {**self.ROUTES["dodge"], "ac_override": 30},
             "stabilize": {**self.ROUTES["stabilize"], "auto_success": True},
+            "offhand": {
+                **self.ROUTES["offhand"],
+                "damage_expression": "999d999+99",
+            },
+            "offhand-seed": {**self.ROUTES["offhand"], "seed": 7},
+            "help": {**self.ROUTES["help"], "auto_grant": True},
         }
         for case, body in smuggles.items():
             name = "grapple" if case.startswith("grapple") else case.split("-")[0]
@@ -597,6 +622,146 @@ class TestManeuverProxyIdentity:
             )
             assert resp.status_code == 502, name
             assert "unreachable" in resp.json()["detail"].lower()
+
+
+class TestOffhandAndHelpProxies:
+    """Identity forwarding + payload contract for the Two-Weapon Fighting and
+    Help proxies (POST /api/v1/engine/offhand -> /action/offhand,
+    POST /api/v1/engine/help -> /action/help).
+
+    The engine decides everything mechanical (light-weapon legality, bonus
+    action economy, reach, the granted advantage); the gateway forwards ids
+    plus the caller's verified identity only — never a seed."""
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    SESSION_ID = "8a2b4c6d-1e3f-4a5b-9c0d-e1f2a3b4c5d6"
+
+    OFFHAND = {
+        "session_id": SESSION_ID,
+        "attacker_id": "twin-blade",
+        "target_id": "goblin",
+        "offhand_index": 1,
+    }
+
+    HELP = {
+        "session_id": SESSION_ID,
+        "helper_id": "cleric",
+        "target_entity_id": "ogre",
+    }
+
+    @staticmethod
+    def _capture(monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_offhand_forwards_identity_path_and_ids_only_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"is_hit": True})
+        resp = client.post(
+            "/api/v1/engine/offhand",
+            params={"token": self._token("player-7", "player")},
+            json=self.OFFHAND,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"is_hit": True}
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/action/offhand"
+        )
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        assert captured["payload"] == {
+            "attacker_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "twin-blade")),
+            "target_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "goblin")),
+            "offhand_index": 1,
+        }
+        assert "seed" not in captured["payload"]
+        assert "session_id" not in captured["payload"]
+
+    def test_help_forwards_identity_path_and_ids_only_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "HELP_GRANTED"})
+        resp = client.post(
+            "/api/v1/engine/help",
+            params={"token": self._token("player-7", "player")},
+            json=self.HELP,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "HELP_GRANTED"}
+        assert captured["path"] == f"/api/v1/sessions/{self.SESSION_ID}/action/help"
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        assert captured["payload"] == {
+            "helper_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "cleric")),
+            "target_entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "ogre")),
+        }
+        assert "seed" not in captured["payload"]
+
+    def test_gm_identity_is_forwarded_on_both(self, monkeypatch):
+        for path, body in (("offhand", self.OFFHAND), ("help", self.HELP)):
+            captured = self._capture(monkeypatch, {})
+            resp = client.post(
+                f"/api/v1/engine/{path}",
+                params={"token": self._token("gm-1", "gm")},
+                json=body,
+            )
+            assert resp.status_code == 200, path
+            assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}, path
+            monkeypatch.undo()
+
+    def test_missing_token_is_422_and_invalid_token_is_401(self):
+        for path, body in (("offhand", self.OFFHAND), ("help", self.HELP)):
+            assert (
+                client.post(f"/api/v1/engine/{path}", json=body).status_code == 422
+            ), path
+            assert (
+                client.post(
+                    f"/api/v1/engine/{path}",
+                    params={"token": "garbage.token.value"},
+                    json=body,
+                ).status_code
+                == 401
+            ), path
+
+    def test_engine_rejections_surface_verbatim(self, monkeypatch):
+        cases = [
+            ("offhand", self.OFFHAND, "BONUS_ACTION_ECONOMY_EXHAUSTED"),
+            ("help", self.HELP, "OUT_OF_REACH"),
+        ]
+        for path, body, code in cases:
+            async def rejected(method, path_, payload=None, *, actor=None, code=code):
+                raise engine_client.EngineRejectedError(409, f'{{"error": "{code}"}}')
+
+            monkeypatch.setattr(engine_client, "engine_request", rejected)
+            resp = client.post(
+                f"/api/v1/engine/{path}",
+                params={"token": self._token("player-7", "player")},
+                json=body,
+            )
+            assert resp.status_code == 409, path
+            assert resp.json()["detail"]["error"] == code, path
+            monkeypatch.undo()
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        for path, body in (("offhand", self.OFFHAND), ("help", self.HELP)):
+            resp = client.post(
+                f"/api/v1/engine/{path}",
+                params={"token": self._token("gm-1", "gm")},
+                json=body,
+            )
+            assert resp.status_code == 502, path
+            assert "unreachable" in resp.json()["detail"].lower(), path
 
 
 class TestMetricsProxy:

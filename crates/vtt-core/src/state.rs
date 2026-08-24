@@ -17,6 +17,10 @@ pub struct ConcentrationState {
 /// [`EntityState::stabilize_attempt`]).
 pub const STABILIZE_MEDICINE_DC: i32 = 10;
 
+/// SRD reach for the Help action's combat use: the helped-against enemy must
+/// be within 5 ft of the HELPER (see [`GameSession::take_help`]).
+pub const HELP_REACH_FEET: f32 = 5.0;
+
 /// Result of one stabilize attempt on a dying creature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StabilizeAttemptOutcome {
@@ -41,6 +45,17 @@ pub struct AttackAction {
     pub attack_bonus: i32,
     pub damage_expression: String,
     pub damage_type: DamageType,
+    /// SRD Light weapon property. Serde default (false) keeps legacy stat
+    /// blocks deserializing; Two-Weapon Fighting requires BOTH held weapons to
+    /// be Light (see
+    /// [`crate::actions::ActionResolver::resolve_offhand_attack`]).
+    ///
+    /// KNOWN LIMITATION (disclosed honestly): the SRD importer does not yet
+    /// parse weapon properties out of monster text, so a stat block must opt
+    /// in by declaring `"light": true` explicitly. Undeclared weapons are
+    /// refused as non-Light — never silently permitted.
+    #[serde(default)]
+    pub light: bool,
 }
 
 /// Default unarmed strike used when an entity has no explicit attacks.
@@ -51,6 +66,7 @@ impl Default for AttackAction {
             attack_bonus: 0,
             damage_expression: "1".to_string(),
             damage_type: DamageType::Bludgeoning,
+            light: false,
         }
     }
 }
@@ -212,6 +228,14 @@ pub struct EntityState {
     /// engine stores and displays it only — resolution is GM adjudication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readied_action: Option<ReadiedAction>,
+    /// SRD Help action promise, stored ON THE BENEFICIARY: the id of the
+    /// helper whose aid grants Advantage on the NEXT attack roll made against
+    /// this entity by an ally of that helper (see
+    /// [`GameSession::take_help`] / [`GameSession::consume_help_advantage`]).
+    /// Consumed once by the first qualifying attack and cleared at the round
+    /// refresh. Serde default keeps legacy payloads deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attacker_has_advantage_against: Option<String>,
 }
 
 impl EntityState {
@@ -258,6 +282,21 @@ impl EntityState {
             return Err("ACTION_ECONOMY_EXHAUSTED".to_string());
         }
         self.action_budget.action = false;
+        Ok(())
+    }
+
+    /// Spends the entity's Bonus Action — same enforcement contract as
+    /// [`EntityState::spend_action`], against `action_budget.bonus_action`.
+    /// This is where Two-Weapon Fighting's off-hand strike (and any future
+    /// bonus-action spell pipeline) must buy its turn resource.
+    pub fn spend_bonus_action(&mut self) -> Result<(), String> {
+        if !self.can_act() {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if !self.action_budget.bonus_action {
+            return Err("BONUS_ACTION_ECONOMY_EXHAUSTED".to_string());
+        }
+        self.action_budget.bonus_action = false;
         Ok(())
     }
 
@@ -542,6 +581,7 @@ impl EntityState {
             is_visible: true,
             concentration: None,
             readied_action: None,
+            next_attacker_has_advantage_against: None,
         }
     }
 }
@@ -812,6 +852,125 @@ impl GameSession {
         Ok(readied)
     }
 
+    // ------------------------------------------------------------- help action
+
+    /// SRD Help: spends the helper's Action to promise Advantage on the NEXT
+    /// attack roll made against `target_entity_id` by an ally of the helper
+    /// (the helper themself qualifies — they are on their own side).
+    ///
+    /// The promise is stored ON THE TARGET as
+    /// [`EntityState::next_attacker_has_advantage_against`] naming the helper,
+    /// and is consumed exactly once by [`GameSession::consume_help_advantage`]
+    /// when a qualifying attack is rolled. A second Help before the first is
+    /// cashed simply overwrites it (last aid wins); the round refresh clears
+    /// an unconsumed promise.
+    ///
+    /// Rejections (nothing is spent or overwritten):
+    /// `ENTITY_NOT_FOUND`, `TARGET_NOT_FOUND`, `SELF_TARGET_INVALID`,
+    /// `OUT_OF_REACH` (SRD: the helped-against enemy must be within 5 ft of
+    /// the helper), `ENTITY_CANNOT_ACT`, `ACTION_ECONOMY_EXHAUSTED`,
+    /// `TARGET_ALREADY_DEAD`.
+    pub fn take_help(&mut self, entity_id: Uuid, target_entity_id: Uuid) -> Result<(), String> {
+        if !self.entities.contains_key(&entity_id) {
+            return Err("ENTITY_NOT_FOUND".to_string());
+        }
+        if !self.entities.contains_key(&target_entity_id) {
+            return Err("TARGET_NOT_FOUND".to_string());
+        }
+        if entity_id == target_entity_id {
+            return Err("SELF_TARGET_INVALID".to_string());
+        }
+
+        // Read-only gates BEFORE any state changes or budget spends.
+        let (helper_can_act, in_reach, target_dead) = {
+            let helper = &self.entities[&entity_id];
+            let target = &self.entities[&target_entity_id];
+            (
+                helper.can_act(),
+                helper.distance_to_feet(target) <= HELP_REACH_FEET,
+                target.is_dead,
+            )
+        };
+        if !in_reach {
+            return Err("OUT_OF_REACH".to_string());
+        }
+        if !helper_can_act {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if target_dead {
+            return Err("TARGET_ALREADY_DEAD".to_string());
+        }
+
+        // Single action-economy enforcement point: rejects an Action-less or
+        // incapacitated helper BEFORE anything is granted.
+        self.entities
+            .get_mut(&entity_id)
+            .expect("checked above")
+            .spend_action()?;
+
+        self.entities.get_mut(&target_entity_id).expect("checked above").next_attacker_has_advantage_against =
+            Some(entity_id.to_string());
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "HELP_ACTION",
+            serde_json::json!({
+                "helper_id": entity_id.to_string(),
+                "target_entity_id": target_entity_id.to_string(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Consumes a standing Help promise against `target_id` for `attacker_id`.
+    ///
+    /// Returns true only when an unconsumed promise exists AND its helper is
+    /// still in the session AND the attacker is on the helper's side
+    /// (`is_player` parity) — that attacker gains Advantage and the token is
+    /// burned. A hostile attacker neither benefits from nor burns the promise,
+    /// so the aided ally keeps it. A stale promise whose helper has left the
+    /// session is discarded without granting anything.
+    pub fn consume_help_advantage(&mut self, attacker_id: Uuid, target_id: Uuid) -> bool {
+        let helper_id = match self
+            .entities
+            .get(&target_id)
+            .and_then(|t| t.next_attacker_has_advantage_against.clone())
+        {
+            Some(h) => h,
+            None => return false,
+        };
+
+        let helper = match helper_id
+            .parse::<Uuid>()
+            .ok()
+            .and_then(|h| self.entities.get(&h))
+        {
+            Some(helper) => helper,
+            None => {
+                // Helper despawned: the promise can no longer be kept.
+                if let Some(t) = self.entities.get_mut(&target_id) {
+                    t.next_attacker_has_advantage_against = None;
+                }
+                return false;
+            }
+        };
+        let attacker_side = match self.entities.get(&attacker_id) {
+            Some(a) => a.is_player,
+            None => return false,
+        };
+        if helper.is_player != attacker_side {
+            return false; // hostile attack: the ally's benefit stays standing
+        }
+
+        self.entities
+            .get_mut(&target_id)
+            .expect("checked above")
+            .next_attacker_has_advantage_against = None;
+        true
+    }
+
     // ---------------------------------------------------- condition lifecycle
 
     /// Applies a timed condition and registers its duration clock.
@@ -866,6 +1025,8 @@ impl GameSession {
             entity.dodge_until_next_turn = false;
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
+            // A Help promise lasts only until the beneficiary's next turn.
+            entity.next_attacker_has_advantage_against = None;
             // SRD: a readied action lasts until the start of the actor's next
             // turn. If the trigger never fired, the held Action is simply lost.
             entity.readied_action = None;
@@ -1353,6 +1514,9 @@ impl GameSession {
             entity.dodge_until_next_turn = false;
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
+            // Turn-scoped Help promises clear wholesale on a rewind too: the
+            // HELP_ACTION event backing them may just have been reverted.
+            entity.next_attacker_has_advantage_against = None;
             // Turn-scoped declarations are cleared wholesale on a rewind: the
             // Ready event backing them may just have been reverted.
             entity.readied_action = None;

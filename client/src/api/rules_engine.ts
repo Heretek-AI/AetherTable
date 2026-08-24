@@ -424,6 +424,85 @@ export async function engineStabilize(params: {
   );
 }
 
+/** Verbatim body of POST /api/v1/sessions/{id}/action/offhand. */
+export interface EngineOffhandResult {
+  attacker_id: string;
+  target_id: string;
+  natural_roll: number;
+  attack_roll: number;
+  target_ac: number;
+  is_hit: boolean;
+  is_critical_hit?: boolean;
+  total_damage: number;
+  target_hp_remaining?: number;
+  /** The damage expression actually rolled — the SRD off-hand strike strips
+   * a POSITIVE ability modifier from the weapon's own expression. */
+  damage_expression_rolled: string;
+  ability_mod_withheld_from_damage: boolean;
+  offhand_index: number;
+  advantage?: boolean;
+  help_advantage_consumed?: boolean;
+  event_sequence?: number;
+}
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/help. */
+export interface EngineHelpResult {
+  status: string;
+  helper_id: string;
+  target_entity_id: string;
+  next_attacker_has_advantage_against: string;
+  event_sequence?: number;
+}
+
+/**
+ * Two-Weapon Fighting bonus-action off-hand strike (SRD). Requires the Attack
+ * action to have been taken this turn and both weapons Light; a positive
+ * ability modifier is withheld from its damage. Rejections surface verbatim:
+ * ATTACK_ACTION_REQUIRED, BONUS_ACTION_ECONOMY_EXHAUSTED,
+ * MAIN_HAND_WEAPON_NOT_LIGHT, OFFHAND_WEAPON_NOT_LIGHT, …
+ */
+export async function engineOffhandAttack(params: {
+  sessionId: string;
+  attackerId: string;
+  targetId: string;
+  /** Index into the attacker's stat-block attack list for the OFF-HAND weapon. */
+  offhandIndex?: number;
+}): Promise<EngineActionOutcome<EngineOffhandResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineOffhandResult>(
+    `/api/v1/engine/offhand?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      attacker_id: params.attackerId,
+      target_id: params.targetId,
+      offhand_index: params.offhandIndex ?? 0,
+    },
+  );
+}
+
+/**
+ * Help action (SRD): spend the helper's Action so an ally gains Advantage on
+ * their NEXT attack roll against `targetEntityId`. One qualifying attack
+ * consumes it; the round refresh clears it.
+ */
+export async function engineHelp(params: {
+  sessionId: string;
+  helperId: string;
+  targetEntityId: string;
+}): Promise<EngineActionOutcome<EngineHelpResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineHelpResult>(
+    `/api/v1/engine/help?token=${encodeURIComponent(token)}`,
+    {
+      session_id: params.sessionId,
+      helper_id: params.helperId,
+      target_entity_id: params.targetEntityId,
+    },
+  );
+}
+
 /**
  * Read the caller-projected entity roster for a session through the gateway's
  * read proxy. Hidden entities are filtered out for players by the projection

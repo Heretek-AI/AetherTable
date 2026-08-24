@@ -1,4 +1,6 @@
 use crate::dice::DiceEngine;
+use crate::rules::RulesEvaluator;
+use crate::state::{AttackAction, EntityState};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -75,6 +77,125 @@ pub struct ShoveResolution {
     pub effect: ShoveEffect,
     /// `Some(Condition::Prone)` when the shove succeeded AND chose `ShoveEffect::Prone`.
     pub applied_condition: Option<Condition>,
+}
+
+// --- Two-Weapon Fighting ------------------------------------------------------
+//
+// SRD 5e: when you take the Attack action and wield TWO weapons that BOTH have
+// the Light property, you may spend your Bonus Action to make one extra attack
+// with the off-hand weapon. That extra attack adds NO positive ability
+// modifier to its damage ("unless that modifier is negative") — the Two-Weapon
+// Fighting fighting style is what restores it, and no style model exists in
+// this stat-block engine yet (disclosed limitation).
+
+/// Result of one SRD Two-Weapon Fighting off-hand strike.
+///
+/// `roll` is the full attack-pipeline result ([`crate::rules::AttackRollResult`])
+/// so callers apply damage / ledger exactly as they do for a normal attack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffhandAttackResolution {
+    /// The complete hit/damage resolution for the off-hand swing.
+    pub roll: crate::rules::AttackRollResult,
+    /// The damage expression ACTUALLY rolled. When a POSITIVE ability modifier
+    /// was withheld this differs from the weapon's own expression by that
+    /// trailing `+N` term; a negative or zero modifier leaves it untouched.
+    pub damage_expression_rolled: String,
+    /// True when a POSITIVE ability modifier was withheld from the damage per
+    /// SRD (the Two-Weapon Fighting style would restore it).
+    pub ability_mod_withheld_from_damage: bool,
+}
+
+/// Strips ONE trailing positive `+N` term from a dice expression such as
+/// `"1d4+3"`. Returns `(stripped_expression, withheld_amount)`. Negative terms
+/// (`1d4-1`) are kept — SRD keeps negative modifiers in off-hand damage.
+fn strip_positive_modifier(expression: &str) -> (&str, i32) {
+    match expression.rfind('+') {
+        Some(idx) => {
+            let tail = expression[idx + 1..].trim();
+            if let Ok(amount) = tail.parse::<i32>() {
+                if amount > 0 {
+                    return (expression[..idx].trim(), amount);
+                }
+            }
+            (expression.trim(), 0)
+        }
+        None => (expression.trim(), 0),
+    }
+}
+
+impl ActionResolver {
+    /// SRD Two-Weapon Fighting bonus-action off-hand strike.
+    ///
+    /// Requirements enforced here:
+    /// - BOTH held weapons carry the Light property (`AttackAction::light`);
+    ///   violations reject with `MAIN_HAND_WEAPON_NOT_LIGHT` /
+    ///   `OFFHAND_WEAPON_NOT_LIGHT` WITHOUT rolling anything;
+    /// - the attacker can act (`EntityState::can_act`) — an unconscious or
+    ///   dead creature cannot buy even a bonus strike;
+    /// - a POSITIVE Strength/Dexterity-style ability modifier on the weapon's
+    ///   damage expression is withheld (SRD), while a NEGATIVE one stays.
+    ///
+    /// Hit math, crits, cover-free AC comparison and resist/vuln/immunity all
+    /// reuse [`RulesEvaluator::resolve_attack`] unchanged — the ONLY delta from
+    /// a normal attack is the stripped damage expression. Advantage/disadvantage
+    /// flags pass straight through (Help, Dodge etc. apply to the off-hand too).
+    ///
+    /// NOTE ON THE ABILITY MODIFIER SOURCE: stat blocks bake the modifier into
+    /// `damage_expression` (e.g. `"1d4+3"`) rather than modelling it
+    /// separately, so "withholding the ability mod" means stripping that baked
+    /// trailing `+N` term. The caller decides WHICH ability score backs the
+    /// finesse weapon; this function only needs the expressions themselves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_offhand_attack(
+        dice: &mut DiceEngine,
+        attacker: &EntityState,
+        target: &EntityState,
+        main_hand_weapon: &AttackAction,
+        offhand_weapon: &AttackAction,
+        target_ac: i32,
+        advantage: bool,
+        disadvantage: bool,
+    ) -> Result<OffhandAttackResolution, String> {
+        // Light-property gates FIRST — an unqualified request must not roll.
+        if !main_hand_weapon.light {
+            return Err("MAIN_HAND_WEAPON_NOT_LIGHT".to_string());
+        }
+        if !offhand_weapon.light {
+            return Err("OFFHAND_WEAPON_NOT_LIGHT".to_string());
+        }
+        if !attacker.can_act() {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+
+        // SRD: no POSITIVE ability modifier to off-hand damage (a negative one
+        // stays). Stat blocks bake it into the expression, so strip it here.
+        let (stripped_expression, withheld) = strip_positive_modifier(&offhand_weapon.damage_expression);
+        let withheld = withheld.max(0);
+
+        let roll = RulesEvaluator::resolve_attack(
+            dice,
+            attacker.id,
+            target.id,
+            offhand_weapon.attack_bonus,
+            target_ac,
+            stripped_expression,
+            offhand_weapon.damage_type,
+            target.current_hp,
+            target.max_hp,
+            target.temp_hp,
+            &target.resistances,
+            &target.vulnerabilities,
+            &target.immunities,
+            advantage,
+            disadvantage,
+        )?;
+
+        Ok(OffhandAttackResolution {
+            roll,
+            damage_expression_rolled: stripped_expression.to_string(),
+            ability_mod_withheld_from_damage: withheld > 0,
+        })
+    }
 }
 
 impl ActionResolver {

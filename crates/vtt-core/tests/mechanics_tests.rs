@@ -1538,3 +1538,338 @@ fn test_readied_action_round_trips_and_legacy_payloads_default_to_none() {
         .expect("legacy payload without readied_action");
     assert!(legacy.readied_action.is_none());
 }
+
+// ------------------------------------------------- Two-Weapon Fighting & Help
+//
+// GOALS.md Pillar 3: the remaining SRD combat actions. Two-weapon fighting is
+// a BONUS-action off-hand attack (both weapons Light, no positive ability mod
+// to its damage); Help spends the Action to hand Advantage on the next attack
+// roll against a target by the helper's allies.
+
+use vtt_core::actions::ActionResolver;
+use vtt_core::state::AttackAction;
+use uuid::Uuid;
+
+/// A dueling pair at melee range where `attacker` carries a custom attack list.
+fn session_with_attacks(attacks: Vec<AttackAction>) -> (GameSession, Uuid, Uuid) {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "TWF".into());
+    let mut attacker = hero("twin-blade", 30, 15);
+    attacker.attacks = attacks;
+    let mut enemy = hero("goblin", 40, 13);
+    enemy.is_player = false;
+    enemy.position = (2.5, 2.6, 0.0); // within 5 ft of the attacker
+    let (ia, ie) = (attacker.id, enemy.id);
+    session.add_entity(attacker, None).unwrap();
+    session.add_entity(enemy, None).unwrap();
+    (session, ia, ie)
+}
+
+fn light_weapon(name: &str, expr: &str) -> AttackAction {
+    AttackAction {
+        name: name.to_string(),
+        attack_bonus: 5,
+        damage_expression: expr.to_string(),
+        damage_type: DamageType::Piercing,
+        light: true,
+    }
+}
+
+/// The SRD bonus-action off-hand strike: reuses resolve_attack's hit math and
+/// withholds a POSITIVE ability modifier from the off-hand damage.
+#[test]
+fn test_offhand_attack_reuses_hit_math_and_withholds_positive_ability_mod() {
+    // Str 16 (+3): "1d6+3" must roll as bare "1d6" for the off-hand.
+    let (session, attacker_id, enemy_id) =
+        session_with_attacks(vec![light_weapon("Shortsword", "1d6+3"), light_weapon("Dagger", "1d4+3")]);
+    let attacker = &session.entities[&attacker_id];
+    let enemy = &session.entities[&enemy_id];
+    assert_eq!(attacker.abilities.modifier(Ability::Strength), 3);
+
+    let mut dice = DiceEngine::with_seed(7);
+    let res = ActionResolver::resolve_offhand_attack(
+        &mut dice,
+        attacker,
+        enemy,
+        &attacker.attacks[0],
+        &attacker.attacks[1],
+        enemy.ac,
+        false,
+        false,
+    )
+    .expect("two light weapons qualify");
+
+    assert_eq!(res.damage_expression_rolled, "1d4");
+    assert!(res.ability_mod_withheld_from_damage);
+    assert_eq!(res.roll.target_ac, enemy.ac);
+
+    // Hit math agrees with a straight RulesEvaluator::resolve_attack call on
+    // the SAME seed: the off-hand path must draw exactly one attack d20 plus
+    // the stripped damage expression — nothing more, nothing less.
+    let mut reference = DiceEngine::with_seed(7);
+    let expected = RulesEvaluator::resolve_attack(
+        &mut reference,
+        attacker.id,
+        enemy.id,
+        5,
+        enemy.ac,
+        "1d4",
+        DamageType::Piercing,
+        enemy.current_hp,
+        enemy.max_hp,
+        enemy.temp_hp,
+        &enemy.resistances,
+        &enemy.vulnerabilities,
+        &enemy.immunities,
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(res.roll.natural_roll, expected.natural_roll);
+    assert_eq!(res.roll.attack_roll, res.roll.natural_roll + 5);
+    assert_eq!(res.roll.is_hit, expected.is_hit);
+    assert_eq!(res.roll.total_damage, expected.total_damage);
+    assert_eq!(res.roll.target_hp_remaining, expected.target_hp_remaining);
+}
+
+/// A NEGATIVE ability modifier stays in the off-hand damage per SRD ("unless
+/// that modifier is negative").
+#[test]
+fn test_offhand_keeps_a_negative_ability_modifier_in_damage() {
+    let (mut session, attacker_id, enemy_id) =
+        session_with_attacks(vec![light_weapon("Shortsword", "1d6+2")]);
+    session.entities.get_mut(&attacker_id).unwrap().abilities.strength = 8; // -1
+    let attacker = &session.entities[&attacker_id];
+    let enemy = &session.entities[&enemy_id];
+
+    let mut dagger = light_weapon("Dagger", "1d4");
+    dagger.damage_expression = "1d4".to_string();
+    let mut dice = DiceEngine::with_seed(11);
+    let res = ActionResolver::resolve_offhand_attack(
+        &mut dice,
+        attacker,
+        enemy,
+        &attacker.attacks[0],
+        &dagger,
+        enemy.ac,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(!res.ability_mod_withheld_from_damage);
+    assert_eq!(res.damage_expression_rolled, "1d4");
+}
+
+/// Both held weapons must carry the Light property; an unqualified request is
+/// refused WITHOUT spending anything.
+#[test]
+fn test_offhand_requires_both_weapons_to_be_light() {
+    let main_heavy = AttackAction {
+        name: "Longsword".to_string(),
+        attack_bonus: 5,
+        damage_expression: "1d8+3".to_string(),
+        damage_type: DamageType::Slashing,
+        light: false,
+    };
+    let (session, attacker_id, enemy_id) =
+        session_with_attacks(vec![main_heavy.clone(), light_weapon("Dagger", "1d4")]);
+    {
+        let attacker = &session.entities[&attacker_id];
+        let enemy = &session.entities[&enemy_id];
+        let mut dice = DiceEngine::with_seed(3);
+        assert_eq!(
+            ActionResolver::resolve_offhand_attack(
+                &mut dice, attacker, enemy, &attacker.attacks[0], &attacker.attacks[1], enemy.ac,
+                false, false,
+            )
+            .unwrap_err(),
+            "MAIN_HAND_WEAPON_NOT_LIGHT"
+        );
+    }
+
+    // Off-hand side: light main, heavy off-hand.
+    let (session, attacker_id, enemy_id) =
+        session_with_attacks(vec![light_weapon("Shortsword", "1d6"), main_heavy]);
+    let attacker = &session.entities[&attacker_id];
+    let enemy = &session.entities[&enemy_id];
+    let mut dice = DiceEngine::with_seed(3);
+    assert_eq!(
+        ActionResolver::resolve_offhand_attack(
+            &mut dice, attacker, enemy, &attacker.attacks[0], &attacker.attacks[1], enemy.ac,
+            false, false,
+        )
+        .unwrap_err(),
+        "OFFHAND_WEAPON_NOT_LIGHT"
+    );
+}
+
+/// The bonus action is the ONLY budget the off-hand strike consumes.
+#[test]
+fn test_offhand_spends_the_bonus_action_not_the_action() {
+    let (mut session, attacker_id, _enemy_id) =
+        session_with_attacks(vec![light_weapon("Shortsword", "1d6"), light_weapon("Dagger", "1d4")]);
+
+    // SRD: the Attack action comes first — spend it, then the bonus strike.
+    session.entities.get_mut(&attacker_id).unwrap().spend_action().unwrap();
+    assert!(session.entities[&attacker_id].action_budget.bonus_action);
+
+    session.entities.get_mut(&attacker_id).unwrap().spend_bonus_action().unwrap();
+    let budget = &session.entities[&attacker_id].action_budget;
+    assert!(!budget.action, "the Action was spent before the off-hand");
+    assert!(!budget.bonus_action, "the off-hand strike consumes the Bonus Action");
+
+    // A second off-hand strike in the same turn is refused without effect.
+    assert_eq!(
+        session.entities.get_mut(&attacker_id).unwrap().spend_bonus_action().unwrap_err(),
+        "BONUS_ACTION_ECONOMY_EXHAUSTED"
+    );
+    assert!(
+        !session.entities[&attacker_id].action_budget.action,
+        "a rejected bonus-action spend must not touch the Action"
+    );
+
+    // An entity that cannot act cannot even buy the bonus strike.
+    session.entities.get_mut(&attacker_id).unwrap().add_condition(Condition::Unconscious);
+    assert_eq!(
+        session.entities.get_mut(&attacker_id).unwrap().spend_bonus_action().unwrap_err(),
+        "ENTITY_CANNOT_ACT"
+    );
+}
+
+// ------------------------------------------------------------------- Help
+
+fn session_trio() -> (GameSession, Uuid, Uuid, Uuid) {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Help".into());
+    let helper = hero("cleric", 25, 15);
+    let ally = hero("fighter", 30, 16);
+    let mut enemy = hero("ogre", 60, 14);
+    enemy.is_player = false;
+    enemy.position = (2.5, 2.6, 0.0);
+    let (ih, ia, ie) = (helper.id, ally.id, enemy.id);
+    session.add_entity(helper, None).unwrap();
+    session.add_entity(ally, None).unwrap();
+    session.add_entity(enemy, None).unwrap();
+    (session, ih, ia, ie)
+}
+
+#[test]
+fn test_take_help_spends_the_action_and_grants_one_consumable_advantage() {
+    let (mut session, helper_id, ally_id, enemy_id) = session_trio();
+
+    session.take_help(helper_id, enemy_id).unwrap();
+
+    // The promise is authoritative state ON THE TARGET, naming the helper.
+    assert_eq!(
+        session.entities[&enemy_id].next_attacker_has_advantage_against,
+        Some(helper_id.to_string())
+    );
+    assert!(
+        !session.entities[&helper_id].action_budget.action,
+        "Help spends the helper's Action"
+    );
+    assert!(session.ledger.events.iter().any(|e| e.event_type == "HELP_ACTION"));
+
+    // The FIRST qualifying (same-side) attack consumes it exactly once...
+    assert!(session.consume_help_advantage(ally_id, enemy_id));
+    assert!(session.entities[&enemy_id].next_attacker_has_advantage_against.is_none());
+
+    // ...and a second attack gets nothing.
+    assert!(!session.consume_help_advantage(ally_id, enemy_id));
+}
+
+/// Advantage is reserved for the helper's SIDE: a hostile attack neither
+/// benefits from nor burns the token — the aided ally keeps the benefit.
+#[test]
+fn test_hostile_attack_leaves_the_help_token_standing() {
+    let (mut session, helper_id, ally_id, enemy_id) = session_trio();
+    session.take_help(helper_id, enemy_id).unwrap();
+
+    let mut rival = hero("rival-goblin", 20, 12);
+    rival.is_player = false; // same side as the helped ENEMY
+    let rival_id = rival.id;
+    session.add_entity(rival, None).unwrap();
+
+    assert!(!session.consume_help_advantage(rival_id, enemy_id));
+    assert_eq!(
+        session.entities[&enemy_id].next_attacker_has_advantage_against,
+        Some(helper_id.to_string()),
+        "the aided ally keeps the pending benefit"
+    );
+
+    // The helper's own side can still cash it afterwards.
+    assert!(session.consume_help_advantage(ally_id, enemy_id));
+}
+
+#[test]
+fn test_take_help_rejects_invalid_targets_and_exhausted_actions() {
+    let (mut session, helper_id, ally_id, enemy_id) = session_trio();
+
+    assert_eq!(
+        session.take_help(helper_id, helper_id).unwrap_err(),
+        "SELF_TARGET_INVALID"
+    );
+    assert_eq!(
+        session.take_help(Uuid::new_v4(), enemy_id).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+    assert_eq!(
+        session.take_help(helper_id, Uuid::new_v4()).unwrap_err(),
+        "TARGET_NOT_FOUND"
+    );
+    assert_eq!(
+        session.take_help(ally_id, enemy_id)
+            .and_then(|_| session.take_help(ally_id, enemy_id))
+            .unwrap_err(),
+        "ACTION_ECONOMY_EXHAUSTED"
+    );
+
+    // Out of reach: move the enemy away from the (still fresh) helper.
+    session.entities.get_mut(&ally_id).unwrap().action_budget.action = true;
+    session.entities.get_mut(&enemy_id).unwrap().position = (20.0, 20.0, 0.0);
+    assert_eq!(
+        session.take_help(ally_id, enemy_id).unwrap_err(),
+        "OUT_OF_REACH"
+    );
+
+    // Dead enemies cannot be helped against.
+    session.entities.get_mut(&enemy_id).unwrap().position = (2.5, 2.6, 0.0);
+    session.entities.get_mut(&enemy_id).unwrap().is_dead = true;
+    assert_eq!(
+        session.take_help(ally_id, enemy_id).unwrap_err(),
+        "TARGET_ALREADY_DEAD"
+    );
+}
+
+/// The token is turn-scoped: the next round refresh clears an unconsumed one.
+#[test]
+fn test_round_refresh_clears_an_unconsumed_help_token() {
+    let (mut session, helper_id, _ally_id, enemy_id) = session_trio();
+    session.take_help(helper_id, enemy_id).unwrap();
+    assert!(session.entities[&enemy_id].next_attacker_has_advantage_against.is_some());
+
+    let mut dice = DiceEngine::with_seed(5);
+    session.advance_round(&mut dice);
+    assert!(
+        session.entities[&enemy_id].next_attacker_has_advantage_against.is_none(),
+        "Help lasts only until the target's next turn refresh"
+    );
+    assert!(!session.consume_help_advantage(_ally_id, enemy_id));
+}
+
+/// Rewinding past the HELP_ACTION event drops the promise along with the
+/// refunded Action (turn-scoped state clears wholesale on a rewind).
+#[test]
+fn test_safety_rewind_past_help_clears_the_token_and_refunds_the_action() {
+    let (mut session, helper_id, ally_id, enemy_id) = session_trio();
+    let pre_help_sequence = session.ledger.current_sequence;
+    session.take_help(helper_id, enemy_id).unwrap();
+    assert!(session.entities[&enemy_id].next_attacker_has_advantage_against.is_some());
+
+    session.safety_rewind(pre_help_sequence);
+
+    assert!(session.entities[&enemy_id].next_attacker_has_advantage_against.is_none());
+    assert!(
+        session.entities[&helper_id].action_budget.action,
+        "the rewound Help refunds the helper's Action like every other event"
+    );
+    assert!(!session.consume_help_advantage(ally_id, enemy_id));
+}

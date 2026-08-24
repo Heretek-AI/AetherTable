@@ -4223,3 +4223,649 @@ async fn ready_action_rejects_wrong_role_owner_and_payload_shape() {
         status
     );
 }
+
+// --- Two-Weapon Fighting (off-hand bonus strike) -------------------------------
+//
+// GOALS.md Pillar 3: the SRD two-weapon-fighting bonus attack. Contract under
+// test: spends the BONUS Action (not the Action), requires the Attack action
+// to have been taken first, refuses non-Light weapons, and lands one seeded,
+// ledgered OFFHAND_ATTACK event.
+
+/// An entity body with an explicit two-weapon stat block: both weapons Light.
+fn twin_blade(id: Uuid, name: &str) -> serde_json::Value {
+    let mut e = entity_json(id, name, 30, 15, 5, "1d6+3");
+    e["attacks"] = serde_json::json!([
+        { "name": "Shortsword", "attack_bonus": 5, "damage_expression": "1d6+3", "damage_type": "piercing", "light": true },
+        { "name": "Dagger",     "attack_bonus": 5, "damage_expression": "1d4+3", "damage_type": "piercing", "light": true }
+    ]);
+    e
+}
+
+/// A session with a twin-blade hero adjacent to a tanky orc. Returns
+/// (app, token, session_id, hero_id, orc_id).
+async fn setup_twf_duel() -> (
+    impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    String,
+    Uuid,
+    Uuid,
+    Uuid,
+) {
+    let app = test_app().await;
+    let token = sign_token("gm-twf", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let mut orc = entity_json(orc_id, "Orc", 200, 11, 0, "1d4");
+    orc["position"] = serde_json::json!([2.5, 2.6, 0.0]);
+    spawn(&app, &token, session_id, twin_blade(hero_id, "Twin Blade")).await;
+    spawn(&app, &token, session_id, orc).await;
+    (app, token, session_id, hero_id, orc_id)
+}
+
+async fn post_offhand(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    post_contest(app, token, session_id, "offhand", body).await
+}
+
+#[actix_web::test]
+async fn offhand_attack_spends_bonus_action_not_the_action_and_ledgers() {
+    let (app, token, session_id, hero_id, orc_id) = setup_twf_duel().await;
+
+    // The Attack action comes first — spend it via the normal attack route.
+    // Any seed resolves it; only the budget state matters here.
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK, "main-hand attack must resolve");
+
+    // Bonus action still standing, action spent.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(snap["entities"][hero_id.to_string()]["action_budget"]["action"], serde_json::json!(false));
+    assert_eq!(snap["entities"][hero_id.to_string()]["action_budget"]["bonus_action"], serde_json::json!(true));
+
+    // The off-hand strike consumes ONLY the bonus action.
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "offhand_index": 1, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+    assert_eq!(
+        body["damage_expression_rolled"],
+        serde_json::json!("1d4"),
+        "the +3 ability modifier must be withheld from off-hand damage"
+    );
+    assert_eq!(body["ability_mod_withheld_from_damage"], serde_json::json!(true));
+    assert!(body["total_damage"].as_i64().unwrap() <= 4, "bare d4 cannot roll above 4");
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let budget = &snap["entities"][hero_id.to_string()]["action_budget"];
+    assert_eq!(budget["action"], serde_json::json!(false), "the Action stays spent");
+    assert_eq!(budget["bonus_action"], serde_json::json!(false), "the Bonus Action is now spent too");
+
+    // Exactly one OFFHAND_ATTACK ledger event with the audit payload.
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    let offs: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("OFFHAND_ATTACK"))
+        .collect();
+    assert_eq!(offs.len(), 1);
+    assert_eq!(offs[0]["payload"]["attacker_id"], json_str(&hero_id));
+    assert_eq!(offs[0]["payload"]["target_id"], json_str(&orc_id));
+}
+
+#[actix_web::test]
+async fn second_offhand_in_the_same_turn_is_refused_without_rolling() {
+    let (app, token, session_id, hero_id, orc_id) = setup_twf_duel().await;
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "offhand_index": 1, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Second attempt this turn → 409 BONUS_ACTION_ECONOMY_EXHAUSTED.
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "offhand_index": 1, "seed": 9}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("BONUS_ACTION_ECONOMY_EXHAUSTED"));
+
+    // Nothing was rolled or ledgered twice.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let offs: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("OFFHAND_ATTACK"))
+        .collect();
+    assert_eq!(offs.len(), 1, "a rejected second off-hand must not ledger");
+}
+
+#[actix_web::test]
+async fn offhand_requires_the_attack_action_first_and_rejects_non_light_weapons() {
+    let (app, token, session_id, hero_id, orc_id) = setup_twf_duel().await;
+
+    // No Attack action taken yet this turn → refused WITHOUT spending anything.
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("ATTACK_ACTION_REQUIRED"));
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let budget = &snap["entities"][hero_id.to_string()]["action_budget"];
+    assert_eq!(budget["bonus_action"], serde_json::json!(true), "nothing was consumed by the rejection");
+
+    // A heavy main hand disqualifies the whole maneuver even with the Attack
+    // action spent.
+    let session2 = create_session_as(&app, &token).await;
+    let longsword_hero = Uuid::new_v4();
+    let mut e = entity_json(longsword_hero, "Sword Board", 30, 15, 5, "1d8+3");
+    e["attacks"] = serde_json::json!([
+        { "name": "Longsword", "attack_bonus": 5, "damage_expression": "1d8+3", "damage_type": "slashing", "light": false },
+        { "name": "Dagger",    "attack_bonus": 5, "damage_expression": "1d4+3", "damage_type": "piercing", "light": true }
+    ]);
+    spawn(&app, &token, session2, entity_at(e, 2.5, 2.5)).await;
+    let target = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session2,
+        entity_at(entity_json(target, "Orc", 100, 11, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+    let (status, _) = attack(&app, &token, session2, longsword_hero, target, 7).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session2,
+        serde_json::json!({"attacker_id": longsword_hero, "target_id": target, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("MAIN_HAND_WEAPON_NOT_LIGHT"));
+}
+
+#[actix_web::test]
+async fn offhand_enforces_rbac_target_gates_and_payload_shape() {
+    let (app, gm, session_id, hero_id, orc_id) = setup_twf_duel().await;
+
+    // Spectators are refused outright.
+    let spectator = sign_token_with_role("spec-twf", "spectator", TEST_SECRET);
+    let (status, _) = post_offhand(
+        &app,
+        &spectator,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Players cannot swing an entity they do not control: the twin-blade is
+    // CLAIMED by someone else here (a real GM-role token binds ownership).
+    let real_gm = sign_token_with_role("gm-twf-owner", "gm", TEST_SECRET);
+    let claimed_session = create_session_as(&app, &real_gm).await;
+    let claimed_hero = Uuid::new_v4();
+    spawn(
+        &app,
+        &real_gm,
+        claimed_session,
+        entity_owned_by(twin_blade(claimed_hero, "Claimed Blade"), "player-elsewhere"),
+    )
+    .await;
+    let claimed_orc = Uuid::new_v4();
+    spawn(
+        &app,
+        &real_gm,
+        claimed_session,
+        entity_at(entity_json(claimed_orc, "Orc", 200, 11, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+    let (status, _) = attack(&app, &real_gm, claimed_session, claimed_hero, claimed_orc, 7).await;
+    assert_eq!(status, StatusCode::OK);
+    let player = sign_token("player-twf", TEST_SECRET);
+    let (status, body) = post_offhand(
+        &app,
+        &player,
+        claimed_session,
+        serde_json::json!({"attacker_id": claimed_hero, "target_id": claimed_orc, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // Unknown attacker → 404; unknown target → 404; self → 422.
+
+    let (status, _) = post_offhand(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"attacker_id": Uuid::new_v4(), "target_id": orc_id, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = post_offhand(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": Uuid::new_v4(), "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = post_offhand(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": hero_id, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Smuggled combat math is structurally rejected.
+    let (status, _) = post_offhand(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "attacker_id": hero_id, "target_id": orc_id,
+            "attack_bonus": 999, "damage_expression": "99d99+99"
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "client math must be rejected, got {}",
+        status
+    );
+}
+
+// --- Help action -----------------------------------------------------------------
+//
+// SRD 5e: spend your Action to hand Advantage on the next same-side attack
+// against a creature within reach. Under test: grant → consume-once on a real
+// attack, refresh clears, hostile attacks do not burn the promise, RBAC.
+
+#[actix_web::test]
+async fn help_grants_advantage_that_a_real_attack_consumes_exactly_once() {
+    let app = test_app().await;
+    let token = sign_token("gm-help", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let helper_id = Uuid::new_v4();
+    let ally_id = Uuid::new_v4();
+    let enemy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(helper_id, "Helper", 30, 14, 0, "1d4")).await;
+    spawn(&app, &token, session_id, entity_owned_by(entity_json(ally_id, "Ally", 30, 15, 8, "1d8+3"), "gm-help")).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Ogre", 200, 16, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+
+    // Grant.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": enemy_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("HELP_GRANTED"));
+    assert_eq!(body["next_attacker_has_advantage_against"], json_str(&helper_id));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"],
+        json_str(&helper_id),
+        "the promise is authoritative session state on the beneficiary"
+    );
+
+    // The helper's Action is spent; the ally's is not.
+    assert_eq!(snap["entities"][helper_id.to_string()]["action_budget"]["action"], serde_json::json!(false));
+
+    // The ally's next attack CONSUMES the advantage and rolls with it.
+    //
+    // Deterministic proof: pick a seed where the FIRST d20 of an advantage
+    // pair MISSES AC 16 (natural+8 < 16) but the SECOND one HITS. A straight
+    // single-d20 roll on that same seed would miss, so a hit here can only
+    // come from advantage keeping the higher of two draws.
+    let mut straddle_seed = None;
+    for s in 1..=200_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        // roll_d20_advantage returns (kept_max, r1, r2).
+        let (kept, r1, r2) = dice.roll_d20_advantage();
+        let (low, high) = (r1.min(r2), r1.max(r2));
+        if low != 1
+            && high != 20
+            && low != 20
+            && high != 1
+            && low + 8 < 16
+            && high + 8 >= 16
+            && kept == high
+        {
+            straddle_seed = Some(s);
+            break;
+        }
+    }
+    let straddle_seed = straddle_seed.expect("some seed must straddle AC 16 under advantage");
+
+    let (status, body) = attack(&app, &token, session_id, ally_id, enemy_id, straddle_seed).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["advantage"], serde_json::json!(true), "the engine must report the granted edge");
+    assert!(
+        body["is_hit"] == serde_json::json!(true),
+        "a seed whose first advantage die misses but second hits must land ONLY under advantage"
+    );
+    assert_ne!(
+        body["natural_roll"].as_i64().unwrap(),
+        DiceEngine::with_seed(straddle_seed).roll_d20() as i64,
+        "the kept roll is the higher of TWO draws, not the plain single d20"
+    );
+
+    // The promise is burned.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
+        "one attack consumes the Help promise exactly once"
+    );
+
+    // A SECOND attack gets no advantage.
+    advance_turn(&app, &token, session_id).await;
+    let mut plain_seed = None;
+    for s in 1..=100_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        let natural = dice.roll_d20();
+        if natural + 8 < 16 && natural != 1 && natural != 20 {
+            plain_seed = Some(s);
+            break;
+        }
+    }
+    let plain_seed = plain_seed.expect("some seed must miss on a straight roll");
+    let (status, body) = attack(&app, &token, session_id, ally_id, enemy_id, plain_seed).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["advantage"], serde_json::json!(false), "no standing Help means no edge");
+
+    // One HELP_ACTION ledger event recorded the grant.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let helps: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("HELP_ACTION"))
+        .collect();
+    assert_eq!(helps.len(), 1);
+    assert_eq!(helps[0]["payload"]["helper_id"], json_str(&helper_id));
+    assert_eq!(helps[0]["payload"]["target_entity_id"], json_str(&enemy_id));
+}
+
+#[actix_web::test]
+async fn help_promise_clears_at_the_round_refresh_and_survives_hostile_attacks() {
+    let app = test_app().await;
+    let token = sign_token("gm-help2", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let helper_id = Uuid::new_v4();
+    let enemy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(helper_id, "Helper", 30, 14, 0, "1d4")).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Ogre", 200, 16, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+
+    // A second hostile on the helper's ENEMY side attacks the beneficiary.
+    let goblin_id = Uuid::new_v4();
+    let mut goblin = entity_json(goblin_id, "Goblin", 40, 12, 8, "1d6+3");
+    goblin["is_player"] = serde_json::json!(false);
+    spawn(&app, &token, session_id, goblin).await;
+
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": enemy_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The HOSTILE's attack neither benefits from nor burns the promise.
+    let (status, body) = attack(&app, &token, session_id, goblin_id, enemy_id, 3).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["advantage"], serde_json::json!(false));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"],
+        json_str(&helper_id),
+        "a hostile attack must leave the ally's pending benefit standing"
+    );
+    // The round refresh clears an unconsumed promise.
+    advance_turn(&app, &token, session_id).await;
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
+        "Help lasts only until the target's next turn refresh"
+    );
+}
+
+#[actix_web::test]
+async fn help_enforces_rbac_reach_self_target_and_payload_shape() {
+    let app = test_app().await;
+    // A real GM-role token: it both creates the session AND may bind entity
+    // ownership to another user (needed for the ENTITY_NOT_OWNED case below).
+    let token = sign_token_with_role("gm-help3", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let helper_id = Uuid::new_v4();
+    let far_enemy = Uuid::new_v4();
+    let near_enemy = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_owned_by(entity_json(helper_id, "Claimed Helper", 30, 14, 0, "1d4"), "player-owner"),
+    )
+    .await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(near_enemy, "Near Orc", 100, 12, 0, "1d4"), 2.6, 2.5),
+    )
+    .await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(far_enemy, "Far Ogre", 200, 16, 0, "1d4"), 20.0, 20.0),
+    )
+    .await;
+
+    // Spectators are refused outright.
+    let spectator = sign_token_with_role("spec-help", "spectator", TEST_SECRET);
+    let (status, _) = post_contest(
+        &app,
+        &spectator,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": near_enemy}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Players cannot spend someone else's Action: the helper is claimed by
+    // "player-owner", not by the caller below.
+    let player = sign_token_with_role("player-intruder", "player", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &player,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": near_enemy}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // Out of reach → refused WITHOUT spending the helper's Action.
+    let (gm_status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": far_enemy}),
+    )
+    .await;
+    assert_eq!(gm_status, StatusCode::CONFLICT, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("OUT_OF_REACH"));
+
+    // Self-targeting → 422; unknown ids → 404.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": helper_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"], serde_json::json!("SELF_TARGET_INVALID"));
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": Uuid::new_v4(), "target_entity_id": near_enemy}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": Uuid::new_v4()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Smuggled fields are structurally rejected.
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({
+            "helper_id": helper_id, "target_entity_id": near_enemy,
+            "auto_success": true
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "extra fields must be rejected, got {}",
+        status
+    );
+
+    // Nothing above consumed the helper's Action: a valid grant still works.
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": near_enemy}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // And once the Action is gone, a second Help is refused with the economy code.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": helper_id, "target_entity_id": near_enemy}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("ACTION_ECONOMY_EXHAUSTED"));
+}
+
+/// The off-hand strike is a real attack roll: it must cash in a standing Help
+/// promise exactly like any other attack.
+#[actix_web::test]
+async fn offhand_attack_consumes_a_standing_help_promise() {
+    let app = test_app().await;
+    let token = sign_token("gm-twf-help", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let mut orc = entity_json(orc_id, "Orc", 200, 11, 0, "1d4");
+    orc["position"] = serde_json::json!([2.5, 2.6, 0.0]);
+    spawn(&app, &token, session_id, twin_blade(hero_id, "Twin Blade")).await;
+    spawn(&app, &token, session_id, orc).await;
+
+    // Take the Attack action with the twin-blade FIRST (the off-hand strike
+    // presupposes it), THEN have an ally grant Help so the promise is still
+    // standing when the bonus swing lands.
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK);
+    let ally_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(ally_id, "Aider", 30, 14, 0, "1d4")).await;
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": ally_id, "target_entity_id": orc_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_offhand(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "offhand_index": 1, "seed": 7}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["advantage"], serde_json::json!(true), "the off-hand swing rides the granted edge");
+    assert_eq!(body["help_advantage_consumed"], serde_json::json!(true));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][orc_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
+        "the off-hand attack burns the Help promise"
+    );
+}

@@ -1537,6 +1537,59 @@ async def engine_ready_action(req: EngineReadyActionRequest, token: str = Query(
     return await _maneuver_proxy("ready", payload, _caller_actor(token))
 
 
+class EngineOffhandRequest(BaseModel):
+    """Mirrors the engine's OffhandActionReq: the SRD Two-Weapon Fighting
+    bonus-action off-hand strike. Which weapon is "light" lives in the
+    server-side stat block; clients only reference indices."""
+
+    session_id: str
+    attacker_id: str
+    target_id: str
+    offhand_index: int = 0
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineHelpRequest(BaseModel):
+    """Mirrors the engine's HelpActionReq: helper + the creature to be helped
+    against. Reach, liveness and the Action economy are engine-owned."""
+
+    session_id: str
+    helper_id: str
+    target_entity_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/offhand")
+async def engine_offhand_attack(req: EngineOffhandRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "offhand",
+        {
+            "session_id": req.session_id,
+            "attacker_id": engine_client._coerce_uuid(req.attacker_id),
+            "target_id": engine_client._coerce_uuid(req.target_id),
+            "offhand_index": req.offhand_index,
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/help")
+async def engine_help_action(req: EngineHelpRequest, token: str = Query(...)):
+    return await _maneuver_proxy(
+        "help",
+        {
+            "session_id": req.session_id,
+            "helper_id": engine_client._coerce_uuid(req.helper_id),
+            "target_entity_id": engine_client._coerce_uuid(req.target_entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
 class EngineSessionStateRequest(BaseModel):
     """Body of the GET-style read proxy below: only the session reference."""
     session_id: str
