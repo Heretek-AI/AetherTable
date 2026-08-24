@@ -5,6 +5,11 @@
  * fall back to demo behavior instead of throwing.
  */
 
+/**
+ * Member record as returned by the lobby detail endpoint.
+ * Backend gaps (follow-up candidates): no ready flag, no latency/ping metric,
+ * and no bound character per member — only these three fields exist.
+ */
 export interface LobbyMember {
   user_id: string;
   display_name: string;

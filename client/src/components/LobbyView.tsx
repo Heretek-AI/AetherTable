@@ -9,7 +9,7 @@ import {
   Check,
   Play,
   UserCheck,
-  Wifi,
+  UserPlus,
   Eye,
   Radio
 } from 'lucide-react';
@@ -17,15 +17,18 @@ import { globalAudio } from '../render/audio_manager';
 import { User } from '../types/auth';
 
 export interface PlayerSeat {
+  /** Real member user_id for occupied seats; `open_N` for unfilled party slots. */
   id: string;
   role: 'gm' | 'player' | 'spectator';
-  characterName: string;
   playerName: string;
-  status: 'connected' | 'ready' | 'idle';
-  pingMs: number;
-  avatarIcon: string;
-  isHost?: boolean;
+  isHost: boolean;
+  /** True for an empty party-slot placeholder — NOT a real player. */
+  isOpen: boolean;
 }
+
+/** Map a backend role string ('gm' | 'player' | 'spectator' | 'admin') to a seat role. */
+const seatRoleOf = (role: string): PlayerSeat['role'] =>
+  role === 'gm' || role === 'admin' ? 'gm' : role === 'spectator' ? 'spectator' : 'player';
 
 interface LobbyViewProps {
   onLaunchCampaign: (selectedSeatId: string) => void;
@@ -34,7 +37,7 @@ interface LobbyViewProps {
 
 export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentUser }) => {
   const [copied, setCopied] = useState(false);
-  const [selectedSeat, setSelectedSeat] = useState<string>('seat_gm');
+  const [selectedSeat, setSelectedSeat] = useState<string>('');
   // Live presence from the engine relay; null while unreachable (solo session).
   const [livePeers, setLivePeers] = useState<number | null>(null);
   // REAL lobby state: created/joined via /api/v1/lobbies. Null = demo fallback.
@@ -84,56 +87,55 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
 
   const displayCode = lobby?.invite_code ?? campaignMeta.passcode;
 
-  const [seats, setSeats] = useState<PlayerSeat[]>([
-    {
-      id: 'seat_gm',
-      role: 'gm',
-      characterName: 'Dungeon Master (Omniscient)',
-      playerName: 'Lead GM (You)',
-      status: 'ready',
-      pingMs: 8,
-      avatarIcon: 'crown',
-      isHost: true,
-    },
-    {
-      id: 'seat_thorin',
-      role: 'player',
-      characterName: 'Thorin Oakenshield (Fighter)',
-      playerName: 'Player 1 (John)',
-      status: 'connected',
-      pingMs: 12,
-      avatarIcon: 'fighter',
-    },
-    {
-      id: 'seat_lyra',
-      role: 'player',
-      characterName: 'Lyra Moonshadow (Caster)',
-      playerName: 'Player 2 (Sarah)',
-      status: 'connected',
-      pingMs: 16,
-      avatarIcon: 'caster',
-    },
-    {
-      id: 'seat_valerius',
-      role: 'player',
-      characterName: 'Valerius the Bold (Dwarf Fighter)',
-      playerName: 'Player 3 (Open Slot)',
-      status: 'ready',
-      pingMs: 10,
-      avatarIcon: 'fighter',
-    },
-    {
-      id: 'seat_spectator',
-      role: 'spectator',
-      characterName: 'Broadcast Spectator',
-      playerName: 'Twitch / Discord Streamer',
-      status: 'idle',
-      pingMs: 24,
-      avatarIcon: 'spectator',
-    },
-  ]);
+  // Seats come ONLY from the real lobby member list (GET /api/v1/lobbies/{id},
+  // polled every 5s). Backend members expose { user_id, display_name, role }
+  // only — there is no ready flag or latency metric, so none are rendered.
+  // Unfilled party slots render as clearly-styled open placeholders, never as
+  // fabricated players.
+  const maxSeats = campaignMeta.maxPlayers;
+  const seats: PlayerSeat[] = (() => {
+    const filled: PlayerSeat[] = lobby
+      ? lobby.members.map((m) => ({
+          id: m.user_id,
+          role: m.user_id === lobby.host_user_id ? 'gm' : seatRoleOf(m.role),
+          playerName: m.display_name,
+          isHost: m.user_id === lobby.host_user_id,
+          isOpen: false,
+        }))
+      : currentUser
+        ? [
+            {
+              id: currentUser.id,
+              role: seatRoleOf(currentUser.role),
+              playerName: `${currentUser.displayName} (You)`,
+              isHost: false,
+              isOpen: false,
+            },
+          ]
+        : [];
+    return [
+      ...filled,
+      ...Array.from({ length: Math.max(0, maxSeats - filled.length) }, (_, i) => ({
+        id: `open_${i + 1}`,
+        role: 'player' as const,
+        playerName: '',
+        isHost: false,
+        isOpen: true,
+      })),
+    ];
+  })();
+  const joinedCount = seats.filter((s) => !s.isOpen).length;
+  // Selection must always point at a real (non-placeholder) seat.
+  const activeSeatId =
+    seats.find((s) => !s.isOpen && s.id === selectedSeat)?.id ?? seats.find((s) => !s.isOpen)?.id ?? '';
 
-  const inviteUrl = `http://localhost:3000?campaign=vane-1042&passcode=${displayCode}`;
+  // Real invite link derived from this deployment's origin plus the actual
+  // lobby id and invite code. With no live lobby there is no real id to share,
+  // so the link carries no fabricated campaign parameters.
+  const pageBase = `${window.location.origin}${window.location.pathname}`;
+  const inviteUrl = lobby
+    ? `${pageBase}?lobby=${encodeURIComponent(lobby.lobby_id)}&passcode=${encodeURIComponent(displayCode)}`
+    : pageBase;
 
   const handleCopyLink = () => {
     navigator.clipboard.writeText(inviteUrl);
@@ -173,7 +175,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
       }
       // Offline/failed launch still proceeds into the demo tabletop.
     }
-    onLaunchCampaign(selectedSeat);
+    onLaunchCampaign(activeSeatId);
   };
 
   return (
@@ -206,7 +208,7 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
           <div className="flex items-center justify-between gap-3">
             <h2 className="vtt-section-header text-sm font-bold">
               <UserCheck className="w-4 h-4 shrink-0" />
-              <span>Assigned Seats &amp; Presence ({seats.length} / {campaignMeta.maxPlayers})</span>
+              <span>Assigned Seats &amp; Presence ({joinedCount} / {campaignMeta.maxPlayers})</span>
               {livePeers !== null && (
                 <span className="vtt-badge vtt-badge-success ml-2">
                   ● {livePeers} live via relay
@@ -221,60 +223,81 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
 
           <div className="space-y-3">
             {seats.map((seat) => {
-              const isSelected = selectedSeat === seat.id;
+              const isSelected = !seat.isOpen && selectedSeat === seat.id;
               const isGm = seat.role === 'gm';
               const isSpectator = seat.role === 'spectator';
 
               return (
                 <div
                   key={seat.id}
-                  onClick={() => handleSeatClick(seat.id)}
-                  className={`p-4 rounded-xl border cursor-pointer transition flex items-center justify-between ${
-                    isSelected
-                      ? 'bg-[color-mix(in_srgb,var(--tavern-accent)_12%,transparent)] border-tavern-accent ring-1 ring-tavern-accent'
-                      : 'vtt-card-elevated'
+                  onClick={() => !seat.isOpen && handleSeatClick(seat.id)}
+                  className={`p-4 rounded-xl border transition flex items-center justify-between ${
+                    seat.isOpen
+                      ? 'border-dashed border-tavern-border bg-transparent opacity-70'
+                      : `cursor-pointer ${
+                          isSelected
+                            ? 'bg-[color-mix(in_srgb,var(--tavern-accent)_12%,transparent)] border-tavern-accent ring-1 ring-tavern-accent'
+                            : 'vtt-card-elevated'
+                        }`
                   }`}
                 >
                   <div className="flex items-center gap-3">
                     <div
                       className={`w-10 h-10 rounded-xl flex items-center justify-center border shadow ${
-                        isGm
-                          ? 'bg-[color-mix(in_srgb,var(--rp-amber-600)_25%,transparent)] border-tavern-accent text-tavern-accent'
-                          : 'bg-tavern-surface border-tavern-border text-[var(--rp-parchment-300)]'
+                        seat.isOpen
+                          ? 'border-dashed border-tavern-border text-[var(--rp-parchment-300)]/50 bg-transparent'
+                          : isGm
+                            ? 'bg-[color-mix(in_srgb,var(--rp-amber-600)_25%,transparent)] border-tavern-accent text-tavern-accent'
+                            : 'bg-tavern-surface border-tavern-border text-[var(--rp-parchment-300)]'
                       }`}
                     >
-                      {isGm ? <Crown className="w-5 h-5" /> : isSpectator ? <Eye className="w-5 h-5" /> : <Shield className="w-5 h-5" />}
+                      {seat.isOpen ? (
+                        <UserPlus className="w-5 h-5" />
+                      ) : isGm ? (
+                        <Crown className="w-5 h-5" />
+                      ) : isSpectator ? (
+                        <Eye className="w-5 h-5" />
+                      ) : (
+                        <Shield className="w-5 h-5" />
+                      )}
                     </div>
 
                     <div>
                       <div className="flex items-center gap-2">
-                        <h3 className="font-bold text-xs font-display text-[var(--rp-parchment-100)]">
-                          {seat.characterName}
+                        <h3
+                          className={`font-bold text-xs font-display ${
+                            seat.isOpen
+                              ? 'text-[var(--rp-parchment-300)] italic'
+                              : 'text-[var(--rp-parchment-100)]'
+                          }`}
+                        >
+                          {seat.isOpen ? 'Open Seat' : seat.playerName}
                         </h3>
                         {seat.isHost && (
                           <span className="vtt-badge">HOST</span>
                         )}
                       </div>
-                      <div className="text-[11px] text-[var(--rp-parchment-300)] font-mono mt-0.5">
-                        Claimed by: <span className="text-[var(--rp-parchment-100)]">{seat.playerName}</span>
+                      <div
+                        className={`text-[11px] font-mono mt-0.5 ${
+                          seat.isOpen ? 'text-[var(--rp-parchment-300)]/60' : 'text-[var(--rp-parchment-300)]'
+                        }`}
+                      >
+                        {seat.isOpen
+                          ? 'Empty party slot — share the invite link to fill it'
+                          : isGm
+                            ? 'Dungeon Master'
+                            : isSpectator
+                              ? 'Read-only spectator'
+                              : 'Party member'}
                       </div>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-4">
-                    <div className="flex items-center gap-1.5 text-[11px] font-mono text-emerald-400">
-                      <Wifi className="w-3.5 h-3.5" />
-                      <span>{seat.pingMs}ms</span>
-                    </div>
-
-                    <span
-                      className={`vtt-badge uppercase ${
-                        seat.status === 'ready' ? 'vtt-badge-success' : ''
-                      }`}
-                    >
-                      {seat.status}
-                    </span>
-                  </div>
+                  <span
+                    className={`vtt-badge uppercase ${seat.isOpen ? '' : 'vtt-badge-success'}`}
+                  >
+                    {seat.isOpen ? 'open' : seat.role}
+                  </span>
                 </div>
               );
             })}
