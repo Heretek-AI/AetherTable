@@ -3963,6 +3963,15 @@ async def trigger_x_card(req: XCardRequest, token: str = Depends(_require_auth))
             result["engine_rewind"] = engine_result
         except EngineUnavailableError as exc:
             result["engine_rewind"] = {"status": "ENGINE_UNAVAILABLE", "detail": str(exc)}
+        except EngineRejectedError as exc:
+            # The orchestrator-side intervention still records; the engine
+            # rewind is best-effort. A live engine may reject an unknown
+            # session (404) or refuse for its own reasons — surface it
+            # honestly instead of failing the whole X-card request.
+            result["engine_rewind"] = {
+                "status": "ENGINE_REJECTED",
+                "detail": f"engine {exc.status_code}: {exc.detail}",
+            }
     return result
 
 

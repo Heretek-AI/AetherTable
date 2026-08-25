@@ -90,10 +90,13 @@ class TestXCardAuth:
             json=_xcard("usr_gm20", session_id="11111111-1111-1111-1111-111111111111"),
         )
         assert resp.status_code == 200, resp.text
-        # Either applied on a live ledger or honestly unavailable offline.
+        # Applied on a live ledger, honestly unavailable offline, or the live
+        # engine rejected the unknown session — all are legitimate outcomes
+        # that keep the orchestrator-side intervention recorded.
         assert resp.json()["engine_rewind"]["status"] in (
             "SAFETY_REWIND_SUCCESS",
             "ENGINE_UNAVAILABLE",
+            "ENGINE_REJECTED",
         )
 
     def test_outsider_cannot_rewind_a_session_they_are_not_in(self):
