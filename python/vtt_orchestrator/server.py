@@ -157,6 +157,10 @@ dm_agent = EncounterDMAgent()
 retry_controller = DiagnosticRetryController(auditor=auditor, max_retries=2)
 spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
+# PROCESS-MEMORY-ONLY shared campaign state. Iteration 47 made this durable by
+# riding it inside campaign autosave snapshots (_faction_slot) and restoring it
+# via POST /api/v1/campaign/restore — but between autosaves it still lives only
+# here, and ticks executed since the last save are lost on restart.
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
 tool_agent = EngineToolAgent(streaming_gateway)
@@ -820,6 +824,148 @@ def _owner_or_401(token: str) -> str:
     return _require_user_id(token)
 
 
+# --- Campaign-scoped gateway state durability (iteration 47) -----------------
+#
+# Several pieces of SHARED campaign state live in gateway process memory as
+# module singletons. The audit flagged that they did not survive a restart:
+# the active quest graph silently regenerated different canon and faction
+# world-state progress evaporated. The durable-worthy pieces now ride inside
+# the existing campaign autosave snapshot (same campaign_saves storage path —
+# no new persistence infrastructure), and are restored on an authenticated
+# reload.
+#
+# Genuinely SESSION-LOCAL, deliberately NOT persisted:
+#   * global_concordia_engine — a pure treaty calculator over request inputs;
+#     it holds no accumulated table state worth restoring.
+#   * _NPC_REGISTRY / _npc_disposition_engine — rebuilt deterministically at
+#     import from the curated persona tables; there is nothing to save.
+#   * _rule_version_cache / rate windows — caches and operational plumbing,
+#     not canon.
+#
+def _quest_slot() -> Optional[Dict[str, Any]]:
+    """Serialized ``quest`` slot for a save snapshot: None when no quest is
+    active, else a versioned envelope around the generated graph."""
+    if active_campaign_quest is None:
+        return None
+    try:
+        graph = active_campaign_quest.model_dump(mode="json")
+    except Exception:
+        # An unserializable in-memory graph is not saved rather than crashing
+        # the autosave itself; restore treats the slot as absent.
+        return None
+    return {"format": "quest_graph_v1", "graph": graph}
+
+
+def _faction_slot() -> Dict[str, Any]:
+    """Serialized faction simulation state. Plain numeric/bool facts by
+    contract, so this is always serializable."""
+    return {
+        "faction_name": faction_sim.faction_name,
+        "resources": faction_sim.resources,
+        "world_state": dict(faction_sim.world_state),
+    }
+
+
+class QuestSlotCorrupt(Exception):
+    """A persisted quest slot exists but does not deserialize to a QuestGraph."""
+
+
+class FactionSlotCorrupt(Exception):
+    """A persisted faction slot exists but its fields are unusable."""
+
+
+def _parse_quest_slot(payload: Any) -> Optional[QuestGraph]:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise QuestSlotCorrupt("QUEST_SLOT_CORRUPT: expected an object")
+    fmt = payload.get("format")
+    if fmt != "quest_graph_v1":
+        raise QuestSlotCorrupt(
+            f"QUEST_SLOT_CORRUPT: unknown quest slot format {fmt!r}"
+        )
+    graph = payload.get("graph")
+    if not isinstance(graph, dict):
+        raise QuestSlotCorrupt("QUEST_SLOT_CORRUPT: missing graph object")
+    try:
+        parsed = QuestGraph.model_validate(graph)
+    except Exception as exc:
+        raise QuestSlotCorrupt(f"QUEST_SLOT_CORRUPT: {exc}") from exc
+    if not parsed.nodes or not parsed.initial_node_id:
+        raise QuestSlotCorrupt(
+            "QUEST_SLOT_CORRUPT: graph has no nodes or no initial node"
+        )
+    return parsed
+
+
+def _parse_faction_slot(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise FactionSlotCorrupt("FACTION_SLOT_CORRUPT: expected an object")
+    world = payload.get("world_state")
+    resources = payload.get("resources")
+    if world is None or isinstance(resources, bool) or not isinstance(resources, (int, float)):
+        raise FactionSlotCorrupt(
+            "FACTION_SLOT_CORRUPT: missing world_state or non-numeric resources"
+        )
+    if not isinstance(world, dict):
+        raise FactionSlotCorrupt("FACTION_SLOT_CORRUPT: world_state must be an object")
+    return {
+        "faction_name": payload.get("faction_name", faction_sim.faction_name),
+        "resources": resources,
+        "world_state": dict(world),
+    }
+
+
+def _apply_restored_gateway_state(
+    quest: Optional[QuestGraph], faction: Dict[str, Any]
+) -> None:
+    """Applies parsed slots back onto the module singletons."""
+    global active_campaign_quest
+    if quest is not None:
+        active_campaign_quest = quest
+    faction_sim.resources = faction["resources"]
+    faction_sim.world_state = dict(faction["world_state"])
+
+
+async def _load_owned_save_or_error(owner: str, save_id: str) -> Dict[str, Any]:
+    record = await storage_backend.get_campaign_save(owner, save_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Save not found")
+    snapshot = record.get("snapshot")
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=422, detail="CORRUPT_SAVE: snapshot missing")
+    return record
+
+
+async def _restore_latest_gateway_state(owner: str) -> Optional[QuestGraph]:
+    """Restart recovery for the quest read path: when no graph lives in memory
+    (fresh process), re-apply the newest persisted quest owned by ``owner``
+    instead of silently rolling new canon.
+
+    Returns the restored graph, or None when the owner has NO save carrying a
+    quest slot (legacy rows / fresh install). A save that carries a quest slot
+    which fails to parse raises QuestSlotCorrupt — surfaced as an honest 422 by
+    the caller rather than masked with a fresh generation. Faction state is NOT
+    touched here: journal reads must not silently rewind world progress; that
+    belongs to the explicit POST /campaign/restore route.
+    """
+    global active_campaign_quest
+    saves = await storage_backend.list_campaign_saves(owner)
+    for meta in saves:
+        record = await storage_backend.get_campaign_save(owner, meta["save_id"])
+        if not isinstance(record, dict):
+            continue  # vanished between list and get; try the next one
+        snapshot = record.get("snapshot")
+        if not isinstance(snapshot, dict) or "quest" not in snapshot:
+            continue
+        quest = _parse_quest_slot(snapshot["quest"])  # raises on corrupt rows
+        if quest is None:
+            continue  # autosaved before any quest existed; keep scanning
+        active_campaign_quest = quest
+        return quest
+    return None
+
+
 @app.post("/api/v1/campaign/save")
 async def campaign_save(req: CampaignSaveRequest, token: str = Depends(_token_from)):
     header_or_query_token = req.token or token
@@ -877,6 +1023,9 @@ async def campaign_autosave(
 
     Fails honestly and atomically: a non-GM caller gets 403 before any engine
     or store touch; an unreachable engine maps to 502 with nothing half-saved.
+
+    Iteration 47: the snapshot additionally carries the gateway-owned campaign
+    state (active quest graph, faction simulation) so it survives a restart.
     """
     actor = _caller_actor(token)
     if actor.get("role", "") not in ("gm", "admin"):
@@ -904,6 +1053,12 @@ async def campaign_autosave(
         "events_count": len(events),
         # Verbatim engine state: the hydrate/restore bridge consumes this shape.
         "snapshot": raw,
+        # Gateway-owned campaign state (iteration 47): persisted alongside the
+        # engine snapshot so it survives a restart. Session-local singletons
+        # (NPC registry, spotlight tracker, rate windows) deliberately stay
+        # out — they are rebuilt per process by design.
+        "quest": _quest_slot(),
+        "faction_simulation": _faction_slot(),
     }
     meta = await storage_backend.upsert_campaign_save(
         _owner_or_401(token), name, snapshot, round_number
@@ -912,6 +1067,67 @@ async def campaign_autosave(
         "save_id": meta["save_id"],
         "round": round_number,
         "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class CampaignRestoreRequest(BaseModel):
+    save_id: str
+
+
+def _restore_payload_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Parses (and validates) the gateway-state slots out of a saved snapshot.
+
+    Raises QuestSlotCorrupt / FactionSlotCorrupt for a structurally broken
+    payload — callers map that to an honest 422 rather than crashing or
+    silently regenerating different canon.
+    """
+    quest = _parse_quest_slot(snapshot.get("quest"))
+    faction_raw = snapshot.get("faction_simulation")
+    faction = (
+        _parse_faction_slot(faction_raw)
+        if faction_raw is not None
+        else {
+            "faction_name": faction_sim.faction_name,
+            "resources": faction_sim.resources,
+            "world_state": dict(faction_sim.world_state),
+        }
+    )
+    return {"quest": quest, "faction": faction}
+
+
+@app.post("/api/v1/campaign/restore")
+async def campaign_restore(
+    req: CampaignRestoreRequest, token: str = Depends(_require_auth)
+):
+    """Restores gateway-owned campaign state from one of the caller's saves.
+
+    This is the authenticated reload half of autosave: after a gateway
+    restart the module singletons are back to import-time defaults, and this
+    route puts the persisted quest graph and faction world state back. GM/admin
+    only — restoring rewrites shared campaign canon every player reads.
+    Ownership follows the save row (same isolation as GET /campaign/save/{id}:
+    another owner's save is indistinguishable from a missing one).
+
+    A corrupt slot is an honest 422 naming what broke; nothing is applied.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="RESTORE_GM_ONLY")
+
+    owner = _owner_or_401(token)
+    record = await _load_owned_save_or_error(owner, req.save_id)
+    try:
+        parsed = _restore_payload_from_snapshot(record["snapshot"])
+    except (QuestSlotCorrupt, FactionSlotCorrupt) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _apply_restored_gateway_state(parsed["quest"], parsed["faction"])
+    return {
+        "status": "restored",
+        "save_id": req.save_id,
+        "save_name": record.get("save_name"),
+        "quest": parsed["quest"].model_dump(mode="json") if parsed["quest"] else None,
+        "faction": parsed["faction"],
     }
 
 
@@ -3779,7 +3995,15 @@ from .simulation.quest_engine import (
 )
 
 global_quest_generator = QuestGraphGenerator()
+# Session-local by design: a stateless treaty calculator over request inputs.
+# Nothing accumulates here worth persisting.
 global_concordia_engine = ConcordiaPactEngine()
+# PROCESS-MEMORY-ONLY shared campaign state (audit finding: quest graphs lived
+# only in gateway process memory). Iteration 47 made it durable: the graph is
+# serialized into campaign autosave snapshots (_quest_slot) and restored on an
+# authenticated reload — via GET /api/v1/quest/active after a restart, or
+# explicitly through POST /api/v1/campaign/restore. Between saves it still
+# lives only here.
 active_campaign_quest: Optional[QuestGraph] = None
 
 
@@ -3819,12 +4043,23 @@ def generate_quest(req: QuestGenerateRequest, token: str = Depends(_require_auth
 
 
 @app.get("/api/v1/quest/active")
-def get_active_quest(token: str = Depends(_require_auth)):
+async def get_active_quest(token: str = Depends(_require_auth)):
     # Authenticated read, any role: the active graph is shared campaign state
     # players must be able to see (mirrors handout reads).
 
     global active_campaign_quest
     if not active_campaign_quest:
+        try:
+            restored = await _restore_latest_gateway_state(_owner_or_401(token))
+        except QuestSlotCorrupt as exc:
+            # A saved graph that no longer parses must not be silently replaced
+            # by a fresh roll behind the table's back.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if restored is not None:
+            return restored
+        # No durable campaign state anywhere (fresh install / legacy saves
+        # only): generate as before. This is the one place regeneration is
+        # honest — there is nothing saved to be faithful to.
         active_campaign_quest = global_quest_generator.generate_campaign_quest()
     return active_campaign_quest
 
@@ -3962,6 +4197,10 @@ def _build_persona_registry(disposition_engine: NpcDispositionEngine) -> Dict[st
 
 #: Shared disposition singleton: one engine, many personas, persistent stances.
 #: The zero-clock keeps decay deterministic (same convention as campaign_sim).
+#: SESSION-LOCAL by design (iteration 47 audit): personas are rebuilt
+#: deterministically from the curated tables at import / reset_npc_registry(),
+#: so there is nothing durable-worthy to save — accumulated stance drift is
+#: accepted as per-session state.
 _npc_disposition_engine = NpcDispositionEngine(clock=lambda: 0.0)
 _NPC_REGISTRY: Dict[str, ConcordiaNPC] = _build_persona_registry(_npc_disposition_engine)
 

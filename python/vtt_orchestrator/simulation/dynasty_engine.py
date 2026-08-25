@@ -692,4 +692,9 @@ class DynastyEngine:
         return len(assertions)
 
 
+# PROCESS-MEMORY-ONLY, session-local by design (iteration 47 audit): this
+# singleton only READS the shared lore graph and answers dynasty payload
+# queries; POST /dynasty/generate builds a fresh engine per request from the
+# seed, so there is no accumulated state worth persisting. Lore assertions
+# themselves go to lore_graph, which is Neo4j-backed when configured.
 global_dynasty_engine = DynastyEngine()
