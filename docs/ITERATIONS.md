@@ -359,3 +359,16 @@ P4 infra: Redis limiters, coturn, per-seat projection, atmosphere policy all
 landed. Remaining known gaps tracked for iterations 40-50: Whisper-in-browser
 transcript→intent, glTF miniatures evaluation, SonarCloud wiring, Foundry
 multipart import.
+### Iteration 41 — e9925a3 — feat(engine): blinded vision semantics + bound-hands somatic model — cargo 316/18
+### Iteration 42 — this wave — fix(gateway): cumulative zip budget + importer path containment (A3 #1/#2) — pytest 814
+### Iteration 43 — e213227 — fix(relay): write auth bound to verified connection origin (A3 #3/#4) — relay vitest 66
+
+## Audit sweep A3 (~it.40) — verdict: no blockers; 9 findings
+
+HIGH zip-bomb cap was per-entry not cumulative (it.42), MEDIUM manifest path
+escape downstream of extraction (it.42), MEDIUM-HIGH atmosphere/speech SET
+auth trusted forgeable clientIDs (it.43, both guards fixed identically),
+LOW-MEDIUM evict amplification (it.43). Remaining low items queued: #5
+compendium rule-version round-trip caching, #6 fallback-reason doc drift,
+#7 limiter key omits bucket config, #8 projection fail-open comment lies.
+A1/A2 fixes verified intact at HEAD.
