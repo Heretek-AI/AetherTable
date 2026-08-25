@@ -376,3 +376,10 @@ A1/A2 fixes verified intact at HEAD.
 ### Iteration 45 — 8fd30c2 — docs(server): projection docstring + residual allowances (A3 #7/#8) — cargo 316/18
 ### Iteration 46 — c30fd84 — feat(client): fail-forward outcome bands in check UI (P8) — vitest 286
 ### Iteration 47 — 6b43e7d — feat(gateway): campaign quest+faction durability across restarts (P2) — pytest 839
+
+### Iteration-50 milestone gate — ALL BENCHMARKS PASSED
+MCR 100% · HCI 1.0 · AFPR 0.0% · recall 14/14 (100%) — live synthetic playtest
+against a booted engine. Fix surfaced by the gate: x-card now degrades
+honestly (ENGINE_REJECTED) instead of failing when the live engine rejects an
+unknown session. Gates at this point: cargo 316/18 · pytest 839 pass/27 skip
+(+853 in benchmark run w/ engine) · vitest 286 · relay vitest 66.
