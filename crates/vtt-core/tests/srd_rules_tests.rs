@@ -520,3 +520,17 @@ fn test_add_and_remove_condition_helpers_are_idempotent() {
     assert!(e.has_condition(&Condition::Exhaustion(5)));
     assert!(e.remove_condition(&Condition::Exhaustion(4)));
 }
+
+#[test]
+fn test_srd_blinded_target_grants_attacker_advantage() {
+    // SRD blinded (PHB appendix A): attacks against a blinded creature have
+    // advantage. The attacker itself sees fine, so no disadvantage applies.
+    let attacker = dummy_entity("sighted_archer");
+    let mut blinded_target = dummy_entity("blinded_owlbear");
+    blinded_target.conditions.push(Condition::Blinded);
+
+    let (adv, dis) =
+        RulesEvaluator::edge_from_conditions(&attacker, &blinded_target, 30.0, 0.0, 0.0);
+    assert!(adv, "attacks against a blinded target roll with advantage");
+    assert!(!dis, "blindness of the TARGET never disadvantages the attacker");
+}

@@ -537,7 +537,13 @@ impl RulesEvaluator {
         if spell.verbal_component && !caster.is_conscious {
             return Err("COMPONENT_UNAVAILABLE_VERBAL".to_string());
         }
-        let _ = spell.somatic_component; // somatic failures need a bound-hands model; none yet.
+        // Bound-hands model: a somatic gesture needs at least one free hand
+        // (a hand holding a won grapple is the only occupier this engine
+        // tracks today — see `EntityState::hands_occupied`). Checked BEFORE
+        // any slot is spent so a refused cast costs nothing.
+        if spell.somatic_component && caster.free_hands() == 0 {
+            return Err("CANNOT_SOMATIZE".to_string());
+        }
         let _ = spell.material_component_desc;
 
         if cast_level < spell.level || cast_level > 9 {

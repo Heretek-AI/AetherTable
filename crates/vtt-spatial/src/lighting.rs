@@ -98,6 +98,48 @@ pub fn cell_visible(
 }
 
 impl GridCollisionMap {
+    /// Lighting-aware line of sight for a VIEWER WITH A CONDITION STATE.
+    ///
+    /// The Blinded condition (SRD 5e PHB appendix A) suppresses every
+    /// special sense: darkvision, blindsight, and truesight all stop helping
+    /// because the creature cannot see, so the viewer is evaluated as
+    /// ordinary normal sight (unlimited range, no darkness penetration).
+    /// Obscured cells anywhere on the ray therefore fail the check no matter
+    /// which vision mode the entity nominally has — "blinded overrides
+    /// darkvision benefits". In fully lit cells ordinary sight still works,
+    /// which is deliberate: SRD blindness penalizes the blind ATTACKER'S
+    /// roll (disadvantage, see
+    /// `vtt_core::rules::RulesEvaluator::edge_from_conditions`) rather than
+    /// making them unable to swing at a lit target at all.
+    ///
+    /// Documented simplification: RAW arguably lets blindsight (which does
+    /// not rely on sight) keep functioning while blinded; this engine models
+    /// the condition as suppressing ALL senses for one uniform rule.
+    ///
+    /// `viewer_is_blinded = false` reproduces
+    /// [`Self::has_line_of_sight_with_lighting`] exactly, so legacy callers
+    /// without condition data keep their behavior unchanged.
+    pub fn has_line_of_sight_for_viewer(
+        &self,
+        lighting: &LightingOverlay,
+        mode: VisionMode,
+        sense_range_feet: f32,
+        viewer_is_blinded: bool,
+        start: &Vector3,
+        end: &Vector3,
+    ) -> bool {
+        if viewer_is_blinded {
+            return self.has_line_of_sight_with_lighting(
+                lighting,
+                VisionMode::Normal,
+                f32::INFINITY,
+                start,
+                end,
+            );
+        }
+        self.has_line_of_sight_with_lighting(lighting, mode, sense_range_feet, start, end)
+    }
+
     /// Lighting-aware line of sight: the same wall/occluder Bresenham test as
     /// [`GridCollisionMap::has_line_of_sight`], PLUS a walk over every cell on
     /// the ray — any cell the viewer's sense cannot see into at that distance

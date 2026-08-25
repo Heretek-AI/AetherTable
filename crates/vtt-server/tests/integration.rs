@@ -7047,3 +7047,229 @@ async fn rule_version_restore_rejects_unknown_version() {
     let res = test::call_service(&app, req).await;
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// --- Iteration 41: blinded × vision modes + bound-hands somatics -------------
+
+#[actix_web::test]
+async fn blinded_darkvision_attacker_cannot_strike_into_darkness() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Blind Strike"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    // Darkness over the goblin's cell (28, 0).
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/map", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "width": 32, "height": 32, "cell_size_feet": 5.0,
+            "solid_cells": [], "difficult_terrain": [],
+            "lighting_zones": [{ "x": 28, "y": 0, "zone": "darkness" }]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "map with lighting accepted");
+
+    let drow_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    for (id, name, x) in [(drow_id, "Drow", 26), (orc_id, "Goblin", 28)] {
+        let mut e = entity_json(id, name, 20, 12, 8, "1d6");
+        e["position"] = serde_json::json!([(x as f32) * 5.0, 2.5, 0.0]);
+        if id == drow_id {
+            e["vision_mode"] = serde_json::json!("darkvision");
+            e["sense_range_feet"] = serde_json::json!(120.0);
+            e["conditions"] = serde_json::json!(["blinded"]);
+        }
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(e)
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "{} spawned", name);
+    }
+
+    // Same 10 ft line the darkvision test strikes through — but this attacker
+    // is Blinded, and blindness suppresses darkvision entirely.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "attacker_id": drow_id,
+            "target_id": orc_id,
+            "seed": 7u64
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "blindness must override darkvision on LoS: {body}"
+    );
+    assert_eq!(body["error"], "NO_LINE_OF_SIGHT", "{body}");
+}
+
+#[actix_web::test]
+async fn somatic_cast_with_both_hands_occupied_is_rejected_422_cannot_somatize() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Bound Hands"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let caster_id = Uuid::new_v4();
+    let mut caster = entity_json(caster_id, "Wizard", 20, 12, 2, "1d6");
+    caster["spell_slots_remaining"] = serde_json::json!({"1": 1});
+    caster["hands_occupied"] = serde_json::json!(2);
+    caster["position"] = serde_json::json!([2.5, 2.5, 0.0]);
+    let dummy_id = Uuid::new_v4();
+    let mut dummy = entity_json(dummy_id, "Dummy", 30, 10, 0, "1d4");
+    dummy["is_player"] = serde_json::json!(false);
+    dummy["position"] = serde_json::json!([30.0, 2.5, 0.0]);
+    for p in [caster, dummy] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(p)
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "spawn ok");
+    }
+
+    let spell = serde_json::json!({
+        "spell": {
+            "spell_id": "probe", "name": "Probe", "level": 1,
+            "school": "Illusion", "casting_time": "1 action", "range_feet": 30,
+            "verbal_component": true, "somatic_component": true,
+            "material_component_desc": null, "save_attribute": null,
+            "damage_formula": "2d4", "damage_type": "psychic",
+            "duration_rounds": 0, "is_concentration": false, "is_ritual": false
+        },
+        "caster_id": caster_id,
+        "target_id": dummy_id,
+        "cast_level": 1
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+        .insert_header(auth.clone())
+        .set_json(spell)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "both hands occupied must be a 422 CANNOT_SOMATIZE: {body}"
+    );
+    assert_eq!(body["error"], "CANNOT_SOMATIZE", "{body}");
+
+    // The refused cast must not have burned the slot.
+    let snapshot = session_snapshot(&app, &token, session_id).await;
+    let caster_view = snapshot["entities"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|e| e["name"] == "Wizard")
+        .unwrap();
+    assert_eq!(
+        caster_view["spell_slots_remaining"]["1"],
+        serde_json::json!(1),
+        "a refused somatic cast must not spend the slot"
+    );
+}
+
+#[actix_web::test]
+async fn won_grapple_occupies_the_grapplers_hand_and_blocks_somatic_casts() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Grapple Hands"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let hero_id = Uuid::new_v4();
+    let brute_id = Uuid::new_v4();
+    for (id, name, x) in [(hero_id, "Barbarian", 2), (brute_id, "Ogre", 3)] {
+        let mut e = entity_json(id, name, 40, 12, 6, "1d8");
+        e["position"] = serde_json::json!([(x as f32) * 5.0, 2.5, 0.0]);
+        if id == brute_id {
+            e["is_player"] = serde_json::json!(false);
+        }
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(auth.clone())
+            .set_json(e)
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "{} spawned", name);
+    }
+
+    // Grapple at melee range; both sides are STR-based (+3 vs +3). Scan
+    // seeds deterministically until one resolves as a won grapple, spending
+    // the turn between attempts (one Action per round).
+    let mut won = false;
+    for seed in 1..=40u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/grapple", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "attacker_id": hero_id,
+                "defender_id": brute_id,
+                "defender_skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let status = res.status();
+        if status == StatusCode::CONFLICT {
+            // Action already spent this round — refresh and retry the seed.
+            advance_turn(&app, &token, session_id).await;
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "grapple contest resolved");
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            won = true;
+            break;
+        }
+    }
+    assert!(won, "some seed in 1..=40 must win an even STR contest");
+
+    // A won grapple keeps one of the grappler's hands busy.
+    let snapshot = session_snapshot(&app, &token, session_id).await;
+    let hero_view = snapshot["entities"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|e| e["name"] == "Barbarian")
+        .unwrap();
+    assert_eq!(
+        hero_view["hands_occupied"],
+        serde_json::json!(1),
+        "the grappler's hand is occupied while the hold lasts"
+    );
+}

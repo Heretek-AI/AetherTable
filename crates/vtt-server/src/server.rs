@@ -1227,7 +1227,16 @@ async fn resolve_cast_spell(
                     "target_was_present": target_present,
                 }))
             }
-            Err(e) => reject(&data, 409, "SPELL_REJECTED", &e),
+            Err(e) => {
+                // A bound-hands refusal is a malformed request against the
+                // caster's current state (422), not an in-fiction conflict
+                // like the other spell rejections.
+                if e == "CANNOT_SOMATIZE" {
+                    reject(&data, 422, "CANNOT_SOMATIZE", "the caster has no free hand for the somatic component")
+                } else {
+                    reject(&data, 409, "SPELL_REJECTED", &e)
+                }
+            }
         }
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
@@ -1493,7 +1502,7 @@ async fn resolve_attack(
         // blindsight, truesight) is evaluated against the session map's
         // per-cell lighting zones. Maps without declared zones are Bright
         // everywhere, so this reproduces the old wall-only behavior exactly.
-        let (attacker_vision_mode, attacker_sense_range) = {
+        let (attacker_vision_mode, attacker_sense_range, attacker_is_blinded) = {
             let a = session
                 .entities
                 .get(&req.attacker_id)
@@ -1501,13 +1510,15 @@ async fn resolve_attack(
             (
                 a.effective_vision_mode(),
                 a.effective_sense_range_feet(),
+                a.is_blinded(),
             )
         };
         let lighting = build_lighting_overlay(&session.map);
-        if !grid.has_line_of_sight_with_lighting(
+        if !grid.has_line_of_sight_for_viewer(
             &lighting,
             attacker_vision_mode,
             attacker_sense_range,
+            attacker_is_blinded,
             &attacker_pos,
             &target_pos,
         ) {
@@ -1882,6 +1893,13 @@ async fn resolve_grapple_action(
         if let Some(condition) = resolution.applied_condition {
             if let Some(t) = session.entities.get_mut(&req.defender_id) {
                 t.add_condition(condition);
+            }
+            // Bound-hands model: a WON grapple keeps one of the grappler's
+            // hands busy (SRD: the creature has a hand occupied by the hold).
+            // Saturating, so a second won grapple cannot phantom-bind a third
+            // hand; the release path is the escape/rewind sweep below.
+            if let Some(a) = session.entities.get_mut(&req.attacker_id) {
+                a.occupy_hand();
             }
         }
 
@@ -3801,6 +3819,11 @@ pub struct LosReq {
     /// Range in feet of the viewer's special sense; absent = unlimited.
     #[serde(default)]
     pub viewer_vision_range_feet: Option<f32>,
+    /// Viewer carries the SRD Blinded condition. True suppresses every
+    /// special sense (darkvision/blindsight/truesight give nothing) and the
+    /// check evaluates plain normal sight. Absent = sighted.
+    #[serde(default)]
+    pub viewer_is_blinded: bool,
 }
 
 /// Resolves the collision-grid depth for a stateless spatial request:
@@ -3899,10 +3922,11 @@ async fn compute_los(
     let vision_mode = req.viewer_vision_mode.unwrap_or(VisionMode::Normal);
     let vision_range_feet = req.viewer_vision_range_feet.unwrap_or(f32::INFINITY);
 
-    let has_los = grid.has_line_of_sight_with_lighting(
+    let has_los = grid.has_line_of_sight_for_viewer(
         &lighting,
         vision_mode,
         vision_range_feet,
+        req.viewer_is_blinded,
         &req.attacker_pos,
         &req.target_pos,
     );

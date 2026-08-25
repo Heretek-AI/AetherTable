@@ -289,6 +289,103 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_viewer_loses_line_of_sight_regardless_of_vision_mode() {
+        // SRD Blinded condition (PHB appendix A): the eyes do not work, so
+        // darkness-piercing senses give NOTHING — darkvision, blindsight, and
+        // truesight are all suppressed and every mode reverts to ordinary
+        // sight. Any obscured cell on the ray therefore blocks LoS no matter
+        // which sense the viewer nominally has. (In fully lit cells a blinded
+        // fighter can still swing — the condition's mechanical weight there is
+        // the attack-roll disadvantage carried by `edge_from_conditions`.)
+        let grid = lit_grid();
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(2, 0, 0, LightingZone::Darkness);
+
+        for (mode, range) in [
+            (VisionMode::Normal, UNLIMITED),
+            (VisionMode::Darkvision, 60.0),
+            (VisionMode::Blindsight, 30.0),
+            (VisionMode::Truesight, 60.0),
+        ] {
+            assert!(
+                !grid.has_line_of_sight_for_viewer(
+                    &lighting,
+                    mode,
+                    range,
+                    true, // viewer is Blinded
+                    &viewer(),
+                    &dark_target(),
+                ),
+                "a blinded {:?} must not see into darkness",
+                mode
+            );
+            // With nothing obscuring the line, ordinary sight still functions.
+            assert!(
+                grid.has_line_of_sight_for_viewer(
+                    &LightingOverlay::new(),
+                    mode,
+                    range,
+                    true,
+                    &viewer(),
+                    &dark_target(),
+                ),
+                "a blinded {:?} in bright light keeps plain normal-sight LoS \
+                 (the penalty is attack disadvantage, not a targeting refusal)",
+                mode
+            );
+        }
+
+        // Magical darkness likewise stays sealed: no sense pierces it while
+        // blinded, not even truesight or blindsight (documented
+        // simplification — see VisionMode docs).
+        let mut magical = LightingOverlay::new();
+        magical.set_zone(2, 0, 0, LightingZone::MagicalDarkness);
+        for (mode, range) in [
+            (VisionMode::Darkvision, 120.0),
+            (VisionMode::Blindsight, 30.0),
+            (VisionMode::Truesight, 60.0),
+        ] {
+            assert!(
+                !grid.has_line_of_sight_for_viewer(
+                    &magical,
+                    mode,
+                    range,
+                    true,
+                    &viewer(),
+                    &dark_target()
+                ),
+                "a blinded {:?} must not pierce magical darkness",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_sighted_viewer_flag_reproduces_legacy_lighting_los() {
+        // Passing viewer_is_blinded = false must be behaviorally identical to
+        // the pre-existing lighting-aware LoS call — legacy paths are
+        // untouched when no Blinded condition is present.
+        let mut grid = lit_grid();
+        grid.set_solid(1, 0, 0, true);
+        let mut lighting = LightingOverlay::new();
+        lighting.set_zone(2, 0, 0, LightingZone::MagicalDarkness);
+
+        for (mode, range) in [
+            (VisionMode::Normal, UNLIMITED),
+            (VisionMode::Darkvision, 120.0),
+            (VisionMode::Blindsight, 30.0),
+            (VisionMode::Truesight, 60.0),
+        ] {
+            assert_eq!(
+                grid.has_line_of_sight_with_lighting(&lighting, mode, range, &viewer(), &dark_target()),
+                grid.has_line_of_sight_for_viewer(&lighting, mode, range, false, &viewer(), &dark_target()),
+                "blinded=false must reproduce legacy LoS for {:?}",
+                mode
+            );
+        }
+    }
+
+    #[test]
     fn test_empty_lighting_overlay_matches_plain_los_backcompat() {
         let empty = GridCollisionMap::new(10, 10, 1, 5.0);
         let mut walled = GridCollisionMap::new(10, 10, 1, 5.0);

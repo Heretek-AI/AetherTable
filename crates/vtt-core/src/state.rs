@@ -260,9 +260,22 @@ pub struct EntityState {
     /// [`VisionMode::typical_range_feet`]). None = normal sight, unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sense_range_feet: Option<f32>,
+    /// Bound-hands model for somatic spell components: how many of the
+    /// creature's two hands are currently occupied (a hand holding a won
+    /// grapple is the only writer this engine has today; weapon wielding is
+    /// not tracked). Casting a spell with a somatic component requires at
+    /// least one free hand — see
+    /// [`crate::rules::RulesEvaluator::validate_and_cast_spell`]. Serde
+    /// default keeps legacy serialized entities deserializing.
+    #[serde(default)]
+    pub hands_occupied: u8,
 }
 
 impl EntityState {
+    /// Hands on a standard humanoid body — the bound-hands model's ceiling
+    /// (`hands_occupied` saturates here).
+    pub const MODELED_HANDS: u8 = 2;
+
     /// The vision this entity effectively sees with: unset => Normal sight.
     pub fn effective_vision_mode(&self) -> VisionMode {
         self.vision_mode.unwrap_or(VisionMode::Normal)
@@ -272,6 +285,31 @@ impl EntityState {
     /// spatial layer treats infinity as "no range gate").
     pub fn effective_sense_range_feet(&self) -> f32 {
         self.sense_range_feet.unwrap_or(f32::INFINITY)
+    }
+
+    /// SRD Blinded condition present? Feeds the lighting-aware line-of-sight
+    /// override in `vtt_spatial` (blindness suppresses darkvision and every
+    /// other special sense) — the attack-roll disadvantage side of the
+    /// condition is carried by [`Condition::inflicts_disadvantage_on_attacks`].
+    pub fn is_blinded(&self) -> bool {
+        self.conditions.contains(&Condition::Blinded)
+    }
+
+    /// Free hands left out of this creature's modeled two.
+    pub fn free_hands(&self) -> u8 {
+        Self::MODELED_HANDS.saturating_sub(self.hands_occupied.min(Self::MODELED_HANDS))
+    }
+
+    /// Occupies one hand (e.g. a won grapple keeps a hold). Saturates at two:
+    /// a humanoid has no third hand to bind.
+    pub fn occupy_hand(&mut self) {
+        self.hands_occupied = self.hands_occupied.saturating_add(1).min(Self::MODELED_HANDS);
+    }
+
+    /// Frees one hand (e.g. the grapple was escaped or broken). Saturating at
+    /// zero so stray releases can never underflow into phantom hands.
+    pub fn release_hand(&mut self) {
+        self.hands_occupied = self.hands_occupied.saturating_sub(1);
     }
 }
 
@@ -621,6 +659,7 @@ impl EntityState {
             next_attacker_has_advantage_against: None,
             vision_mode: None,
             sense_range_feet: None,
+            hands_occupied: 0,
         }
     }
 }
@@ -1529,6 +1568,26 @@ impl GameSession {
         for entity in self.entities.values_mut() {
             entity.remove_condition(&Condition::Grappled);
             entity.remove_condition(&Condition::Prone);
+            // Bound-hands sweep: the only hand occupier this engine writes is
+            // a WON grapple (see the server's grapple route), which is exactly
+            // one hand. Rewinding past the GRAPPLE_ATTEMPTED event must
+            // release it, so every surviving grapple re-occupies from zero.
+            entity.hands_occupied = 0;
+        }
+        // Re-occupy one grappler hand per surviving won-grapple event.
+        let mut surviving_grapplers: Vec<Uuid> = Vec::new();
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type == "GRAPPLE_ATTEMPTED"
+                && ev.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+                && ev.payload.get("applied_condition").is_some()
+            {
+                surviving_grapplers.push(ev.actor_id);
+            }
+        }
+        for id in surviving_grapplers {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.occupy_hand();
+            }
         }
         for (id, condition) in condition_state {
             if let Some(entity) = self.entities.get_mut(&id) {

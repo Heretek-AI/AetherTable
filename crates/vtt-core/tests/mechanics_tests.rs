@@ -2160,3 +2160,133 @@ fn test_verified_flag_reflects_actual_validation_outcome() {
         "rejected ingress must not sit in the stack"
     );
 }
+
+// ------------------------------------------------ bound-hands model (iter 41)
+
+fn somatic_spell() -> SpellDefinition {
+    SpellDefinition {
+        spell_id: "charm_like".to_string(),
+        name: "Somatic Probe".to_string(),
+        level: 1,
+        school: "Illusion".to_string(),
+        casting_time: "1 action".to_string(),
+        range_feet: 30,
+        area_of_effect_shape: None,
+        area_of_effect_size_feet: None,
+        verbal_component: true,
+        somatic_component: true,
+        material_component_desc: None,
+        save_attribute: Some(Ability::Wisdom),
+        damage_formula: Some("2d4".to_string()),
+        damage_type: Some(DamageType::Psychic),
+        duration_rounds: 0,
+        is_concentration: false,
+        is_ritual: false,
+    }
+}
+
+fn verbal_only_spell() -> SpellDefinition {
+    let mut s = somatic_spell();
+    s.spell_id = "verbal_probe".to_string();
+    s.somatic_component = false;
+    s
+}
+
+#[test]
+fn test_somatic_cast_fails_with_both_hands_occupied_and_spends_no_slot() {
+    let mut session = session_with_pair();
+    let caster_id = *session.entities.keys().next().unwrap();
+    let target_id = *session.entities.keys().find(|k| **k != caster_id).unwrap();
+
+    let caster = session.entities.get_mut(&caster_id).unwrap();
+    caster.spell_slots_remaining = [(1u8, 1u32)].into_iter().collect();
+    // Both hands bound (grappling with one, shield in the other, etc.).
+    caster.hands_occupied = 2;
+
+    let mut dice = DiceEngine::with_seed(3);
+    let mut target = session.entities.remove(&target_id).unwrap();
+    let err = RulesEvaluator::validate_and_cast_spell(
+        &mut dice,
+        session.entities.get_mut(&caster_id).unwrap(),
+        Some(&mut target),
+        &somatic_spell(),
+        1,
+        false,
+    )
+    .unwrap_err();
+    session.entities.insert(target_id, target);
+
+    assert_eq!(err, "CANNOT_SOMATIZE", "both hands occupied must refuse a somatic cast");
+    assert_eq!(
+        session.entities[&caster_id].spell_slots_remaining.get(&1),
+        Some(&1),
+        "a refused somatic cast must not spend the slot"
+    );
+}
+
+#[test]
+fn test_somatic_cast_needs_one_free_hand_and_non_somatic_ignores_bound_hands() {
+    let mut session = session_with_pair();
+    let caster_id = *session.entities.keys().next().unwrap();
+    let target_id = *session.entities.keys().find(|k| **k != caster_id).unwrap();
+    session.entities.get_mut(&caster_id).unwrap().spell_slots_remaining =
+        [(1u8, 2u32)].into_iter().collect();
+
+    // One hand free (the other grapples): the somatic gesture is still possible.
+    session.entities.get_mut(&caster_id).unwrap().hands_occupied = 1;
+    let mut dice = DiceEngine::with_seed(5);
+    let mut target = session.entities.remove(&target_id).unwrap();
+    let res = RulesEvaluator::validate_and_cast_spell(
+        &mut dice,
+        session.entities.get_mut(&caster_id).unwrap(),
+        Some(&mut target),
+        &somatic_spell(),
+        1,
+        false,
+    )
+    .expect("one free hand must be enough to somatize");
+    session.entities.insert(target_id, target);
+    assert_eq!(res.slot_level_used, 1);
+
+    // BOTH hands occupied, but the spell has no somatic component: castable.
+    let caster2 = *session.entities.keys().next().unwrap();
+    let target2_id = *session.entities.keys().find(|k| **k != caster2).unwrap();
+    session.entities.get_mut(&caster2).unwrap().spell_slots_remaining =
+        [(1u8, 1u32)].into_iter().collect();
+    session.entities.get_mut(&caster2).unwrap().hands_occupied = 2;
+    let mut target2 = session.entities.remove(&target2_id).unwrap();
+    let res2 = RulesEvaluator::validate_and_cast_spell(
+        &mut dice,
+        session.entities.get_mut(&caster2).unwrap(),
+        Some(&mut target2),
+        &verbal_only_spell(),
+        1,
+        false,
+    )
+    .expect("a verbal-only spell must not care about bound hands");
+    session.entities.insert(target2_id, target2);
+    assert_eq!(res2.slot_level_used, 1);
+}
+
+#[test]
+fn test_bound_hands_helpers_round_trip() {
+    let mut e = hero("palm_reader", 20, 14);
+    assert_eq!(e.free_hands(), 2);
+    assert!(!e.is_blinded());
+
+    e.occupy_hand(); // won a grapple
+    assert_eq!(e.free_hands(), 1);
+    e.occupy_hand();
+    assert_eq!(e.free_hands(), 0);
+    e.occupy_hand(); // saturates at two modeled hands
+    assert_eq!(e.free_hands(), 0, "a humanoid only has two hands");
+
+    e.release_hand();
+    assert_eq!(e.free_hands(), 1);
+    e.release_hand();
+    e.release_hand(); // saturating release never underflows
+    assert_eq!(e.free_hands(), 2);
+
+    e.conditions.push(Condition::Blinded);
+    assert!(e.is_blinded());
+}
