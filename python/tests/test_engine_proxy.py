@@ -977,6 +977,434 @@ class TestOffhandAndHelpProxies:
             assert "unreachable" in resp.json()["detail"].lower(), path
 
 
+class TestInspirationSpendForwarding:
+    """Iteration 64: the engine accepts an optional ``spend_inspiration`` flag
+    on attack/check/save (iteration 56). The gateway schemas lagged and stripped
+    it, so a client asking to burn its held point silently rolled straight.
+    Regression: the flag must travel VERBATIM to the engine, and legacy payloads
+    without it must be byte-for-byte unchanged (default False)."""
+
+    @staticmethod
+    def _token(user_id: str = "player-7", role: str = "player") -> str:
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    def _capture(self, monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_attack_forwards_spend_inspiration_true(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"natural_roll": 15, "is_hit": True})
+        resp = client.post(
+            "/api/v1/engine/attack",
+            params={"token": self._token()},
+            json={
+                "session_id": "s",
+                "attacker_id": "thorin",
+                "target_id": "orc-warlord",
+                "spend_inspiration": True,
+            },
+        )
+        assert resp.status_code == 200
+        assert captured["payload"]["spend_inspiration"] is True
+
+    def test_check_forwards_spend_inspiration_true(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"roll": 18})
+        resp = client.post(
+            "/api/v1/engine/check",
+            params={"token": self._token()},
+            json={"modifier": 3, "dc": 12, "spend_inspiration": True},
+        )
+        assert resp.status_code == 200
+        assert captured["payload"]["spend_inspiration"] is True
+        # The rest of the legacy shape is untouched.
+        assert captured["payload"]["modifier"] == 3
+        assert captured["payload"]["dc"] == 12
+
+    def test_save_forwards_spend_inspiration_true(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"roll": 14})
+        resp = client.post(
+            "/api/v1/engine/save",
+            params={"token": self._token()},
+            json={"save_modifier": 2, "dc": 10, "spend_inspiration": True},
+        )
+        assert resp.status_code == 200
+        assert captured["payload"]["spend_inspiration"] is True
+
+    def test_attack_false_is_forwarded_explicitly(self, monkeypatch):
+        captured = self._capture(monkeypatch, {})
+        resp = client.post(
+            "/api/v1/engine/attack",
+            params={"token": self._token()},
+            json={
+                "session_id": "s",
+                "attacker_id": "a",
+                "target_id": "b",
+                "spend_inspiration": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert captured["payload"]["spend_inspiration"] is False
+
+    def test_legacy_payloads_without_the_field_are_unchanged(self, monkeypatch):
+        """Back-compat: omitting the flag defaults to False everywhere and no
+        other legacy field drifts."""
+        cases = [
+            (
+                "/api/v1/engine/attack",
+                {"session_id": "s", "attacker_id": "a", "target_id": "b"},
+                {
+                    "attacker_id": engine_client._coerce_uuid("a"),
+                    "target_id": engine_client._coerce_uuid("b"),
+                    "action_index": 0,
+                },
+                None,
+            ),
+            (
+                "/api/v1/engine/check",
+                {"modifier": 3, "dc": 12},
+                {"modifier": 3, "dc": 12, "cost_margin": 3},
+                None,
+            ),
+            (
+                "/api/v1/engine/save",
+                {"save_modifier": 2, "dc": 10, "ability": "wisdom"},
+                {
+                    "save_modifier": 2,
+                    "dc": 10,
+                    "ability": "WISDOM",
+                    "advantage": False,
+                    "disadvantage": False,
+                    "conditions": [],
+                },
+                None,
+            ),
+        ]
+        for path, body, expected_payload, _ in cases:
+            captured = self._capture(monkeypatch, {"roll": 7})
+            resp = client.post(path, params={"token": self._token()}, json=body)
+            assert resp.status_code == 200, path
+            expected = dict(expected_payload)
+            expected.setdefault("spend_inspiration", False)
+            assert captured["payload"] == expected, path
+            monkeypatch.undo()
+
+
+class TestEscapeGrappleProxy:
+    """Iteration 64: gateway proxy for the engine's /action/escape-grapple
+    route (iteration 49). Mirrors the grapple/shove maneuver contract exactly:
+    ids-only Pydantic body with unknown fields refused, verified caller identity
+    forwarded for engine RBAC, engine verdict surfaced verbatim, client seed
+    never forwardable. The GM ``force`` override passes through as-is — the
+    ENGINE re-checks privilege, the gateway does not second-guess it."""
+
+    SESSION_ID = "7c6d5e4f-3a2b-4918-a7b6-c5d4e3f2a1b0"
+
+    BODY = {
+        "session_id": SESSION_ID,
+        "entity_id": "grappled-hero",
+        "grappler_id": "ogre",
+        "skill": "acrobatics",
+    }
+
+    @staticmethod
+    def _token(user_id: str = "player-7", role: str = "player") -> str:
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    def _capture(self, monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_forwards_identity_path_and_ids_only_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"success": True, "escaped": True})
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token("player-7", "player")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"success": True, "escaped": True}
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/action/escape-grapple"
+        )
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "grappled-hero")),
+            "grappler_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "ogre")),
+            "skill": "acrobatics",
+        }
+        assert "seed" not in captured["payload"]
+
+    def test_gm_force_override_is_forwarded(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"escaped": True, "forced": True})
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token("gm-1", "gm")},
+            json={**self.BODY, "force": True},
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+        assert captured["payload"]["force"] is True
+
+    def test_athletics_skill_is_accepted(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"escaped": False})
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token()},
+            json={**self.BODY, "skill": "athletics"},
+        )
+        assert resp.status_code == 200
+        assert captured["payload"]["skill"] == "athletics"
+
+    def test_missing_token_is_401_and_invalid_token_is_401(self):
+        assert (
+            client.post("/api/v1/engine/escape-grapple", json=self.BODY).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/v1/engine/escape-grapple",
+                params={"token": "not.a.valid.token"},
+                json=self.BODY,
+            ).status_code
+            == 401
+        )
+
+    def test_unknown_skill_is_rejected_locally(self, monkeypatch):
+        async def refuse(method, path, payload=None, *, actor=None):
+            raise AssertionError("engine must not be called for an invalid skill")
+
+        monkeypatch.setattr(engine_client, "engine_request", refuse)
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token()},
+            json={**self.BODY, "skill": "basket-weaving"},
+        )
+        assert resp.status_code == 422
+
+    def test_extra_body_fields_are_rejected(self):
+        """Trust-inversion regression: no seeds, no math, no auto-success."""
+        token = self._token()
+        for smuggle in ({"seed": 42}, {"auto_success": True}, {"dc_override": 1}):
+            resp = client.post(
+                "/api/v1/engine/escape-grapple",
+                params={"token": token},
+                json={**self.BODY, **smuggle},
+            )
+            assert resp.status_code == 422, smuggle
+
+    def test_engine_rejection_is_surfaced_verbatim(self, monkeypatch):
+        async def rejected(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(
+                409, '{"error": "NOT_GRAPPLED", "message": "no active hold"}'
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token()},
+            json=self.BODY,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "error": "NOT_GRAPPLED",
+            "message": "no active hold",
+        }
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        resp = client.post(
+            "/api/v1/engine/escape-grapple",
+            params={"token": self._token()},
+            json=self.BODY,
+        )
+        assert resp.status_code == 502
+        assert "unreachable" in resp.json()["detail"].lower()
+
+    def test_anonymous_case_registered_in_the_route_matrix(self):
+        """The route joins the audit 401 matrix like every other proxy."""
+        resp = client.post("/api/v1/engine/escape-grapple", json=self.BODY)
+        assert resp.status_code == 401
+        assert resp.json().get("detail")
+
+
+class TestInspirationFiatProxies:
+    """Iteration 64: GM-only gateway surfaces for the engine's iteration-60
+    /inspiration/grant | /inspiration/revoke routes (SRD inspiration is GM
+    fiat — players RECEIVE points, they never confer them). Gating mirrors the
+    x-card/simulation-tick style at BOTH layers: the gateway refuses non-staff
+    tokens 403 before dialing the engine, and the caller's real identity still
+    rides the hop so the engine re-authorizes."""
+
+    SESSION_ID = "5e4d3c2b-1a09-48f7-b6c5-d4e3f2a1b0c9"
+    GRANT = {"session_id": SESSION_ID, "entity_id": "bard", "reason": "great plan"}
+    REVOKE = {"session_id": SESSION_ID, "entity_id": "bard"}
+
+    @staticmethod
+    def _token(user_id: str = "gm-1", role: str = "gm") -> str:
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    def _capture(self, monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_player_token_is_403_and_never_dials_the_engine(self, monkeypatch):
+        for suffix, body in (("grant", self.GRANT), ("revoke", self.REVOKE)):
+            captured = self._capture(monkeypatch, {"status": "SHOULD_NOT_HAPPEN"})
+            resp = client.post(
+                f"/api/v1/engine/inspiration/{suffix}",
+                params={"token": self._token("player-7", "player")},
+                json=body,
+            )
+            assert resp.status_code == 403, suffix
+            assert resp.json()["detail"], suffix
+            assert captured == {}, f"{suffix}: player must not reach the engine"
+            monkeypatch.undo()
+
+    def test_gm_grant_forwards_identity_path_and_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "INSPIRATION_GRANTED"})
+        resp = client.post(
+            "/api/v1/engine/inspiration/grant",
+            params={"token": self._token("gm-1", "gm")},
+            json=self.GRANT,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "INSPIRATION_GRANTED"}
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/inspiration/grant"
+        )
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "bard")),
+            "reason": "great plan",
+        }
+
+    def test_gm_revoke_forwards_identity_path_and_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "INSPIRATION_REVOKED"})
+        resp = client.post(
+            "/api/v1/engine/inspiration/revoke",
+            params={"token": self._token("gm-2", "gm")},
+            json=self.REVOKE,
+        )
+        assert resp.status_code == 200
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/inspiration/revoke"
+        )
+        assert captured["actor"] == {"user_id": "gm-2", "role": "gm"}
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "bard"))
+        }
+        assert "reason" not in captured["payload"]
+
+    def test_admin_token_is_accepted(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "INSPIRATION_GRANTED"})
+        resp = client.post(
+            "/api/v1/engine/inspiration/grant",
+            params={"token": self._token("admin-1", "admin")},
+            json=self.REVOKE,
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "admin-1", "role": "admin"}
+
+    def test_reason_is_optional_on_grant(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "INSPIRATION_GRANTED"})
+        resp = client.post(
+            "/api/v1/engine/inspiration/grant",
+            params={"token": self._token()},
+            json={"session_id": self.SESSION_ID, "entity_id": "bard"},
+        )
+        assert resp.status_code == 200
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "bard"))
+        }
+
+    def test_missing_token_is_401_and_invalid_token_is_401(self):
+        for suffix in ("grant", "revoke"):
+            assert (
+                client.post(
+                    f"/api/v1/engine/inspiration/{suffix}", json=self.GRANT
+                ).status_code
+                == 401
+            ), suffix
+            assert (
+                client.post(
+                    f"/api/v1/engine/inspiration/{suffix}",
+                    params={"token": "garbage.token"},
+                    json=self.GRANT,
+                ).status_code
+                == 401
+            ), suffix
+
+    def test_extra_body_fields_are_rejected(self):
+        token = self._token()
+        resp = client.post(
+            "/api/v1/engine/inspiration/grant",
+            params={"token": token},
+            json={**self.GRANT, "amount": 99},
+        )
+        assert resp.status_code == 422
+
+    def test_unknown_session_or_entity_surfaces_verbatim(self, monkeypatch):
+        async def rejected(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(
+                404, '{"error": "ENTITY_NOT_FOUND"}'
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        resp = client.post(
+            "/api/v1/engine/inspiration/revoke",
+            params={"token": self._token()},
+            json=self.REVOKE,
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == {"error": "ENTITY_NOT_FOUND"}
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        for suffix, body in (("grant", self.GRANT), ("revoke", self.REVOKE)):
+            resp = client.post(
+                f"/api/v1/engine/inspiration/{suffix}",
+                params={"token": self._token()},
+                json=body,
+            )
+            assert resp.status_code == 502, suffix
+            assert "unreachable" in resp.json()["detail"].lower(), suffix
+
+
 class TestMetricsProxy:
     """GET /api/v1/engine/metrics — read-only telemetry proxy.
 

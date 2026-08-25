@@ -1428,6 +1428,10 @@ class EngineAttackRequest(BaseModel):
     attacker_id: str
     target_id: str
     action_index: int = 0
+    # SRD inspiration spend (engine iteration 56): burn the attacker's held
+    # point for Advantage on THIS roll. Forwarded verbatim — the ENGINE decides
+    # atomically whether a point is actually consumed; the gateway adds nothing.
+    spend_inspiration: bool = False
 
     class Config:
         extra = "forbid"
@@ -1437,6 +1441,9 @@ class EngineCheckRequest(BaseModel):
     modifier: int
     dc: int
     cost_margin: int = 3
+    # Same iteration-56 flag as attack: session-grounded rolls may burn the
+    # checker's held point for Advantage. Omitted -> legacy straight roll.
+    spend_inspiration: bool = False
 
 
 class EngineSaveRequest(BaseModel):
@@ -1446,6 +1453,8 @@ class EngineSaveRequest(BaseModel):
     advantage: bool = False
     disadvantage: bool = False
     conditions: List[str] = Field(default_factory=list)
+    # Saves ground inspiration spend the same way (Help tokens are check-only).
+    spend_inspiration: bool = False
 
 
 class EngineConcentrationRequest(BaseModel):
@@ -1513,6 +1522,7 @@ async def engine_resolve_attack(
         "attacker_id": engine_client._coerce_uuid(req.attacker_id),
         "target_id": engine_client._coerce_uuid(req.target_id),
         "action_index": req.action_index,
+        "spend_inspiration": req.spend_inspiration,
     }
     return await _engine_call(
         engine_client.resolve_attack(
@@ -2645,6 +2655,101 @@ async def engine_ready_action(req: EngineReadyActionRequest, token: str = Depend
     if req.trigger_hint:
         payload["trigger_hint"] = req.trigger_hint
     return await _maneuver_proxy("ready", payload, _caller_actor(token))
+
+
+class EngineEscapeGrappleRequest(BaseModel):
+    """Mirrors the engine's EscapeGrappleReq (deny_unknown_fields): the
+    currently-grappled creature, WHOSE hold it is escaping (its STR sets the
+    DC), and the escaper's choice of contested skill. The optional GM ``force``
+    override passes through as-is — the engine re-checks privilege itself
+    (ESCAPE_OVERRIDE_FORBIDDEN for non-GM callers), so no gateway second-guess.
+    The optional deterministic `seed` is deliberately NOT forwardable."""
+
+    session_id: str
+    entity_id: str
+    grappler_id: str
+    skill: Literal["athletics", "acrobatics"]
+    force: Optional[bool] = None
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/escape-grapple")
+async def engine_escape_grapple(
+    req: EngineEscapeGrappleRequest, token: str = Depends(_require_auth)
+):
+    payload: Dict[str, Any] = {
+        "session_id": req.session_id,
+        "entity_id": engine_client._coerce_uuid(req.entity_id),
+        "grappler_id": engine_client._coerce_uuid(req.grappler_id),
+        "skill": req.skill,
+    }
+    if req.force is not None:
+        payload["force"] = req.force
+    return await _maneuver_proxy(
+        "escape-grapple", payload, _caller_actor(token)
+    )
+
+
+# --- Inspiration fiat proxies -------------------------------------------------
+# The engine's iteration-60 routes: POST /inspiration/grant|revoke. SRD
+# inspiration is GM FIAT — players RECEIVE points, they never confer them — so
+# these gateway surfaces are gated gm/admin BEFORE any engine traffic, in the
+# x-card/simulation-tick gating style. The caller's real identity still rides
+# the hop so the engine's own INSPIRATION_GM_ONLY RBAC re-authorizes.
+
+class EngineInspirationRequest(BaseModel):
+    """Ids-only body mirroring the engine's InspirationGrantReq
+    (deny_unknown_fields); the free-text reason is GM-supplied flavor."""
+
+    session_id: str
+    entity_id: str
+    reason: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+
+async def _inspiration_fiat_proxy(suffix: str, req: EngineInspirationRequest, token: str):
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "INSPIRATION_GM_ONLY: inspiration may only be "
+                f"{suffix}ed by GM/admin tokens (SRD fiat); players receive "
+                "points through grants."
+            ),
+        )
+    payload: Dict[str, Any] = {
+        "entity_id": engine_client._coerce_uuid(req.entity_id)
+    }
+    if req.reason:
+        payload["reason"] = req.reason
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}"
+            f"/inspiration/{suffix}",
+            payload,
+            actor=actor,
+        )
+    )
+
+
+@app.post("/api/v1/engine/inspiration/grant")
+async def engine_grant_inspiration(
+    req: EngineInspirationRequest, token: str = Depends(_require_auth)
+):
+    return await _inspiration_fiat_proxy("grant", req, token)
+
+
+@app.post("/api/v1/engine/inspiration/revoke")
+async def engine_revoke_inspiration(
+    req: EngineInspirationRequest, token: str = Depends(_require_auth)
+):
+    return await _inspiration_fiat_proxy("revoke", req, token)
 
 
 class EngineOffhandRequest(BaseModel):
