@@ -1764,6 +1764,322 @@ async fn short_rest_does_not_touch_exhaustion_or_hp() {
     );
 }
 
+// --- SRD exhaustion ladder: wire-level enforcement (iteration 66) -----------
+//
+// The per-level helpers live in vtt-core (`has_disadvantage_on_checks`,
+// `has_disadvantage_on_saves`, `effective_max_hp`, `effective_speed_feet`), but
+// a helper nobody calls is not a rule. These pins make each rung observable on
+// the live HTTP surface:
+//   - level >= 1 disadvantages ability checks (and ONLY checks at level 1)
+//   - level >= 3 disadvantages saving throws
+//   - level >= 4 caps healing at the halved maximum and halves the
+//     massive-damage instant-death threshold
+//   - (levels 2/5 movement enforcement is pinned by the server unit tests on
+//     `validate_token_move`; the action-budget seeding is covered in core)
+
+/// Spawns one entity carrying exactly `[{"exhaustion": level}]`.
+async fn spawn_exhausted(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    id: Uuid,
+    name: &str,
+    hp: i64,
+    level: u8,
+) {
+    let mut entity = entity_json(id, name, hp as i32, 13, 4, "1d6");
+    if level > 0 {
+        entity["conditions"] = serde_json::json!([{"exhaustion": level}]);
+    }
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(token))
+        .set_json(entity)
+        .to_request();
+    assert_eq!(test::call_service(app, req).await.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn exhaustion_level_1_disadvantages_ability_checks_but_not_saves() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let weary_id = Uuid::new_v4();
+    spawn_exhausted(&app, &gm, session_id, weary_id, "Weary Scout", 22, 1).await;
+    let fresh_id = Uuid::new_v4();
+    spawn_exhausted(&app, &gm, session_id, fresh_id, "Fresh Scout", 22, 0).await;
+
+    for (id, expected_disadvantage) in [(weary_id, true), (fresh_id, false)] {
+        let req = test::TestRequest::post()
+            .uri("/api/v1/actions/check")
+            .insert_header(bearer(&gm))
+            .set_json(serde_json::json!({
+                "modifier": 3,
+                "dc": 12,
+                "cost_margin": 3,
+                "session_id": session_id,
+                "entity_id": id,
+                "seed": seed_producing_roll(10)
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(
+            body["disadvantage"],
+            serde_json::json!(expected_disadvantage),
+            "exhaustion 1 must disadvantage ability checks (SRD ladder rung 1)"
+        );
+    }
+
+    // Level 1 stops there: saving throws are only disadvantaged from rung 3.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/actions/save")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "save_modifier": 3,
+            "dc": 12,
+            "session_id": session_id,
+            "entity_id": weary_id,
+            "seed": seed_producing_roll(10)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["disadvantage"],
+        serde_json::json!(false),
+        "exhaustion 1 must leave saving throws untouched"
+    );
+}
+
+#[actix_web::test]
+async fn exhaustion_level_3_disadvantages_saving_throws() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let drained_id = Uuid::new_v4();
+    spawn_exhausted(&app, &gm, session_id, drained_id, "Drained Mage", 20, 3).await;
+    let tired_id = Uuid::new_v4();
+    spawn_exhausted(&app, &gm, session_id, tired_id, "Tired Cleric", 20, 2).await;
+
+    // Rung boundary: 3 disadvantages saves, 2 does not.
+    for (id, expected) in [(drained_id, true), (tired_id, false)] {
+        let req = test::TestRequest::post()
+            .uri("/api/v1/actions/save")
+            .insert_header(bearer(&gm))
+            .set_json(serde_json::json!({
+                "save_modifier": 3,
+                "dc": 12,
+                "session_id": session_id,
+                "entity_id": id,
+                "seed": seed_producing_roll(10)
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(
+            body["disadvantage"],
+            serde_json::json!(expected),
+            "exhaustion 3+ must disadvantage saving throws (SRD ladder rung 3)"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn exhaustion_level_4_caps_healing_at_the_halved_maximum() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // Max 30 → effective max 15 while exhausted at 4. Wounded to 5, offered
+    // far more healing than fits: the refill must stop at the HALVED cap.
+    let worn_id = Uuid::new_v4();
+    let mut worn = entity_json(worn_id, "Worn Fighter", 30, 14, 4, "1d8");
+    worn["current_hp"] = serde_json::json!(5);
+    worn["conditions"] = serde_json::json!([{"exhaustion": 4}]);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(worn)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": worn_id, "amount": 100}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["hp_remaining"], 15,
+        "level 4 halves max HP: healing must cap at 30 / 2"
+    );
+    assert_eq!(body["amount_applied"], 10);
+}
+
+#[actix_web::test]
+async fn exhaustion_level_4_halves_the_instant_death_damage_threshold() {
+    let (app, state) = test_app_with_state().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // One heavy hitter, two statistically identical victims at 14/30 HP.
+    // With exhaustion 4 the effective maximum is 15, so damage that lands the
+    // victim between -15 and -29 must kill them instantly — the same hit
+    // leaves an unexhausted twin alive (raw floor -30).
+    let attacker_id = Uuid::new_v4();
+    let mut attacker = entity_json(attacker_id, "Bruiser", 40, 16, 12, "6d6");
+    attacker["is_player"] = serde_json::json!(false);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(attacker)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let doomed_id = Uuid::new_v4();
+    let mut doomed = entity_json(doomed_id, "Doomed Twin", 30, 10, 0, "1d4");
+    doomed["current_hp"] = serde_json::json!(14);
+    let spared_id = Uuid::new_v4();
+    let mut spared = entity_json(spared_id, "Spared Twin", 30, 10, 0, "1d4");
+    spared["current_hp"] = serde_json::json!(14);
+    for payload in [doomed, spared] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Scan seeds for a clean experiment: a HIT carrying 16..=30 damage —
+    // lethal past the halved floor of -15 yet shy of the raw -30 floor.
+    let mut chosen: Option<(u64, u64, i64)> = None; // (seed, seq, damage)
+    'scan: for seed in 1..=300u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(serde_json::json!({
+                "attacker_id": attacker_id,
+                "target_id": doomed_id,
+                "action_index": 0,
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let status = res.status();
+        let body: serde_json::Value = test::read_body_json(res).await;
+        match status {
+            StatusCode::OK => {
+                if body["is_hit"] == serde_json::json!(true) {
+                    let dmg = body["total_damage"].as_i64().unwrap_or(0);
+                    if (16..=30).contains(&dmg) {
+                        chosen = Some((
+                            seed,
+                            body["event_sequence"].as_u64().unwrap(),
+                            dmg,
+                        ));
+                        break 'scan;
+                    }
+                }
+            }
+            StatusCode::CONFLICT => {}
+            other => panic!("seed {}: unexpected status {}: {}", seed, other, body),
+        }
+        advance_turn(&app, &gm, session_id).await;
+    }
+    let (seed, doomed_seq, damage) =
+        chosen.expect("no seed produced a 16..=30 damage hit in 300 tries");
+
+    // Same dice against the unexhausted twin: identical roll chain, identical
+    // damage, no conditions in play on either side of either attack.
+    advance_turn(&app, &gm, session_id).await;
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "attacker_id": attacker_id,
+            "target_id": spared_id,
+            "action_index": 0,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["total_damage"], serde_json::json!(damage),
+        "fixture sanity: the twin absorbs the same rolled damage");
+    assert_eq!(body["is_hit"], serde_json::json!(true));
+    let spared_seq = body["event_sequence"].as_u64().unwrap();
+
+    // Exhaust the doomed twin to level 4 AFTER both attacks are ledgered so
+    // the attack rolls themselves are untouched by any edge.
+    state
+        .sessions
+        .get_mut(&session_id)
+        .unwrap()
+        .write()
+        .entities
+        .get_mut(&doomed_id)
+        .unwrap()
+        .set_exhaustion(4);
+
+    // Apply the SAME wound to each twin.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "target_id": doomed_id,
+            "source_event_sequence": doomed_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["instant_death"], serde_json::json!(true),
+        "{damage} vs exhausted-4 floor -(30/2) = -15 with 14 HP must be instant death"
+    );
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "target_id": spared_id,
+            "source_event_sequence": spared_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["instant_death"], serde_json::json!(false),
+        "the same wound stays short of the RAW -max_hp floor without exhaustion"
+    );
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&doomed_id.to_string()]["is_dead"],
+        serde_json::json!(true),
+        "the massive-damage death must persist to the snapshot"
+    );
+    assert_eq!(
+        snap["entities"][&spared_id.to_string()]["is_dead"],
+        serde_json::json!(false)
+    );
+}
+
 // --- Fail-forward wire-up (audit remediation) -------------------------------
 //
 // The fail-forward resolution engine (CheckOutcomeTier bands + deterministic

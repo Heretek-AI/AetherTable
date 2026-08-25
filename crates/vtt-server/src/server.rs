@@ -3779,9 +3779,13 @@ async fn apply_damage(
             None => return reject(&data, 404, "TARGET_NOT_FOUND", "target no longer exists"),
         };
 
+        // The massive-damage instant-death floor is -(hit point MAXIMUM).
+        // Exhaustion level 4+ halves that maximum (SRD ladder), so the floor
+        // rides `effective_max_hp` — a deeply exhausted creature dies from a
+        // wound a healthy twin would survive.
         let (hp_rem, temp_rem, instant_death) = RulesEvaluator::apply_damage_to_hp(
             target.current_hp,
-            target.max_hp,
+            target.effective_max_hp(),
             target.temp_hp,
             rolled_damage,
         );
@@ -3905,11 +3909,17 @@ async fn heal_entity(
                 .entities
                 .get_mut(&req.entity_id)
                 .expect("existence checked above");
-            let applied = req.amount.min(entity.max_hp - entity.current_hp).max(0);
+            // Exhaustion level 4+ halves the hit-point MAXIMUM (SRD ladder):
+            // healing clamps against the EFFECTIVE max, never the raw one.
+            // (`enforce_exhaustion_hp_cap` inside the mutation below re-clamps
+            // any stale overfill too.)
+            let cap = entity.effective_max_hp();
+            let applied = req.amount.min(cap - entity.current_hp).max(0);
             entity.current_hp += applied;
             if entity.current_hp > 0 && !entity.is_dead {
                 entity.is_conscious = true;
             }
+            entity.enforce_exhaustion_hp_cap();
             let wiped = entity.reset_death_saves_if_healed();
             (applied, entity.current_hp, wiped)
         };
@@ -4368,6 +4378,18 @@ fn ground_roll_in_session(
         entity.position.2,
         spend_inspiration,
     );
+    // SRD exhaustion ladder (iteration 66): `edge_from_conditions` only sees
+    // the attack-roll rung (level >= 3) because it is attack-shaped. These two
+    // routes roll CHECKS and SAVES, so their own rungs fold in here:
+    //   - level >= 1: disadvantage on ability checks
+    //   - level >= 3: disadvantage on saving throws
+    // Disadvantage never cancels an earned advantage here — the caller's SRD
+    // cancellation branch (`disadvantage` wins the merge order) already
+    // resolves combined asks exactly as it does for explicit client flags.
+    let disadvantage = match check_only {
+        true => disadvantage || entity.has_disadvantage_on_checks(),
+        false => disadvantage || entity.has_disadvantage_on_saves(),
+    };
     if spent {
         // Persist the burn and journal exactly ONE spend event so a safety
         // rewind past this roll restores the point.
@@ -5624,14 +5646,41 @@ fn validate_token_move(
             if session.map.solid_cells.is_empty() && session.map.difficult_terrain.is_empty() {
                 return Ok(()); // No authored geometry yet — nothing to violate.
             }
-            // Resolve the entity behind this token by display name.
-            let speed = session
+            // Resolve the entity behind this token by display name. Exhaustion
+            // modifies speed through `effective_speed_feet` — halved at level
+            // 2+, ZERO at level 5+ (SRD ladder) — so a paralyzed-by-fatigue
+            // token cannot be dragged across the board at walking pace. A
+            // zeroed speed still yields a zero cap: no boundary slack is added
+            // for it, and any nonzero hop is refused below.
+            match session
                 .entities
                 .values()
                 .find(|e| e.name.eq_ignore_ascii_case(token_name))
-                .map(|e| e.speed_feet)
-                .unwrap_or(DEFAULT_MOVE_STEP_FEET);
-            (build_collision_grid(&session.map), session.map.cell_size_feet, speed + cell_hint(&session.map))
+            {
+                None => (
+                    build_collision_grid(&session.map),
+                    session.map.cell_size_feet,
+                    DEFAULT_MOVE_STEP_FEET + cell_hint(&session.map),
+                ),
+                Some(entity) => {
+                    let effective = entity.effective_speed_feet();
+                    // Level 5+ zeroes speed outright: no boundary slack may
+                    // resurrect movement from a 0 ft budget. The FIRST drag
+                    // for a token only seeds this process's baseline (no prior
+                    // position to measure against), so it still lands below;
+                    // every subsequent hop is refused as SPEED_ZERO.
+                    let slack = if entity.exhaustion_level() >= 5 {
+                        0.0
+                    } else {
+                        cell_hint(&session.map)
+                    };
+                    (
+                        build_collision_grid(&session.map),
+                        session.map.cell_size_feet,
+                        effective + slack,
+                    )
+                }
+            }
         }
         None => return Ok(()), // Free rooms (e.g. lobby) carry no map constraints.
     };
@@ -5646,6 +5695,12 @@ fn validate_token_move(
         let dx = x - px;
         let dy = y - py;
         let dist = (dx * dx + dy * dy).sqrt();
+        if speed_cap <= 0.0 {
+            return Err(
+                "SPEED_ZERO: exhaustion level 5+ reduces speed to 0 ft — this token cannot move"
+                    .to_string(),
+            );
+        }
         if dist > speed_cap {
             return Err(format!(
                 "MOVE_TOO_FAST: {:.1} ft in one update exceeds {:.1} ft cap",
@@ -6653,5 +6708,88 @@ mod per_seat_projection_tests {
         assert_eq!(DeliveryView::of(Role::Gm), DeliveryView::Gm);
         assert_eq!(DeliveryView::of(Role::Player), DeliveryView::Player);
         assert_eq!(DeliveryView::of(Role::Spectator), DeliveryView::Spectator);
+    }
+}
+
+// --- Exhaustion-modified token-drag validation (iteration 66) ---------------
+//
+// `validate_token_move` is the WS relay's speed cap. Before iteration 66 it
+// read the RAW `speed_feet`, so exhaustion's halved (level 2+) / zeroed
+// (level 5+) speed was invisible to token drags even though the action budget
+// seeded from `effective_speed_feet` correctly.
+#[cfg(test)]
+mod exhaustion_token_move_tests {
+    use super::*;
+    use vtt_core::{AbilityScores, SessionMap};
+
+    fn app_with_token(speed: f32, exhaustion: u8) -> (web::Data<AppState>, Uuid) {
+        let data = web::Data::new(AppState::new());
+        let session_id = Uuid::new_v4();
+        // Movement validation only arms itself once authored geometry exists.
+        let map = SessionMap {
+            solid_cells: vec![(0, 0)],
+            ..Default::default()
+        };
+        let mut session = GameSession::new(session_id, Uuid::new_v4(), "test".to_string());
+        session.map = map;
+        let mut entity = EntityState::new(
+            Uuid::new_v4(),
+            "test_orc".to_string(),
+            "Orc".to_string(),
+            false,
+            20,
+            12,
+            speed,
+            AbilityScores::default(),
+        );
+        entity.set_exhaustion(exhaustion);
+        session.entities.insert(entity.id, entity);
+        data.sessions.insert(session_id, Arc::new(RwLock::new(session)));
+        (data, session_id)
+    }
+
+    fn token_key(name: &str) -> u64 {
+        fnv1a_hash(name)
+    }
+
+    #[test]
+    fn exhaustion_level_5_zeroed_speed_refuses_even_the_smallest_drag() {
+        let (data, room_id) = app_with_token(30.0, 5);
+        let key = token_key("Orc");
+        // Seed the per-token movement baseline at the origin cell.
+        assert!(
+            validate_token_move(&data, &room_id.to_string(), key, "Orc", 25.0, 25.0).is_ok(),
+            "seeding the baseline is not a move and must pass"
+        );
+        let reason = validate_token_move(&data, &room_id.to_string(), key, "Orc", 26.0, 26.0)
+            .expect_err("a zero-speed token must not be able to move at all");
+        assert!(
+            reason.contains("SPEED_ZERO"),
+            "refusal must name the cause, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn exhaustion_level_2_halves_the_token_drag_cap() {
+        let (data, room_id) = app_with_token(30.0, 2);
+        let key = token_key("Orc");
+        assert!(validate_token_move(&data, &room_id.to_string(), key, "Orc", 25.0, 25.0).is_ok());
+        // Effective speed 15 + one cell of boundary slack == a 20 ft cap; a
+        // 22 ft hop fits under the raw 35 ft cap but not the halved one.
+        let reason = validate_token_move(&data, &room_id.to_string(), key, "Orc", 40.6, 40.6)
+            .expect_err("22+ ft exceeds the halved drag cap");
+        assert!(reason.contains("MOVE_TOO_FAST"), "got: {reason}");
+    }
+
+    #[test]
+    fn unexhausted_tokens_keep_the_raw_speed_cap() {
+        let (data, room_id) = app_with_token(30.0, 0);
+        let key = token_key("Orc");
+        assert!(validate_token_move(&data, &room_id.to_string(), key, "Orc", 25.0, 25.0).is_ok());
+        // 34 ft stays inside the raw 30 + 5 slack cap.
+        assert!(
+            validate_token_move(&data, &room_id.to_string(), key, "Orc", 49.05, 49.05).is_ok(),
+            "a healthy token keeps its full drag radius"
+        );
     }
 }

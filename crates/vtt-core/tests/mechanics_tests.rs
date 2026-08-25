@@ -864,6 +864,44 @@ fn test_safety_rewind_restores_exhaustion_from_surviving_long_rest_event() {
     );
 }
 
+#[test]
+fn test_safety_rewind_reapplies_the_halved_hp_cap_when_replaying_deep_exhaustion() {
+    let mut session = session_with_pair();
+    let tired = *session.entities.keys().next().unwrap();
+
+    // A rest event whose payload records exhaustion 4 alongside a FULL refill
+    // (the shape an older build could journal before the effective-max cap
+    // existed). HP replay alone would land at 30; the exhaustion replay runs
+    // AFTER the HP pass precisely so `set_exhaustion` re-clamps to the halved
+    // maximum of 15.
+    let seq_after_rest = append_and_seq(
+        &mut session,
+        tired,
+        "LONG_REST_APPLIED",
+        serde_json::json!({
+            "target_id": tired.to_string(),
+            "hp_remaining": 30,
+            "exhaustion_reduced": true,
+            "exhaustion_level": 4,
+        }),
+    );
+
+    // Live drift past the rewind point: fully rested and unexhausted.
+    {
+        let entity = session.entities.get_mut(&tired).unwrap();
+        entity.set_exhaustion(0);
+        entity.current_hp = 30;
+    }
+
+    session.safety_rewind(seq_after_rest);
+
+    assert_eq!(session.entities[&tired].exhaustion_level(), 4);
+    assert_eq!(
+        session.entities[&tired].current_hp, 15,
+        "restored level-4+ exhaustion must clamp replayed HP back to the halved max"
+    );
+}
+
 // ------------------------------------------------- contest rewind (audit F4)
 //
 // GRAPPLE_ATTEMPTED / SHOVE_ATTEMPTED mutate live state (conditions, position)
