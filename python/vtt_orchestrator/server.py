@@ -13,8 +13,8 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Dict, Any, List, Literal, Optional, Tuple, Union
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Annotated, Dict, Any, List, Literal, Optional, Tuple, Union
 
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
@@ -1534,6 +1534,44 @@ class SpawnActionBudget(BaseModel):
     free_object_interaction: bool
 
 
+# F10 damage-expression grammar: terms are dice ("NdS") or integer constants,
+# joined by +/-, optional leading sign, whitespace allowed between terms.
+# Die sides restricted to the physical/polyhedral set; total dice across all
+# terms <= 40 (matches vtt-core's MAX_SPELL_DICE_COUNT homebrew guard).
+_DAMAGE_EXPR_RE = re.compile(
+    r"^[+-]?\s*(\d*d\d+|\d+)(\s*[+-]\s*(\d*d\d+|\d+))*$"
+)
+_DIE_SIDES_ALLOWED = {4, 6, 8, 10, 12, 20, 100}
+_MAX_TOTAL_DICE = 40
+_MAX_CONSTANT_TERM = 100
+
+
+def _validate_damage_expression(value: str) -> str:
+    if not isinstance(value, str) or not _DAMAGE_EXPR_RE.fullmatch(value.strip()):
+        raise ValueError(
+            "damage_expression must be a dice expression like '2d6+3' "
+            f"(die sides in {sorted(_DIE_SIDES_ALLOWED)}, at most "
+            f"{_MAX_TOTAL_DICE} dice, constant terms within +-{_MAX_CONSTANT_TERM})"
+        )
+    total_dice = 0
+    for count_str, sides_str in re.findall(r"(\d*)d(\d+)", value):
+        sides = int(sides_str)
+        if sides not in _DIE_SIDES_ALLOWED:
+            raise ValueError(f"d{count_str or ''}{sides}: die side must be one of d4/6/8/10/12/20/100")
+        total_dice += int(count_str) if count_str else 1
+        if total_dice > _MAX_TOTAL_DICE:
+            raise ValueError(
+                f"damage_expression exceeds {_MAX_TOTAL_DICE} total dice"
+            )
+    for term in re.findall(r"(?:^|[+-])\s*(\d+)(?![d\d])", value):
+        # Constants only — the negative lookahead above excludes die counts/sides.
+        if int(term) > _MAX_CONSTANT_TERM:
+            raise ValueError(
+                f"constant term {term} exceeds +-{_MAX_CONSTANT_TERM}"
+            )
+    return value
+
+
 class SpawnAttackAction(BaseModel):
     """Mirrors vtt_core::state::AttackAction. Attack bonuses and damage dice
     live HERE on the server-side stat block; clients reference them by index.
@@ -1541,9 +1579,23 @@ class SpawnAttackAction(BaseModel):
     carry anything outside this shape."""
 
     model_config = ConfigDict(extra="forbid")
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     attack_bonus: int = Field(ge=-5, le=30)
+    # F10: the engine's attack route rolls this expression UNCLAMPED (rules.rs
+    # resolve_attack -> dice::roll_expression; clamp_damage_expression covers
+    # only the spell path), and its dice parser allows constant terms up to
+    # +-1e9 each — so "9999d9999" or "2000000000+0" minted at spawn would make
+    # the entity one-shot anything. The grammar below (see
+    # _validate_damage_expression) admits every expression observed in real
+    # content (compendium monsters, SRD spells, weapon tables,
+    # _derive_class_attack) while refusing absurd constants, unknown die
+    # shapes, and non-dice syntax.
     damage_expression: str
+
+    @field_validator("damage_expression")
+    @classmethod
+    def _check_damage_expression(cls, v: str) -> str:
+        return _validate_damage_expression(v)
     damage_type: Literal[
         "slashing", "piercing", "bludgeoning", "fire", "cold", "lightning",
         "thunder", "poison", "acid", "psychic", "radiant", "necrotic", "force",
@@ -1563,26 +1615,36 @@ class EngineSpawnEntity(BaseModel):
 
     Optional-with-default fields match the Rust serde defaults so legacy
     callers that omit them still deserialize identically on both sides.
+
+    F10 magnitude bounds (iteration 15): the engine accepts these stats
+    verbatim and never re-validates magnitudes server-side, so unbounded ints
+    here meant a caller could mint AC 2^31-1 / HP 2^31-1 — mechanically
+    unhittable and unkillable. The caps are set far above every value in the
+    real content corpus (compendium srd_5_1/srd_5_2 monsters top out at AC 25,
+    HP ~700) with generous headroom for homebrew.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    compendium_id: str
-    name: str
+    # Generous headroom over the observed corpus (AC 5..25): the SRD's printed
+    # maximum for a creature is 30 (Tarrasque-adjacent homebrew included).
+    id: str = Field(min_length=1)
+    compendium_id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=120)
     is_player: bool
     owner_player_id: Optional[str] = None
-    current_hp: int
-    max_hp: int
-    temp_hp: int = 0
-    ac: int
-    speed_feet: float = 30.0
+    current_hp: int = Field(ge=0, le=1000)
+    max_hp: int = Field(ge=0, le=1000)
+    temp_hp: int = Field(ge=0, le=100)
+    ac: int = Field(ge=0, le=30)
+    speed_feet: float = Field(ge=0.0, le=200.0, allow_inf_nan=False)
     position: Tuple[float, float, float] = (2.5, 2.5, 0.0)
     zone_id: str = "Zone_Default"
     abilities: SpawnAbilityScores
     conditions: List[Union[str, Tuple[str, int]]] = []
     action_budget: SpawnActionBudget
-    spell_slots_remaining: Dict[int, int] = {}
+    spell_slots_remaining: Dict[Annotated[int, Field(ge=0, le=9)],
+                                Annotated[int, Field(ge=0, le=50)]] = {}
     attacks: List[SpawnAttackAction] = []
     resistances: List[str] = []
     vulnerabilities: List[str] = []
@@ -1593,10 +1655,39 @@ class EngineSpawnEntity(BaseModel):
     is_visible: bool
 
 
+class EngineIngressEvent(BaseModel):
+    """Strict mirror of vtt_core::types::IngressEvent (types.rs) — the typed
+    replacement for the old untyped ``ingress: Dict[str, Any]`` blob that was
+    forwarded verbatim to the engine. extra="forbid" makes smuggled payload
+    fields structurally impossible, matching every other engine proxy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: str
+    # Mirrors the Rust enum's SCREAMING_SNAKE_CASE serde rename (types.rs
+    # IngressType) — the casing the engine's own integration tests use.
+    ingress_type: Literal[
+        "TELEPORTATION", "PORTAL_DOOR", "STEALTH_REVEAL", "BURROWING", "SPAWN_EVENT",
+    ]
+    source_point: Tuple[float, float, float]
+    target_point: Tuple[float, float, float]
+    verified: bool
+
+    @field_validator("source_point", "target_point")
+    @classmethod
+    def _finite_and_bounded(cls, v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        for coord in v:
+            if not math.isfinite(coord) or abs(coord) > 1000.0:
+                raise ValueError(
+                    "ingress coordinates must be finite and within +-1000.0"
+                )
+        return v
+
+
 class EngineSpawnRequest(BaseModel):
     session_id: str
     entity: EngineSpawnEntity
-    ingress: Optional[Dict[str, Any]] = None
+    ingress: Optional[EngineIngressEvent] = None
 
 
 class EngineCastSpellRequest(BaseModel):
@@ -1663,7 +1754,7 @@ async def engine_spawn(req: EngineSpawnRequest, token: str = Depends(_require_au
     if payload.get("owner_player_id") is None:
         payload.pop("owner_player_id")
     if req.ingress is not None:
-        payload["ingress"] = req.ingress
+        payload["ingress"] = req.ingress.model_dump(mode="json")
     return await _engine_call(
         engine_client.engine_request(
             "POST",
