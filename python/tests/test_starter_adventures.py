@@ -54,7 +54,10 @@ def test_list_starter_adventures_exposes_karas():
     meta = karas[0]
     assert meta["title"] == "The Sunken Crypt of Karas"
     assert meta["level_range"] == "1-3"
-    assert meta["encounter_count"] == 3
+    # Iteration 52 depth: entry fight + hazards + mini-boss, five fights total.
+    assert meta["encounter_count"] == 5
+    assert meta["hazard_count"] == 2
+    assert meta["mini_boss"] == "The Vault of House Vane"
 
 
 # --- Bundle construction -------------------------------------------------------
@@ -85,7 +88,8 @@ def test_bundle_contains_structured_adventure_artifact(tmp_path):
 
     artifact = imported["adventure"]
     assert artifact["key"] == starter_adventures.KARAS_KEY
-    assert len(artifact["encounters"]) == 3
+    assert len(artifact["encounters"]) == 5
+    assert len(artifact["encounter_tree"]) == 7
 
     # Layout provenance must be documented in the artifact: either the engine's
     # WFC produced it or the documented in-module fallback did.
@@ -158,7 +162,11 @@ def test_lore_seeds_match_canon_node_ids():
         else:
             # New adventure-local nodes use a namespaced prefix so they can be
             # told apart from canon during retcon audits.
-            assert node["id"].startswith("Location_Sunken_Crypt") or node["id"].startswith("NPC_Karas")
+            assert node["id"].startswith(
+                ("Location_Sunken_Crypt", "Location_Karas", "NPC_Karas",
+                 "Item_Karas", "Faction_Karas")), (
+                f"adventure-local node {node['id']!r} lacks a namespaced prefix"
+            )
 
     for edge in seeds["edges"]:
         assert edge["to"] in seed_ids and edge["from"] in seed_ids
