@@ -251,18 +251,91 @@ all_origins: List[Dict[str, Any]] = _load_json(ORIGINS_FILE)
 all_glossary_terms: List[Dict[str, Any]] = _load_json(GLOSSARY_FILE)
 
 
+# Session-scoped rule-version resolutions are memoized per session id so a
+# burst of compendium/narrative requests does not turn into a burst of
+# gateway->engine GETs (audit F-A3#5). Entries expire after a short TTL — a
+# table switching editions mid-session is picked up within seconds, not
+# never — and only ENGINE-ANSWERED outcomes are cached: an unreachable or
+# not-found session keeps retrying rather than freezing a transient blip.
+_RULE_VERSION_CACHE_TTL_SECONDS = 30.0
+_RULE_VERSION_CACHE_MAX_ENTRIES = 256
+_rule_version_cache: Dict[str, Tuple[float, Tuple[Optional[str], str, str]]] = {}
+
+# Anonymous callers may read any compendium corpus, but per-session edition
+# branching needs a verified identity (audit F-A3#5): without one they get the
+# default corpus plus this reason instead of a free engine round trip.
+_SESSION_CORPUS_AUTH_REASON = (
+    "authentication required for session-scoped corpora"
+)
+
+# Statuses whose outcome is deterministic per snapshot snapshot-of-engine and
+# therefore safe to cache. Connection-level failures stay uncached.
+_CACHEABLE_STATUSES = ("session", "missing_version", "unknown_version")
+
+
+def reset_rule_version_cache() -> None:
+    """Drops every cached resolution immediately (tests and admin tooling)."""
+    _rule_version_cache.clear()
+
+
 async def resolve_session_rule_version(
     engine_session_id: str,
+    token: Optional[str] = None,
 ) -> Tuple[Optional[str], str, str]:
     """Resolves one session's rules baseline from the authoritative engine.
 
-    Returns ``(rule_version_or_None, status, reason)`` where status is one of
-    ``"session"`` (resolved from the live snapshot), ``"unreachable"``,
-    ``"missing_version"`` (snapshot predates preference tracking) or
-    ``"unknown_version"``. Callers fall back to ``default_rule_version`` for
-    every non-"session" status and MUST surface the reason — a table silently
-    running the other edition is worse than a loud provenance field.
+    Requires a verified caller token: anonymous (or invalid-token) callers are
+    answered from ``default_rule_version`` WITHOUT touching the engine and get
+    status ``"unauthenticated"`` with the explicit reason string.
+
+    Returns ``(rule_version_or_None, status, reason)`` where status is exactly
+    one of:
+
+    * ``"session"`` — resolved from the live engine snapshot;
+    * ``"missing_version"`` — the engine answered but the snapshot carries no
+      ``rule_version`` (it predates preference tracking);
+    * ``"unknown_version"`` — the snapshot names a version outside
+      :data:`VALID_RULE_VERSIONS`;
+    * ``"session_not_found"`` — the engine answered 404 for this session id;
+    * ``"unreachable"`` — the engine could not be reached at all (connection
+      failure, or a non-404 HTTP rejection surfaced with its status code);
+    * ``"unauthenticated"`` — no valid caller token was supplied.
+
+    Callers fall back to ``default_rule_version`` for every non-"session"
+    status and MUST surface the reason — a table silently running the other
+    edition is worse than a loud provenance field.
     """
+    if _verify_token(token or "") is None:
+        return None, "unauthenticated", _SESSION_CORPUS_AUTH_REASON
+
+    key = str(engine_session_id)
+    now = time.monotonic()
+    cached = _rule_version_cache.get(key)
+    if cached is not None and now - cached[0] < _RULE_VERSION_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    resolved = await _resolve_session_rule_version_from_engine(engine_session_id)
+    if resolved[1] in _CACHEABLE_STATUSES:
+        if len(_rule_version_cache) >= _RULE_VERSION_CACHE_MAX_ENTRIES:
+            # Evict expired entries first, then the oldest survivor, so the
+            # cache stays bounded under adversarial session-id churn.
+            expired = [
+                k for k, (stamp, _) in _rule_version_cache.items()
+                if now - stamp >= _RULE_VERSION_CACHE_TTL_SECONDS
+            ]
+            for k in expired:
+                del _rule_version_cache[k]
+            while len(_rule_version_cache) >= _RULE_VERSION_CACHE_MAX_ENTRIES:
+                oldest = min(_rule_version_cache, key=lambda k: _rule_version_cache[k][0])
+                del _rule_version_cache[oldest]
+        _rule_version_cache[key] = (now, resolved)
+    return resolved
+
+
+async def _resolve_session_rule_version_from_engine(
+    engine_session_id: str,
+) -> Tuple[Optional[str], str, str]:
+    """Uncached engine lookup behind resolve_session_rule_version."""
     try:
         snapshot = await engine_client.engine_request(
             "GET",
@@ -271,8 +344,19 @@ async def resolve_session_rule_version(
     except engine_client.EngineUnavailableError as exc:
         return None, "unreachable", f"engine unreachable ({exc})"
     except engine_client.EngineRejectedError as exc:
+        if exc.status_code == 404:
+            # A named session that does not exist is a distinct fact from a
+            # dead engine (audit F-A3#6): callers should not be told the
+            # engine is down when it just said "no such session".
+            return None, "session_not_found", (
+                f"engine reports no such session ({exc.status_code})"
+            )
         return None, "unreachable", f"engine rejected session lookup ({exc.status_code})"
     raw = snapshot.get("rule_version")
+    if raw is None:
+        return None, "missing_version", (
+            "session snapshot predates rule_version tracking"
+        )
     if raw not in VALID_RULE_VERSIONS:
         return None, "unknown_version", (
             f"session reported rule_version {raw!r}; expected one of "
@@ -288,9 +372,10 @@ def _versioned_provenance(
     """Maps a resolve_session_rule_version result onto response provenance.
 
     Returns (effective_version, provenance_fields). ``rule_version_source`` is
-    ``"session"`` when the named session decided, ``"default"`` when no session
-    was named, and ``"default_fallback"`` (plus a ``rule_version_reason``) when
-    a named session could not be honored.
+    ``"session"`` when the named session decided (which requires a verified
+    caller — see :func:`resolve_session_rule_version`), ``"default"`` when no
+    session was named, and ``"default_fallback"`` (plus a
+    ``rule_version_reason``) when a named session could not be honored.
     """
     version, status, reason = resolved
     effective = version if version else default_rule_version
@@ -309,7 +394,12 @@ def _versioned_provenance(
 
 
 def _versioned_lists(resolved: Tuple[Optional[str], str, str]) -> Tuple[List, List]:
-    """Spell/monster lists for the resolved version (default on any failure)."""
+    """Spell/monster lists for the resolved version (default on any failure).
+
+    Callers resolve session scope through :func:`resolve_session_rule_version`,
+    which already enforces the authentication gate (audit F-A3#5): anonymous
+    callers receive the default corpus before this function is reached.
+    """
     version = resolved[0] if resolved[0] else default_rule_version
     corpus = compendium_corpora.get(version)
     if not corpus:
@@ -948,11 +1038,18 @@ async def get_compendium_spells(
     limit: int = Query(50, ge=1, le=400),
     engine_session_id: Optional[str] = Query(
         None,
-        description="Prefer this session's persisted rule_version corpus",
+        description=(
+            "Prefer this session's persisted rule_version corpus "
+            "(requires an authenticated caller)"
+        ),
     ),
+    token: Optional[str] = Depends(_token_from),
 ):
+    # Compendium reads stay public; only per-session edition branching needs a
+    # verified caller (audit F-A3#5). Anonymous callers silently get the
+    # default corpus plus the honest fallback reason.
     resolved = (
-        await resolve_session_rule_version(engine_session_id)
+        await resolve_session_rule_version(engine_session_id, token)
         if engine_session_id else (None, "", "")
     )
     spells, _ = _versioned_lists(resolved)
@@ -979,11 +1076,16 @@ async def get_compendium_monsters(
     limit: int = Query(50, ge=1, le=400),
     engine_session_id: Optional[str] = Query(
         None,
-        description="Prefer this session's persisted rule_version corpus",
+        description=(
+            "Prefer this session's persisted rule_version corpus "
+            "(requires an authenticated caller)"
+        ),
     ),
+    token: Optional[str] = Depends(_token_from),
 ):
+    # Same auth gate as /spells: public read, authenticated session branching.
     resolved = (
-        await resolve_session_rule_version(engine_session_id)
+        await resolve_session_rule_version(engine_session_id, token)
         if engine_session_id else (None, "", "")
     )
     _, monsters = _versioned_lists(resolved)
@@ -3247,10 +3349,12 @@ async def stream_narrative_endpoint(
     # Ground the narration in SRD stat blocks whenever the player's action
     # names a known monster or spell — drawn from the NAMED SESSION's edition
     # corpus when one is bound (its persisted rule_version decides), the
-    # default edition otherwise. Provenance rides along in the grounding
-    # context so degraded/offline narration stays attributable.
+    # default edition otherwise. This route already required a token above,
+    # so the resolver's auth gate is satisfied by construction; provenance
+    # rides along in the grounding context so degraded/offline narration
+    # stays attributable.
     resolved = (
-        await resolve_session_rule_version(req.engine_session_id)
+        await resolve_session_rule_version(req.engine_session_id, token)
         if req.engine_session_id else (None, "", "")
     )
     spells, monsters = _versioned_lists(resolved)
@@ -3392,16 +3496,21 @@ async def compendium_lore_lookup(
     k: int = Query(5, ge=1, le=25, description="Top-K entries (semantic mode)"),
     engine_session_id: Optional[str] = Query(
         None,
-        description="Prefer this session's persisted rule_version corpus",
+        description=(
+            "Prefer this session's persisted rule_version corpus "
+            "(requires an authenticated caller)"
+        ),
     ),
+    token: Optional[str] = Depends(_token_from),
 ):
     # Response shape is identical across retrieval modes; the "retrieval"
     # provenance field tells callers which path served the facts:
     # "qdrant-dense-sparse" | "qdrant-dense" | "qdrant-hash-fallback"
     # (vector search — the last one is NOT semantic, just lexical hashing)
     # | "substring" | "substring_fallback".
+    # Same auth gate as /spells and /monsters (audit F-A3#5).
     resolved = (
-        await resolve_session_rule_version(engine_session_id)
+        await resolve_session_rule_version(engine_session_id, token)
         if engine_session_id else (None, "", "")
     )
     spells, monsters = _versioned_lists(resolved)
