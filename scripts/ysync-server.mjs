@@ -21,8 +21,10 @@ const require = createRequire(new URL('../client/package.json', import.meta.url)
 const wsModule = require('ws');
 // ws <8 exposes Server; >=8 exposes WebSocketServer.
 const WebSocketServer = wsModule.WebSocketServer || wsModule.Server;
-const { setupWSConnection, setPersistence } = require('y-websocket/bin/utils');
+const { setupWSConnection, setPersistence, getYDoc } = require('y-websocket/bin/utils');
 const Y = require('yjs');
+const decoding = require('lib0/decoding');
+import { installSpeechGuard } from './ysync_speech_guard.mjs';
 
 const PORT = process.env.PORT || 6380;
 const DATA_DIR = process.env.YSYNC_DATA_DIR || path.join(process.cwd(), 'ydata');
@@ -92,6 +94,80 @@ const server = http.createServer((_req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', setupWSConnection);
 
+// --- Speech-map authorization (audit A2 finding #4) -------------------------
+//
+// Every speech-ledger entry lives under a per-owner key (`user:<userId>`);
+// only that user's own devices may write it. The relay enforces this with
+// per-writer attribution:
+//
+//   1. AWARENESS CLAIM BINDING — each peer's awareness state carries its
+//      clientID and a `user_id` claim. On every awareness update we bind
+//      clientID -> user_id ONLY when the claim matches the connection's
+//      HMAC-verified identity; spoofed claims never become authoritative.
+//   2. DELTA CHECK — every doc update is decoded; speech keys touched are
+//      attributed to their writing clientIDs via step 1. Foreign or
+//      unattributed writes are EVICTED from the room doc, and the corrective
+//      delete-set update repairs every replica that already merged them.
+//
+// RESIDUAL threat model (documented honestly in scripts/ysync_speech_guard.mjs):
+// re-poisoning with a fresh clock re-triggers eviction each time (loud, not
+// silent); unattributed writers fail closed; non-speech maps are out of scope.
+
+/** room name -> guard handle */
+const speechGuards = new Map();
+
+function guardForRoom(roomName) {
+  let guard = speechGuards.get(roomName);
+  if (!guard) {
+    const doc = getYDoc(roomName);
+    guard = installSpeechGuard(doc);
+    doc.on('update', (update) => {
+      try {
+        guard.checkUpdate(update);
+      } catch (e) {
+        console.warn(`[ysync] speech-guard delta check failed for '${roomName}':`, e);
+      }
+    });
+    speechGuards.set(roomName, guard);
+  }
+  return guard;
+}
+
+/**
+ * Validate an awareness update against the connection's verified identity.
+ * The payload layout mirrors y-protocols/awareness#applyAwarenessUpdate:
+ * [varUint count] then per entry [varUint clientID][varUint clock][string JSON].
+ * Claims that match the connection's HMAC-verified identity are bound to
+ * their clientID for speech attribution; mismatched claims are rejected so
+ * they can never bless a foreign speech write.
+ */
+function processAwarenessClaims(roomName, connKey, verifiedUserId, payloadBytes) {
+  if (!verifiedUserId || !payloadBytes?.length) return;
+  const guard = guardForRoom(roomName);
+  try {
+    const decoder = decoding.createDecoder(payloadBytes);
+    const len = decoding.readVarUint(decoder);
+    for (let i = 0; i < len; i++) {
+      const clientId = decoding.readVarUint(decoder);
+      decoding.readVarUint(decoder); // clock — informational only here
+      let claimed;
+      try {
+        const state = JSON.parse(decoding.readVarString(decoder));
+        claimed = state && typeof state === 'object' ? state.user_id : null;
+      } catch {
+        claimed = null; // unparsable state: treat as no claim
+      }
+      if (!guard.bindClaim(verifiedUserId, clientId, claimed)) {
+        console.warn(
+          `[ysync] speech-guard: rejected awareness claim '${claimed}' from conn '${connKey}' (verified as '${verifiedUserId}')`,
+        );
+      }
+    }
+  } catch {
+    /* malformed awareness payload: leave attribution untouched (fail closed) */
+  }
+}
+
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
   // y-websocket providers pass the room name as the pathname; tokens ride
@@ -105,7 +181,34 @@ server.on('upgrade', (request, socket, head) => {
     );
     return;
   }
+  // Room name = pathname minus leading slash and query string (the same slice
+  // setupWSConnection uses as the Y.Doc name).
+  const roomName = decodeURIComponent(url.pathname.slice(1).split('?')[0]);
+  try {
+    guardForRoom(roomName); // ensure the guard exists before any traffic flows
+  } catch (e) {
+    console.warn(`[ysync] speech-guard install failed for '${roomName}':`, e);
+  }
   wss.handleUpgrade(request, socket, head, (ws) => {
+    const connKey = `${roomName}#${identity.user_id}`;
+    // Inspect awareness frames BEFORE y-websocket applies them, so claims are
+    // validated against this connection's HMAC-verified identity.
+    ws.on('message', (data, _isBinary) => {
+      try {
+        const bytes = new Uint8Array(data);
+        if (bytes.length === 0 || bytes[0] !== 1 /* messageAwareness */) return;
+        // Frame layout: [messageType][varUint8Array payload]
+        const decoder = decoding.createDecoder(bytes.subarray(1));
+        processAwarenessClaims(
+          roomName,
+          connKey,
+          identity.user_id,
+          decoding.readVarUint8Array(decoder),
+        );
+      } catch {
+        /* malformed frame: y-websocket's own handler will reject it too */
+      }
+    });
     wss.emit('connection', ws, request);
   });
 });

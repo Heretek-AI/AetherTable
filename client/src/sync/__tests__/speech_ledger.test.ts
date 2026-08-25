@@ -12,10 +12,13 @@ import { describe, expect, it } from 'vitest';
 import {
   clipSegmentsToWindow,
   computeSpotlightWeights,
+  DEFAULT_WINDOW_MS,
   decayedSeconds,
   LocalSpeechLedger,
   MAX_SEGMENT_MS,
+  MAX_SEGMENTS_PER_PEER,
   sanitizeSegments,
+  SPOTLIGHT_WEIGHT_WINDOW_FACTOR,
 } from '../speech_ledger';
 
 const NOW = 1_000_000;
@@ -37,6 +40,69 @@ describe('sanitizeSegments', () => {
   it('clamps runaway durations to MAX_SEGMENT_MS', () => {
     const [seg] = sanitizeSegments([{ s: 1000, e: 1000 + 10 * MAX_SEGMENT_MS }]);
     expect(seg.e - seg.s).toBe(MAX_SEGMENT_MS);
+  });
+});
+
+describe('sanitizeSegments poisoning caps (audit A2 #5)', () => {
+  it('caps the per-peer segment count at MAX_SEGMENTS_PER_PEER', () => {
+    expect(MAX_SEGMENTS_PER_PEER).toBeGreaterThanOrEqual(100);
+    const flood = Array.from({ length: MAX_SEGMENTS_PER_PEER + 500 }, (_, i) => ({
+      s: i * 1000,
+      e: i * 1000 + 500,
+    }));
+    const out = sanitizeSegments(flood);
+    expect(out).toHaveLength(MAX_SEGMENTS_PER_PEER);
+  });
+
+  it('keeps the NEWEST segments when the count cap drops the overflow', () => {
+    // 210 one-second bursts marching forward in time; the oldest must be the
+    // ones dropped, so a live speaker keeps counting while history truncates.
+    const N = MAX_SEGMENTS_PER_PEER + 10;
+    const flood = Array.from({ length: N }, (_, i) => ({ s: i * 1000, e: i * 1000 + 500 }));
+    const out = sanitizeSegments(flood);
+    expect(out[0].s).toBe(10 * 1000); // first ten dropped
+    expect(out[out.length - 1].s).toBe((N - 1) * 1000);
+  });
+
+  it('merges overlapping and contained duplicate intervals instead of double-counting them', () => {
+    const out = sanitizeSegments([
+      { s: 0, e: 100 },
+      { s: 50, e: 150 },   // overlaps → merged into [0,150)
+      { s: 60, e: 80 },    // fully contained → dropped
+      { s: 200, e: 300 },  // disjoint → kept
+      { s: 250, e: 260 },  // contained in the disjoint one → dropped
+    ]);
+    expect(out).toEqual([
+      { s: 0, e: 150 },
+      { s: 200, e: 300 },
+    ]);
+  });
+
+  it('merges adjacent back-to-back bursts (touching intervals) into one', () => {
+    expect(sanitizeSegments([{ s: 0, e: 100 }, { s: 100, e: 200 }])).toEqual([
+      { s: 0, e: 200 },
+    ]);
+  });
+
+  it('is idempotent: sanitizing already-sanitized output is a no-op', () => {
+    const once = sanitizeSegments([
+      { s: 0, e: 100 },
+      { s: 90, e: 120 },
+      null,
+      { s: 'x' as unknown as number, e: 1 },
+    ]);
+    expect(sanitizeSegments(once)).toEqual(once);
+  });
+
+  it('still clamps durations AFTER merging, so a merge cannot smuggle in a marathon', () => {
+    // Two chained 90-second overlaps fuse into a ~3-minute span; the clamp
+    // must reapply to the merged interval.
+    const out = sanitizeSegments([
+      { s: 0, e: 90_000 },
+      { s: 89_000, e: 179_000 },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].e - out[0].s).toBe(MAX_SEGMENT_MS);
   });
 });
 
@@ -215,7 +281,77 @@ describe('computeSpotlightWeights', () => {
   it('refuses to compute from a non-finite clock', () => {
     expect(computeSpotlightWeights([{ user_id: 'a', name: 'A', segments: [{ s: 0, e: 5 }] }], { nowMs: NaN })).toEqual([]);
   });
+
+  it('caps one hostile peer at a fraction of the window so it cannot own normalization (audit A2 #4)', () => {
+    expect(SPOTLIGHT_WEIGHT_WINDOW_FACTOR).toBeGreaterThan(0);
+    expect(SPOTLIGHT_WEIGHT_WINDOW_FACTOR).toBeLessThan(1);
+    const ceilingSeconds = (DEFAULT_WINDOW_MS * SPOTLIGHT_WEIGHT_WINDOW_FACTOR) / 1000;
+    // Sanity: the cap demonstrably binds. The most damage the #5 caps allow a
+    // single key to carry is ~5 non-overlapping clamped bursts across the
+    // window (~600 raw seconds); decay still pulls that under 150s here, so
+    // assert instead that the ceiling binds against an aggressive half-life
+    // (no decay) where the same flood scores far above it.
+    const flood = Array.from({ length: 5 }, (_, i) => ({
+      s: NOW - (i + 1) * 120_000 + 1_000,
+      e: NOW - (i + 1) * 120_000 + 120_000,
+    }));
+    const rawNoDecay = decayedSeconds(
+      clipSegmentsToWindow(sanitizeSegments(flood), NOW, DEFAULT_WINDOW_MS),
+      NOW,
+      Infinity,
+    );
+    expect(rawNoDecay).toBeGreaterThan(ceilingSeconds);
+
+    const [poisoner] = computeSpotlightWeights(
+      [{ user_id: 'evil', name: 'Evil', segments: flood.slice() }],
+      { nowMs: NOW, halfLifeMs: Infinity },
+    );
+    // The ceiling binds exactly at the boundary — no free seconds above it.
+    expect(poisoner.weightedSeconds).toBe(ceilingSeconds);
+    // Alone in the ledger it is still normalized to the whole pie — the cap
+    // bounds absolute weight, not presence.
+    expect(poisoner.share).toBe(1);
+  });
+
+  it('stops a flooder from holding a majority against several honest speakers', () => {
+    const ceilingSeconds = (DEFAULT_WINDOW_MS * SPOTLIGHT_WEIGHT_WINDOW_FACTOR) / 1000;
+    const flood = Array.from({ length: 5 }, (_, i) => ({
+      s: NOW - (i + 1) * 120_000 + 1_000,
+      e: NOW - (i + 1) * 120_000 + 120_000,
+    }));
+    // Two honest table members who each really talked for ~100 fresh seconds.
+    const honestSegments = [{ s: NOW - 105_000, e: NOW - 5_000 }];
+    const weights = computeSpotlightWeights(
+      [
+        { user_id: 'evil', name: 'Evil', segments: flood },
+        { user_id: 'alice', name: 'Alice', segments: honestSegments },
+        { user_id: 'bob', name: 'Bob', segments: honestSegments },
+      ],
+      { nowMs: NOW, halfLifeMs: DEFAULT_HALF_LIFE_MS_FOR_TEST },
+    );
+    const evil = weights.find((w) => w.userId === 'evil')!;
+    expect(evil.weightedSeconds).toBeLessThanOrEqual(ceilingSeconds);
+    // No single peer — hostile or not — may command the majority share.
+    expect(evil.share).toBeLessThan(0.5);
+  });
+
+  it('leaves honest speakers strictly under the ceiling completely untouched', () => {
+    const modest = [{ s: NOW - 105_000, e: NOW - 5_000 }];
+    const expected = decayedSeconds(modest, NOW, DEFAULT_HALF_LIFE_MS_FOR_TEST);
+    const weights = computeSpotlightWeights(
+      [
+        { user_id: 'a', name: 'Ada', segments: modest },
+        { user_id: 'b', name: 'Bo', segments: modest },
+      ],
+      { nowMs: NOW, halfLifeMs: DEFAULT_HALF_LIFE_MS_FOR_TEST },
+    );
+    expect(weights.map((w) => w.weightedSeconds)).toEqual([expected, expected]);
+  });
 });
+
+// Half-life short enough that the flooded history decays hard and the
+// ceiling-vs-honesty contrast above is unambiguous.
+const DEFAULT_HALF_LIFE_MS_FOR_TEST = 60_000;
 
 describe('LocalSpeechLedger', () => {
   it('records nothing until VAD actually reports speech', () => {

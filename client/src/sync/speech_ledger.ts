@@ -17,6 +17,11 @@
  *     `user:<userId>` key (same per-owner keying convention as fog layers),
  *     so cross-peer merges are conflict-free and every client converges on
  *     the same ledger before recomputing weights locally.
+ *
+ * Poison resistance (audit A2 #4/#5): sanitizeSegments caps one peer's entry
+ * at MAX_SEGMENTS_PER_PEER merged intervals and computeSpotlightWeights caps
+ * any single peer's weightedSeconds at a fraction of the window, so neither a
+ * wedged VAD loop nor hostile CRDT data can dominate the balance view.
  */
 
 /** One closed VAD speech burst, epoch-ms inclusive-exclusive [s, e). */
@@ -70,16 +75,45 @@ export const DEFAULT_HALF_LIFE_MS = 3 * 60_000;
 export const MAX_SEGMENT_MS = 2 * 60_000;
 
 /**
+ * Hard cap on the number of segments ONE peer's ledger entry may carry.
+ *
+ * Audit A2 #5: a wedged VAD loop (or a hostile peer writing raw Y.Doc frames)
+ * could otherwise grow `closed[]` without bound, bloating every replica and
+ * the persisted relay snapshot. When the cap overflows, the OLDEST segments
+ * are dropped first — live speech keeps counting while stale history
+ * truncates — and overlapping intervals are merged beforehand so the cap
+ * measures real distinct talking time, not duplicate spam.
+ */
+export const MAX_SEGMENTS_PER_PEER = 200;
+
+/**
+ * Ceiling on how much of the spotlight normalization ONE peer's weighted
+ * seconds may occupy, expressed as a fraction of the sliding window length.
+ *
+ * Audit A2 #4 defense in depth: even with client-side identity binding,
+ * relay-side eviction, per-segment clamps and count caps, residual hostile
+ * data can still reach a replica (e.g. a fresh-clock re-poison between
+ * evictions). This ceiling bounds what any such residue can do: no single
+ * peer's weightedSeconds may exceed `windowMs × factor` worth of seconds, so
+ * a poisoner can never dominate the normalized shares beyond that bound.
+ */
+export const SPOTLIGHT_WEIGHT_WINDOW_FACTOR = 0.25;
+
+/**
  * Coerce arbitrary (possibly tampered / partially-written / pre-schema) data
  * into valid segments. Rejects non-finite numbers, inverted or zero-length
- * ranges, and clamps runaway durations to MAX_SEGMENT_MS.
+ * ranges, clamps runaway durations to MAX_SEGMENT_MS, MERGES overlapping or
+ * touching intervals so duplicate spam cannot inflate counted time, and caps
+ * the result at MAX_SEGMENTS_PER_PEER entries — dropping the OLDEST first so
+ * a live speaker keeps counting while history truncates.
  */
 export function sanitizeSegments(
   raw: unknown,
   maxSegmentMs: number = MAX_SEGMENT_MS,
 ): SpeechSegment[] {
   if (!Array.isArray(raw)) return [];
-  const out: SpeechSegment[] = [];
+  // Pass 1: coerce + validate, keeping only well-formed ranges in input order.
+  const valid: Array<{ s: number; e: number }> = [];
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) continue;
     const rec = item as Record<string, unknown>;
@@ -87,10 +121,25 @@ export function sanitizeSegments(
     const e = typeof rec.e === 'number' ? rec.e : NaN;
     if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
     if (e <= s) continue;
-    const dur = Math.min(e - s, maxSegmentMs);
-    out.push({ s, e: s + dur });
+    valid.push({ s, e });
   }
-  return out;
+  // Pass 2: sort by start and fuse overlapping/touching intervals; the clamp
+  // is applied to each MERGED interval afterwards, so chaining overlaps can't
+  // smuggle a marathon past MAX_SEGMENT_MS.
+  valid.sort((a, b) => a.s - b.s || a.e - b.e);
+  const merged: SpeechSegment[] = [];
+  for (const seg of valid) {
+    const last = merged[merged.length - 1];
+    if (last && seg.s <= last.e) {
+      last.e = Math.min(Math.max(last.e, seg.e), last.s + maxSegmentMs);
+    } else {
+      merged.push({ s: seg.s, e: Math.min(seg.e, seg.s + maxSegmentMs) });
+    }
+  }
+  // Pass 3: enforce the per-peer cap, oldest first.
+  return merged.length > MAX_SEGMENTS_PER_PEER
+    ? merged.slice(merged.length - MAX_SEGMENTS_PER_PEER)
+    : merged;
 }
 
 /**
@@ -143,6 +192,13 @@ export function decayedSeconds(
  * every replica renders the same ranking from the same merged ledger. Empty
  * input, or a table where nobody has spoken inside the window, yields []
  * — callers must render that honestly rather than substituting demo weights.
+ *
+ * POISON CEILING (audit A2 #4): each peer's weightedSeconds is capped at
+ * `windowMs × SPOTLIGHT_WEIGHT_WINDOW_FACTOR` worth of seconds. This is the
+ * last line of defense behind publishSpeech identity binding and the relay's
+ * speech-key eviction: even if hostile segment data reaches this function, it
+ * cannot push one peer's share arbitrarily close to 1 and silence everyone
+ * else.
  */
 export function computeSpotlightWeights(
   entries: LedgerEntry[],
@@ -150,6 +206,9 @@ export function computeSpotlightWeights(
 ): SpeakerWeight[] {
   const { nowMs, windowMs = DEFAULT_WINDOW_MS, halfLifeMs = DEFAULT_HALF_LIFE_MS } = options;
   if (!Number.isFinite(nowMs)) return [];
+  const perUserCeilingSeconds = Number.isFinite(windowMs)
+    ? Math.max(0, (windowMs * SPOTLIGHT_WEIGHT_WINDOW_FACTOR) / 1000)
+    : Infinity;
 
   const rows: Array<{ userId: string; name: string; weightedSeconds: number }> = [];
   const seen = new Set<string>();
@@ -158,7 +217,10 @@ export function computeSpotlightWeights(
     if (seen.has(entry.user_id)) continue; // first occurrence wins; no double counting
     seen.add(entry.user_id);
     const clipped = clipSegmentsToWindow(sanitizeSegments(entry.segments), nowMs, windowMs);
-    const weightedSeconds = decayedSeconds(clipped, nowMs, halfLifeMs);
+    const weightedSeconds = Math.min(
+      decayedSeconds(clipped, nowMs, halfLifeMs),
+      perUserCeilingSeconds,
+    );
     if (!(weightedSeconds > 0)) continue;
     rows.push({
       userId: entry.user_id,

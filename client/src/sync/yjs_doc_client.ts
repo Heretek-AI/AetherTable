@@ -467,8 +467,20 @@ export class YjsCrdtClient {
    * no session token the provider never connects and this write lands only
    * in our local Y.Doc + IndexedDB — a genuinely local-only ledger, which is
    * exactly what App.tsx labels it as.
+   *
+   * IDENTITY BINDING (audit A2 #4): `userId` MUST equal the identity stamped
+   * by setLocalUser. Without this check any code path (or tampered caller)
+   * could publish under ANOTHER user's key and inflate their talking time,
+   * distorting Pillar-11 spotlight balancing. A mismatch throws before any
+   * CRDT write happens — fail loudly rather than silently poisoning shared
+   * state; App.tsx only ever passes the signed-in user's id.
    */
   public publishSpeech(userId: string, name: string, segments: SpeechSegment[]): void {
+    if (userId !== this.localUserId || userId === '') {
+      throw new Error(
+        `[YjsSync] publishSpeech refused: key 'user:${userId}' does not match this client's bound identity '${this.localUserId}'. Speech entries may only be written by their own user.`,
+      );
+    }
     const clean = sanitizeSegments(segments);
     this.speech.set(`user:${userId}`, {
       user_id: userId,
@@ -522,6 +534,13 @@ export class YjsCrdtClient {
     name: string,
     snapshotFn: () => SpeechSegment[],
   ): void {
+    // Same identity contract as publishSpeech — validate up front so a
+    // foreign key cannot ride the throttle's deferred trailing edge either.
+    if (userId !== this.localUserId || userId === '') {
+      throw new Error(
+        `[YjsSync] scheduleLiveSpeechPublish refused: key 'user:${userId}' does not match this client's bound identity '${this.localUserId}'.`,
+      );
+    }
     if (this.speechThrottleTimer !== null) {
       this.pendingSpeechPublish = true;
       return;

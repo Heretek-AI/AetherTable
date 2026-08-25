@@ -31,7 +31,12 @@ vi.stubGlobal('IDBKeyRange', {});
 vi.stubGlobal('WebSocket', class { constructor() { throw new Error('no WS in tests'); } });
 
 import { YjsCrdtClient } from '../yjs_doc_client';
-import type { SpotlightView } from '../speech_ledger';
+import {
+  computeSpotlightWeights,
+  DEFAULT_WINDOW_MS,
+  SPOTLIGHT_WEIGHT_WINDOW_FACTOR,
+  type SpotlightView,
+} from '../speech_ledger';
 
 /**
  * Pair two clients through an in-memory bidirectional update relay,
@@ -87,6 +92,9 @@ describe('YjsCrdtClient speech ledger convergence', () => {
     const phone = makeClient();
     const laptop = makeClient(); // same human, second device
     pairClients(phone, laptop);
+    // Both devices are legitimately bound to the same human identity.
+    phone.setLocalUser({ user_id: 'p1', name: 'Thorin' });
+    laptop.setLocalUser({ user_id: 'p1', name: 'Thorin' });
 
     const NOW = 2_000_000;
     // Both devices write the SAME user key; Y.Map resolves LWW per key, and
@@ -134,5 +142,111 @@ describe('YjsCrdtClient speech ledger convergence', () => {
     expect(view.shares).toHaveLength(1);
     expect(view.shares[0].userId).toBe('u9');
     expect(view.shares[0].name).toBe('u9');
+  });
+
+  it('caps a hostile peer at the weight ceiling so it cannot own normalization', () => {
+    const victim = makeClient();
+    const poisoner = makeClient();
+    pairClients(victim, poisoner);
+
+    const NOW = Date.now();
+    poisoner.setLocalUser({ user_id: 'mallory', name: 'Mallory' });
+    victim.setLocalUser({ user_id: 'honest', name: 'Honest' });
+
+    // Mallory publishes a wall of clamped bursts spread across the window —
+    // the most damage a single key can legally carry after sanitizeSegments —
+    // while the honest peer spoke only ~100 fresh seconds.
+    const flood = Array.from({ length: 5 }, (_, i) => ({
+      s: NOW - (i + 1) * 120_000 + 1_000,
+      e: NOW - (i + 1) * 120_000 + 120_000,
+    }));
+    poisoner.publishSpeech('mallory', 'Mallory', flood);
+    victim.publishSpeech('honest', 'Honest', [{ s: NOW - 105_000, e: NOW - 5_000 }]);
+
+    const view = victim.getSpotlightView(NOW);
+    const honest = view.shares.find((w) => w.userId === 'honest');
+    const evil = view.shares.find((w) => w.userId === 'mallory');
+    expect(honest).toBeDefined();
+    expect(evil).toBeDefined();
+    // The flooder is pinned at the ceiling (default half-life still leaves
+    // the packed bursts above it) while the honest peer's ~100 fresh seconds
+    // land just below — the point is the CEILING, not a rank flip: without
+    // it, Mallory's raw flood would be far larger.
+    expect(evil!.weightedSeconds).toBe(150); // exactly windowMs × factor / 1000
+    expect(evil!.weightedSeconds).toBeGreaterThanOrEqual(honest!.weightedSeconds);
+    // But the honest speaker's weight equals their un-capped decayed time:
+    const uncapped = computeSpotlightWeights(
+      [{ user_id: 'honest', name: 'Honest', segments: [{ s: NOW - 105_000, e: NOW - 5_000 }] }],
+      { nowMs: NOW },
+    );
+    expect(honest!.weightedSeconds).toBe(uncapped[0].weightedSeconds);
+    // And the flooder's weighted seconds cannot exceed the documented ceiling.
+    expect(evil!.weightedSeconds).toBeLessThanOrEqual(
+      (DEFAULT_WINDOW_MS * SPOTLIGHT_WEIGHT_WINDOW_FACTOR) / 1000
+    );
+  });
+});
+
+describe('YjsCrdtClient publishSpeech identity binding (audit A2 #4)', () => {
+  const clients: YjsCrdtClient[] = [];
+
+  afterEach(() => {
+    while (clients.length) clients.pop()?.destroy();
+    vi.restoreAllMocks();
+  });
+
+  const makeClient = (): YjsCrdtClient => {
+    const client = new YjsCrdtClient('', 'test-room');
+    clients.push(client);
+    return client;
+  };
+
+  it('rejects writes under a key that does not match the bound identity', () => {
+    const c = makeClient();
+    c.setLocalUser({ user_id: 'alice', name: 'Alice' });
+    expect(() => c.publishSpeech('bob', 'Bob', [{ s: 1, e: 2 }])).toThrow(/bound identity/);
+    // Nothing landed in the ledger under the foreign key.
+    expect(c.getSpeechLedger()).toHaveLength(0);
+  });
+
+  it('accepts writes only under its own bound key', () => {
+    const c = makeClient();
+    c.setLocalUser({ user_id: 'alice', name: 'Alice' });
+    c.publishSpeech('alice', 'Alice', [{ s: Date.now() - 5_000, e: Date.now() - 1_000 }]);
+    expect(c.getSpeechLedger()).toHaveLength(1);
+    expect(c.getSpeechLedger()[0].user_id).toBe('alice');
+  });
+
+  it('never lets a caller publish under an empty or unbound identity', () => {
+    const c = makeClient(); // setLocalUser never called → no identity bound
+    expect(() => c.publishSpeech('anyone', 'X', [])).toThrow(/bound identity/);
+    c.setLocalUser({ user_id: 'alice', name: 'Alice' });
+    // Bound now, but the userId argument must still MATCH it exactly.
+    expect(() => c.publishSpeech('', 'X', [])).toThrow(/bound identity/);
+    expect(c.getSpeechLedger()).toHaveLength(0);
+  });
+
+  it('refuses to publish when the bound identity CHANGES mid-session to something else', () => {
+    const c = makeClient();
+    c.setLocalUser({ user_id: 'alice', name: 'Alice' });
+    c.setLocalUser({ user_id: 'carol', name: 'Carol' }); // re-login as Carol
+    // Alice's stale key is no longer ours; publishing as her must fail.
+    expect(() => c.publishSpeech('alice', 'Alice', [])).toThrow(/bound identity/);
+    c.publishSpeech('carol', 'Carol', []);
+    expect(c.getSpeechLedger().map((e) => e.user_id)).toEqual(['carol']);
+  });
+
+  it('does not mutate shared state on a rejected cross-user write (no partial entry)', () => {
+    const a = makeClient();
+    const b = makeClient();
+    pairClients(a, b);
+    a.setLocalUser({ user_id: 'a', name: 'A' });
+    b.setLocalUser({ user_id: 'b', name: 'B' });
+
+    b.publishSpeech('b', 'B', [{ s: Date.now() - 5_000, e: Date.now() - 1_000 }]);
+    // A malicious call from B's replica targeting A's key is rejected before
+    // any CRDT write happens, so nothing propagates to A.
+    expect(() => b.publishSpeech('a', 'A-impersonated', [{ s: 1, e: 999_999 }])).toThrow();
+    expect(a.getSpeechLedger().map((e) => e.user_id)).toEqual(['b']);
   });
 });
