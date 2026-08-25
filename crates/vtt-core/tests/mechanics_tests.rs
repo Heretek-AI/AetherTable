@@ -1993,6 +1993,341 @@ fn test_safety_rewind_past_help_clears_the_token_and_refunds_the_action() {
     assert!(!session.consume_help_advantage(ally_id, enemy_id));
 }
 
+// ------------------------------------------------------- Inspiration (P5)
+
+/// Grant/revoke lifecycle: flag flips, ledger records every transition.
+#[test]
+fn test_inspiration_grant_revoke_lifecycle_and_ledger() {
+    let (mut session, hero_id, _ally_id, _enemy_id) = session_trio();
+
+    assert!(
+        !session.entities[&hero_id].inspiration,
+        "fresh entities hold no inspiration"
+    );
+
+    session.grant_inspiration(hero_id, Some("heroic roleplay")).unwrap();
+    assert!(session.entities[&hero_id].inspiration);
+
+    session.revoke_inspiration(hero_id, Some("GM fiat")).unwrap();
+    assert!(!session.entities[&hero_id].inspiration);
+
+    let inspiration_events: Vec<_> = session
+        .ledger
+        .events
+        .iter()
+        .filter(|e| e.event_type == "INSPIRATION_CHANGED")
+        .collect();
+    assert_eq!(inspiration_events.len(), 2, "one event per grant and one per revoke");
+    assert_eq!(
+        inspiration_events[0].payload.get("granted").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        inspiration_events[1].payload.get("granted").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        inspiration_events[0].payload.get("reason").and_then(|v| v.as_str()),
+        Some("heroic roleplay")
+    );
+}
+
+/// RAW: a character can hold at most one point of inspiration.
+#[test]
+fn test_inspiration_is_capped_at_one() {
+    let (mut session, hero_id, _ally_id, _enemy_id) = session_trio();
+
+    session.grant_inspiration(hero_id, None).unwrap();
+    let err = session.grant_inspiration(hero_id, None).unwrap_err();
+    assert_eq!(err, "INSPIRATION_ALREADY_HELD");
+    assert!(
+        session.entities[&hero_id].inspiration,
+        "a rejected over-grant leaves the held point intact"
+    );
+}
+
+#[test]
+fn test_inspiration_grant_revoke_reject_missing_entities_and_empty_revokes() {
+    let (mut session, hero_id, _ally_id, _enemy_id) = session_trio();
+
+    assert_eq!(
+        session.grant_inspiration(Uuid::new_v4(), None).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+    assert_eq!(
+        session.revoke_inspiration(Uuid::new_v4(), None).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+    // Nothing to revoke yet.
+    assert_eq!(
+        session.revoke_inspiration(hero_id, None).unwrap_err(),
+        "INSPIRATION_NOT_HELD"
+    );
+}
+
+/// Spending is atomic with the edge computation: the FIRST spend flips the
+/// flag off and yields advantage; a second spend finds nothing to burn.
+#[test]
+fn test_spend_inspiration_consumes_atomically_at_the_edge_computation() {
+    let (mut session, attacker_id, _ally_id, target_id) = session_trio();
+
+    session.grant_inspiration(attacker_id, None).unwrap();
+    {
+        // Take the attacker OUT so we can also look up the target without a
+        // borrow-checker collision (the engine API wants &mut attacker and
+        // &target borrowed simultaneously, and HashMap can't split).
+        let mut attacker = session.entities.remove(&attacker_id).unwrap();
+        let target = &session.entities[&target_id];
+        let (advantage, _disadvantage, consumed) =
+            RulesEvaluator::edge_from_conditions_with_inspiration(
+                &mut attacker, target, 5.0, 0.0, 0.0, true,
+            );
+        assert!(advantage, "spent inspiration grants advantage");
+        assert!(consumed, "the spend reports consumption for the response body");
+        session.entities.insert(attacker.id, attacker);
+    }
+    assert!(
+        !session.entities[&attacker_id].inspiration,
+        "the point is burned by the roll that used it"
+    );
+    assert!(
+        session
+            .ledger
+            .events
+            .iter()
+            .any(|e| e.event_type == "INSPIRATION_CHANGED"),
+        "the spend is journaled so a rewind can restore it"
+    );
+
+    // Second roll: nothing left to burn.
+    let mut attacker = session.entities.remove(&attacker_id).unwrap();
+    let target = &session.entities[&target_id];
+    let (_, _, consumed) = RulesEvaluator::edge_from_conditions_with_inspiration(
+        &mut attacker, target, 5.0, 0.0, 0.0, true,
+    );
+    assert!(!consumed);
+    assert!(!attacker.inspiration);
+    session.entities.insert(attacker.id, attacker);
+}
+
+/// Advantage and disadvantage CANCEL per SRD: spending inspiration into an
+/// already-disadvantaged edge buys nothing, so it must not be consumed —
+/// the player keeps the point instead of wasting it on a cancelled pair.
+#[test]
+fn test_inspiration_spend_is_not_consumed_when_disadvantage_would_cancel_it() {
+    let (mut session, attacker_id, _ally_id, target_id) = session_trio();
+
+    session.grant_inspiration(attacker_id, None).unwrap();
+    session.entities
+        .get_mut(&attacker_id)
+        .unwrap()
+        .add_condition(Condition::Poisoned); // disadvantage on attacks
+
+    {
+        let mut attacker = session.entities.remove(&attacker_id).unwrap();
+        let target = &session.entities[&target_id];
+        let (advantage, disadvantage, consumed) =
+            RulesEvaluator::edge_from_conditions_with_inspiration(
+                &mut attacker, target, 5.0, 0.0, 0.0, true,
+            );
+        assert!(!advantage && disadvantage, "the pair still cancels to a straight d20");
+        assert!(!consumed, "no advantage was bought, so no point burns");
+        session.entities.insert(attacker.id, attacker);
+    }
+    assert!(
+        session.entities[&attacker_id].inspiration,
+        "the player keeps their inspiration"
+    );
+}
+
+/// A spend request from someone holding nothing changes neither the edge nor
+/// any state — it is a silent no-op, not an error.
+#[test]
+fn test_inspiration_spend_without_a_held_point_is_a_noop() {
+    let (mut session, attacker_id, _ally_id, target_id) = session_trio();
+
+    {
+        let mut attacker = session.entities.remove(&attacker_id).unwrap();
+        let target = &session.entities[&target_id];
+        let (advantage, disadvantage, consumed) =
+            RulesEvaluator::edge_from_conditions_with_inspiration(
+                &mut attacker, target, 5.0, 0.0, 0.0, true,
+            );
+        assert!(!advantage && !disadvantage && !consumed);
+        session.entities.insert(attacker.id, attacker);
+    }
+    assert!(!session.entities[&attacker_id].inspiration);
+}
+
+/// Rewinding past the SPEND replays the surviving GRANT: the player gets
+/// their point back because the roll that burned it never happened.
+#[test]
+fn test_safety_rewind_restores_spent_inspiration() {
+    let (mut session, hero_id, _ally_id, _enemy_id) = session_trio();
+    session.grant_inspiration(hero_id, None).unwrap();
+    let after_grant_sequence = session.ledger.current_sequence;
+
+    // Spend it (consume path journals INSPIRATION_CHANGED granted=false).
+    assert!(session.consume_inspiration(hero_id));
+    assert!(!session.entities[&hero_id].inspiration);
+
+    session.safety_rewind(after_grant_sequence);
+
+    assert!(
+        session.entities[&hero_id].inspiration,
+        "rewind past the spend restores the surviving grant"
+    );
+}
+
+/// Rewinding past the GRANT itself strips the point: no surviving event
+/// vouches for it anymore.
+#[test]
+fn test_safety_rewind_past_the_grant_strips_inspiration() {
+    let (mut session, hero_id, _ally_id, _enemy_id) = session_trio();
+    let pre_grant_sequence = session.ledger.current_sequence;
+    session.grant_inspiration(hero_id, None).unwrap();
+    assert!(session.entities[&hero_id].inspiration);
+
+    session.safety_rewind(pre_grant_sequence);
+
+    assert!(!session.entities[&hero_id].inspiration);
+}
+
+// ------------------------------------------- Help on ability checks (P3)
+
+/// Help used on an ABILITY CHECK stores its promise ON THE BENEFICIARY (they
+/// make the check), spends the helper's Action, and is cashed exactly once.
+#[test]
+fn test_help_check_spends_action_and_grants_one_consumable_check_advantage() {
+    let (mut session, helper_id, ally_id, _enemy_id) = session_trio();
+
+    session.take_help_check(helper_id, ally_id).unwrap();
+
+    assert_eq!(
+        session.entities[&ally_id].next_check_has_advantage_from,
+        Some(helper_id.to_string()),
+        "the promise lives on the checker, naming the helper"
+    );
+    assert!(
+        !session.entities[&helper_id].action_budget.action,
+        "Help spends the helper's Action whether aiding an attack or a check"
+    );
+    assert!(
+        session
+            .ledger
+            .events
+            .iter()
+            .any(|e| e.event_type == "HELP_CHECK_ACTION")
+    );
+
+    // The beneficiary's NEXT ability check cashes it exactly once...
+    assert!(session.consume_help_check_advantage(ally_id));
+    assert!(session.entities[&ally_id].next_check_has_advantage_from.is_none());
+    // ...and a later check gets nothing.
+    assert!(!session.consume_help_check_advantage(ally_id));
+}
+
+#[test]
+fn test_take_help_check_rejects_invalid_targets_exhausted_actions_and_distance() {
+    let (mut session, helper_id, ally_id, enemy_id) = session_trio();
+
+    assert_eq!(
+        session.take_help_check(helper_id, helper_id).unwrap_err(),
+        "SELF_TARGET_INVALID"
+    );
+    assert_eq!(
+        session.take_help_check(Uuid::new_v4(), ally_id).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+    assert_eq!(
+        session.take_help_check(helper_id, Uuid::new_v4()).unwrap_err(),
+        "TARGET_NOT_FOUND"
+    );
+
+    // Reach gate: the helper must be able to physically assist.
+    session.entities.get_mut(&ally_id).unwrap().position = (20.0, 20.0, 0.0);
+    assert_eq!(
+        session.take_help_check(helper_id, ally_id).unwrap_err(),
+        "OUT_OF_REACH"
+    );
+    session.entities.get_mut(&ally_id).unwrap().position = (2.6, 2.6, 0.0);
+
+    // Action economy: the helper has no Action left.
+    session.entities.get_mut(&helper_id).unwrap().action_budget.action = false;
+    assert_eq!(
+        session.take_help_check(helper_id, ally_id).unwrap_err(),
+        "ACTION_ECONOMY_EXHAUSTED"
+    );
+    session.entities.get_mut(&helper_id).unwrap().action_budget.action = true;
+
+    // An incapacitated helper cannot assist either.
+    session.entities
+        .get_mut(&helper_id)
+        .unwrap()
+        .add_condition(Condition::Unconscious);
+    assert_eq!(
+        session.take_help_check(helper_id, ally_id).unwrap_err(),
+        "ENTITY_CANNOT_ACT"
+    );
+
+    // Nor can anyone help a dead beneficiary with a check.
+    session.entities.get_mut(&helper_id).unwrap().conditions.clear();
+    session.entities.get_mut(&enemy_id).unwrap().is_dead = true;
+    assert_eq!(
+        session.take_help_check(helper_id, enemy_id).unwrap_err(),
+        "TARGET_ALREADY_DEAD"
+    );
+    // And none of the rejections above spent the helper's Action.
+    session.entities.get_mut(&helper_id).unwrap().action_budget.action = true;
+}
+
+/// A stale check-help promise whose helper has left the session is discarded
+/// without granting anything.
+#[test]
+fn test_help_check_promise_dies_with_its_helper() {
+    let (mut session, helper_id, ally_id, _enemy_id) = session_trio();
+    session.take_help_check(helper_id, ally_id).unwrap();
+
+    session.remove_entity(&helper_id, "left the table");
+
+    assert!(
+        !session.consume_help_check_advantage(ally_id),
+        "a departed helper cannot keep the promise"
+    );
+}
+
+/// Check-help is turn-scoped like attack-help: the round refresh clears an
+/// unconsumed promise.
+#[test]
+fn test_round_refresh_clears_an_unconsumed_help_check_token() {
+    let (mut session, helper_id, ally_id, _enemy_id) = session_trio();
+    session.take_help_check(helper_id, ally_id).unwrap();
+
+    let mut dice = DiceEngine::with_seed(7);
+    session.advance_round(&mut dice);
+
+    assert!(session.entities[&ally_id].next_check_has_advantage_from.is_none());
+    assert!(!session.consume_help_check_advantage(ally_id));
+}
+
+/// Rewinding past the HELP_CHECK_ACTION drops the promise along with the
+/// refunded Action.
+#[test]
+fn test_safety_rewind_past_help_check_clears_the_token() {
+    let (mut session, helper_id, ally_id, _enemy_id) = session_trio();
+    let pre_help_sequence = session.ledger.current_sequence;
+    session.take_help_check(helper_id, ally_id).unwrap();
+
+    session.safety_rewind(pre_help_sequence);
+
+    assert!(session.entities[&ally_id].next_check_has_advantage_from.is_none());
+    assert!(
+        session.entities[&helper_id].action_budget.action,
+        "the rewound help-check refunds the helper's Action"
+    );
+    assert!(!session.consume_help_check_advantage(ally_id));
+}
+
 // --- Audit iteration 14 / F11: validate_ingress must enforce its docstring ---
 
 use vtt_core::SessionMap;

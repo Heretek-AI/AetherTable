@@ -250,6 +250,26 @@ pub struct EntityState {
     /// refresh. Serde default keeps legacy payloads deserializing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_attacker_has_advantage_against: Option<String>,
+    /// SRD Help action promise for ABILITY CHECKS, stored ON THE BENEFICIARY:
+    /// the id of the helper whose aid grants Advantage on this entity's NEXT
+    /// ability check (see [`GameSession::take_help_check`] /
+    /// [`GameSession::consume_help_check_advantage`]). Consumed exactly once
+    /// by the first check the beneficiary rolls and cleared at the round
+    /// refresh. Kept separate from
+    /// [`EntityState::next_attacker_has_advantage_against`] so an attack-help
+    /// promise can never be cashed by a check nor vice versa. Serde default
+    /// keeps legacy payloads deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_has_advantage_from: Option<String>,
+    /// SRD inspiration (GOALS.md P5): at most ONE point per character, granted
+    /// by GM fiat for heroic play and spent to gain Advantage on one d20 roll
+    /// (attack / check / save). Spent atomically with the edge computation in
+    /// [`crate::rules::RulesEvaluator::edge_from_conditions_with_inspiration`];
+    /// every transition journals an `INSPIRATION_CHANGED` ledger event so a
+    /// safety rewind can restore a point whose spend was undone. Serde
+    /// default keeps legacy serialized entities deserializing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inspiration: bool,
     /// Active SRD vision/sense mode ([`VisionMode`]). None = ordinary sight.
     /// Feeds lighting-aware line-of-sight in `vtt_spatial::lighting`; serde
     /// default keeps pre-existing persisted entities deserializing.
@@ -657,6 +677,8 @@ impl EntityState {
             concentration: None,
             readied_action: None,
             next_attacker_has_advantage_against: None,
+            next_check_has_advantage_from: None,
+            inspiration: false,
             vision_mode: None,
             sense_range_feet: None,
             hands_occupied: 0,
@@ -1061,6 +1083,209 @@ impl GameSession {
         }
     }
 
+    // ------------------------------------------------------------ inspiration
+
+    /// SRD inspiration (GOALS.md P5): grants ONE point of inspiration to
+    /// `entity_id` (GM fiat for heroic play). RAW caps a character at a single
+    /// point: granting to someone who already holds one is rejected with
+    /// `INSPIRATION_ALREADY_HELD` and changes nothing. Every accepted grant
+    /// journals an `INSPIRATION_CHANGED` ledger event `{granted: true, reason}`
+    /// so safety rewinds replay the correct holding.
+    ///
+    /// Rejections: `ENTITY_NOT_FOUND`, `INSPIRATION_ALREADY_HELD`.
+    pub fn grant_inspiration(&mut self, entity_id: Uuid, reason: Option<&str>) -> Result<(), String> {
+        let entity = self
+            .entities
+            .get_mut(&entity_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        if entity.inspiration {
+            return Err("INSPIRATION_ALREADY_HELD".to_string());
+        }
+        entity.inspiration = true;
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "INSPIRATION_CHANGED",
+            serde_json::json!({
+                "granted": true,
+                "reason": reason,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Removes a held inspiration point (GM fiat). Revoking from someone who
+    /// holds none is rejected with `INSPIRATION_NOT_HELD` and changes nothing.
+    /// Journals `INSPIRATION_CHANGED {granted: false, reason}` on success.
+    ///
+    /// Rejections: `ENTITY_NOT_FOUND`, `INSPIRATION_NOT_HELD`.
+    pub fn revoke_inspiration(&mut self, entity_id: Uuid, reason: Option<&str>) -> Result<(), String> {
+        let entity = self
+            .entities
+            .get_mut(&entity_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        if !entity.inspiration {
+            return Err("INSPIRATION_NOT_HELD".to_string());
+        }
+        entity.inspiration = false;
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "INSPIRATION_CHANGED",
+            serde_json::json!({
+                "granted": false,
+                "reason": reason,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Spends the entity's held inspiration point for Advantage on one d20
+    /// roll. Returns true when a point was actually held and burned; false is
+    /// a silent no-op (nothing held — callers simply get no edge). The spend
+    /// journals `INSPIRATION_CHANGED {granted: false, reason: "spent"}` so a
+    /// safety rewind past the roll restores the point.
+    ///
+    /// Prefer [`crate::rules::RulesEvaluator::edge_from_conditions_with_inspiration`]
+    /// at roll time: it consumes the point atomically WITH the advantage/
+    /// disadvantage computation so an SRD cancellation never wastes it.
+    pub fn consume_inspiration(&mut self, entity_id: Uuid) -> bool {
+        let held = match self.entities.get_mut(&entity_id) {
+            Some(e) => {
+                let held = e.inspiration;
+                e.inspiration = false;
+                held
+            }
+            None => return false,
+        };
+        if !held {
+            return false;
+        }
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "INSPIRATION_CHANGED",
+            serde_json::json!({
+                "granted": false,
+                "reason": "spent",
+            }),
+        );
+        true
+    }
+
+    // ------------------------------------------------- help action: ability check
+
+    /// SRD Help used on an ABILITY CHECK: spends the helper's Action to grant
+    /// Advantage on the BENEFICIARY's next ability check ("I'll boost you up
+    /// while you pick that lock"). The promise lives ON THE BENEFICIARY as
+    /// [`EntityState::next_check_has_advantage_from`] naming the helper, and
+    /// is consumed exactly once by [`GameSession::consume_help_check_advantage`].
+    ///
+    /// Distinct from [`GameSession::take_help`] (the combat use): attack-help
+    /// promises can only be cashed by attack rolls, check-help only by checks,
+    /// so one flavor can never silently eat the other's token.
+    ///
+    /// Reach: the helper must be able to physically assist — this engine uses
+    /// the same 5 ft convention as the combat use ([`HELP_REACH_FEET`]), a
+    /// disclosed approximation of the SRD's looser "within reach" wording.
+    ///
+    /// Rejections (nothing is spent): `ENTITY_NOT_FOUND`, `TARGET_NOT_FOUND`,
+    /// `SELF_TARGET_INVALID`, `OUT_OF_REACH`, `ENTITY_CANNOT_ACT`,
+    /// `ACTION_ECONOMY_EXHAUSTED`, `TARGET_ALREADY_DEAD`.
+    pub fn take_help_check(
+        &mut self,
+        helper_id: Uuid,
+        beneficiary_id: Uuid,
+    ) -> Result<(), String> {
+        if !self.entities.contains_key(&helper_id) {
+            return Err("ENTITY_NOT_FOUND".to_string());
+        }
+        if !self.entities.contains_key(&beneficiary_id) {
+            return Err("TARGET_NOT_FOUND".to_string());
+        }
+        if helper_id == beneficiary_id {
+            return Err("SELF_TARGET_INVALID".to_string());
+        }
+
+        // Read-only gates BEFORE any state changes or budget spends.
+        let (helper_can_act, in_reach, beneficiary_dead) = {
+            let helper = &self.entities[&helper_id];
+            let beneficiary = &self.entities[&beneficiary_id];
+            (
+                helper.can_act(),
+                helper.distance_to_feet(beneficiary) <= HELP_REACH_FEET,
+                beneficiary.is_dead,
+            )
+        };
+        if !in_reach {
+            return Err("OUT_OF_REACH".to_string());
+        }
+        if !helper_can_act {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if beneficiary_dead {
+            return Err("TARGET_ALREADY_DEAD".to_string());
+        }
+
+        // Action economy AFTER every other gate passes, mirroring take_help:
+        // an illegal help must not consume the turn.
+        let helper = self
+            .entities
+            .get_mut(&helper_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        helper.spend_action()?;
+
+        let beneficiary = self
+            .entities
+            .get_mut(&beneficiary_id)
+            .ok_or_else(|| "TARGET_NOT_FOUND".to_string())?;
+        beneficiary.next_check_has_advantage_from = Some(helper_id.to_string());
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            helper_id,
+            "HELP_CHECK_ACTION",
+            serde_json::json!({
+                "helper_id": helper_id.to_string(),
+                "beneficiary_id": beneficiary_id.to_string(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Consumes a standing check-help promise held BY `beneficiary_id`.
+    /// Returns true exactly once — the first check cashes the token; a stale
+    /// promise whose helper has left the session is discarded without
+    /// granting anything.
+    pub fn consume_help_check_advantage(&mut self, beneficiary_id: Uuid) -> bool {
+        let helper_id = match self
+            .entities
+            .get(&beneficiary_id)
+            .and_then(|b| b.next_check_has_advantage_from.clone())
+        {
+            Some(h) => h,
+            None => return false,
+        };
+
+        let helper_present = match helper_id.parse::<Uuid>() {
+            Ok(h) => self.entities.contains_key(&h),
+            Err(_) => false,
+        };
+
+        match self.entities.get_mut(&beneficiary_id) {
+            Some(b) => b.next_check_has_advantage_from = None,
+            None => return false,
+        }
+        helper_present
+    }
+
     // ---------------------------------------------------- condition lifecycle
 
     /// Applies a timed condition and registers its duration clock.
@@ -1115,8 +1340,10 @@ impl GameSession {
             entity.dodge_until_next_turn = false;
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
-            // A Help promise lasts only until the beneficiary's next turn.
+            // A Help promise lasts only until the beneficiary's next turn —
+            // the attack flavor AND the ability-check flavor alike.
             entity.next_attacker_has_advantage_against = None;
+            entity.next_check_has_advantage_from = None;
             // SRD: a readied action lasts until the start of the actor's next
             // turn. If the trigger never fired, the held Action is simply lost.
             entity.readied_action = None;
@@ -1704,6 +1931,33 @@ impl GameSession {
             }
         }
 
+        // Inspiration replay: strip drifted holds first (a GRANT that was
+        // just reverted, or a SPEND that was rewound past leaving the point
+        // held) so we end up with exactly what the surviving ledger vouches
+        // for, then re-apply any surviving GRANT. Last-surviving-INSPIRATION
+        // -CHANGED-event-wins, mirroring the exhaustion / concentration
+        // patterns above. Entities spawned after the rewind point are gone by
+        // now; their ids simply find no live entity to restore.
+        for entity in self.entities.values_mut() {
+            entity.inspiration = false;
+        }
+        let mut inspiration_state: HashMap<Uuid, bool> = HashMap::new();
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type == "INSPIRATION_CHANGED" {
+                if let Some(granted) = ev.payload.get("granted").and_then(|v| v.as_bool()) {
+                    inspiration_state.insert(ev.actor_id, granted);
+                }
+            }
+        }
+        for (id, granted) in inspiration_state {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                if granted {
+                    entity.inspiration = true;
+                    restored += 1;
+                }
+            }
+        }
+
         // Combat-state replay: the ledger is authoritative at the rewind
         // point. A surviving end (or no surviving begin at all) means no
         // engagement is active — clear any drifted tracker. A surviving
@@ -1733,8 +1987,13 @@ impl GameSession {
             entity.disengaged_until_next_turn = false;
             entity.dashed_this_turn = false;
             // Turn-scoped Help promises clear wholesale on a rewind too: the
-            // HELP_ACTION event backing them may just have been reverted.
+            // HELP_ACTION / HELP_CHECK_ACTION events backing them may just
+            // have been reverted.
             entity.next_attacker_has_advantage_against = None;
+            entity.next_check_has_advantage_from = None;
+            // Inspiration is replayed from the surviving INSPIRATION_CHANGED
+            // history in step 3 above — no wholesale clear here, or it would
+            // clobber the restored point.
             // Turn-scoped declarations are cleared wholesale on a rewind: the
             // Ready event backing them may just have been reverted.
             entity.readied_action = None;

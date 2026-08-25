@@ -271,6 +271,46 @@ impl RulesEvaluator {
         (advantage, disadvantage)
     }
 
+    /// [`Self::edge_from_conditions`] plus the SRD inspiration spend (GOALS.md
+    /// P5): a player holding inspiration may burn their one point to gain
+    /// Advantage on a single d20 roll.
+    ///
+    /// The spend happens HERE — atomically with the edge computation — so the
+    /// SRD cancellation rule can protect the point: when conditions already
+    /// impose DISADVANTAGE, an extra advantage source cancels into a straight
+    /// d20 and buys nothing, so `spend` is left unconsumed and the flag stays
+    /// set for a roll where it will matter. When there is no disadvantage and
+    /// no other advantage, the point flips off and the returned pair carries
+    /// the bought advantage.
+    ///
+    /// Returns `(advantage, disadvantage, consumed)`; `consumed` lets callers
+    /// journal exactly one spend event per burned point (a plain
+    /// `INSPIRATION_CHANGED {granted: false}` on the actor's ledger).
+    pub fn edge_from_conditions_with_inspiration(
+        attacker: &mut EntityState,
+        target: &EntityState,
+        distance_feet: f32,
+        attacker_z: f32,
+        target_z: f32,
+        spend: bool,
+    ) -> (bool, bool, bool) {
+        let (mut advantage, disadvantage) =
+            Self::edge_from_conditions(attacker, target, distance_feet, attacker_z, target_z);
+
+        let mut consumed = false;
+        if spend && !advantage && !disadvantage {
+            // Only a roll with nothing else going for it actually burns the
+            // point; cancelled or already-advantaged rolls keep it.
+            if attacker.inspiration {
+                attacker.inspiration = false;
+                advantage = true;
+                consumed = true;
+            }
+        }
+
+        (advantage, disadvantage, consumed)
+    }
+
     /// Starts concentration on a spell, overwriting any prior concentration
     /// (SRD replacement rule: casting a new concentration spell ends the old one).
     pub fn begin_concentration(entity: &mut EntityState, spell_id: &str) {
