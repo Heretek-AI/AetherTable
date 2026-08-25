@@ -26,6 +26,48 @@ export interface XCardRequestBody {
   engine_session_id: string | null;
 }
 
+/** Reason an authoritative post-rewind read could not be performed. */
+export type SessionStateFailure =
+  | { kind: 'NO_SESSION' }
+  | { kind: 'NOT_SIGNED_IN' }
+  | { kind: 'HTTP_ERROR'; status: number }
+  | { kind: 'UNREACHABLE' };
+
+/**
+ * GET-style refetch of the authoritative session state through the gateway's
+ * read proxy (POST /api/v1/engine/session-state). This is the convergence
+ * fallback for the X-card rewind: when the x-card response itself carries no
+ * `engine_rewind.snapshot` (older engine build), the client pulls the same
+ * role-projected post-rewind state with one authenticated round trip instead
+ * of drifting until the next poll.
+ *
+ * Returns the raw body verbatim — projection/shape parsing stays in
+ * ui/safetyXCard.ts, mirroring every other api/* module boundary. Never
+ * throws: failures come back as a structured kind so callers render honest
+ * states and leave local tokens untouched.
+ */
+export async function fetchSessionState(
+  sessionId: string | null | undefined,
+): Promise<{ kind: 'OK'; body: unknown } | { kind: 'ERROR'; failure: SessionStateFailure }> {
+  if (!sessionId) return { kind: 'ERROR', failure: { kind: 'NO_SESSION' } };
+  const token = getStoredToken();
+  if (!token) return { kind: 'ERROR', failure: { kind: 'NOT_SIGNED_IN' } };
+  try {
+    const resp = await fetch('/api/v1/engine/session-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!resp.ok) {
+      return { kind: 'ERROR', failure: { kind: 'HTTP_ERROR', status: resp.status } };
+    }
+    return { kind: 'OK', body: await resp.json() };
+  } catch (e) {
+    console.warn('Session-state proxy unreachable:', e);
+    return { kind: 'ERROR', failure: { kind: 'UNREACHABLE' } };
+  }
+}
+
 /** Reason the caller could not record the x-card. Honest strings, not crashes. */
 export type XCardFailure =
   | { kind: 'NOT_SIGNED_IN'; detail: string }

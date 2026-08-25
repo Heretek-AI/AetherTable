@@ -85,8 +85,13 @@ import type { CampaignSnapshot } from './api/campaign_store';
 import type { Lobby } from './api/lobby_store';
 import type { CampaignWizardConfig } from './components/CampaignWizardModal';
 import { listSaves, loadCampaign } from './api/campaign_store';
-import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
-import { triggerXCard } from './api/safety_xcard';
+import {
+  computeLocalRewindPlan,
+  computeTokenReconciliation,
+  parseEngineRewind,
+  parseRewoundSnapshot,
+} from './ui/safetyXCard';
+import { fetchSessionState, triggerXCard } from './api/safety_xcard';
 import { canMoveTokensOnTransport, type BoundTransport } from './sync/transport_gate';
 import {
   REPROBE_INTERVAL_MS,
@@ -1541,13 +1546,22 @@ export function App() {
    *    initiative pass. Everything after the latest such marker at trigger
    *    time is the turn being reverted, so those lines are dropped when the
    *    engine confirms it actually rewound events.
-   *  - Tokens (NOT reverted — documented drift): the RewindReport carries only
-   *    counts, not entity ids, and there is no read path back to the
-   *    post-rewind engine session for the browser (orchestrator /api/v1/engine/*
-   *    proxies are write-only; the engine's GET /sessions/{id} needs HMAC auth).
-   *    Local token HP/positions can therefore still show pre-rewind values
-   *    until a snapshot load (lobby hydration / Campaign Save modal) or CRDT
-   *    position updates arrive. See client/src/ui/safetyXCard.ts.
+   *  - Tokens (reverted, iteration 28): the engine's x-card response embeds a
+   *    full role-projected GameSession snapshot taken AFTER its ledger replay,
+   *    and the gateway forwards it verbatim inside `engine_rewind.snapshot`.
+   *    When that block is absent (older engine), an immediate authenticated
+   *    refetch through POST /api/v1/engine/session-state returns the same
+   *    projection. The local token mirror is reconciled against whichever one
+   *    arrives — HP only where the projection discloses it (own sheet / GM),
+   *    positions where a numeric [x,y,z] exists; provably-removed tokens are
+   *    dropped ONLY on a privileged view so GM-hidden NPCs are never erased
+   *    by a player-role projection. Unmatched snapshot entities are reported
+   *    in the audit line, never fabricated into the board.
+   *  - STILL NOT converged here (documented drift): CharacterSheet's
+   *    death-save tallies are component-local state that subscribes to
+   *    nothing; SpellbookModal/CharacterSheet slot+concentration+readied
+   *    reads and BossHealthBar's 15 s poll each refresh on their own cadence,
+   *    not on rewind confirmation. See client/src/ui/safetyXCard.ts.
    */
   const handleSafetyRewind = async (topic: string) => {
     // Snapshot the pre-trigger chat so the revert plan is anchored to the
@@ -1565,7 +1579,7 @@ export function App() {
       current_sequence_id: roundNumber * 10,
       engine_session_id: sessionId,
     })
-      .then((result) => {
+      .then(async (result) => {
         if (result.kind === 'ERROR') {
           if (result.failure.kind === 'NOT_SIGNED_IN') {
             addSystemMessage(`SAFETY X-card: ${result.failure.detail}`);
@@ -1581,7 +1595,55 @@ export function App() {
           addSystemMessage('Intervention recorded; engine ledger offline.');
           return;
         }
+
+        // --- Token reconciliation (iteration 28) --------------------------
+        // Prefer the snapshot embedded in the x-card response (one round
+        // trip); fall back to an immediate authenticated session-state read
+        // when the engine did not include one. If neither yields usable
+        // entities, tokens stay untouched and the audit line says so.
+        let snapshot = rewind.snapshot;
+        let snapshotSource: 'embedded' | 'refetched' | null =
+          snapshot && !computeTokenReconciliation(tokens, snapshot).empty ? 'embedded' : null;
+        if (!snapshotSource) {
+          // The session-state body IS the projected GameSession, so it parses
+          // as a snapshot directly.
+          const refetch = await fetchSessionState(sessionId ?? combatSessionId);
+          const refetched =
+            refetch.kind === 'OK' ? parseRewoundSnapshot(refetch.body) : null;
+          if (refetched && !computeTokenReconciliation(tokens, refetched).empty) {
+            snapshot = refetched;
+            snapshotSource = 'refetched';
+          }
+        }
+        const reconciliation = computeTokenReconciliation(tokens, snapshot);
+
         const { reverted_event_count = 0, restored_entities = 0, removed_entities = 0 } = rewind.report;
+        if (!reconciliation.empty) {
+          setTokens((prev) =>
+            prev.flatMap((t) => {
+              if (reconciliation.provablyRemovedTokenIds.includes(t.id)) return [];
+              const patch = reconciliation.patches.find((p) => p.id === t.id);
+              if (!patch) return [t];
+              return [
+                {
+                  ...t,
+                  ...(patch.hp !== undefined ? { hp: patch.hp } : {}),
+                  ...(patch.x !== undefined || patch.y !== undefined
+                    ? { x: patch.x ?? t.x, y: patch.y ?? t.y }
+                    : {}),
+                },
+              ];
+            })
+          );
+          // Keep the CRDT room converging with the authoritative placement:
+          // every token whose position was patched is re-published so peers
+          // see the rewound grid cell instead of their own pre-rewind mirror.
+          for (const patch of reconciliation.patches) {
+            if (patch.x === undefined || patch.y === undefined) continue;
+            syncClientRef.current?.updateTokenPosition(patch.id, patch.x, patch.y, 0);
+          }
+        }
+
         // Local chat revert: drop the lines played out during the reverted
         // turn. Only prune when the engine actually rewound something and we
         // have a turn boundary to anchor on; the filter runs inside the
@@ -1598,10 +1660,22 @@ export function App() {
               `Scene re-synced: engine reverted ${reverted_event_count} ledger event(s) ` +
               `(${restored_entities} entity state(s) restored, ${removed_entities} removed); ` +
               `${shouldPrune ? rewindPlan.droppedCount : 0} local chat line(s) dropped.` +
-              // Documented drift: without entity ids in the report the client
-              // cannot restore token HP/positions authoritatively here.
-              (reverted_event_count > 0 && !shouldPrune
-                ? ' Note: local token HP/positions may retain pre-rewind drift until the next authoritative snapshot.'
+              // Iteration 28: tokens converge from the post-rewind projection
+              // (embedded or refetched). Disclose exactly what happened.
+              (reverted_event_count > 0
+                ? reconciliation.empty
+                  ? ' Note: no authoritative token state available — local HP/positions may retain pre-rewind drift until the next snapshot load.'
+                  : ` Tokens reconciled from the ${
+                      snapshotSource === 'refetched' ? 'session-state read' : 'rewind snapshot'
+                    }` +
+                    ` (${reconciliation.patches.length} updated` +
+                    (reconciliation.provablyRemovedTokenIds.length > 0
+                      ? `, ${reconciliation.provablyRemovedTokenIds.length} removed`
+                      : '') +
+                    (reconciliation.unmatchedEntityIds.length > 0
+                      ? `; ${reconciliation.unmatchedEntityIds.length} engine entity/entities have no local token`
+                      : '') +
+                    '). Death-save tallies and spell-slot panels refresh on their own surfaces.'
                 : ''),
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           },
