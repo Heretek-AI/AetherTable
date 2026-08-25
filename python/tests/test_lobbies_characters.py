@@ -74,6 +74,19 @@ def test_lobby_lifecycle(host, guest):
     )
     assert denied.status_code == 403
 
+    # Launch is gated on party readiness (iteration 33): with the guest still
+    # unready the host is refused until everyone readies up.
+    gated = client.post(
+        f"/api/v1/lobbies/{lobby['lobby_id']}/launch", params={"token": host["token"]}
+    )
+    assert gated.status_code == 409
+    for user in (host, guest):
+        readied = client.post(
+            f"/api/v1/lobbies/{lobby['lobby_id']}/ready",
+            params={"token": user["token"]}, json={"ready": True},
+        )
+        assert readied.status_code == 200
+
     launched = client.post(
         f"/api/v1/lobbies/{lobby['lobby_id']}/launch", params={"token": host["token"]}
     )

@@ -1240,6 +1240,14 @@ class LobbyJoinRequest(BaseModel):
     invite_code: str
 
 
+class LobbyReadyRequest(BaseModel):
+    ready: bool
+
+
+class LobbyCharacterRequest(BaseModel):
+    character_id: str
+
+
 _INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
@@ -1306,14 +1314,94 @@ async def get_lobby(lobby_id: str, token: str = Depends(_require_auth)):
     return lobby
 
 
+@app.post("/api/v1/lobbies/{lobby_id}/ready")
+async def set_lobby_ready(lobby_id: str, req: LobbyReadyRequest,
+                          token: str = Depends(_require_auth)):
+    """Toggles the CALLING member's ready flag.
+
+    Membership-gated like GET /lobbies/{id}: a member may only flip their own
+    flag, never another seat's. Returns the full refreshed roster so clients
+    can render live synchrony from one response.
+    """
+    user_id = _require_user_id(token)
+    lobby = await storage_backend.get_lobby(lobby_id)
+    if lobby is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    if not any(m["user_id"] == user_id for m in lobby["members"]):
+        raise HTTPException(status_code=403, detail="Lobby not accessible")
+    updated = await storage_backend.set_member_ready(lobby_id, user_id, req.ready)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    return updated
+
+
+@app.post("/api/v1/lobbies/{lobby_id}/character")
+async def set_lobby_character(lobby_id: str, req: LobbyCharacterRequest,
+                              token: str = Depends(_require_auth)):
+    """Binds one of the CALLING member's own characters to their lobby seat.
+
+    Ownership reuses the player_characters checks deploy_character enforces:
+    a foreign (but real) sheet is a 403, an unknown id a 404 — so the route
+    cannot probe other players' character ids. A successful bind leaves any
+    prior binding replaced; a refused bind leaves it untouched.
+    """
+    user_id = _require_user_id(token)
+    lobby = await storage_backend.get_lobby(lobby_id)
+    if lobby is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    if not any(m["user_id"] == user_id for m in lobby["members"]):
+        raise HTTPException(status_code=403, detail="Lobby not accessible")
+    record = await storage_backend.get_character(req.character_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    if record["owner_user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this character")
+    updated = await storage_backend.set_member_character(
+        lobby_id, user_id, req.character_id
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Lobby not found")
+    return updated
+
+
+class LobbyLaunchRequest(BaseModel):
+    force: bool = False
+
+
 @app.post("/api/v1/lobbies/{lobby_id}/launch")
-async def launch_lobby(lobby_id: str, token: str = Depends(_require_auth)):
+async def launch_lobby(lobby_id: str,
+                       req: Optional[LobbyLaunchRequest] = None,
+                       token: str = Depends(_require_auth)):
+    """Host-only launch, gated on party readiness.
+
+    While ANY member has not readied up the host gets 409 MEMBERS_NOT_READY
+    with the unready seats listed by id AND display name — an honest refusal,
+    not a silent partial-party start. The host alone may pass {"force": true}
+    to override (the body is optional so existing callers that post without
+    one keep working).
+    """
     user_id = _require_user_id(token)
     lobby = await storage_backend.get_lobby(lobby_id)
     if lobby is None:
         raise HTTPException(status_code=404, detail="Lobby not found")
     if lobby["host_user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Only the host can launch")
+    force = bool(req.force) if req is not None else False
+    if not force:
+        unready = [
+            {"user_id": m["user_id"], "display_name": m["display_name"]}
+            for m in lobby["members"] if not m.get("ready", False)
+        ]
+        if unready:
+            names = ", ".join(m["display_name"] or m["user_id"] for m in unready)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "MEMBERS_NOT_READY",
+                    "message": f"Cannot launch: members not ready: {names}",
+                    "unready_members": unready,
+                },
+            )
     created = await _engine_call(
         engine_client.engine_request(
             "POST",

@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS narrative_state.lobby_members (
     user_id      TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
     role         TEXT NOT NULL DEFAULT 'player',
+    ready        BOOLEAN NOT NULL DEFAULT FALSE,
+    selected_character_id TEXT,
     joined_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (lobby_id, user_id)
 );
@@ -110,6 +112,14 @@ CREATE TABLE IF NOT EXISTS narrative_state.handouts (
 
 CREATE INDEX IF NOT EXISTS idx_handouts_campaign
     ON narrative_state.handouts (campaign_id, created_at DESC);
+
+-- Lobby depth columns (iteration 33). ADD COLUMN IF NOT EXISTS so tables
+-- created by an older 03_campaign_persistence.sql volume are migrated in
+-- place at startup, same idempotent approach as the CREATE TABLE block.
+ALTER TABLE narrative_state.lobby_members
+    ADD COLUMN IF NOT EXISTS ready BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE narrative_state.lobby_members
+    ADD COLUMN IF NOT EXISTS selected_character_id TEXT;
 """
 
 
@@ -253,11 +263,16 @@ class MemoryStore:
             "host_user_id": host_user_id,
             "engine_session_id": None,
             "created_at": time.time(),
+            # Lobby depth: every member carries a ready flag and an optional
+            # bound character so launch gating and party binding have state
+            # to read (audit defect: rosters used to be identity-only).
             "members": [{
                 "user_id": host_user_id,
                 "display_name": host_display_name,
                 "role": "gm",
                 "joined_at": time.time(),
+                "ready": False,
+                "selected_character_id": None,
             }],
         }
         self.lobbies[lobby_id] = record
@@ -270,10 +285,11 @@ class MemoryStore:
             return False
         for m in record["members"]:
             if m["user_id"] == user_id:
-                return True  # idempotent rejoin
+                return True  # idempotent rejoin keeps prior ready/binding state
         record["members"].append({
             "user_id": user_id, "display_name": display_name,
             "role": role, "joined_at": time.time(),
+            "ready": False, "selected_character_id": None,
         })
         return True
 
@@ -294,6 +310,38 @@ class MemoryStore:
         if record is not None:
             record["engine_session_id"] = engine_session_id
 
+    async def set_member_ready(self, lobby_id: str, user_id: str,
+                               ready: bool) -> Optional[Dict[str, Any]]:
+        """Flags one member's readiness; returns the refreshed public lobby,
+        or None when the lobby does not exist or the user is not a member."""
+        record = self.lobbies.get(lobby_id)
+        member = self._find_member(record, user_id)
+        if member is None:
+            return None
+        member["ready"] = bool(ready)
+        return self._lobby_public(record)
+
+    async def set_member_character(self, lobby_id: str, user_id: str,
+                                   character_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Binds (or, with None, unbinds) a character to a member; ownership of
+        the sheet is validated by the caller before this write."""
+        record = self.lobbies.get(lobby_id)
+        member = self._find_member(record, user_id)
+        if member is None:
+            return None
+        member["selected_character_id"] = character_id
+        return self._lobby_public(record)
+
+    @staticmethod
+    def _find_member(record: Optional[Dict[str, Any]],
+                     user_id: str) -> Optional[Dict[str, Any]]:
+        if record is None:
+            return None
+        for m in record["members"]:
+            if m["user_id"] == user_id:
+                return m
+        return None
+
     @staticmethod
     def _lobby_public(record: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -304,7 +352,13 @@ class MemoryStore:
             "engine_session_id": record["engine_session_id"],
             "created_at": record["created_at"],
             "members": [
-                {"user_id": m["user_id"], "display_name": m["display_name"], "role": m["role"]}
+                {
+                    "user_id": m["user_id"],
+                    "display_name": m["display_name"],
+                    "role": m["role"],
+                    "ready": bool(m.get("ready", False)),
+                    "selected_character_id": m.get("selected_character_id"),
+                }
                 for m in record["members"]
             ],
         }
@@ -550,7 +604,8 @@ class PostgresStore:
             row["lobby_id"], host_user_id, host_display_name,
         )
         members = await self.pool.fetch(
-            "SELECT user_id, display_name, role FROM narrative_state.lobby_members WHERE lobby_id = $1",
+            """SELECT user_id, display_name, role, ready, selected_character_id
+               FROM narrative_state.lobby_members WHERE lobby_id = $1""",
             row["lobby_id"],
         )
         return {
@@ -560,7 +615,7 @@ class PostgresStore:
             "host_user_id": row["host_user_id"],
             "engine_session_id": None,
             "created_at": str(row["created_at"]),
-            "members": [dict(m) for m in members],
+            "members": self._member_rows(members),
         }
 
     async def join_lobby(self, lobby_id: str, user_id: str,
@@ -585,7 +640,8 @@ class PostgresStore:
         if row is None:
             return None
         members = await self.pool.fetch(
-            "SELECT user_id, display_name, role FROM narrative_state.lobby_members WHERE lobby_id = $1",
+            """SELECT user_id, display_name, role, ready, selected_character_id
+               FROM narrative_state.lobby_members WHERE lobby_id = $1""",
             lobby_id,
         )
         return {
@@ -595,8 +651,49 @@ class PostgresStore:
             "host_user_id": row["host_user_id"],
             "engine_session_id": str(row["engine_session_id"]) if row["engine_session_id"] else None,
             "created_at": str(row["created_at"]),
-            "members": [dict(m) for m in members],
+            "members": self._member_rows(members),
         }
+
+    @staticmethod
+    def _member_rows(rows) -> List[Dict[str, Any]]:
+        """Normalizes member rows to the MemoryStore public shape so route
+        handlers and clients see identical keys on either backend."""
+        out = []
+        for r in rows:
+            out.append({
+                "user_id": r["user_id"],
+                "display_name": r["display_name"],
+                "role": r["role"],
+                "ready": bool(r["ready"]),
+                # character ids are TEXT here (memory ids are 'chr_' strings;
+                # postgres deployments store UUIDs) — pass through verbatim.
+                "selected_character_id": r["selected_character_id"],
+            })
+        return out
+
+    async def set_member_ready(self, lobby_id: str, user_id: str,
+                               ready: bool) -> Optional[Dict[str, Any]]:
+        updated = await self.pool.fetchrow(
+            """UPDATE narrative_state.lobby_members SET ready = $3
+               WHERE lobby_id = $1 AND user_id = $2
+               RETURNING lobby_id""",
+            lobby_id, user_id, bool(ready),
+        )
+        if updated is None:
+            return None
+        return await self.get_lobby(lobby_id)
+
+    async def set_member_character(self, lobby_id: str, user_id: str,
+                                   character_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        updated = await self.pool.fetchrow(
+            """UPDATE narrative_state.lobby_members SET selected_character_id = $3
+               WHERE lobby_id = $1 AND user_id = $2
+               RETURNING lobby_id""",
+            lobby_id, user_id, character_id,
+        )
+        if updated is None:
+            return None
+        return await self.get_lobby(lobby_id)
 
     async def list_lobbies_for_user(self, user_id: str) -> List[Dict[str, Any]]:
         rows = await self.pool.fetch(

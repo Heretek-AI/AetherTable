@@ -264,6 +264,14 @@ class CampaignSimPlayer:
         self.lobby_id = lobby_id
         self.invite_code = invite_code
 
+    async def mark_ready(self) -> None:
+        """Readies this seat so the host's launch passes the readiness gate
+        (launch refuses while any member is unready unless forced)."""
+        marked = await self.authed(
+            "POST", f"/api/v1/lobbies/{self.lobby_id}/ready", {"ready": True})
+        if marked["status"] != 200:
+            raise CampaignSimError(f"{self.name}: ready failed: {marked['body']}")
+
     async def launch_table(self) -> str:
         launched = await self.authed("POST", f"/api/v1/lobbies/{self.lobby_id}/launch")
         if launched["status"] != 200:
@@ -904,6 +912,11 @@ class CampaignSimulation:
         report["lobby_id"] = host.lobby_id
         for guest in players[1:]:
             await guest.join_table(host.lobby_id, host.invite_code)
+
+        # Every seat readies before the host launches — the launch route
+        # refuses a partial party (409 MEMBERS_NOT_READY) unless forced.
+        for player in players:
+            await player.mark_ready()
 
         session_id = await host.launch_table()
         report["engine_session_id"] = session_id

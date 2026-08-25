@@ -123,6 +123,8 @@ async def setup_table(n_players=1):
     await host.host_table("AI Companion Table")
     for guest in players[1:]:
         await guest.join_table(host.lobby_id, host.invite_code)
+    for p in players:
+        await p.mark_ready()
     session_id = await host.launch_table()
     for p in players:
         p.bind_session(session_id)
