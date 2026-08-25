@@ -5572,6 +5572,7 @@ async fn spectators_cannot_generate_maps_or_query_spatial_solvers() {
     for (path, payload) in [
         ("/api/v1/maps/generate", wfc_payload()),
         ("/api/v1/spatial/los", los_payload()),
+        ("/api/v1/spatial/visibility", visibility_payload()),
         (
             "/api/v1/spatial/path",
             serde_json::json!({
@@ -5593,8 +5594,111 @@ async fn spectators_cannot_generate_maps_or_query_spatial_solvers() {
     let player = sign_token_with_role("p1", "player", TEST_SECRET);
     let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", los_payload()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/visibility",
+        visibility_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = post_raw(&app, &player, "/api/v1/maps/generate", wfc_payload()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Payload for `/api/v1/spatial/visibility`: viewer at world (0,0), empty
+/// 16x16 grid, 30 ft sight radius.
+fn visibility_payload() -> serde_json::Value {
+    serde_json::json!({
+        "origin": {"x": 2.5, "y": 2.5, "z": 0.0},
+        "grid_width": 16,
+        "grid_height": 16,
+        "solid_cells": [],
+        "max_range_feet": 30.0
+    })
+}
+
+#[actix_web::test]
+async fn visibility_route_returns_occlusion_polygon_for_viewer() {
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+
+    // Empty room: the polygon is the full-range disc approximation.
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/visibility",
+        visibility_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let poly = body["polygon"].as_array().expect("polygon array");
+    assert!(!poly.is_empty(), "empty room must still bound the range: {body}");
+
+    // Every vertex respects the range clamp.
+    for v in poly {
+        let (x, y) = (v[0].as_f64().unwrap(), v[1].as_f64().unwrap());
+        let d = ((x - 2.5).powi(2) + (y - 2.5).powi(2)).sqrt();
+        assert!(d <= 30.5, "vertex ({x},{y}) exceeds max_range_feet=30");
+    }
+
+    // A wall column east of the viewer truncates the polygon on that side:
+    // a probe point beyond the wall must fall outside the returned polygon.
+    let mut payload = visibility_payload();
+    payload["solid_cells"] =
+        serde_json::json!([[6, 0], [6, 1], [6, 2], [6, 3], [6, 4], [6, 5]]);
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/visibility",
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let poly: Vec<(f64, f64)> = body["polygon"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v[0].as_f64().unwrap(), v[1].as_f64().unwrap()))
+        .collect();
+    assert!(
+        !poly.is_empty(),
+        "occluded polygon must not be empty: {body}"
+    );
+    // Probe deep behind the wall — strictly shadowed.
+    let behind = (42.5f64, 12.5f64);
+    let inside = {
+        // Same ray-crossing parity the client applies when rendering fog.
+        let mut inside = false;
+        let mut j = poly.len() - 1;
+        for i in 0..poly.len() {
+            let (xi, yi) = poly[i];
+            let (xj, yj) = poly[j];
+            if (yi > behind.1) != (yj > behind.1)
+                && behind.0 < (xj - xi) * (behind.1 - yi) / (yj - yi) + xi
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    };
+    assert!(
+        !inside,
+        "point beyond the wall must be outside the visibility polygon"
+    );
+
+    // Spectators are refused like every other stateless spatial route.
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let (status, body) = post_raw(
+        &app,
+        &spec,
+        "/api/v1/spatial/visibility",
+        visibility_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
 }
 
 #[actix_web::test]

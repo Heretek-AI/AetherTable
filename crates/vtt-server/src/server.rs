@@ -36,7 +36,7 @@ use vtt_crdt_sync::{
 use vtt_scripting::{RhaiNarrativeEngine, SandboxedWasmEngine, ScriptExecutionContext};
 use vtt_spatial::{
     AStarPathfinder, CoverCalculator, CoverType, GridCollisionMap, LightingOverlay, TerrainOverlay,
-    Vector3,
+    Vector3, visibility_polygon_z,
 };
 use vtt_wfc::{DungeonGenerator, RoomDescriptor};
 
@@ -3520,6 +3520,59 @@ async fn compute_los(
     }))
 }
 
+/// Request for POST /api/v1/spatial/visibility: the raycasted visibility
+/// polygon (GOALS.md Pillar 4) for one viewer position against the map's
+/// wall/door occluders, truncated at `max_range_feet` (a viewer's sense range).
+#[derive(Debug, Deserialize)]
+pub struct VisibilityReq {
+    /// Viewer position in world feet.
+    pub origin: Vector3,
+    pub grid_width: usize,
+    pub grid_height: usize,
+    pub solid_cells: Vec<(usize, usize)>,
+    /// Sight radius in feet bounding the polygon.
+    #[serde(default = "default_visibility_range")]
+    pub max_range_feet: f32,
+    /// Elevation layer to cast against (defaults to the ground floor).
+    #[serde(default)]
+    pub z: usize,
+}
+
+fn default_visibility_range() -> f32 {
+    30.0
+}
+
+async fn compute_visibility(
+    data: web::Data<AppState>,
+    identity: AuthIdentity,
+    req: web::Json<VisibilityReq>,
+) -> impl Responder {
+    data.count_request();
+    if let Some(resp) =
+        refuse_non_compute_role(&data, "query visibility polygon", Role::from_identity(&identity))
+    {
+        return resp;
+    }
+    let z = req.z;
+    let mut grid =
+        GridCollisionMap::new(req.grid_width.max(1), req.grid_height.max(1), z + 1, 5.0);
+    for &(x, y) in &req.solid_cells {
+        grid.set_solid(x, y, z, true);
+    }
+
+    let polygon = if req.origin.x.is_finite() && req.origin.y.is_finite() {
+        visibility_polygon_z(&grid, &req.origin, z, req.max_range_feet)
+    } else {
+        Vec::new()
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "polygon": polygon,
+        "max_range_feet": req.max_range_feet,
+        "z": req.z
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PathReq {
     pub start: Vector3,
@@ -4647,7 +4700,8 @@ pub fn configure_app_with(
                     web::scope("/spatial")
                         .wrap(action.clone())
                         .route("/los", web::post().to(compute_los))
-                        .route("/path", web::post().to(compute_path)),
+                        .route("/path", web::post().to(compute_path))
+                        .route("/visibility", web::post().to(compute_visibility)),
                 )
                 .service(
                     web::scope("/maps")

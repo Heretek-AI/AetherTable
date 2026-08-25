@@ -12,7 +12,10 @@ pub mod geometry;
 pub mod lighting;
 pub mod pathfinding;
 pub mod raycast;
+pub mod visibility;
 pub mod zone_graph;
+pub use raycast::GridCollisionMap;
+pub use visibility::{point_in_polygon, visibility_polygon, visibility_polygon_z};
 
 pub use cover::{CoverCalculator, CoverType};
 pub use geometry::{AreaOfEffect, Vector3};
@@ -21,7 +24,6 @@ pub use lighting::{cell_visible, LightingOverlay};
 // spatial callers.
 pub use vtt_core::types::{LightingZone, LightingZoneCell, VisionMode};
 pub use pathfinding::{AStarPathfinder, PathResult, TerrainOverlay};
-pub use raycast::GridCollisionMap;
 pub use zone_graph::{RangeBand, TopologicalZoneGraph, ZoneEdge, ZoneNode};
 
 #[cfg(test)]
