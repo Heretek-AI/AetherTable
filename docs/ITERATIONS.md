@@ -383,3 +383,9 @@ against a booted engine. Fix surfaced by the gate: x-card now degrades
 honestly (ENGINE_REJECTED) instead of failing when the live engine rejects an
 unknown session. Gates at this point: cargo 316/18 · pytest 839 pass/27 skip
 (+853 in benchmark run w/ engine) · vitest 286 · relay vitest 66.
+### Iteration 48 — this wave — feat(engine): container weight+volume capacity enforcement (P7 complete) — cargo 336/18
+### Iteration 49 — b8379cb — feat(engine): escape-grapple route + rewind consistency — cargo 332→336 with it48
+### Iteration 50 — 1de5892 — feat(client): audio elevation + glTF honest evaluation (P9) — vitest 298
+
+## Iteration-60 checkpoint approaching: next = audit sweep A4 (~it.60), SonarCloud wiring,
+starter-adventure depth, live-LLM checkpoint ~it.60.
