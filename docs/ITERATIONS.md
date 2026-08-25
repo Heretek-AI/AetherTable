@@ -341,3 +341,9 @@ New findings all remediated red-first: #4 speech-ledger CRDT poisoning
 cover no-op through /los single-layer grid + #2 unbounded spatial route params
 (iteration 29). Claim-audit lesson repeated: iteration 20's "server callers
 pass real z" was wrong — proven wrong by test, fixed, tracker noted.
+### Iteration 31 — 2812c8f — feat(gateway): Redis-backed distributed rate-limit windows — pytest 776
+### Iteration 32 — 7856b75 — fix(relay): GM-only atmosphere writes at the ysync boundary — relay 46, cargo 298
+### Iteration 33 — 716c80c — feat(gateway): lobby ready flags + character binding + launch gating — pytest 782
+### Iteration 34 — 0f76cea — feat(server): rule-version preference persisted and exposed — cargo 302/18
+### Iteration 35 — d9ffac5 — feat(client): lobby ready/character UI on iteration-33 contracts — vitest 224
+### Iteration 36 — this commit — fix(server): per-seat WS token-delta projection (closes stat-field wire leak) — cargo 307/18
