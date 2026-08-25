@@ -91,8 +91,11 @@ class SyntheticPlaytestRunner:
     LIVE authoritative engine.
     """
 
-    def __init__(self, num_turns: int = 200):
+    def __init__(self, num_turns: int = 200, seed: int = 42):
         self.num_turns = num_turns
+        # Seeded RNG: utterance mix + recall-probe sampling must be
+        # reproducible across runs so benchmark deltas are meaningful.
+        self.rng = random.Random(seed)
         self.router = IntentClassificationRouter()
         self.auditor = PreCommitAuditorAgent()
         self.dm = EncounterDMAgent()
@@ -173,15 +176,15 @@ class SyntheticPlaytestRunner:
         dummy_generation = 0
 
         for turn in range(self.num_turns):
-            roll = random.random()
+            roll = self.rng.random()
             if roll < 0.80:
-                utterance = random.choice(tactical_utterances)
+                utterance = self.rng.choice(tactical_utterances)
                 probe_mode = "standard"
             elif roll < 0.95:
-                utterance = random.choice(lore_utterances)
+                utterance = self.rng.choice(lore_utterances)
                 probe_mode = "lore"
             else:
-                utterance = random.choice(chaos_utterances)
+                utterance = self.rng.choice(chaos_utterances)
                 probe_mode = "chaos"
 
             classification = self.router.classify_utterance(utterance)
@@ -263,7 +266,7 @@ class SyntheticPlaytestRunner:
             # the death of a target the live state says is alive. The auditor
             # MUST reject it — misses here are hallucinations that would
             # reach players.
-            if random.random() < 0.10:
+            if self.rng.random() < 0.10:
                 recall_probes_total += 1
                 if self._run_recall_probe(turn):
                     recall_probes_caught += 1
