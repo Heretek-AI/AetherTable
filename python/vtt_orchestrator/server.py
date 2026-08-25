@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Annotated, Dict, Any, List, Literal, Optional, Tuple, Union
 
+from .death_audit import build_death_audit, render_death_audit_markdown
 from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
@@ -3181,6 +3182,15 @@ def _render_replay_markdown(meta: Dict[str, Any], events: List[Any]) -> str:
 async def session_replay_export(
     session_id: str,
     fmt: Literal["json", "markdown"] = Query("json", alias="format"),
+    include: Optional[Literal["death_audit"]] = Query(
+        None,
+        description=(
+            "Optional add-on section. `death_audit` walks the exported "
+            "events and reports, per token, what dropped it to 0 HP and "
+            "which death saves followed. Omitted from the artifact entirely "
+            "when not requested."
+        ),
+    ),
     token: str = Depends(_require_auth),
 ):
     """Exports one session's event ledger as json or markdown.
@@ -3196,6 +3206,14 @@ async def session_replay_export(
     projected summaries otherwise); ``format=markdown`` returns a human-readable
     turn-by-turn transcript with actions resolved, outcomes, and X-card rewinds
     marked inline. Both formats size-cap honestly via ``_MAX_REPLAY_EXPORT_EVENTS``.
+
+    ``include=death_audit`` appends a per-token death-save history derived
+    from the same exported window (PILLAR-3): what dropped each creature to
+    0 HP, the death saves that followed, and whether the episode ended
+    stabilized / dead / is still in progress. The audit is best-effort by
+    contract — triggers need damage-shaped events with post-event HP, and a
+    ledger without them exports an honest empty section rather than an
+    invented one.
     """
     actor = _caller_actor(token)
     role = actor.get("role", "")
@@ -3235,6 +3253,19 @@ async def session_replay_export(
     round_number = combat.get("round") if isinstance(combat, dict) else None
     truncated = omitted > 0
 
+    # Opt-in PILLAR-3 audit. Derived from the RAW exported window (not the
+    # projected summaries) so the same derivation serves both projections;
+    # it exposes only ledger facts (token ids, sequences, save rolls and
+    # outcome labels) that the caller's role is already trusted to see.
+    death_audit_report: Optional[Dict[str, Any]] = None
+    if include == "death_audit":
+        death_audit_report = build_death_audit(capped)
+        death_audit_report["scope"] = (
+            "exported_events"
+            if truncated
+            else "full_ledger"
+        )
+
     meta = {
         "session_id": raw.get("session_id", engine_client._coerce_uuid(session_id)),
         "session_name": raw.get("session_name") or engine_client._coerce_uuid(session_id),
@@ -3257,6 +3288,16 @@ async def session_replay_export(
     filename_round = round_number if round_number is not None else "unknown"
     if fmt == "markdown":
         text = _render_replay_markdown(meta, exported_events)
+        if death_audit_report is not None:
+            scope_note = (
+                "(derived from the exported window only — earlier ledger "
+                "events were omitted by the size cap)"
+                if truncated
+                else ""
+            )
+            text += "\n" + render_death_audit_markdown(death_audit_report)
+            if scope_note:
+                text += f"_{scope_note}_\n"
         return Response(
             content=text,
             media_type="text/markdown; charset=utf-8",
@@ -3281,6 +3322,8 @@ async def session_replay_export(
         "truncation_marker": meta["truncation_marker"] or None,
         "events": exported_events,
     }
+    if death_audit_report is not None:
+        body["death_audit"] = death_audit_report
     return Response(
         content=json.dumps(body, indent=2, ensure_ascii=False),
         media_type="application/json",
