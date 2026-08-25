@@ -399,3 +399,6 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 61 — 4e30782 — feat(engine): whole-ancestor capacity chain + cycle-proof reparenting (A4 #4/#5) — cargo 391
 ### Iteration 62 — 7513e5b — feat(server): bounded landings, rewindable transfers, uniform counting (A4 #6/#7/#9)
 ### Iteration 63 — ee4e8af — feat(client): live combat status + inspiration/escape wiring on sheet (P3/P11 UX) — vitest 336
+### Iteration 66 — 7d0fcf2 — feat(engine): full SRD exhaustion ladder enforced (P3) — cargo 399/19
+### Iteration 67 — 3d03516 — feat(engine): 5e dice notation kh/kl/ro/exploding — cargo 420/20
+### Iteration 68 — d9cebb9 — feat(client): dedicated GM-only StreamerView (P9) — vitest 344/27
