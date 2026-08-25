@@ -22,6 +22,7 @@
  */
 
 import { authHeaders, getStoredToken } from './auth_headers';
+import type { EngineCheckComplication } from './check_outcome';
 
 export interface EngineAttackResult {
   attack_roll: number;
@@ -38,7 +39,14 @@ export interface EngineCheckResult {
   modifier: number;
   total: number;
   dc: number;
+  /** SCREAMING_SNAKE_CASE 4-tier margin (see api/check_outcome.ts). */
   outcome: string;
+  /**
+   * Fail-forward cost fields from vtt-core's Complication (resource
+   * deductions, inflicted conditions, tactical penalty). Present only when
+   * the engine resolved a SUCCESS_AT_A_COST or a complicated CRITICAL_FAILURE.
+   */
+  complication?: EngineCheckComplication | null;
 }
 
 /**

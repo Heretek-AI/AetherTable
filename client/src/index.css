@@ -56,6 +56,7 @@
   --parchment-ink: var(--rp-ink-900);         /* writing on parchment */
   --state-danger: var(--rp-crimson-600);
   --state-success: var(--rp-forest-600);
+  --state-warning: var(--rp-amber-600);
 
   /* Encounter styling defaults — retinted per theme by theme/atmospheres.ts
      (Dynamic Thematic Atmosphere). Components may consume these directly; the
@@ -362,6 +363,13 @@
   border-color: color-mix(in srgb, var(--state-success) 55%, transparent);
   color: var(--state-success);
   background: color-mix(in srgb, var(--state-success) 10%, transparent);
+}
+/* Pillar-8 fail-forward band: amber "success at a cost" / honest
+   "unresolved" marker — distinct from both clean success and failure. */
+.vtt-badge-warning {
+  border-color: color-mix(in srgb, var(--state-warning) 55%, transparent);
+  color: var(--state-warning);
+  background: color-mix(in srgb, var(--state-warning) 10%, transparent);
 }
 /* Dark-chrome modifier: the base colors are tuned for parchment contrast
    (#9f1239 red / #166534 green) and sink into iron backgrounds — brighten

@@ -72,6 +72,7 @@ import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, formulaModifier, ensureEngineSession } from './api/rules_engine';
+import { logOutcomeForTier, shapeCheckOutcome } from './api/check_outcome';
 import { authHeaders, getStoredToken } from './api/auth_headers';
 import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
@@ -1434,9 +1435,12 @@ export function App() {
       });
       return;
     }
+    // Pillar-8 fail-forward band: shape the engine's 4-tier margin (including
+    // its verbatim Complication costs) instead of collapsing it to pass/fail.
+    // A response without a recognizable tier stays honestly unresolved.
+    const shaped = shapeCheckOutcome(result);
     const roll = result.roll;
     const total = result.total;
-    const passed = ['SUCCESS', 'CRITICAL_SUCCESS', 'SUCCESS_AT_A_COST'].includes(result.outcome);
 
     // Audit trail: ability checks log natural d20 so crits/fumbles stand out.
     addRollEntry({
@@ -1445,7 +1449,9 @@ export function App() {
       expression: `1d20 + ${modifier}`,
       natural: roll,
       total,
-      outcome: roll === 20 ? 'crit' : roll === 1 ? 'fumble' : passed ? 'success' : 'failure',
+      outcome:
+        roll === 20 ? 'crit' : roll === 1 ? 'fumble' : logOutcomeForTier(shaped.tier),
+      detail: shaped.detail,
     });
 
     if (selectedToken) {
@@ -1474,9 +1480,16 @@ export function App() {
         id: `dm_${Date.now() + 1}`,
         sender: 'Encounter DM (AI)',
         role: 'dm',
-        content: passed
-          ? `Success! You execute your ${skillName} attempt with remarkable finesse.`
-          : `Failure. The conditions prove too hazardous for your ${skillName} maneuver.`,
+        content:
+          shaped.tier === 'unresolved'
+            ? `The engine resolved ${total} vs DC ${dc} but returned no outcome tier — GM ruling required for this ${skillName} attempt.`
+            : shaped.tier === 'critical_success'
+              ? `Critical success! Your ${skillName} attempt is flawless.`
+              : shaped.tier === 'success'
+                ? `Success! You execute your ${skillName} attempt with remarkable finesse.`
+                : shaped.tier === 'success_at_cost'
+                  ? `${shaped.headline} on your ${skillName} attempt${shaped.detail ? ` — ${shaped.detail}` : ''}.`
+                  : `Critical failure. The ${skillName} attempt goes wrong${shaped.detail ? ` — ${shaped.detail}` : ''}.`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       },
     ]);
@@ -1891,14 +1904,22 @@ export function App() {
     const d20Roll = result.roll;
     const macroTotal = result.total;
 
-    // Audit trail: quickbar macros resolve through the engine like any other roll.
+    // Audit trail: quickbar macros resolve through the engine like any other
+    // roll, and carry the same Pillar-8 fail-forward band as skill checks.
+    const shapedMacro = shapeCheckOutcome(result);
     addRollEntry({
       kind: 'macro',
       label: macroName,
       expression: formula,
       natural: d20Roll,
       total: macroTotal,
-      outcome: d20Roll === 20 ? 'crit' : d20Roll === 1 ? 'fumble' : undefined,
+      outcome:
+        d20Roll === 20
+          ? 'crit'
+          : d20Roll === 1
+            ? 'fumble'
+            : logOutcomeForTier(shapedMacro.tier),
+      detail: shapedMacro.detail,
     });
 
     if (diceBoxRef.current) {

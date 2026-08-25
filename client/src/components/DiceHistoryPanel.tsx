@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Dices, History, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
+import type { RollOutcomeTag } from '../api/check_outcome';
 
 /**
  * One resolved dice roll in the session history.
@@ -19,7 +20,9 @@ export interface RollLogEntry {
   natural?: number;
   total: number;
   /** Optional semantic outcome for colouring (hit/miss/success/failure). */
-  outcome?: 'hit' | 'miss' | 'success' | 'failure' | 'crit' | 'fumble';
+  outcome?: RollOutcomeTag;
+  /** Fail-forward cost text quoted from the engine's Complication, if any. */
+  detail?: string | null;
   timestamp: string;
 }
 
@@ -45,9 +48,16 @@ const outcomeBadge = (entry: RollLogEntry): { label: string; className: string }
     case 'hit':
     case 'success':
       return { label: 'Success', className: 'vtt-badge-success' };
+    // Pillar 8 fail-forward band: a pass that cost something is its own
+    // amber band, visually distinct from a clean success.
+    case 'success_at_cost':
+      return { label: 'At a Cost', className: 'vtt-badge-warning' };
     case 'miss':
     case 'failure':
       return { label: 'Miss', className: 'vtt-badge-danger' };
+    // The engine answered without an outcome tier — never graded as either.
+    case 'unresolved':
+      return { label: 'Unresolved', className: 'vtt-badge-warning' };
     default:
       return null;
   }
@@ -134,6 +144,15 @@ export const DiceHistoryPanel: React.FC<DiceHistoryPanelProps> = ({ entries, onC
                   <p className="truncate text-[10px] font-prose text-[var(--rp-parchment-300)]">
                     {entry.expression} · {entry.timestamp}
                   </p>
+                  {entry.detail && (
+                    <p
+                      className="truncate text-[10px] font-prose italic"
+                      style={{ color: 'var(--state-warning, var(--tavern-accent))' }}
+                      title={entry.detail}
+                    >
+                      {entry.detail}
+                    </p>
+                  )}
                 </div>
                 {badge && (
                   <span className={`${badge.className} shrink-0`} style={{ fontSize: '9px', padding: '0.05rem 0.4rem' }}>
