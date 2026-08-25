@@ -31,6 +31,19 @@
 //! `VTT_READ_RATE` accept plain integers ("requests per minute"); unset,
 //! non-numeric or non-positive values fall back to the default rather than
 //! panicking or producing an impossible quota.
+//!
+//! Cross-replica note (audit A3#7): the Python gateway's Redis limiter keys on
+//! `vtt:rl:<bucket>:<identity>` WITHOUT the configured quota, so two replicas
+//! running different `RATE_LIMITS` during a rolling deploy share one ZSET
+//! while enforcing different limits. That hazard is structurally impossible
+//! here: windows live in a process-local `DashMap` (one per `RateLimit`
+//! instance), keyed by `(IpAddr, Bucket)` with the limit resolved once at
+//! startup and stored alongside the window it governs. There is no shared
+//! store to alias across replicas — each process enforces exactly the limits
+//! it was constructed with against its own private state. The cost of that
+//! choice is that quotas are PER-REPLICA, not global; if this module ever
+//! moves to a shared backend, the config fingerprint must become part of the
+//! key (e.g. hash of the three per-minute values).
 
 use actix_web::body::EitherBody;
 use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};

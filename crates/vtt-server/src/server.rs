@@ -5,6 +5,18 @@
 //!   movement legality) resolves here from server-side `EntityState`.
 //! - Every mutating endpoint requires a gateway-signed HMAC session token.
 //! - Token movement over the CRDT relay is validated against the session map.
+//!
+//! Threat model — disclosed residual allowances (accepted, not fixed):
+//! - Spectator inference from traffic silence: per-seat projection drops
+//!   hidden-token deltas for player/spectator views (`project_frame_for_view`),
+//!   but the ABSENCE of frames and their timestamp gaps still tells an
+//!   observer that a hidden entity acted and roughly how often. Not where or
+//!   what; closing this needs constant-rate cover traffic. (Audit A3#8.)
+//! - Unowned player-flagged tokens may be spawned by any non-spectator seat
+//!   (`MONSTER_SPAWN_FORBIDDEN` gate) — legacy-client compatibility.
+//! - Egress/ingress ledger records for entities already removed from the
+//!   board survive projection for non-GM views (unresolvable against the
+//!   roster); the ledger itself is trusted wholesale for non-GMs.
 
 use crate::auth::{AuthIdentity, AuthVerifier};
 
@@ -4597,9 +4609,25 @@ const TOKEN_UPDATE_PUBLIC_FIELDS: &[&str] = &[
 ///   `TokenUpdate` frames for HIDDEN tokens are dropped entirely (`None`), and
 ///   surviving frames are rebuilt down to board-token geometry so nothing the
 ///   sender attached beyond the transform can leak onto their wire.
-/// - Unknown/unresolvable tokens stay visible (same fail-open as
-///   `token_is_hidden`: we never invent a restriction the data cannot back),
-///   but their payloads are still field-projected.
+///
+/// Resolution of a frame the session map CANNOT answer for splits by what
+/// exactly is unresolvable (audit A3#8):
+/// - No extractable `payload.tokenId` (missing or empty): FAIL-CLOSED — the
+///   frame is dropped (`None`) for non-GM views. Visibility cannot be resolved
+///   against any roster, so nothing is forwarded rather than trusting it.
+///   (Inbound relay validation already rejects such frames before fan-out;
+///   this is defense in depth for future callers.)
+/// - Resolvable room but unknown token NAME, or non-session/free room:
+///   FAIL-OPEN, same as `token_is_hidden` — the frame survives, reduced to the
+///   public geometry fields. We never invent a restriction the data cannot
+///   back, because these names match nothing in the authoritative roster.
+///
+/// Disclosed residual (audit A3#8): even correct dropping is not
+/// information-theoretically silent. A spectator who watches the relay sees
+/// WHICH frames vanish and when — traffic silence and timestamp gaps around a
+/// hidden token's turns let them infer that *something* moved and roughly how
+/// often, though not where or what. Closing that channel would require
+/// constant-rate cover traffic; accepted as out of scope.
 fn project_frame_for_view(
     data: &AppState,
     room_id: &str,
