@@ -535,7 +535,9 @@ class TestLoreLookupRouteProvenance:
             "/api/v1/compendium/lore-lookup",
             params={"q": "an explosion of flame", "semantic": "true", "k": 3},
         ).json()
-        assert payload["retrieval"] == "qdrant"
+        # Default embedding backend is the lexical-hash pseudo-embedder; the
+        # route must say so rather than claiming real ("qdrant") embeddings.
+        assert payload["retrieval"] == "qdrant-hash-fallback"
         assert payload["facts"]
         assert all("score" in f for f in payload["facts"])
         scores = [f["score"] for f in payload["facts"]]

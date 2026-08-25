@@ -3136,11 +3136,19 @@ def compendium_lore_lookup(
 ):
     # Response shape is identical across retrieval modes; the "retrieval"
     # provenance field tells callers which path served the facts:
-    # "qdrant" | "substring" | "substring_fallback".
+    # "qdrant-dense-sparse" | "qdrant-dense" | "qdrant-hash-fallback"
+    # (vector search — the last one is NOT semantic, just lexical hashing)
+    # | "substring" | "substring_fallback".
     if semantic:
         results = compendium_rag.search(q, k=k)
         if results is not None:
-            return {"query": q, "facts": results, "retrieval": "qdrant"}
+            return {
+                "query": q,
+                "facts": results,
+                "retrieval": getattr(
+                    compendium_rag, "retrieval_provenance", "qdrant"
+                ),
+            }
         marker = (
             "substring_fallback"
             if compendium_rag.available  # healthy at startup, failed NOW

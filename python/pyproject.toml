@@ -21,6 +21,16 @@ dependencies = [
     "pytest-asyncio>=0.23.0",
 ]
 
+[project.optional-dependencies]
+# Real semantic embeddings for the Qdrant compendium RAG (see
+# vtt_orchestrator/lore/compendium_rag.py). Deliberately NOT a core
+# dependency: fastembed pulls ONNX runtime and downloads model weights from
+# HuggingFace on first use, which offline CI must never do — without it the
+# index degrades to the honest "qdrant-hash-fallback" embedder.
+embeddings = [
+    "fastembed>=0.6",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
