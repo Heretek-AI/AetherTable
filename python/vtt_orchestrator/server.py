@@ -3062,6 +3062,236 @@ async def engine_session_replay(session_id: str = Query(...), token: str = Depen
     )
 
 
+# --- Canonical session replay export (PILLAR-2/9) ------------------------------------
+#
+# GET /api/v1/sessions/{id}/replay/export?format=json|markdown — the portable,
+# shareable artifact route. The older /api/v1/engine/session-replay stays as the
+# browser-facing JSON download; this route is its stricter superset:
+#
+# Projection matrix (documented decision, mirrors the live-state policy in
+# _project_session_state but with a HARDER spectator line):
+#
+#   ================  ==========================================================
+#   Caller role       Export received
+#   ================  ==========================================================
+#   gm / admin        FULL: verbatim engine events (raw payloads, state hashes)
+#                     plus exact HP/damage numbers everywhere.
+#   player            PROJECTED: auditable per-event summaries only ({sequence_id,
+#                     actor_id, event_type, is_reverted, summary}); no raw
+#                     payloads or hashes, so hidden-entity stat data that the
+#                     live projection hides cannot ride along inside an export.
+#                     Exact numbers are kept for events the caller witnessed —
+#                     same ledger policy as the live state route.
+#   spectator         403. A live redacted view is not a portable artifact;
+#                     nothing about hidden entities should ever leave in a file.
+#   any other role    403 (fails closed).
+#   anonymous         401.
+#   ================  ==========================================================
+#
+# Honesty gates: an empty ledger exports honestly empty (round=null, zero rows,
+# never a fabricated "round 1"), and a ledger past the size cap exports the
+# FIRST chunk WITH an explicit truncation marker and omission counts instead of
+# silently clipping.
+
+#: Hard cap on events carried by one export so a marathon campaign's ledger
+#: cannot produce an unbounded response body. Module-level so tests can shrink it.
+_MAX_REPLAY_EXPORT_EVENTS = 5_000
+
+#: Roles trusted to take ANY replay artifact off the table at all.
+_REPLAY_EXPORT_ROLES = frozenset({"gm", "admin", "player"})
+
+
+def _render_replay_markdown(meta: Dict[str, Any], events: List[Any]) -> str:
+    """Renders one projected/full export as a turn-by-turn narrative transcript.
+
+    Every segment derives ONLY from fields genuinely present in the engine
+    payload (the same honesty contract as :func:`_event_summary`); rounds come
+    from TURN_ADVANCED events actually in the ledger, X-card rewinds are marked
+    inline rather than dropped, and truncation is stated in plain text.
+    """
+    lines: List[str] = [f"# Session Replay: {meta['session_name']}"]
+    lines.append("")
+    round_label = f"round {meta['round']}" if meta["round"] is not None else "no combat begun"
+    lines.append(f"- Session: `{meta['session_id']}`")
+    lines.append(f"- Exported at: {meta['exported_at']}")
+    lines.append(f"- Combat: {round_label}")
+    lines.append(f"- Projection: {meta['projection']} (exported to role `{meta['role']}`)")
+    if meta["truncated"]:
+        lines.append(
+            f"- Events exported: {meta['exported_event_count']} of "
+            f"{meta['event_count']} total"
+        )
+    else:
+        lines.append(f"- Events exported: {meta['event_count']}")
+    lines.append("")
+
+    if not events:
+        # Honest emptiness: say so, never invent an opening round.
+        lines.append("_No events have been recorded in this session yet._")
+        return "\n".join(lines) + "\n"
+
+    current_round: Any = None
+    opened_any_round = False
+    for event in events:
+        if not isinstance(event, dict):
+            continue  # never narrate a malformed entry verbatim
+        if event.get("event_type") == "TURN_ADVANCED":
+            payload = event.get("payload")
+            new_round = payload.get("round") if isinstance(payload, dict) else None
+            if new_round is not None and new_round != current_round:
+                current_round = new_round
+                lines.append(f"## Round {current_round}")
+                lines.append("")
+                opened_any_round = True
+                continue
+        if isinstance(event.get("summary"), str):
+            narrated = event  # already projected (player export)
+        else:
+            # Full exports carry VERBATIM engine events; the transcript still
+            # narrates them through the same derived-summary path (exact
+            # numbers kept) so the artifact reads as prose, not raw JSON.
+            narrated = _project_ledger_event(event, redact_numbers=False)
+        summary = (
+            narrated.get("summary")
+            if isinstance(narrated.get("summary"), str)
+            else json.dumps(narrated.get("payload", {}), sort_keys=True)
+        )
+        marker = ""
+        if event.get("is_reverted"):
+            marker = "**[X-CARD REWIND]** "
+        seq = event.get("sequence_id")
+        seq_label = f"[#{seq}] " if seq is not None else ""
+        if not opened_any_round and current_round is None:
+            lines.append("## Opening")
+            lines.append("")
+            opened_any_round = True
+        lines.append(f"- {marker}{seq_label}{summary}")
+
+    if meta["truncated"]:
+        lines.append("")
+        lines.append(
+            f"**[TRUNCATED]** The session ledger holds {meta['event_count']} events; "
+            f"this export carries only the first {meta['exported_event_count']} "
+            f"({meta['omitted_event_count']} omitted)."
+        )
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/api/v1/sessions/{session_id}/replay/export")
+async def session_replay_export(
+    session_id: str,
+    fmt: Literal["json", "markdown"] = Query("json", alias="format"),
+    token: str = Depends(_require_auth),
+):
+    """Exports one session's event ledger as json or markdown.
+
+    Requires a valid HMAC session token (401 without one). Only GM/admin
+    (full verbatim export), players (projected summary export), and admins'
+    staff view pass authorization; spectators and unrecognized roles get 403
+    because a downloadable artifact must not become a side channel around the
+    live projection. The caller's real identity is forwarded to the engine's
+    GET /sessions/{id} so ITS RBAC also authorizes the participant.
+
+    ``format=json`` returns structured metadata + events (verbatim when full,
+    projected summaries otherwise); ``format=markdown`` returns a human-readable
+    turn-by-turn transcript with actions resolved, outcomes, and X-card rewinds
+    marked inline. Both formats size-cap honestly via ``_MAX_REPLAY_EXPORT_EVENTS``.
+    """
+    actor = _caller_actor(token)
+    role = actor.get("role", "")
+    if role not in _REPLAY_EXPORT_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Replay exports are limited to GM, admin, and player roles",
+        )
+
+    raw = await _engine_call(
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(session_id)}",
+            actor=actor,
+        )
+    )
+
+    full_export = role in _PRIVILEGED_ROLES
+    projection = "full" if full_export else "projected"
+
+    ledger = raw.get("ledger") if isinstance(raw.get("ledger"), dict) else {}
+    ledger_events = ledger.get("events") if isinstance(ledger.get("events"), list) else []
+    total_events = len(ledger_events)
+    capped = ledger_events[:_MAX_REPLAY_EXPORT_EVENTS]
+    omitted = total_events - len(capped)
+
+    if full_export:
+        exported_events: List[Any] = [e for e in capped if isinstance(e, dict)]
+        # Verbatim means verbatim: malformed entries are withheld entirely
+        # rather than silently reshaped into something that looks authoritative.
+    else:
+        exported_events = [
+            _project_ledger_event(e, redact_numbers=False) for e in capped
+        ]
+
+    combat = raw.get("combat")
+    round_number = combat.get("round") if isinstance(combat, dict) else None
+    truncated = omitted > 0
+
+    meta = {
+        "session_id": raw.get("session_id", engine_client._coerce_uuid(session_id)),
+        "session_name": raw.get("session_name") or engine_client._coerce_uuid(session_id),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "round": round_number,
+        "role": role,
+        "projection": projection,
+        "event_count": total_events,
+        "exported_event_count": len(exported_events),
+        "omitted_event_count": omitted,
+        "truncated": truncated,
+        "truncation_marker": (
+            f"[TRUNCATED] Export capped at {_MAX_REPLAY_EXPORT_EVENTS} of "
+            f"{total_events} ledger events."
+            if truncated
+            else ""
+        ),
+    }
+
+    filename_round = round_number if round_number is not None else "unknown"
+    if fmt == "markdown":
+        text = _render_replay_markdown(meta, exported_events)
+        return Response(
+            content=text,
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="replay-{meta["session_id"]}-{filename_round}.md"'
+                )
+            },
+        )
+
+    body = {
+        "session_id": meta["session_id"],
+        "session_name": meta["session_name"],
+        "exported_at": meta["exported_at"],
+        "round": round_number,
+        "role": role,
+        "projection": projection,
+        "event_count": total_events,
+        "exported_event_count": len(exported_events),
+        "omitted_event_count": omitted,
+        "truncated": truncated,
+        "truncation_marker": meta["truncation_marker"] or None,
+        "events": exported_events,
+    }
+    return Response(
+        content=json.dumps(body, indent=2, ensure_ascii=False),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="replay-{meta["session_id"]}-{filename_round}.json"'
+            )
+        },
+    )
+
+
 # --- Request observability & rate limiting ------------------------------------------
 
 import logging as _logging
