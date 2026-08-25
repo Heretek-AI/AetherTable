@@ -396,3 +396,6 @@ starter-adventure depth, live-LLM checkpoint ~it.60.
 Remaining A4 design items queued: #4 ancestor-chain capacity, #5 reparent
 cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 #8 forced-escape attribution, #9 metrics consistency.
+### Iteration 61 — 4e30782 — feat(engine): whole-ancestor capacity chain + cycle-proof reparenting (A4 #4/#5) — cargo 391
+### Iteration 62 — 7513e5b — feat(server): bounded landings, rewindable transfers, uniform counting (A4 #6/#7/#9)
+### Iteration 63 — ee4e8af — feat(client): live combat status + inspiration/escape wiring on sheet (P3/P11 UX) — vitest 336
