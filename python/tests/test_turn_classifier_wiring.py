@@ -18,15 +18,28 @@ The stream endpoints never classified before this change and are deliberately
 left alone.
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator.routing import llm_client as llm_client_module
 from vtt_orchestrator.routing.intent_router import IntentClassificationRouter
 from vtt_orchestrator.routing.llm_client import LLMConfig, LLMStreamingGateway
-from vtt_orchestrator.server import app, router as server_router
+from vtt_orchestrator.server import _sign_token, app, router as server_router
 
 client = TestClient(app)
+
+
+def _gm_headers() -> dict:
+    """Valid token: /orchestrator/turn is now authenticated (any seat may
+    narrate; the check gates model spend)."""
+    return {
+        "Authorization": "Bearer "
+        + _sign_token(
+            {"user_id": "usr_wiring_gm", "role": "gm", "exp": time.time() + 600}
+        )
+    }
 
 MECHANICAL_PAYLOAD = {
     "user_intent": "I strike the goblin",
@@ -158,7 +171,7 @@ class TestLLMWiredTurn:
         reset_llm_classifier_cache()
         _wire_gateway(monkeypatch, '{"intent_type": "OUT_OF_CHARACTER", "confidence": 0.9}')
 
-        resp = client.post("/api/v1/orchestrator/turn", json={**MECHANICAL_PAYLOAD, "user_intent": "brb pizza"})
+        resp = client.post("/api/v1/orchestrator/turn", headers=_gm_headers(), json={**MECHANICAL_PAYLOAD, "user_intent": "brb pizza"})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -174,7 +187,7 @@ class TestLLMWiredTurn:
         reset_llm_classifier_cache()
         _wire_gateway(monkeypatch, '{"intent_type": "MECHANICAL_INVOCATION", "confidence": 0.93}')
 
-        resp = client.post("/api/v1/orchestrator/turn", json=MECHANICAL_PAYLOAD)
+        resp = client.post("/api/v1/orchestrator/turn", headers=_gm_headers(), json=MECHANICAL_PAYLOAD)
 
         assert resp.status_code == 200
         body = resp.json()
@@ -191,7 +204,7 @@ class TestKeywordFallbackWiring:
         _no_llm_env(monkeypatch)
         _explode_network(monkeypatch)
 
-        resp = client.post("/api/v1/orchestrator/turn", json=MECHANICAL_PAYLOAD)
+        resp = client.post("/api/v1/orchestrator/turn", headers=_gm_headers(), json=MECHANICAL_PAYLOAD)
 
         assert resp.status_code == 200
         body = resp.json()
@@ -206,7 +219,7 @@ class TestKeywordFallbackWiring:
         reset_llm_classifier_cache()
         _explode_network(monkeypatch)
 
-        resp = client.post("/api/v1/orchestrator/turn", json=MECHANICAL_PAYLOAD)
+        resp = client.post("/api/v1/orchestrator/turn", headers=_gm_headers(), json=MECHANICAL_PAYLOAD)
 
         assert resp.status_code == 200
         body = resp.json()
@@ -220,7 +233,7 @@ class TestKeywordFallbackWiring:
         reset_llm_classifier_cache()
         _explode_network(monkeypatch)
 
-        resp = client.post("/api/v1/orchestrator/turn", json=MECHANICAL_PAYLOAD)
+        resp = client.post("/api/v1/orchestrator/turn", headers=_gm_headers(), json=MECHANICAL_PAYLOAD)
 
         assert resp.status_code == 200
         assert resp.json()["classifier"] == "keyword_fallback"
@@ -242,6 +255,7 @@ class TestSafetyWinsEndToEnd:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json={**MECHANICAL_PAYLOAD, "user_intent": "we need an x-card please"},
         )
 
@@ -261,6 +275,7 @@ class TestSafetyWinsEndToEnd:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json={**MECHANICAL_PAYLOAD, "user_intent": "lines and veils check"},
         )
 

@@ -625,7 +625,12 @@ async def campaign_autosave(
 
 
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
-def classify_intent(req: ClassifyRequest):
+def classify_intent(
+    req: ClassifyRequest, token: str = Depends(_require_auth)
+):
+    # Any authenticated seat may classify (players narrate too), but the call
+    # is metered in the `llm` bucket — see _bucket_for_path.
+    _caller_actor(token)
     return router.classify_utterance(req.utterance, req.speaker_id)
 
 
@@ -2333,6 +2338,14 @@ http_logger = _logging.getLogger("aethertable.http")
 _RATE_LIMITS = {  # bucket -> (max_events, window_seconds)
     "auth": (30, 60),
     "agent": (60, 60),
+    # LLM-spend routes (classify / orchestrator turns / narrative streams):
+    # every hit can cost model tokens, so the cap sits below the agent bucket
+    # — a player mashing "narrate" must not mint a model bill.
+    "llm": (30, 60),
+    # Empirical benchmark: each accepted call runs 10-1000 encounter
+    # simulations in-process. Tightest cap of all; even GMs have no business
+    # hammering it.
+    "benchmark": (5, 60),
     "default": (600, 60),
 }
 _rate_windows: Dict[tuple, List[float]] = {}
@@ -2372,6 +2385,20 @@ def _bucket_for_path(path: str) -> str:
         return "auth"
     if path.startswith("/api/v1/agent"):
         return "agent"
+    # Empirical benchmark: 10-1000 in-process simulations per accepted call —
+    # matched before the generic simulation prefix so it gets its own tight cap.
+    if path.startswith("/api/v1/simulation/empirical-benchmark"):
+        return "benchmark"
+    # LLM-spend surfaces: intent classification and every orchestrator
+    # narrative path (including the legacy /narrative/* aliases).
+    if path.startswith(
+        (
+            "/api/v1/intent/",
+            "/api/v1/orchestrator/",
+            "/api/v1/narrative/",
+        )
+    ):
+        return "llm"
     return "default"
 
 
@@ -2421,7 +2448,30 @@ class AgentTurnRequest(BaseModel):
 
 
 @app.post("/api/v1/agent/turn")
-async def agent_turn(req: AgentTurnRequest):
+async def agent_turn(
+    req: AgentTurnRequest, token: str = Depends(_require_auth)
+):
+    """One agentic turn. Authorization mirrors the x-card rewind gate:
+
+    * gm/admin tokens may drive the tool agent against ANY session.
+    * Any other authenticated seat must be a member of a lobby bound to the
+      named engine session (the gateway's own roster data — invite-code joins
+      plus the host's launch binding; see ``_caller_is_session_participant``).
+    * Sessions with no lobby binding fail CLOSED to staff only: without a
+      roster there is nothing proving a player's standing, and an agentic turn
+      executes engine mutations under the caller's forwarded identity.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin") and not (
+        await _caller_is_session_participant(actor["user_id"], req.session_id)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "AGENT_TURN_FORBIDDEN: only GMs or members of a lobby bound to "
+                f"session {req.session_id} may drive the tool agent against it."
+            ),
+        )
     return await tool_agent.run_turn(req.user_intent, req.session_id)
 
 
@@ -2450,7 +2500,19 @@ def generate_new_dynasties(seed: Optional[int] = Query(None)):
 
 
 @app.post("/api/v1/dynasty/inject-lore")
-def inject_dynasty_lore(req: DynastyInjectRequest):
+def inject_dynasty_lore(
+    req: DynastyInjectRequest, token: str = Depends(_require_auth)
+):
+    """GM/admin only: this mutates the SHARED global lore graph every table
+    reads from — a player injecting house lore would write canon for everyone."""
+    if _caller_actor(token).get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "LORE_INJECTION_FORBIDDEN: only GM tokens may inject dynasty "
+                "lore into the shared canon graph."
+            ),
+        )
     injected = global_dynasty_engine.inject_lore_into_graph(req.house_id, lore_graph)
     if injected == 0:
         raise HTTPException(status_code=404, detail="House not found")
@@ -2463,7 +2525,22 @@ def inject_dynasty_lore(req: DynastyInjectRequest):
 
 
 @app.post("/api/v1/simulation/empirical-benchmark")
-def run_empirical_benchmark(simulations: int = Query(200, ge=10, le=1000)):
+def run_empirical_benchmark(
+    simulations: int = Query(200, ge=10, le=1000),
+    token: str = Depends(_require_auth),
+):
+    """GM/admin only. Each accepted call runs 10-1000 full encounter
+    simulations in-process — anonymous access would make this a one-request
+    CPU exhaustion vector; the `benchmark` rate bucket additionally caps how
+    often even a GM may trigger it."""
+    if _caller_actor(token).get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "BENCHMARK_FORBIDDEN: the empirical benchmark runs hundreds of "
+                "simulations per call and is restricted to GM tokens."
+            ),
+        )
     return empirical_playtester.run_benchmark(simulations)
 
 
@@ -2691,7 +2768,13 @@ async def _resolve_audit_inputs(req: NarrativeGenerateRequest) -> tuple[Dict[str
 
 @app.post("/api/v1/narrative/generate")
 @app.post("/api/v1/orchestrator/turn")
-async def execute_orchestrator_turn(req: NarrativeGenerateRequest):
+async def execute_orchestrator_turn(
+    req: NarrativeGenerateRequest, token: str = Depends(_require_auth)
+):
+    # Any authenticated seat may run a narrated turn (players narrate too);
+    # the identity check is the spend gate — every hit can reach the model and
+    # is metered in the `llm` bucket.
+    _caller_actor(token)
     # Classify FIRST (audit remediation): the LLM-assisted classifier runs when
     # configured; a keyword safety hit short-circuits before any network call
     # and before any engine grounding. Provenance ("classifier") is surfaced to
@@ -2737,7 +2820,13 @@ async def execute_orchestrator_turn(req: NarrativeGenerateRequest):
 
 @app.post("/api/v1/narrative/stream")
 @app.post("/api/v1/orchestrator/narrative/stream")
-async def stream_narrative_endpoint(req: NarrativeGenerateRequest):
+async def stream_narrative_endpoint(
+    req: NarrativeGenerateRequest, token: str = Depends(_require_auth)
+):
+    # Any authenticated seat may stream narration; the token check is the spend
+    # gate (each accepted call can reach the model) and the `llm` bucket caps
+    # how often.
+    _caller_actor(token)
     # Ground-truth reconciliation happens BEFORE any token is emitted: when a
     # session is named, the stream must be reachable and audited against live
     # engine state, never the client's claims.
@@ -3092,7 +3181,18 @@ async def trigger_x_card(req: XCardRequest, token: str = Depends(_require_auth))
 
 
 @app.post("/api/v1/simulation/tick")
-def advance_faction_simulation():
+def advance_faction_simulation(token: str = Depends(_require_auth)):
+    """GM/admin only: a tick advances the SHARED faction simulation every table
+    observes — letting any caller drive world state would let one player
+    rewrite it for everyone."""
+    if _caller_actor(token).get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "SIMULATION_TICK_FORBIDDEN: only GM tokens may advance the "
+                "shared faction simulation."
+            ),
+        )
     actions = faction_sim.advance_simulation_tick()
     return {
         "faction_name": faction_sim.faction_name,

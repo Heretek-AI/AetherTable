@@ -1,6 +1,6 @@
 import pytest
 import json
-import asyncio
+import time
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator.routing.intent_router import IntentClassificationRouter
@@ -12,7 +12,17 @@ from vtt_orchestrator.simulation.spotlight_tracker import VoiceSpotlightTracker
 from vtt_orchestrator.simulation.safety_gateway import SafetyGateway
 from vtt_orchestrator.playtest.synthetic_playtest import SyntheticPlaytestRunner
 from vtt_orchestrator.schemas.models import IntentType, EpistemicTier, LoreAssertionPayload
-from vtt_orchestrator.server import app
+from vtt_orchestrator.server import _sign_token, app
+
+
+def _gm_headers() -> dict:
+    """Valid gm HMAC token for the now-authenticated gateway routes."""
+    return {
+        "Authorization": "Bearer "
+        + _sign_token(
+            {"user_id": "usr_orch_gm", "role": "gm", "exp": time.time() + 600}
+        )
+    }
 
 
 def test_intent_router_classification():
@@ -187,11 +197,11 @@ def test_fastapi_server_endpoints():
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "healthy"
 
-    classify_resp = client.post("/api/v1/intent/classify", json={"utterance": "I attack with greatsword", "speaker_id": "Thorin"})
+    classify_resp = client.post("/api/v1/intent/classify", headers=_gm_headers(), json={"utterance": "I attack with greatsword", "speaker_id": "Thorin"})
     assert classify_resp.status_code == 200
     assert classify_resp.json()["intent_type"] == "MECHANICAL_INVOCATION"
 
-    narrative_resp = client.post("/api/v1/narrative/generate", json={
+    narrative_resp = client.post("/api/v1/narrative/generate", headers=_gm_headers(), json={
         "user_intent": "I strike with greataxe",
         "turn_index": 1,
         "entity_id": "pc_thorin",
@@ -211,7 +221,7 @@ def test_fastapi_server_endpoints():
     assert narrative_resp.status_code == 200
     assert narrative_resp.json()["status"] == "COMMITTED"
 
-    sim_resp = client.post("/api/v1/simulation/tick")
+    sim_resp = client.post("/api/v1/simulation/tick", headers=_gm_headers())
     assert sim_resp.status_code == 200
     assert "actions_executed" in sim_resp.json()
 
@@ -237,7 +247,7 @@ async def test_llm_streaming_gateway():
 
 def test_fastapi_sse_stream_endpoint():
     client = TestClient(app)
-    response = client.post("/api/v1/narrative/stream", json={
+    response = client.post("/api/v1/narrative/stream", headers=_gm_headers(), json={
         "user_intent": "I strike with greataxe",
         "engine_execution_payload": {
             "action_name": "Greataxe Slash",

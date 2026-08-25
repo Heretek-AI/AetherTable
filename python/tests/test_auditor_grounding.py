@@ -9,14 +9,26 @@ Covers:
 """
 
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator.routing import engine_client
-from vtt_orchestrator.server import app, _engine_ground_truth
+from vtt_orchestrator.server import _sign_token, app, _engine_ground_truth
 
 client = TestClient(app)
+
+
+def _gm_headers() -> dict:
+    """Valid gm token: the orchestrator turn/stream routes are authenticated
+    (any seat may narrate; gm here keeps the fixture role-agnostic)."""
+    return {
+        "Authorization": "Bearer "
+        + _sign_token(
+            {"user_id": "usr_audit_gm", "role": "gm", "exp": time.time() + 600}
+        )
+    }
 
 ALIVE_TARGET = {
     "target_hp_remaining": 25,
@@ -62,6 +74,7 @@ class TestGroundTruthOverride:
         """Legacy path: inconsistent client counts are caught by Vector 2."""
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json=_request(active_entity_count=99, previous_entity_count=1),
         )
         assert resp.status_code == 200
@@ -77,6 +90,7 @@ class TestGroundTruthOverride:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json=_request(
                 engine_session_id="22222222-2222-2222-2222-222222222222",
                 target_entity_id="goblin",
@@ -109,6 +123,7 @@ class TestGroundTruthOverride:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json=_request(
                 engine_session_id="22222222-2222-2222-2222-222222222222",
                 target_entity_id="goblin",
@@ -130,6 +145,7 @@ class TestGroundTruthOverride:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json=_request(
                 engine_session_id="22222222-2222-2222-2222-222222222222",
                 target_entity_id="ancient-red-dragon",
@@ -146,6 +162,7 @@ class TestGroundTruthOverride:
 
         resp = client.post(
             "/api/v1/orchestrator/turn",
+            headers=_gm_headers(),
             json=_request(engine_session_id="22222222-2222-2222-2222-222222222222"),
         )
         assert resp.status_code == 502
@@ -174,7 +191,7 @@ class TestStreamingAuditBeforeYield:
 
     def _collect(self, payload):
         frames = []
-        with client.stream("POST", "/api/v1/narrative/stream", json=payload) as resp:
+        with client.stream("POST", "/api/v1/narrative/stream", headers=_gm_headers(), json=payload) as resp:
             for line in resp.iter_lines():
                 if line.startswith("data: "):
                     frames.append(json.loads(line[len("data: "):]))

@@ -21,6 +21,7 @@ def _stream_text(intent: str, action: str) -> str:
     with client.stream(
         "POST",
         "/api/v1/orchestrator/narrative/stream",
+        headers={"Authorization": "Bearer " + _auth_token("usr_srd_gm", "gm")},
         json={
             "user_intent": intent,
             "engine_execution_payload": {"action_name": action, "is_hit": True, "total_damage": 20},

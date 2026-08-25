@@ -10,15 +10,27 @@ Contract under test:
 """
 
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator.routing import llm_client
 from vtt_orchestrator.routing.llm_client import LLMConfig, LLMStreamingGateway
-from vtt_orchestrator.server import app, streaming_gateway
+from vtt_orchestrator.server import _sign_token, app, streaming_gateway
 
 client = TestClient(app)
+
+
+def _gm_headers() -> dict:
+    """Valid token: the narrative stream route is now authenticated (any seat
+    may narrate; the check gates model spend)."""
+    return {
+        "Authorization": "Bearer "
+        + _sign_token(
+            {"user_id": "usr_stream_gm", "role": "gm", "exp": time.time() + 600}
+        )
+    }
 
 
 def _request():
@@ -39,7 +51,7 @@ def _request():
 
 def _collect_frames(payload):
     frames = []
-    with client.stream("POST", "/api/v1/narrative/stream", json=payload) as resp:
+    with client.stream("POST", "/api/v1/narrative/stream", headers=_gm_headers(), json=payload) as resp:
         assert resp.status_code == 200
         for line in resp.iter_lines():
             if line.startswith("data: "):

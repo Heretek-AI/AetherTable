@@ -18,6 +18,7 @@ import {
   Users
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
+import { authHeaders, getStoredToken } from '../api/auth_headers';
 import { LorePanel } from './LorePanel';
 
 export interface DynastyMember {
@@ -74,6 +75,10 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
   const [isBenchmarkRunning, setIsBenchmarkRunning] = useState(false);
   const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
 
+  // Token presence is read per render of a mutation attempt (not cached at
+  // mount) so signing in via AuthModal unlocks the surfaces without a remount.
+  const hasToken = Boolean(getStoredToken());
+
   const fetchDynasties = async () => {
     setIsLoading(true);
     setFetchError(null);
@@ -118,9 +123,13 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
   const handleRunBenchmark = async () => {
     setIsBenchmarkRunning(true);
     setBenchmarkError(null);
+    // Iteration-10 gateway hardening: the benchmark route is gm/admin-only
+    // (hundreds of simulations per call) and rate-limited; the request must
+    // carry credentials or it 401s.
     try {
       const res = await fetch('/api/v1/simulation/empirical-benchmark?simulations=200', {
         method: 'POST',
+        headers: authHeaders(),
       });
       if (!res.ok) {
         let detail = `HTTP ${res.status} ${res.statusText}`;
@@ -154,7 +163,10 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
     try {
       const res = await fetch('/api/v1/dynasty/inject-lore', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // Iteration-10 gateway hardening: lore injection mutates the SHARED
+        // canon graph and is gm/admin-only — credentials required (401/403
+        // otherwise, surfaced verbatim in the error state below).
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ house_id: selectedHouse.id }),
       });
 
@@ -237,11 +249,18 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
 
           <button
             onClick={handleInjectLore}
-            className="vtt-btn vtt-btn-primary text-xs active:scale-95"
+            disabled={!hasToken}
+            title={!hasToken ? 'Sign in as GM — lore injection mutates the shared canon graph and is GM-only.' : undefined}
+            className="vtt-btn vtt-btn-primary text-xs active:scale-95 disabled:opacity-50"
           >
             <Sparkles className="w-4 h-4" />
             <span>Inject Dynasty Lore into Campaign</span>
           </button>
+          {!hasToken && (
+            <span className="text-[10px] font-prose text-[var(--rp-parchment-300)]">
+              Sign in as GM to inject — the shared canon graph rejects unauthenticated or non-GM writes.
+            </span>
+          )}
         </div>
       </div>
 
@@ -343,12 +362,19 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                 </div>
                 <button
                   onClick={handleRunBenchmark}
-                  disabled={isBenchmarkRunning}
+                  disabled={isBenchmarkRunning || !hasToken}
+                  title={!hasToken ? 'Sign in to run the benchmark — the gateway rejects unauthenticated calls.' : undefined}
                   className="vtt-btn vtt-btn-secondary text-xs w-full"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isBenchmarkRunning ? 'animate-spin' : ''}`} />
                   <span>{isBenchmarkRunning ? 'Simulating...' : 'Re-run Benchmark'}</span>
                 </button>
+                {!hasToken && (
+                  <p className="text-[11px] font-prose p-2 rounded-lg border border-tavern-border">
+                    Sign in (GM recommended — the endpoint is GM-only) to run the benchmark; the
+                    gateway rejects unauthenticated simulation requests.
+                  </p>
+                )}
               </>
             ) : (
               <div className="space-y-2 text-xs font-prose">
@@ -361,12 +387,19 @@ export const DynastyView: React.FC<DynastyViewProps> = ({ onInjectLoreToCampaign
                 )}
                 <button
                   onClick={handleRunBenchmark}
-                  disabled={isBenchmarkRunning}
+                  disabled={isBenchmarkRunning || !hasToken}
+                  title={!hasToken ? 'Sign in to run the benchmark — the gateway rejects unauthenticated calls.' : undefined}
                   className="vtt-btn vtt-btn-secondary text-xs w-full"
                 >
                   <Zap className="w-3.5 h-3.5" />
                   <span>{isBenchmarkRunning ? 'Simulating...' : 'Run Empirical Benchmark'}</span>
                 </button>
+                {!hasToken && (
+                  <p className="text-[11px] font-prose p-2 rounded-lg border border-tavern-border">
+                    Sign in (GM recommended — the endpoint is GM-only) to run the benchmark; the
+                    gateway rejects unauthenticated simulation requests.
+                  </p>
+                )}
               </div>
             )}
           </div>

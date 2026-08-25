@@ -72,6 +72,7 @@ import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { getStoredToken } from './api/auth_headers';
+import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
 import type { CampaignSnapshot } from './api/campaign_store';
@@ -913,20 +914,31 @@ export function App() {
   ) => {
     setIsStreamingResponse(true);
     try {
-      const response = await fetch('/api/v1/orchestrator/narrative/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_intent: userIntent,
-          engine_execution_payload: enginePayload,
-        }),
+      // Iteration-10 gateway hardening: the stream endpoint requires an HMAC
+      // session token (any seat may narrate — this is a model-spend gate, and
+      // anonymous calls now 401). openNarrativeStream appends ?token= exactly
+      // like api/rules_engine.ts / api/safety_xcard.ts and surfaces
+      // NOT_SIGNED_IN / HTTP_ERROR honestly instead of stalling the "..."
+      // DM bubble forever.
+      const opened = await openNarrativeStream({
+        user_intent: userIntent,
+        engine_execution_payload: enginePayload,
       });
-
-      if (!response.body) {
-        throw new Error('ReadableStream not supported');
+      if (opened.kind === 'ERROR') {
+        const f = opened.failure;
+        const reason =
+          f.kind === 'NOT_SIGNED_IN'
+            ? 'Sign in first — narration requires an authenticated session.'
+            : f.kind === 'HTTP_ERROR'
+              ? `Narration refused by the gateway (${f.status}): ${f.detail}`
+              : 'The narration stream could not be opened (no readable body).';
+        setMessages((prev) =>
+          prev.map((m) => (m.id === targetMsgId ? { ...m, content: reason } : m))
+        );
+        return;
       }
 
-      const reader = response.body.getReader();
+      const reader = opened.body.getReader();
       const decoder = new TextDecoder();
       let accumulatedText = '';
 
@@ -962,7 +974,7 @@ export function App() {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === targetMsgId
-            ? { ...m, content: 'The strike lands with authoritative impact.' }
+            ? { ...m, content: 'The narration stream failed — the gateway could not be reached.' }
             : m
         )
       );

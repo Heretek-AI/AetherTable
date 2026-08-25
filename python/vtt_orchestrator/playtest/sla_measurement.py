@@ -111,6 +111,10 @@ def _engine_secret() -> str:
         "aethertable-dev-secret"
 
 
+def _gateway_secret() -> str:
+    return os.environ.get("AUTH_SECRET", "") or "aethertable-dev-secret"
+
+
 # --------------------------------------------------------------------------
 # Measurement primitives
 # --------------------------------------------------------------------------
@@ -180,6 +184,7 @@ def measure_sse_first_token(
     client: httpx.Client,
     url: str,
     json_body: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
 ) -> Measurement:
     """One real streaming call; times socket-send to FIRST SSE data frame.
 
@@ -193,7 +198,7 @@ def measure_sse_first_token(
     status_code: Optional[int] = None
     try:
         start = time.perf_counter_ns()
-        with client.stream("POST", url, json=json_body, timeout=30.0) as resp:
+        with client.stream("POST", url, headers=headers, json=json_body, timeout=30.0) as resp:
             status_code = resp.status_code
             if resp.status_code != 200:
                 m.notes.append(f"stream returned HTTP {resp.status_code}")
@@ -432,6 +437,10 @@ def print_report(rows: Sequence[RowVerdict]) -> bool:
 
 def run_measurement(n_calls: int = 200, sse_streams: int = 1) -> List[RowVerdict]:
     engine_auth = {"Authorization": f"Bearer {service_token(_engine_secret())}"}
+    # The gateway's intent/narrative routes are authenticated (iteration-10
+    # hardening); the same HMAC secret signs a probe token so measured rows
+    # are real round-trips, not a wall of 401 exclusions.
+    gateway_auth = {"Authorization": f"Bearer {service_token(_gateway_secret())}"}
     limits = httpx.Limits(max_connections=4, max_keepalive_connections=4)
 
     rows: List[RowVerdict] = []
@@ -468,6 +477,7 @@ def run_measurement(n_calls: int = 200, sse_streams: int = 1) -> List[RowVerdict
         if gateway_up:
             m_intent = measure_calls(
                 gateway, "POST", "/api/v1/intent/classify",
+                headers=gateway_auth,
                 json_body={"utterance": CLASSIFY_UTTERANCE, "speaker_id": "player"},
                 n=n_calls,
             )
@@ -502,7 +512,8 @@ def run_measurement(n_calls: int = 200, sse_streams: int = 1) -> List[RowVerdict
             m_sse = Measurement()
             for _ in range(sse_streams):
                 one = measure_sse_first_token(
-                    gateway, "/api/v1/narrative/stream", stream_body
+                    gateway, "/api/v1/narrative/stream", stream_body,
+                    headers=gateway_auth,
                 )
                 m_sse.samples_ms.extend(one.samples_ms)
                 m_sse.excluded.extend(one.excluded)

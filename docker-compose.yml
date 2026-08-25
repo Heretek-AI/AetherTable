@@ -217,6 +217,14 @@ services:
       PEERJS_URL: ${PEERJS_URL:-http://vtt-peerjs:9000}
       VITE_PEERJS_URL: ${VITE_PEERJS_URL:-http://localhost:9000}
       VITE_PEERJS_ROOM: ${VITE_PEERJS_ROOM:-aethertable-live}
+      # Yjs CRDT relay (service `ysync-relay`, container_name `vtt-ysync`).
+      # Inside the compose network the browser client is NOT the dialer here:
+      # this default keeps a containerized build from silently pointing at
+      # ws://localhost:6380 (the host loopback, where no relay listens) and
+      # falling back to the legacy LWW transport on every containerized
+      # session. Set VITE_YSYNC_WS_URL to a host-reachable ws:// URL when the
+      # browser runs outside the compose network.
+      VITE_YSYNC_WS_URL: ${VITE_YSYNC_WS_URL:-ws://localhost:6380}
     ports:
       - "3000:3000"
     depends_on:
@@ -225,6 +233,8 @@ services:
       vtt-orchestrator:
         condition: service_healthy
       vtt-peerjs:
+        condition: service_healthy
+      ysync-relay:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/ || exit 1"]
