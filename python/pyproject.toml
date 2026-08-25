@@ -11,6 +11,9 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.6.0",
     "fastapi>=0.110.0",
+    # Required by FastAPI for multipart/form-data parsing (Foundry module
+    # upload route); plain fastapi does not pull it in.
+    "python-multipart>=0.0.20",
     "uvicorn>=0.28.0",
     "httpx>=0.27.0",
     "redis>=5.0.0",

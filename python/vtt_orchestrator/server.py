@@ -1,16 +1,22 @@
 import math
 import os
 import re
+import io
 import json
 import base64
 import hashlib
 import hmac
 import secrets
+import shutil
+import stat
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -38,6 +44,7 @@ from .compendium.starter_adventures import (
 )
 from .compendium.homebrew_parser import global_homebrew_parser
 from .compendium.roll20_importer import global_roll20_importer
+from .compendium.foundry_importer import global_foundry_importer
 from .pdf.character_sheet_renderer import CharacterSheetPDFRenderer
 from .routing.intent_router import LLM_CLASSIFIER_KILL_SWITCH_ENV
 from .schemas.models import (
@@ -3928,12 +3935,23 @@ async def npc_record_interaction(
 # --- External platform import (Pillar 10 interop) -----------------------------------
 # Wire-up of the tested importers in compendium/ onto the HTTP surface. Roll20
 # exports are single JSON documents, so they arrive as one request body;
-# Foundry modules are directory trees and are deliberately NOT implemented
-# over this transport (see foundry_import_preview below).
+# Foundry modules are directory trees delivered as a zip through the multipart
+# upload route below (import_foundry_upload), which extracts safely inside a
+# temp dir before delegating to compendium/foundry_importer.py.
 
 # Sanity bound on an import body. Real Roll20 character/campaign exports are
 # kilobytes; anything near this limit is an accidental dump or abuse.
 _MAX_IMPORT_BODY_BYTES = 2 * 1024 * 1024
+
+# Sanity bound on a Foundry module upload. Real community modules range from
+# tens of KB (pure data packs) to tens of MB (embedded art); 64 MiB admits
+# every data-bearing module while refusing accidental dumps and abuse.
+_MAX_FOUNDRY_UPLOAD_BYTES = 64 * 1024 * 1024
+
+# Cumulative uncompressed size the archive may expand to inside the temp dir
+# (zip-bomb defense: declared per-entry sizes are checked up front AND the
+# streamed copy is bounded, since zip headers can lie).
+_MAX_FOUNDRY_EXTRACTED_BYTES = 256 * 1024 * 1024
 
 _ABILITY_ORDER = ("STR", "DEX", "CON", "INT", "WIS", "CHA")
 
@@ -4122,24 +4140,179 @@ async def import_roll20(
     }
 
 
+def _reject_unsafe_zip_entry(name: str) -> Optional[str]:
+    """Return a rejection reason when an archive entry name is unsafe to
+    extract (zip-slip traversal, absolute path, drive letter, NUL byte), else
+    None when the entry may proceed."""
+    if not name or "\x00" in name:
+        return "empty or NUL-bearing archive entry name"
+    normalized = name.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", normalized):
+        return f"absolute Windows-style archive entry: {name!r}"
+    pure = PurePosixPath(normalized)
+    if pure.is_absolute():
+        return f"absolute archive entry path: {name!r}"
+    if ".." in pure.parts:
+        return f"archive entry escapes the extraction directory: {name!r}"
+    return None
+
+
+def _copy_bounded(src, dst, limit: int) -> int:
+    """Stream ``src`` into ``dst`` refusing to write more than ``limit``
+    bytes. Zip headers can understate real sizes, so the copy itself — not
+    just the declared metadata — enforces the expansion bound."""
+    copied = 0
+    while True:
+        chunk = src.read(1024 * 1024)
+        if not chunk:
+            return copied
+        copied += len(chunk)
+        if copied > limit:
+            raise ValueError(
+                f"archive expands beyond the {_MAX_FOUNDRY_EXTRACTED_BYTES} byte "
+                "extraction bound (zip-bomb protection)"
+            )
+        dst.write(chunk)
+
+
+@app.post("/api/v1/import/foundry/upload")
+async def import_foundry_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    token: str = Depends(_require_auth),
+):
+    """Import a zipped Foundry VTT module via multipart upload.
+
+    The archive is extracted INSIDE a per-request temp dir with zip-slip
+    protection (traversal entries, absolute paths and symlinks are rejected
+    with 422 before anything is written), then the existing fail-loud
+    FoundryModuleImporter library runs against the extracted module tree.
+    GM/admin seats only: module import reshapes shared table content, which
+    mirrors the staff-role gate on campaign autosave rather than Roll20's
+    self-owned-character import.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Foundry module import requires a GM or admin seat",
+        )
+
+    # Size sanity before any work: declared Content-Length first (cheap), then
+    # the bytes actually received (honest).
+    cap = _MAX_FOUNDRY_UPLOAD_BYTES
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Foundry module upload exceeds the {cap} byte sanity bound "
+                f"(declared {declared}); is this the right file?"
+            ),
+        )
+    payload = await file.read()
+    if len(payload) > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Foundry module upload exceeds the {cap} byte sanity bound "
+                f"(received {len(payload)}); is this the right file?"
+            ),
+        )
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(payload))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Upload is not a readable zip archive: {exc}",
+        )
+
+    with archive, tempfile.TemporaryDirectory(prefix="foundry-import-") as workdir:
+        extract_dir = os.path.join(workdir, "module")
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            for info in archive.infolist():
+                reason = _reject_unsafe_zip_entry(info.filename)
+                if reason:
+                    raise ValueError(f"unsafe archive entry rejected: {reason}")
+                mode = info.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    raise ValueError(
+                        f"unsafe archive entry rejected: symlink entries are "
+                        f"never extracted ({info.filename!r})"
+                    )
+                target = os.path.normpath(
+                    os.path.join(extract_dir, *PurePosixPath(info.filename.replace("\\", "/")).parts)
+                )
+                if target != extract_dir and not target.startswith(extract_dir + os.sep):
+                    raise ValueError(
+                        "unsafe archive entry rejected: "
+                        f"{info.filename!r} escapes the extraction directory"
+                    )
+                if info.filename.endswith("/"):
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(info) as src, open(target, "wb") as dst:
+                    _copy_bounded(src, dst, _MAX_FOUNDRY_EXTRACTED_BYTES)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        # Locate the module root: module.json either at the archive root or in
+        # exactly one wrapper directory (the common 'Export Module' shape).
+        candidates: List[Tuple[int, str]] = []
+        for dirpath, _dirnames, filenames in os.walk(extract_dir):
+            if "module.json" in filenames:
+                candidates.append((dirpath.count(os.sep), dirpath))
+        if not candidates:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Archive contains no module.json anywhere; it is not a "
+                    "recognizable Foundry VTT module"
+                ),
+            )
+        candidates.sort()
+        module_root = candidates[0][1]
+
+        try:
+            result = global_foundry_importer.import_module(module_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    result["upload"] = {
+        "filename": file.filename,
+        "bytes": len(payload),
+    }
+    return result
+
+
 @app.post("/api/v1/import/foundry/preview")
 async def foundry_import_preview(token: str = Depends(_require_auth)):
-    """Deliberate stub, not an accident.
+    """Deliberate stub for the PREVIEW surface, not the transport.
 
-    A Foundry module is a DIRECTORY tree (module.json manifest plus NDJSON
-    pack database files), which cannot be delivered as a single JSON body the
-    way a Roll20 export can. Receiving one requires multipart upload support
-    so clients can attach the module files; until that transport exists there
-    is no honest preview to serve, so this answers 501 rather than pretending.
+    The multipart transport now EXISTS: POST /api/v1/import/foundry/upload
+    receives a zipped module over multipart, extracts it safely and runs the
+    full importer. What this endpoint would add on top of that is still
+    unimplemented, so it keeps answering 501 rather than pretending. Still-
+    true limitations, named honestly instead of blaming the transport:
+    - unsupported compendium pack types (JournalEntry, RollTable, Macro,
+      Playlist, Cards, Adventure) are skipped with a warning, never projected;
+    - LevelDB-format pack directories are unsupported;
+    - imported documents are returned as projections only — nothing is
+      persisted to character/compendium storage yet.
     """
     raise HTTPException(
         status_code=501,
         detail=(
-            "NOT_IMPLEMENTED: Foundry module directories require multipart "
-            "upload support to receive module.json plus its NDJSON pack files; "
-            "single-body JSON import cannot represent a module tree. Deferred "
-            "to a future iteration — use POST /api/v1/import/roll20 for "
-            "single-document Roll20 exports meanwhile."
+            "NOT_IMPLEMENTED: POST /api/v1/import/foundry/upload now accepts "
+            "zipped modules over multipart; this preview surface remains "
+            "unimplemented. Still-true limitations: unsupported pack types "
+            "(JournalEntry, RollTable, Macro, Playlist, Cards, Adventure) are "
+            "skipped rather than projected; LevelDB-format pack directories "
+            "are unsupported; imported documents are projections only and are "
+            "not persisted to storage yet."
         ),
     )
 
