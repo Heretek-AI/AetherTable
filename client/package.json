@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@3d-dice/dice-box": "^1.1.4",
+    "@huggingface/transformers": "^4.2.0",
     "@ricky0123/vad-web": "^0.0.30",
     "@tailwindcss/vite": "^4.3.3",
     "lucide-react": "^0.363.0",

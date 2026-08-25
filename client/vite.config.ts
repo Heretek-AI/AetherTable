@@ -93,6 +93,14 @@ export default defineConfig({
           if (/[/\\]node_modules[/\\](react|react-dom|scheduler|lucide-react)[/\\]/.test(id)) {
             return 'vendor-react';
           }
+          // Opt-in on-device speech-to-text (iteration-39): transformers.js +
+          // ONNX Runtime Web load lazily behind VITE_ENABLE_BROWSER_STT; keep
+          // them out of the chunks every page load fetches.
+          if (
+            /[/\\]node_modules[/\\](@huggingface[/\\]|onnxruntime[^/\\]*)/.test(id)
+          ) {
+            return 'vendor-stt';
+          }
           return undefined;
         },
       },

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Send,
   Sparkles,
@@ -16,11 +16,21 @@ import {
   Users,
   Dices,
   Eye,
-  MapPin
+  MapPin,
+  X
 } from 'lucide-react';
 import { globalVoiceCapture } from '../render/voice_capture';
 import { globalAudio } from '../render/audio_manager';
 import type { SpotlightView } from '../sync/speech_ledger';
+import {
+  MIN_TRANSCRIBABLE_MS,
+  AudioSegmentBuffer,
+  reduceVoiceTranscription,
+  resolveTranscriptionEngine,
+  type VoiceTranscriptionEvent,
+  type VoiceUtterance,
+} from '../api/speech_transcription';
+import { BrowserWhisperTranscriber } from '../api/browser_whisper';
 
 export type ChatChannel = 'all' | 'party' | 'gm' | 'combat';
 
@@ -62,6 +72,10 @@ interface NarrativeChatProps {
 
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
 const INK_MUTED = 'color-mix(in srgb, var(--parchment-ink) 65%, transparent)';
+/** vad-web resamples the mic stream to 16 kHz mono before onSpeechEnd fires. */
+const VOICE_SAMPLE_RATE = 16_000;
+
+type ReduceVoice = (event: VoiceTranscriptionEvent) => void;
 
 /**
  * Tiny inline glyph for the speaker-balance readout: a pulsing dot while real
@@ -95,7 +109,22 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const [isSpeechActive, setIsSpeechActive] = useState(false);
   const [vadReady, setVadReady] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(0);
+  /** Voice drafts: captured VAD segments moving through transcription. */
+  const [voiceUtterances, setVoiceUtterances] = useState<VoiceUtterance[]>([]);
+  /** Whether on-device STT is enabled this session (drives honest titles). */
+  const sttEnabled = useMemo(
+    () => resolveTranscriptionEngine(import.meta.env.VITE_ENABLE_BROWSER_STT) === 'browser-whisper',
+    [],
+  );
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * Lazily-created engine. Null ⇒ no STT this session (VITE_ENABLE_BROWSER_STT
+   * unset) and the UI says "transcription unavailable" instead of pretending
+   * audio became text.
+   */
+  const voiceEngineRef = useRef<BrowserWhisperTranscriber | null>(null);
+  /** Retained mic audio for bursts still being transcribed (bounded). */
+  const segmentBufferRef = useRef<AudioSegmentBuffer>(new AudioSegmentBuffer());
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -106,6 +135,81 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
     if (!inputText.trim()) return;
     onSendMessage(inputText.trim(), activeChannel);
     setInputText('');
+  };
+
+  const applyVoiceEvent: ReduceVoice = (event) =>
+    setVoiceUtterances((prev) => reduceVoiceTranscription(prev, event).utterances);
+
+  const ensureVoiceEngine = (): BrowserWhisperTranscriber | null => {
+    if (!voiceEngineRef.current) {
+      voiceEngineRef.current =
+        resolveTranscriptionEngine(import.meta.env.VITE_ENABLE_BROWSER_STT) === 'browser-whisper'
+          ? new BrowserWhisperTranscriber({ enabled: true })
+          : null;
+    }
+    return voiceEngineRef.current;
+  };
+
+  /**
+   * Iteration-39: the VAD burst used to be dropped here. Now it is retained
+   * as wire-format audio, transcribed by the opt-in browser Whisper engine,
+   * and surfaced ONLY as an editable draft — the player confirms before the
+   * text enters the normal send pipeline. Raw STT never auto-submits.
+   */
+  const handleVoiceSegment = (audio: Float32Array) => {
+    const id =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // vad-web delivers 16 kHz mono; duration derives from sample count.
+    const durationMs = Math.round((audio.length / VOICE_SAMPLE_RATE) * 1000);
+    if (durationMs < MIN_TRANSCRIBABLE_MS) return;
+
+    const engine = ensureVoiceEngine();
+    if (!engine) {
+      applyVoiceEvent({
+        type: 'SEGMENT',
+        id,
+        durationMs,
+      });
+      applyVoiceEvent({
+        type: 'ENGINE_UNAVAILABLE',
+        reason:
+          'On-device transcription is off (set VITE_ENABLE_BROWSER_STT=true to enable). Audio was counted for spotlight balance only.',
+      });
+      return;
+    }
+
+    segmentBufferRef.current.retain(id, audio);
+    applyVoiceEvent({ type: 'SEGMENT', id, durationMs });
+    void engine.transcribe(audio).then((result) => {
+      // Terminal state: the retained burst's job is done.
+      segmentBufferRef.current.release(id);
+      if (result.ok) {
+        applyVoiceEvent({ type: 'TEXT_READY', id, text: result.text });
+      } else {
+        applyVoiceEvent({ type: 'FAILED', id, reason: result.reason });
+      }
+    });
+  };
+
+  /** KEEP: prefill the normal chat input with the shaped transcript. The
+      user reviews/edits/sends through the existing intent pipeline — we
+      never dispatch a spoken draft straight to the engine as an action. */
+  const keepUtterance = (utterance: VoiceUtterance) => {
+    const { utterances, keptText } = reduceVoiceTranscription(voiceUtterances, {
+      type: 'KEEP',
+      id: utterance.id,
+    });
+    setVoiceUtterances(utterances);
+    if (!keptText) return;
+    setInputText((prev) => (prev.trim() ? `${prev.trim()} ${keptText}` : keptText));
+    document.getElementById('narrative-chat-input')?.focus();
+  };
+
+  const dismissUtterance = (utterance: VoiceUtterance) => {
+    applyVoiceEvent({ type: 'DISMISS', id: utterance.id });
+    segmentBufferRef.current.release(utterance.id);
   };
 
   const toggleRecording = async () => {
@@ -126,6 +230,8 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         onSpeechEnd: (audio) => {
           setIsSpeechActive(false);
           onSpeechSegment?.(audio);
+          // Previously discarded; now captured for opt-in transcription.
+          handleVoiceSegment(audio);
         },
       });
       if (!started) {
@@ -143,8 +249,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       // phantom live tail keeps accruing after the mic is off.
       onCaptureStop?.();
       setVoiceVolume(0);
-      // No transcription backend exists in this client, so a recorded segment
-      // produces NO chat text. Never fabricate utterances on the player's behalf.
+      // Release retained mic audio; transcription already in flight keeps its
+      // own reference and still lands as a draft bubble.
+      segmentBufferRef.current.releaseAll();
     }
   };
 
@@ -338,6 +445,88 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Voice drafts (iteration-39): captured VAD bursts moving through
+          opt-in on-device transcription. Nothing here is ever sent by itself —
+          a ready draft must be loaded into the chat box, reviewed and sent
+          through the normal pipeline by the player. */}
+      {voiceUtterances.length > 0 && (
+        <div className="px-2 pt-1.5 space-y-1" aria-live="polite">
+          {voiceUtterances.map((u) => (
+            <div
+              key={u.id}
+              role="status"
+              className="vtt-surface rounded-lg p-1.5 flex items-center gap-2 text-[11px]"
+              style={{ borderColor: 'color-mix(in srgb, var(--tavern-accent) 35%, transparent)' }}
+            >
+              <Mic className="w-3 h-3 shrink-0 text-tavern-accent" />
+              {u.state === 'pending' && (
+                <>
+                  <span className="flex-1 opacity-70 animate-pulse">Transcribing speech…</span>
+                  <button
+                    type="button"
+                    onClick={() => dismissUtterance(u)}
+                    title="Discard this voice capture"
+                    className="opacity-60 hover:opacity-100 cursor-pointer shrink-0"
+                    aria-label="Discard voice capture"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </>
+              )}
+              {u.state === 'ready' && (
+                <>
+                  <span
+                    className="flex-1 italic font-prose selectable-text"
+                    style={{ fontFamily: 'var(--font-serif-prose)' }}
+                  >
+                    “{u.text}”
+                  </span>
+                  <span className="vtt-badge" style={{ fontSize: '9px', padding: '0.05rem 0.4rem' }}>
+                    Voice draft — review before sending
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => keepUtterance(u)}
+                    title="Load transcript into the chat box to edit and send"
+                    className="vtt-btn vtt-btn-secondary"
+                    style={{ padding: '0.15rem 0.5rem', fontSize: '10px' }}
+                  >
+                    Edit &amp; Send
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => dismissUtterance(u)}
+                    title="Discard this draft"
+                    className="opacity-60 hover:opacity-100 cursor-pointer shrink-0"
+                    aria-label="Discard voice draft"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </>
+              )}
+              {(u.state === 'failed' || u.state === 'unavailable') && (
+                <>
+                  <span className="flex-1 opacity-70">
+                    {u.state === 'failed'
+                      ? `Transcription failed: ${u.detail ?? 'unknown error'}`
+                      : `Transcription unavailable: ${u.detail ?? 'no engine'}`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => dismissUtterance(u)}
+                    title="Dismiss notice"
+                    className="opacity-60 hover:opacity-100 cursor-pointer shrink-0"
+                    aria-label="Dismiss transcription notice"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Message Input & Action Bar */}
       <form onSubmit={handleSend} className="p-2 border-t border-tavern-border bg-tavern-surface/80 flex items-center gap-2">
         <div className="relative flex items-center">
@@ -359,7 +548,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
             title={
               isRecording
                 ? vadReady
-                  ? 'Stop Recording (Silero VAD active)'
+                  ? `Stop Recording (Silero VAD active${sttEnabled ? ' · on-device transcription on' : ' · transcription off'})`
                   : 'Stop Recording (amplitude-only mode — no speech detection)'
                 : 'Push-to-Talk (Microphone Ingestion)'
             }
