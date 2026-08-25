@@ -824,7 +824,13 @@ export function App() {
       for (const peer of globalWebRTCMesh.getRemoteTiles()) {
         const bound = resolveTokenForUser(peer.userId, peer.name);
         if (bound) {
-          globalWebRTCMesh.updatePeerPosition(peer.peerId, bound.x, bound.y, bound.id);
+          globalWebRTCMesh.updatePeerPosition(
+            peer.peerId,
+            bound.x,
+            bound.y,
+            bound.id,
+            bound.elevationFeet
+          );
         } else {
           globalWebRTCMesh.markPeerUnmapped(peer.peerId);
         }
@@ -839,9 +845,13 @@ export function App() {
   useEffect(() => {
     const ownToken = resolveTokenForUser(currentUser.id, currentUser.displayName);
     if (ownToken) {
-      globalSpatialAudio.setListenerPosition(ownToken.x, ownToken.y);
+      globalSpatialAudio.setListenerPosition(ownToken.x, ownToken.y, ownToken.elevationFeet);
     } else {
-      globalSpatialAudio.setListenerPosition(BOARD_CENTER_FALLBACK.x, BOARD_CENTER_FALLBACK.y);
+      globalSpatialAudio.setListenerPosition(
+        BOARD_CENTER_FALLBACK.x,
+        BOARD_CENTER_FALLBACK.y,
+        0
+      );
     }
   }, [tokens, currentUser, resolveTokenForUser]);
 
@@ -1104,7 +1114,8 @@ export function App() {
     const activeId = combat.order[nextIndex]?.entity_id ?? tokens[nextIndex]?.id;
     if (activeId) setSelectedTokenId(activeId);
     const anchor = tokens.find((t) => t.id === activeId) ?? tokens[0];
-    if (anchor) globalSpatialAudio.setListenerPosition(anchor.x, anchor.y);
+    if (anchor)
+      globalSpatialAudio.setListenerPosition(anchor.x, anchor.y, anchor.elevationFeet);
     const name =
       combat.order[nextIndex]?.name ?? tokens[nextIndex]?.name ?? 'the next combatant';
     addSystemMessage(`Turn passed to ${name} (Round ${nextIndex === 0 ? roundNumber + 1 : roundNumber}).`);
@@ -1282,7 +1293,7 @@ export function App() {
     }
 
     // 3D Positional Audio + Particle Shockwave + 3D Dice
-    globalSpatialAudio.playSpatialImpact(target.x, target.y);
+    globalSpatialAudio.playSpatialImpact(target.x, target.y, target.elevationFeet ?? 0);
     if (particleFXRef.current) {
       particleFXRef.current.spawnMeleeImpact((target.x + 0.5) * 60, (target.y + 0.5) * 60);
     }
@@ -1377,7 +1388,7 @@ export function App() {
     }
 
     // 3D Positional Audio + Spell Particle Shockwave + 3D Dice
-    globalSpatialAudio.playSpatialSpell(target.x, target.y);
+    globalSpatialAudio.playSpatialSpell(target.x, target.y, target.elevationFeet ?? 0);
     if (particleFXRef.current) {
       particleFXRef.current.spawnFireballShockwave((target.x + 0.5) * 60, (target.y + 0.5) * 60, 220);
     }
@@ -1455,7 +1466,11 @@ export function App() {
     });
 
     if (selectedToken) {
-      globalSpatialAudio.playSpatialDice(selectedToken.x, selectedToken.y);
+      globalSpatialAudio.playSpatialDice(
+        selectedToken.x,
+        selectedToken.y,
+        selectedToken.elevationFeet ?? 0
+      );
     }
 
     if (diceBoxRef.current && selectedToken) {

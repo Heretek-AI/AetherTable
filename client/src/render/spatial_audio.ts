@@ -17,8 +17,11 @@
  *  - `attachMediaStream` fails honestly (returns false) when the AudioContext
  *    cannot run yet (autoplay policy before a user gesture) or spatial mode is
  *    off; callers must fall back to plain element playback in that case.
- *  - Sources are positioned on the same plane as the listener (y = 1.5 world
- *    height for both), so elevation differences between tokens are NOT modeled.
+ *  - ELEVATION (iteration 50): sources and the listener carry their token's
+ *    `elevationFeet` on the panner's vertical axis via `./audio_elevation`
+ *    (board-cell units, 5ft per cell), so HRTF produces true above/below cues
+ *    and inverse-distance attenuation over full 3D separation. Grounded
+ *    tokens behave exactly as before (both planes at the 1.5 ear height).
  *
  * Occlusion (Pillar 9, implemented): every source path additionally attenuates
  * by the WALL CELLS standing between the listener token and the source token.
@@ -32,6 +35,10 @@
  */
 
 import { computeOccludedDistanceGain, countWallsOnSegment, wallCountToGainFactor, wallKey } from './occlusion';
+import { elevationToAudioZ } from './audio_elevation';
+
+/** Ear height above the board plane for grounded tokens (world units). */
+const EAR_HEIGHT = 1.5;
 
 interface VoiceSourceNodes {
   tap: MediaStreamAudioSourceNode;
@@ -41,6 +48,8 @@ interface VoiceSourceNodes {
   panner: PannerNode | null;
   x: number;
   y: number;
+  /** Source token elevation in feet (0 = board plane). */
+  elevationFeet: number;
   /** Mixer-slider loudness requested by the caller (occlusion multiplies it). */
   userVolume: number;
 }
@@ -51,6 +60,8 @@ export class SpatialAudioEngine {
   private isSpatialEnabled: boolean = true;
   private masterGain: GainNode | null = null;
   private listenerPos: { x: number; y: number } = { x: 4, y: 4 };
+  /** Listener token elevation in feet (0 = board plane). */
+  private listenerElevationFeet = 0;
   /** Persistent peer-voice chains, keyed by peer id. */
   private voiceSources = new Map<string, VoiceSourceNodes>();
   /**
@@ -58,7 +69,10 @@ export class SpatialAudioEngine {
    * across detach/reattach), so a re-attached peer lands where its token is,
    * not back at the listener.
    */
-  private desiredPositions = new Map<string, { x: number; y: number }>();
+  private desiredPositions = new Map<
+    string,
+    { x: number; y: number; elevationFeet?: number }
+  >();
   /**
    * Current session wall cells as "x:y" keys (pixi_board convention). Empty
    * until `setWalls` is called; an empty set means zero occlusion everywhere.
@@ -125,13 +139,14 @@ export class SpatialAudioEngine {
         this.masterGain = this.ctx.createGain();
         this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
         this.masterGain.connect(this.ctx.destination);
-        // Listener sits ON the board plane; sources are placed relative to it
-        // so the HRTF convolution produces true azimuth + elevation cues.
+        // Listener sits on the board plane (plus its token's elevation); sources
+        // are placed relative to it so the HRTF convolution produces true
+        // azimuth + elevation cues.
         const listener = this.ctx.listener;
         const now = this.ctx.currentTime;
         if (listener.positionX) {
           listener.positionX.setValueAtTime(this.listenerPos.x, now);
-          listener.positionY.setValueAtTime(1.5, now);
+          listener.positionY.setValueAtTime(this.listenerHeight(), now);
           listener.positionZ.setValueAtTime(this.listenerPos.y, now);
           listener.forwardX.setValueAtTime(0, now);
           listener.forwardY.setValueAtTime(-1, now);
@@ -147,20 +162,38 @@ export class SpatialAudioEngine {
     }
   }
 
-  public setListenerPosition(x: number, y: number) {
+  /**
+   * Moves the listener. Elevation is optional so existing callers keep working
+   * (a call without it PRESERVES the previous elevation rather than resetting
+   * to zero — position and altitude are independent facts about the token).
+   */
+  public setListenerPosition(x: number, y: number, elevationFeet?: number) {
     this.listenerPos = { x, y };
+    if (elevationFeet !== undefined) this.listenerElevationFeet = elevationFeet;
     if (this.ctx?.listener.positionX) {
       const t = this.ctx.currentTime;
-      this.ctx.listener.positionX.setValueAtTime(x, t);
-      this.ctx.listener.positionZ.setValueAtTime(y, t);
+      const listener = this.ctx.listener;
+      listener.positionX.setValueAtTime(x, t);
+      listener.positionY.setValueAtTime(this.listenerHeight(), t);
+      listener.positionZ.setValueAtTime(y, t);
     }
     // Every voice's occlusion is measured from the listener token, so moving
     // our token re-evaluates all peer paths (e.g. stepping around a wall).
     this.reapplyOcclusionToAllSources();
   }
 
+  /** Listener's vertical world position (ear height + elevation offset). */
+  private listenerHeight(): number {
+    return EAR_HEIGHT + elevationToAudioZ(this.listenerElevationFeet);
+  }
+
   public getListenerPosition(): { x: number; y: number } {
     return { ...this.listenerPos };
+  }
+
+  /** Listener token elevation in feet (diagnostics/mixer display). */
+  public getListenerElevationFeet(): number {
+    return this.listenerElevationFeet;
   }
 
   public setMasterVolume(val: number) {
@@ -206,7 +239,10 @@ export class SpatialAudioEngine {
       if (!this.isSpatialEnabled) return false;
 
       this.detachSource(id);
-      const start = this.desiredPositions.get(id) ?? { ...this.listenerPos };
+      const start = this.desiredPositions.get(id) ?? {
+        ...this.listenerPos,
+        elevationFeet: this.listenerElevationFeet,
+      };
       const userVolume = Math.max(0, Math.min(1, opts?.volume ?? 1));
       const tap = ctx.createMediaStreamSource(stream);
       const gain = ctx.createGain();
@@ -227,7 +263,7 @@ export class SpatialAudioEngine {
         panner.refDistance = 1;
         panner.rolloffFactor = 0.15;
         panner.coneInnerAngle = 360;
-        this.writePannerPosition(panner, start.x, start.y);
+        this.writePannerPosition(panner, start.x, start.y, start.elevationFeet ?? 0);
         gain.connect(panner);
         panner.connect(this.masterGain);
       } else {
@@ -235,7 +271,15 @@ export class SpatialAudioEngine {
       }
       tap.connect(gain);
 
-      this.voiceSources.set(id, { tap, gain, panner, x: start.x, y: start.y, userVolume });
+      this.voiceSources.set(id, {
+        tap,
+        gain,
+        panner,
+        x: start.x,
+        y: start.y,
+        elevationFeet: start.elevationFeet ?? 0,
+        userVolume,
+      });
       return true;
     } catch {
       return false;
@@ -265,13 +309,26 @@ export class SpatialAudioEngine {
    * ≈10 Hz as the peer's bound token moves; positions are smoothed with
    * setTargetAtTime so stepped updates do not zipper the HRTF filter.
    */
-  public setSourcePosition(id: string, x: number, y: number): void {
-    this.desiredPositions.set(id, { x, y });
+  /**
+   * Moves a peer's voice to board coordinates (x, y). Elevation is optional —
+   * when supplied it moves the source on the panner's vertical axis too; when
+   * omitted the previously known elevation is preserved. Called from the mesh
+   * at ≈10 Hz as the peer's bound token moves; positions are smoothed with
+   * setTargetAtTime so stepped updates do not zipper the HRTF filter.
+   */
+  public setSourcePosition(id: string, x: number, y: number, elevationFeet?: number): void {
+    const desired = this.desiredPositions.get(id);
+    this.desiredPositions.set(id, {
+      x,
+      y,
+      elevationFeet: elevationFeet ?? desired?.elevationFeet,
+    });
     const s = this.voiceSources.get(id);
     if (!s || !this.ctx) return;
     s.x = x;
     s.y = y;
-    if (s.panner) this.writePannerPosition(s.panner, x, y);
+    if (elevationFeet !== undefined) s.elevationFeet = elevationFeet;
+    if (s.panner) this.writePannerPosition(s.panner, x, y, s.elevationFeet);
     // The peer's token moved (~10 Hz mesh feed): its wall count may have
     // changed, so re-derive the occluded gain stage for the new position.
     this.applyOcclusionToSource(s);
@@ -286,18 +343,27 @@ export class SpatialAudioEngine {
     this.applyOcclusionToSource(s);
   }
 
-  private writePannerPosition(panner: PannerNode, x: number, y: number): void {
+  private writePannerPosition(panner: PannerNode, x: number, y: number, elevationFeet = 0): void {
     const ctx = this.ctx;
     if (!ctx) return;
     const t = ctx.currentTime;
+    // Vertical axis = ear height + this token's elevation in board-cell units.
+    const height = EAR_HEIGHT + elevationToAudioZ(elevationFeet);
     if (panner.positionX) {
       panner.positionX.setTargetAtTime(x, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
-      panner.positionY.setTargetAtTime(1.5, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
+      panner.positionY.setTargetAtTime(height, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
       panner.positionZ.setTargetAtTime(y, t, SpatialAudioEngine.POSITION_SMOOTHING_TC);
     } else {
       // Legacy setPosition API has no smoothing; step directly.
-      (panner as unknown as { setPosition(x: number, y: number, z: number): void }).setPosition(x, 1.5, y);
+      (panner as unknown as { setPosition(x: number, y: number, z: number): void }).setPosition(x, height, y);
     }
+  }
+
+  /** A source's vertical world position (ear height + elevation offset). */
+  public getSourceHeight(id: string): number | null {
+    const s = this.voiceSources.get(id);
+    if (!s || !this.ctx) return null;
+    return EAR_HEIGHT + elevationToAudioZ(s.elevationFeet);
   }
 
   public calculateSpatialParameters(sourceX: number, sourceY: number): { pan: number; gain: number; distance: number } {
@@ -337,7 +403,8 @@ export class SpatialAudioEngine {
    */
   private buildSpatialChain(
     sourceX: number,
-    sourceY: number
+    sourceY: number,
+    sourceElevationFeet = 0
   ): { input: GainNode; pan: number; gain: number } {
     const { pan, gain } = this.calculateSpatialParameters(sourceX, sourceY);
     const ctx = this.ctx!;
@@ -350,14 +417,15 @@ export class SpatialAudioEngine {
       panner.refDistance = 1;
       panner.rolloffFactor = 0.15;
       panner.coneInnerAngle = 360;
+      const height = EAR_HEIGHT + elevationToAudioZ(sourceElevationFeet);
       if (panner.positionX) {
         const t = ctx.currentTime;
         panner.positionX.setValueAtTime(sourceX, t);
-        panner.positionY.setValueAtTime(1.5, t);
+        panner.positionY.setValueAtTime(height, t);
         panner.positionZ.setValueAtTime(sourceY, t);
       } else {
         // Legacy setPosition API.
-        (panner as any).setPosition(sourceX, 1.5, sourceY);
+        (panner as any).setPosition(sourceX, height, sourceY);
       }
       soundGain.connect(panner);
       panner.connect(this.masterGain!);
@@ -375,13 +443,13 @@ export class SpatialAudioEngine {
     return { input: soundGain, pan, gain };
   }
 
-  public playSpatialImpact(sourceX: number, sourceY: number) {
+  public playSpatialImpact(sourceX: number, sourceY: number, sourceElevationFeet = 0) {
     if (this.isMuted) return;
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
     const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
-    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY, sourceElevationFeet);
     const now = this.ctx.currentTime;
     // `gain` (distance rolloff × wall occlusion) drives the envelope below;
     // the PannerNode adds azimuth on top.
@@ -404,13 +472,13 @@ export class SpatialAudioEngine {
     osc.stop(now + 0.25);
   }
 
-  public playSpatialSpell(sourceX: number, sourceY: number) {
+  public playSpatialSpell(sourceX: number, sourceY: number, sourceElevationFeet = 0) {
     if (this.isMuted) return;
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
     const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
-    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY, sourceElevationFeet);
     const now = this.ctx.currentTime;
 
 
@@ -433,13 +501,13 @@ export class SpatialAudioEngine {
     });
   }
 
-  public playSpatialCreatureRoar(sourceX: number, sourceY: number) {
+  public playSpatialCreatureRoar(sourceX: number, sourceY: number, sourceElevationFeet = 0) {
     if (this.isMuted) return;
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
     const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
-    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY, sourceElevationFeet);
     const now = this.ctx.currentTime;
 
 
@@ -460,13 +528,13 @@ export class SpatialAudioEngine {
     osc.stop(now + 0.5);
   }
 
-  public playSpatialDice(sourceX: number, sourceY: number) {
+  public playSpatialDice(sourceX: number, sourceY: number, sourceElevationFeet = 0) {
     if (this.isMuted) return;
     this.initContext();
     if (!this.ctx || !this.masterGain) return;
 
     const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
-    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
+    const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY, sourceElevationFeet);
     const now = this.ctx.currentTime;
 
 

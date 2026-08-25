@@ -61,6 +61,14 @@ interface ImportMetaEnv {
    * deployment rather than baking a long-lived value.
    */
   readonly VITE_TURN_CREDENTIAL?: string;
+
+  /**
+   * Opt-in gate for the (future) three.js glTF miniature layer. Default OFF —
+   * see render/gltf_miniatures.ts for the full iteration-50 evaluation record:
+   * why the layer is NOT implemented yet, and what a verified implementation
+   * must provide before this flag may turn anything on.
+   */
+  readonly VITE_ENABLE_GLTF_MINIATURES?: 'true' | 'false';
 }
 
 interface ImportMeta {

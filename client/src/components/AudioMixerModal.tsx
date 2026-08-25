@@ -38,10 +38,15 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
     });
   }, []);
 
-  // Update spatial listener position whenever selected token changes
+  // Update spatial listener position whenever selected token changes (elevation
+  // rides along so the mixer's HRTF seat matches the selected token's altitude).
   useEffect(() => {
     if (selectedToken) {
-      globalSpatialAudio.setListenerPosition(selectedToken.x, selectedToken.y);
+      globalSpatialAudio.setListenerPosition(
+        selectedToken.x,
+        selectedToken.y,
+        selectedToken.elevationFeet
+      );
     }
   }, [selectedToken]);
 

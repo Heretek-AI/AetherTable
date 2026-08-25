@@ -231,7 +231,10 @@ export class WebRTCMeshManager {
 
   private rosterTimer: ReturnType<typeof setInterval> | null = null;
   /** Coalesced spatial position writes awaiting the ~10 Hz flush. */
-  private pendingPositions = new Map<string, { x: number; y: number }>();
+  private pendingPositions = new Map<
+    string,
+    { x: number; y: number; elevationFeet?: number }
+  >();
   private positionFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   private rosterListeners = new Set<(remotes: RemoteVideoTile[]) => void>();
@@ -660,20 +663,33 @@ export class WebRTCMeshManager {
   // pan; they are never given simulated coordinates.
 
   /**
-   * Records the board position of the token a remote peer's identity was
-   * bound to and feeds it to the spatial engine (throttled to ~10 Hz).
+   * Records the board position (and elevation) of the token a remote peer's
+   * identity was bound to and feeds it to the spatial engine (throttled to
+   * ~10 Hz).
    *
    * Calls for unknown peer ids are ignored — there is nothing real to move.
    * The mixer radar snapshots (`getLegacyPeers`) pick up the new position on
-   * the next flush so the UI never leads the audio graph.
+   * the next flush so the UI never leads the audio graph. Elevation is
+   * optional; when omitted the last known value is preserved.
    */
-  public updatePeerPosition(peerId: string, x: number, y: number, tokenId = ''): void {
+  public updatePeerPosition(
+    peerId: string,
+    x: number,
+    y: number,
+    tokenId = '',
+    elevationFeet?: number
+  ): void {
     const entry = this.remotes.get(peerId);
     if (!entry) return;
 
     entry.positionMapped = true;
     entry.boundTokenId = tokenId;
-    this.pendingPositions.set(peerId, { x, y });
+    const prev = this.pendingPositions.get(peerId);
+    this.pendingPositions.set(peerId, {
+      x,
+      y,
+      elevationFeet: elevationFeet ?? prev?.elevationFeet,
+    });
 
     if (this.positionFlushTimer !== null) return;
     this.positionFlushTimer = setTimeout(() => this.flushPendingPositions(), PEER_POSITION_THROTTLE_MS);
@@ -710,7 +726,7 @@ export class WebRTCMeshManager {
       entry.boardX = pos.x;
       entry.boardY = pos.y;
       entry.pinnedNeutral = false;
-      globalSpatialAudio.setSourcePosition(peerId, pos.x, pos.y);
+      globalSpatialAudio.setSourcePosition(peerId, pos.x, pos.y, pos.elevationFeet);
     }
     this.pendingPositions.clear();
   }
