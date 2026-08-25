@@ -207,7 +207,12 @@ class IntentClassificationRouter:
         # 4. Consult the LLM.
         system_prompt = (
             "You are an intent classifier for a virtual tabletop session. "
-            "Classify the player's utterance into EXACTLY ONE of these labels:\n"
+            # NOTE: no apostrophe anywhere in this prompt — the configured
+            # gateway (llm.heretek.one) deterministically degrades when a raw
+            # single quote reaches it (live-probed 2026-08-25: "player's"
+            # flipped MECHANICAL_INVOCATION → IN_CHARACTER_DIALOGUE at
+            # reduced confidence; escaped/absent quotes classify correctly).
+            "Classify the player utterance into EXACTLY ONE of these labels:\n"
             + "\n".join(f"- {item.value}" for item in IntentType)
             + "\n\nRespond with ONLY a single JSON object of the form "
             '{"intent_type": "<LABEL>", "confidence": <float between 0 and 1>}. '
