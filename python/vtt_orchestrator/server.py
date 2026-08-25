@@ -157,19 +157,25 @@ pdf_renderer = CharacterSheetPDFRenderer()
 empirical_playtester = EmpiricalPlaytester()
 
 # Load Compendium Data
-# Prefer the richer SRD 5.2 fixtures (full stat blocks, untruncated spells,
-# magic items, feats, origins, animals, glossary); fall back to the legacy
-# 5.1 data files when they are absent.
+# Both SRD editions are loaded when their fixtures exist so a session's
+# persisted rule_version (iteration 34, exposed on GET /sessions/{id}) can pick
+# the right corpus per route. The DEFAULT corpus stays the richer SRD 5.2 set
+# (legacy behavior for callers that name no session); when only one edition's
+# fixtures exist every session gets that one, logged once and honestly.
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 COMPENDIUM_DIR = os.path.join(PROJECT_ROOT, "compendium")
 SPELLS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_spells.json")
 MONSTERS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_monsters.json")
+SRD_51_SPELLS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_1_spells.json")
+SRD_51_MONSTERS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_1_monsters.json")
 MAGIC_ITEMS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_magic_items.json")
 FEATS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_feats.json")
 ANIMALS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_animals.json")
 ORIGINS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_origins.json")
 GLOSSARY_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_rules_glossary.json")
+
+VALID_RULE_VERSIONS = ("srd_5_1", "srd_5_2")
 
 
 def _load_json(path: str) -> List[Dict[str, Any]]:
@@ -179,15 +185,129 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
-all_spells: List[Dict[str, Any]] = _load_json(SPELLS_FILE) or _load_json(
+compendium_corpora: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
+_srd_52_spells = _load_json(SPELLS_FILE)
+_srd_52_monsters = _load_json(MONSTERS_FILE)
+if _srd_52_spells and _srd_52_monsters:
+    compendium_corpora["srd_5_2"] = {
+        "spells": _srd_52_spells,
+        "monsters": _srd_52_monsters,
+    }
+
+# The 5.1 edition falls back to the legacy truncated data/ files when the full
+# compendium fixtures are absent — same fallback chain the gateway always had.
+_srd_51_spells = _load_json(SRD_51_SPELLS_FILE) or _load_json(
     os.path.join(DATA_DIR, "srd_spells.json"))
-all_monsters: List[Dict[str, Any]] = _load_json(MONSTERS_FILE) or _load_json(
+_srd_51_monsters = _load_json(SRD_51_MONSTERS_FILE) or _load_json(
     os.path.join(DATA_DIR, "srd_monsters.json"))
+if _srd_51_spells and _srd_51_monsters:
+    compendium_corpora["srd_5_1"] = {
+        "spells": _srd_51_spells,
+        "monsters": _srd_51_monsters,
+    }
+
+# Deployment default: prefer 5.2 (the richer fixture set the gateway has always
+# served), degrade to whichever edition actually loaded.
+default_rule_version: str = (
+    "srd_5_2" if "srd_5_2" in compendium_corpora
+    else "srd_5_1" if "srd_5_1" in compendium_corpora
+    else "srd_5_2"
+)
+
+_default_corpus = compendium_corpora.get(default_rule_version, {})
+all_spells: List[Dict[str, Any]] = _default_corpus.get("spells", [])
+all_monsters: List[Dict[str, Any]] = _default_corpus.get("monsters", [])
+
+import logging as _corpus_logging
+
+_corpus_log = _corpus_logging.getLogger("aethertable.compendium")
+_loaded = ", ".join(
+    f"{v} ({len(c['spells'])} spells / {len(c['monsters'])} monsters)"
+    for v, c in sorted(compendium_corpora.items())
+) or "none"
+_missing = [v for v in VALID_RULE_VERSIONS if v not in compendium_corpora]
+_corpus_log.info(
+    "compendium corpora loaded: %s; default_rule_version=%s%s",
+    _loaded,
+    default_rule_version,
+    (
+        f"; sessions stamped {_missing} will be served the default corpus"
+        if _missing else ""
+    ),
+)
+
 all_magic_items: List[Dict[str, Any]] = _load_json(MAGIC_ITEMS_FILE)
 all_feats: List[Dict[str, Any]] = _load_json(FEATS_FILE)
 all_animals: List[Dict[str, Any]] = _load_json(ANIMALS_FILE)
 all_origins: List[Dict[str, Any]] = _load_json(ORIGINS_FILE)
 all_glossary_terms: List[Dict[str, Any]] = _load_json(GLOSSARY_FILE)
+
+
+async def resolve_session_rule_version(
+    engine_session_id: str,
+) -> Tuple[Optional[str], str, str]:
+    """Resolves one session's rules baseline from the authoritative engine.
+
+    Returns ``(rule_version_or_None, status, reason)`` where status is one of
+    ``"session"`` (resolved from the live snapshot), ``"unreachable"``,
+    ``"missing_version"`` (snapshot predates preference tracking) or
+    ``"unknown_version"``. Callers fall back to ``default_rule_version`` for
+    every non-"session" status and MUST surface the reason — a table silently
+    running the other edition is worse than a loud provenance field.
+    """
+    try:
+        snapshot = await engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(str(engine_session_id))}",
+        )
+    except engine_client.EngineUnavailableError as exc:
+        return None, "unreachable", f"engine unreachable ({exc})"
+    except engine_client.EngineRejectedError as exc:
+        return None, "unreachable", f"engine rejected session lookup ({exc.status_code})"
+    raw = snapshot.get("rule_version")
+    if raw not in VALID_RULE_VERSIONS:
+        return None, "unknown_version", (
+            f"session reported rule_version {raw!r}; expected one of "
+            f"{list(VALID_RULE_VERSIONS)}"
+        )
+    return raw, "session", ""
+
+
+def _versioned_provenance(
+    resolved: Tuple[Optional[str], str, str],
+    requested: bool,
+) -> Tuple[str, Dict[str, Any]]:
+    """Maps a resolve_session_rule_version result onto response provenance.
+
+    Returns (effective_version, provenance_fields). ``rule_version_source`` is
+    ``"session"`` when the named session decided, ``"default"`` when no session
+    was named, and ``"default_fallback"`` (plus a ``rule_version_reason``) when
+    a named session could not be honored.
+    """
+    version, status, reason = resolved
+    effective = version if version else default_rule_version
+    if not requested:
+        return effective, {
+            "rule_version": effective,
+            "rule_version_source": "default",
+        }
+    fields: Dict[str, Any] = {
+        "rule_version": effective,
+        "rule_version_source": "session" if status == "session" else "default_fallback",
+    }
+    if status != "session":
+        fields["rule_version_reason"] = reason
+    return effective, fields
+
+
+def _versioned_lists(resolved: Tuple[Optional[str], str, str]) -> Tuple[List, List]:
+    """Spell/monster lists for the resolved version (default on any failure)."""
+    version = resolved[0] if resolved[0] else default_rule_version
+    corpus = compendium_corpora.get(version)
+    if not corpus:
+        corpus = compendium_corpora.get(default_rule_version, {"spells": [], "monsters": []})
+    return corpus["spells"], corpus["monsters"]
 
 # Compendium RAG backend selection (backlog 4.7): QDRANT_ENABLED=1 plus a
 # healthy Qdrant indexes the loaded compendium lists for semantic lore lookup;
@@ -219,16 +339,25 @@ class NarrativeGenerateRequest(BaseModel):
     target_entity_id: Optional[str] = None
 
 
-def extract_srd_context(text: str, limit: int = 2) -> List[Dict[str, Any]]:
+def extract_srd_context(
+    text: str,
+    limit: int = 2,
+    *,
+    spells: Optional[List[Dict[str, Any]]] = None,
+    monsters: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Find SRD monster/spell references in free text and return stat facts.
 
     Used to ground LLM narration in authoritative compendium data so the DM
     agent cannot contradict the stat blocks (mechanical hallucination guard).
+    ``spells``/``monsters`` let session-aware callers inject the corpus
+    matching the session's rule_version; they default to the deployment's
+    default edition so legacy call sites are unchanged.
     """
     lowered = (text or "").lower()
     facts: List[Dict[str, Any]] = []
 
-    for monster in all_monsters:
+    for monster in monsters if monsters is not None else all_monsters:
         name = monster.get("name", "")
         if len(name) >= 4 and name.lower() in lowered:
             facts.append({
@@ -242,7 +371,7 @@ def extract_srd_context(text: str, limit: int = 2) -> List[Dict[str, Any]]:
             if len(facts) >= limit:
                 return facts
 
-    for spell in all_spells:
+    for spell in spells if spells is not None else all_spells:
         name = spell.get("name", "")
         if len(name) >= 4 and name.lower() in lowered:
             level = spell.get("level", 0)
@@ -805,13 +934,23 @@ async def delete_handout(handout_id: str, token: str = Depends(_require_auth)):
 
 
 @app.get("/api/v1/compendium/spells")
-def get_compendium_spells(
+async def get_compendium_spells(
     q: Optional[str] = Query(None, description="Search query for spell name"),
     school: Optional[str] = Query(None, description="Filter by magic school"),
     level: Optional[int] = Query(None, description="Filter by spell level"),
-    limit: int = Query(50, ge=1, le=400)
+    limit: int = Query(50, ge=1, le=400),
+    engine_session_id: Optional[str] = Query(
+        None,
+        description="Prefer this session's persisted rule_version corpus",
+    ),
 ):
-    results = all_spells
+    resolved = (
+        await resolve_session_rule_version(engine_session_id)
+        if engine_session_id else (None, "", "")
+    )
+    spells, _ = _versioned_lists(resolved)
+    provenance = _versioned_provenance(resolved, bool(engine_session_id))[1]
+    results = spells
     if q:
         query = q.lower()
         results = [s for s in results if query in s.get("name", "").lower() or query in s.get("description", "").lower()]
@@ -821,17 +960,28 @@ def get_compendium_spells(
         results = [s for s in results if s.get("level") == level]
     return {
         "total": len(results),
-        "spells": results[:limit]
+        "spells": results[:limit],
+        **provenance,
     }
 
 
 @app.get("/api/v1/compendium/monsters")
-def get_compendium_monsters(
+async def get_compendium_monsters(
     q: Optional[str] = Query(None, description="Search query for monster name"),
     challenge_rating: Optional[str] = Query(None, description="Filter by challenge rating"),
-    limit: int = Query(50, ge=1, le=400)
+    limit: int = Query(50, ge=1, le=400),
+    engine_session_id: Optional[str] = Query(
+        None,
+        description="Prefer this session's persisted rule_version corpus",
+    ),
 ):
-    results = all_monsters
+    resolved = (
+        await resolve_session_rule_version(engine_session_id)
+        if engine_session_id else (None, "", "")
+    )
+    _, monsters = _versioned_lists(resolved)
+    provenance = _versioned_provenance(resolved, bool(engine_session_id))[1]
+    results = monsters
     if q:
         query = q.lower()
         results = [m for m in results if query in m.get("name", "").lower() or query in m.get("type", "").lower()]
@@ -839,7 +989,8 @@ def get_compendium_monsters(
         results = [m for m in results if str(m.get("challenge_rating")) == str(challenge_rating)]
     return {
         "total": len(results),
-        "monsters": results[:limit]
+        "monsters": results[:limit],
+        **provenance,
     }
 
 
@@ -3086,13 +3237,24 @@ async def stream_narrative_endpoint(
     # engine state, never the client's claims.
     audited_payload, active_count, previous_count = await _resolve_audit_inputs(req)
 
-    # Ground the narration in SRD 5.2 stat blocks whenever the player's
-    # action names a known monster or spell.
-    srd_facts = extract_srd_context(req.user_intent)
+    # Ground the narration in SRD stat blocks whenever the player's action
+    # names a known monster or spell — drawn from the NAMED SESSION's edition
+    # corpus when one is bound (its persisted rule_version decides), the
+    # default edition otherwise. Provenance rides along in the grounding
+    # context so degraded/offline narration stays attributable.
+    resolved = (
+        await resolve_session_rule_version(req.engine_session_id)
+        if req.engine_session_id else (None, "", "")
+    )
+    spells, monsters = _versioned_lists(resolved)
+    _, grounding_provenance = _versioned_provenance(resolved, bool(req.engine_session_id))
+    srd_facts = extract_srd_context(
+        req.user_intent, spells=spells, monsters=monsters
+    )
     raw_generator = streaming_gateway.stream_narrative(
         user_intent=req.user_intent,
         engine_payload=audited_payload,
-        context={"srd": srd_facts},
+        context={"srd": srd_facts, **grounding_provenance},
     )
 
     async def audited_stream():
@@ -3214,40 +3376,70 @@ _SENTENCE_END_RE = re.compile(r"[.!?…](\s|$)")
 
 
 @app.get("/api/v1/compendium/lore-lookup")
-def compendium_lore_lookup(
+async def compendium_lore_lookup(
     q: str = Query(..., description="Text to scan for SRD monster/spell references"),
     semantic: bool = Query(
         False,
         description="Rank via the Qdrant compendium RAG index when enabled",
     ),
     k: int = Query(5, ge=1, le=25, description="Top-K entries (semantic mode)"),
+    engine_session_id: Optional[str] = Query(
+        None,
+        description="Prefer this session's persisted rule_version corpus",
+    ),
 ):
     # Response shape is identical across retrieval modes; the "retrieval"
     # provenance field tells callers which path served the facts:
     # "qdrant-dense-sparse" | "qdrant-dense" | "qdrant-hash-fallback"
     # (vector search — the last one is NOT semantic, just lexical hashing)
     # | "substring" | "substring_fallback".
+    resolved = (
+        await resolve_session_rule_version(engine_session_id)
+        if engine_session_id else (None, "", "")
+    )
+    spells, monsters = _versioned_lists(resolved)
+    effective_version, provenance = _versioned_provenance(resolved, bool(engine_session_id))
+    # The Qdrant index is built once at startup from the DEFAULT corpus, so its
+    # hits cannot be re-labeled with another session's edition. When the
+    # session's version differs we degrade to the versioned substring scan
+    # instead of serving 5.2-indexed facts under a 5.1 banner.
+    rag_edition_mismatch = (
+        bool(engine_session_id)
+        and effective_version != default_rule_version
+    )
     if semantic:
         results = compendium_rag.search(q, k=k)
-        if results is not None:
+        if results is not None and not rag_edition_mismatch:
             return {
                 "query": q,
                 "facts": results,
                 "retrieval": getattr(
                     compendium_rag, "retrieval_provenance", "qdrant"
                 ),
+                **provenance,
             }
         marker = (
             "substring_fallback"
-            if compendium_rag.available  # healthy at startup, failed NOW
+            if compendium_rag.available or rag_edition_mismatch
             else "substring"             # never enabled/reachable
         )
+        if rag_edition_mismatch and resolved[1] == "session":
+            provenance["rule_version_reason"] = (
+                f"semantic index serves the {default_rule_version} corpus; "
+                f"fell back to the {effective_version} substring scan"
+            )
         return {
             "query": q,
-            "facts": extract_srd_context(q, limit=k),
+            "facts": extract_srd_context(q, limit=k, spells=spells, monsters=monsters),
             "retrieval": marker,
+            **provenance,
         }
-    return {"query": q, "facts": extract_srd_context(q), "retrieval": "substring"}
+    return {
+        "query": q,
+        "facts": extract_srd_context(q, spells=spells, monsters=monsters),
+        "retrieval": "substring",
+        **provenance,
+    }
 
 
 async def _caller_is_session_participant(user_id: str, engine_session_id: str) -> bool:
