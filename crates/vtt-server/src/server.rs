@@ -1740,6 +1740,14 @@ pub struct ShoveActionReq {
     pub defender_id: Uuid,
     /// Chosen effect on success ("prone" | "push_5ft").
     pub shove_effect: ShoveEffectChoice,
+    /// Ledge convention (SRD edge case): when set alongside `push_5ft`, a
+    /// WON shove sends the defender over the edge instead of sliding them 5
+    /// ft along the deck — the defender resolves a full tactical fall to this
+    /// elevation (damage, Prone, massive-damage death) via the same
+    /// FALL_RESOLVED ledger event as /action/fall. Requires a downward drop;
+    /// meaningless with the `prone` effect (rejected).
+    #[serde(default)]
+    pub ledge_target_z: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
 }
@@ -2196,6 +2204,35 @@ async fn resolve_shove_action(
         } else {
             DefenderSkill::Acrobatics
         };
+
+        // Ledge-convention gates run BEFORE the Action is spent: a malformed
+        // ledge request must never consume the turn.
+        if let Some(ledge_z) = req.ledge_target_z {
+            if !ledge_z.is_finite() {
+                return reject(
+                    &data,
+                    422,
+                    "INVALID_LEDGE_Z",
+                    "ledge_target_z must be a finite elevation",
+                );
+            }
+            if req.shove_effect != ShoveEffectChoice::Push5Feet {
+                return reject(
+                    &data,
+                    422,
+                    "LEDGE_REQUIRES_PUSH",
+                    "ledge_target_z only applies to the push_5ft effect",
+                );
+            }
+            if defender.position.2 - ledge_z <= 0.0 {
+                return reject(
+                    &data,
+                    422,
+                    "NO_DOWNWARD_DROP",
+                    "the ledge must sit below the defender",
+                );
+            }
+        }
         let defender_mod = defender.abilities.modifier(defender_skill.ability());
 
         if let Err(e) = session
@@ -2231,6 +2268,10 @@ async fn resolve_shove_action(
         let mut pushed_from: Option<(f32, f32, f32)> = None;
         let mut pushed_to: Option<(f32, f32, f32)> = None;
         let mut push_distance_feet = 0.0f32;
+        let mut ledge_fall_payload: Option<serde_json::Value> = None;
+        // Ledge convention: set when a won push carried the defender over the
+        // requested ledge and a fall resolved on top of the displacement.
+        let mut ledge_fall: Option<vtt_core::actions::FallResolution> = None;
 
         if let Some(condition) = resolution.applied_condition {
             if let Some(t) = session.entities.get_mut(&req.defender_id) {
@@ -2239,10 +2280,39 @@ async fn resolve_shove_action(
         } else if resolution.success && effect == vtt_core::actions::ShoveEffect::Push5Feet {
             // Push 5 ft directly away from the shover along their connecting
             // line, clamped cell-by-cell against solid cells and map bounds.
-            let (from, to, moved) =
+            let (from, mut to, moved) =
                 resolve_clamped_push(&session.map, attacker.position, defender.position);
+            if moved > 0.0 {
+                if let Some(ledge_z) = req.ledge_target_z {
+                    // Ledge convention: the push goes OVER the edge instead of
+                    // along the deck — same 5 ft of horizontal travel, then a
+                    // full tactical fall to the ledge floor. Only a shove that
+                    // actually displaces the defender can carry them off; a
+                    // fully wall-blocked push leaves them standing.
+                    if let Ok(fall) = ActionResolver::resolve_fall(
+                        defender.position.2,
+                        ledge_z,
+                        vtt_core::actions::LandingSurface::Normal,
+                        &mut dice,
+                        defender.current_hp,
+                        defender.max_hp,
+                        None,
+                    ) {
+                        to = (to.0, to.1, ledge_z);
+                        ledge_fall = Some(fall);
+                    }
+                }
+            }
             if let Some(t) = session.entities.get_mut(&req.defender_id) {
                 t.position = to;
+                if let Some(fall) = &ledge_fall {
+                    t.current_hp = fall.hp_remaining;
+                    t.is_conscious = fall.is_conscious;
+                    t.is_dead = fall.instant_death;
+                    if fall.knocked_prone {
+                        t.add_condition(Condition::Prone);
+                    }
+                }
             }
             // Keep the WS relay's movement baseline consistent: the token was
             // displaced engine-side, so the next TokenTransform update must be
@@ -2255,6 +2325,35 @@ async fn resolve_shove_action(
             pushed_from = Some(from);
             pushed_to = Some(to);
             push_distance_feet = moved;
+
+            // The fall is its OWN ledger event so a rewind past either record
+            // undoes exactly its half of the story (the SHOVE_ATTEMPTED seeds
+            // the landing position via `pushed_to`; FALL_RESOLVED replays HP,
+            // consciousness and Prone).
+            if let Some(fall) = &ledge_fall {
+                let fall_payload = serde_json::json!({
+                    "entity_id": req.defender_id.to_string(),
+                    "dropped_from": [from.0, from.1, defender.position.2],
+                    "landed_at": [to.0, to.1, to.2],
+                    "drop_feet": fall.drop_feet,
+                    "surface": "normal",
+                    "outcome": fall.outcome,
+                    "raw_damage": fall.raw_damage,
+                    "damage_taken": fall.damage_taken,
+                    "knocked_prone": fall.knocked_prone,
+                    "hp_before": defender.current_hp,
+                    "hp_remaining": fall.hp_remaining,
+                    "instant_death": fall.instant_death,
+                });
+                session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    req.defender_id,
+                    "FALL_RESOLVED",
+                    fall_payload.clone(),
+                );
+                ledge_fall_payload = Some(fall_payload);
+            }
         }
 
         let mut payload = serde_json::json!({
@@ -2289,6 +2388,9 @@ async fn resolve_shove_action(
         body["winner_side"] = serde_json::json!(resolution.contest.winner_side);
         body["margin"] = serde_json::json!(resolution.contest.margin);
         body["effect"] = serde_json::json!(req.shove_effect);
+        if let Some(fall_payload) = ledge_fall_payload {
+            body["fall"] = fall_payload;
+        }
         body["distance_feet"] = serde_json::json!(attacker.distance_to_feet(&defender));
         body["event_sequence"] = serde_json::json!(event.sequence_id);
         HttpResponse::Ok().json(body)
@@ -2297,6 +2399,205 @@ async fn resolve_shove_action(
     }
 }
 
+
+// --- Tactical falls (PILLAR-3 gap) --------------------------------------------
+//
+// Gravity is not an action: a creature that goes off a ledge (knocked off,
+// shoved off, or voluntarily stepping down) falls NOW. The route models the
+// resolution only — the caller (or the shove push below) supplies the landing
+// elevation. Contract mirrors the grapple/shove endpoints: ids-only payload
+// (`deny_unknown_fields`), server-measured geometry only, session-scoped
+// deterministic seed, ledger event for rewind.
+//
+// Disclosed approximations:
+// - the vertical descent is charged against the movement budget (SRD leaves
+//   falling free; charging it keeps the budget meaningful without inventing
+//   an extra resource) — but no Action is ever spent by gravity;
+// - the DC 15 Acrobatics land-on-your-feet check is supplied as a save total
+//   (stat blocks carry no proficiency bonuses), not rolled here.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallActionReq {
+    /// The creature going over the edge.
+    pub entity_id: Uuid,
+    /// Landing elevation in feet (may be negative — pits below ground level).
+    pub target_z: f32,
+    /// Landing surface ("normal" | "soft"). Absent = normal ground.
+    #[serde(default)]
+    pub surface: FallSurfaceChoice,
+    /// Optional client-declared drop distance. The engine measures the fall
+    /// from authoritative positions; a declaration that disagrees with the
+    /// board by more than half a foot is refused (DROP_MISMATCH) rather than
+    /// trusted — same trust model as refusing smuggled attack math.
+    #[serde(default)]
+    pub declared_drop_feet: Option<f32>,
+    /// Total of a DC 15 Acrobatics check to land on your feet. Absent = no
+    /// check attempted (prone on any 10 ft+ landing).
+    #[serde(default)]
+    pub acrobatics_total: Option<i32>,
+    /// Optional deterministic seed pinning the damage roll.
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+/// Caller-chosen landing surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallSurfaceChoice {
+    #[default]
+    Normal,
+    Soft,
+}
+
+impl From<FallSurfaceChoice> for vtt_core::actions::LandingSurface {
+    fn from(choice: FallSurfaceChoice) -> Self {
+        match choice {
+            FallSurfaceChoice::Normal => vtt_core::actions::LandingSurface::Normal,
+            FallSurfaceChoice::Soft => vtt_core::actions::LandingSurface::Soft,
+        }
+    }
+}
+
+async fn resolve_fall_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<FallActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE any validation
+    // side effect (movement spend, ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let faller = match session.entities.get(&req.entity_id) {
+            Some(e) => e.clone(),
+            None => {
+                return reject(
+                    &data,
+                    404,
+                    "ENTITY_NOT_FOUND",
+                    "entity_id does not exist in this session",
+                )
+            }
+        };
+        if !may_control_entity(faller.owner_player_id.as_ref(), role, &identity.user_id) {
+            return reject(
+                &data,
+                403,
+                "ENTITY_NOT_OWNED",
+                "you do not control the falling entity",
+            );
+        }
+        if !faller.position.0.is_finite()
+            || !faller.position.1.is_finite()
+            || !faller.position.2.is_finite()
+        {
+            return reject(
+                &data,
+                422,
+                "NON_FINITE_POSITION",
+                "the entity's stored position is not finite",
+            );
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+        // Resolve FIRST (pure math, no state touched yet): a rejected fall
+        // must leave neither HP scars nor ledger records behind.
+        let surface: vtt_core::actions::LandingSurface = req.surface.into();
+        let resolution = ActionResolver::resolve_fall(
+            faller.position.2,
+            req.target_z,
+            surface,
+            &mut dice,
+            faller.current_hp,
+            faller.max_hp,
+            req.acrobatics_total,
+        );
+        let resolution = match resolution {
+            Ok(r) => r,
+            Err(code @ ("NON_FINITE_ELEVATION" | "NO_DOWNWARD_DROP")) => {
+                return reject(&data, 422, code, "not a legal downward fall")
+            }
+            Err(other) => return reject(&data, 422, other, "fall rejected"),
+        };
+        if let Some(declared) = req.declared_drop_feet {
+            if !declared.is_finite() || (declared - resolution.drop_feet).abs() > 0.5 {
+                return reject(
+                    &data,
+                    422,
+                    "DROP_MISMATCH",
+                    "declared_drop_feet disagrees with the board-measured fall",
+                );
+            }
+        }
+
+        // Movement cost AFTER every gate passes: the vertical drop comes out
+        // of the speed budget, clamped at zero (a long fall can exceed a
+        // turn's movement; the fall still happens — gravity does not stop).
+        if let Some(entity) = session.entities.get_mut(&req.entity_id) {
+            entity.action_budget.movement_remaining_feet = (entity
+                .action_budget
+                .movement_remaining_feet
+                - resolution.drop_feet)
+                .max(0.0);
+            entity.position = (faller.position.0, faller.position.1, req.target_z);
+            if resolution.instant_death {
+                entity.current_hp = 0;
+                entity.is_conscious = false;
+                entity.is_dead = true;
+            } else {
+                entity.current_hp = resolution.hp_remaining;
+                entity.is_conscious = resolution.is_conscious;
+                if resolution.knocked_prone {
+                    entity.add_condition(Condition::Prone);
+                }
+            }
+        }
+
+        let campaign_id = session.campaign_id;
+        let payload = serde_json::json!({
+            "entity_id": req.entity_id.to_string(),
+            "dropped_from": [faller.position.0, faller.position.1, faller.position.2],
+            "landed_at": [faller.position.0, faller.position.1, req.target_z],
+            "drop_feet": resolution.drop_feet,
+            "surface": req.surface,
+            "outcome": resolution.outcome,
+            "raw_damage": resolution.raw_damage,
+            "damage_taken": resolution.damage_taken,
+            "knocked_prone": resolution.knocked_prone,
+            "hp_before": faller.current_hp,
+            "hp_remaining": resolution.hp_remaining,
+            "instant_death": resolution.instant_death,
+        });
+        let event =
+            session
+                .ledger
+                .append_event(session_id, campaign_id, req.entity_id, "FALL_RESOLVED", payload.clone());
+
+        data.count_valid();
+        let mut body = payload;
+        body["is_conscious"] = serde_json::json!(resolution.is_conscious);
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
 
 // --- Dodge / Dash / Disengage / Stabilize (standard action options) -----------
 //
@@ -5588,6 +5889,7 @@ pub fn configure_app_with(
                         .route("/action/grapple", web::post().to(resolve_grapple_action))
                         .route("/action/escape-grapple", web::post().to(resolve_escape_grapple_action))
                         .route("/action/shove", web::post().to(resolve_shove_action))
+                        .route("/action/fall", web::post().to(resolve_fall_action))
                         .route("/action/dodge", web::post().to(resolve_dodge))
                         .route("/action/dash", web::post().to(resolve_dash))
                         .route("/action/disengage", web::post().to(resolve_disengage))

@@ -39,6 +39,11 @@ pub enum ShoveEffect {
     Push5Feet,
 }
 
+/// SRD DC 15 Acrobatics check to land on your feet after a fall (avoiding
+/// Prone). The caller rolls and supplies the total — see
+/// [`ActionResolver::resolve_fall`].
+pub const FALL_LAND_ON_FEET_DC: i32 = 15;
+
 /// Outcome of a contested ability check.
 ///
 /// `margin` is the winner's total minus the loser's total (0 on a tie, which
@@ -77,6 +82,129 @@ pub struct ShoveResolution {
     pub effect: ShoveEffect,
     /// `Some(Condition::Prone)` when the shove succeeded AND chose `ShoveEffect::Prone`.
     pub applied_condition: Option<Condition>,
+}
+
+// --- Tactical falls ------------------------------------------------------------
+//
+// SRD 5e falling (PHB "Falling"): a creature that falls 10 ft or more takes
+// 1d6 bludgeoning damage per 10 ft fallen (max 20d6) and lands Prone, unless
+// it avoids damage. The DC 15 Acrobatics check to land on your feet is
+// approximated here as an optional supplied save total (the engine's stat
+// blocks carry no proficiency bonuses; the caller rolls and supplies the
+// total). Landing on a soft surface halves the damage — the disclosed
+// approximation for the feather-fall / soft-landing family of rulings.
+//
+// Massive damage instant death reuses [`RulesEvaluator::check_instant_death`]
+// so falls kill exactly like every other damage source in this engine.
+
+/// What the faller lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandingSurface {
+    /// Ordinary ground: full damage.
+    Normal,
+    /// Water, deep snow, soft earth, a heap of hay: damage halved (floor).
+    Soft,
+}
+
+/// Coarse bucket for the fall outcome, mirroring the PILLAR-3 ladder:
+/// nothing / prone only / prone + damage / massive-damage death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallOutcome {
+    /// Under 10 ft of drop: no damage, no condition.
+    SafeDrop,
+    /// 10 ft or more survived: prone, plus damage when any was rolled.
+    InjuredLanding,
+    /// Damage dropped the faller AND exceeded max HP: dead before hitting
+    /// the ground (SRD massive damage instant death).
+    MassiveDamage,
+}
+
+/// Full resolution of one fall. `damage_taken` is what actually applies to
+/// the faller's HP (surface-adjusted); `raw_damage` is the pre-surface roll
+/// so audits can see both.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FallResolution {
+    pub drop_feet: f32,
+    pub surface: LandingSurface,
+    pub outcome: FallOutcome,
+    /// Dice total before any surface adjustment (1d6 per 10 ft, capped 20d6).
+    pub raw_damage: i32,
+    /// Damage actually applied to HP (`raw_damage`, or half on a soft surface).
+    pub damage_taken: i32,
+    /// Landed Prone (always true at 10 ft+ unless a passed save total is supplied).
+    pub knocked_prone: bool,
+    pub hp_remaining: i32,
+    pub is_conscious: bool,
+    pub instant_death: bool,
+}
+
+impl ActionResolver {
+    /// Resolves a tactical fall from `current_z` down to `target_z` (world
+    /// units are feet).
+    ///
+    /// Errors are returned as static strings (clippy `result_large_err`):
+    /// `"NON_FINITE_ELEVATION"` when either elevation is not finite, and
+    /// `"NO_DOWNWARD_DROP"` when the target is at or above the start.
+    #[allow(clippy::result_large_err)] // plain &'static str payload
+    pub fn resolve_fall(
+        current_z: f32,
+        target_z: f32,
+        surface: LandingSurface,
+        dice: &mut DiceEngine,
+        current_hp: i32,
+        max_hp: i32,
+        acrobatics_save_total: Option<i32>,
+    ) -> Result<FallResolution, &'static str> {
+        if !current_z.is_finite() || !target_z.is_finite() {
+            return Err("NON_FINITE_ELEVATION");
+        }
+        let drop = current_z - target_z;
+        if drop <= 0.0 {
+            return Err("NO_DOWNWARD_DROP");
+        }
+
+        let raw_damage = RulesEvaluator::calculate_fall_damage(dice, drop, None).0;
+        let damage_taken = match surface {
+            LandingSurface::Normal => raw_damage,
+            LandingSurface::Soft => raw_damage / 2,
+        };
+
+        // SRD massive-damage instant death, shared with every other damage
+        // source in this engine.
+        let instant_death = Self::check_instant_death(damage_taken, current_hp, max_hp);
+
+        let landed_on_feet = acrobatics_save_total.is_some_and(|total| total >= FALL_LAND_ON_FEET_DC);
+        let knocked_prone = !instant_death && drop >= 10.0 && !landed_on_feet;
+
+        let hp_remaining = if instant_death {
+            0
+        } else {
+            (current_hp - damage_taken).max(0)
+        };
+        let is_conscious = !instant_death && hp_remaining > 0;
+
+        let outcome = if instant_death {
+            FallOutcome::MassiveDamage
+        } else if drop >= 10.0 {
+            FallOutcome::InjuredLanding
+        } else {
+            FallOutcome::SafeDrop
+        };
+
+        Ok(FallResolution {
+            drop_feet: drop,
+            surface,
+            outcome,
+            raw_damage,
+            damage_taken,
+            knocked_prone,
+            hp_remaining,
+            is_conscious,
+            instant_death,
+        })
+    }
 }
 
 // --- Two-Weapon Fighting ------------------------------------------------------

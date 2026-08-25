@@ -1338,12 +1338,12 @@ impl GameSession {
         let mut death_save_state: HashMap<Uuid, DeathSaveState> = HashMap::new();
         let mut pos_state: HashMap<Uuid, (f32, f32, f32)> = HashMap::new();
         // Contest-derived conditions (Grappled from a won grapple, Prone from
-        // a prone-shove): last surviving grant per entity wins. Anything not
-        // backed by a surviving event is stripped below — these two
-        // conditions are only ever granted by GRAPPLE_ATTEMPTED /
-        // SHOVE_ATTEMPTED flows, so a rewind past those events must un-grant
-        // them even though they live outside the HP/position replay set
-        // (audit F4: the rewind-blind-spot class).
+        // a prone-shove or a tactical fall): last surviving grant per entity
+        // wins. Anything not backed by a surviving event is stripped below —
+        // these two conditions are only ever granted by GRAPPLE_ATTEMPTED /
+        // SHOVE_ATTEMPTED / FALL_RESOLVED flows, so a rewind past those events
+        // must un-grant them even though they live outside the HP/position
+        // replay set (audit F4: the rewind-blind-spot class).
         let mut condition_state: HashMap<Uuid, Condition> = HashMap::new();
 
         // Seed positions from REVERTED shove pushes first (`or_insert`, so any
@@ -1365,6 +1365,31 @@ impl GameSession {
                 parse_payload_position(ev.payload.get("pushed_from")),
             ) {
                 pos_state.entry(id).or_insert(from);
+            }
+        }
+        // Same blind-spot class for tactical falls: a fall moves its victim
+        // and wounds them WITHOUT any MOVE_ENTITY or DAMAGE_APPLIED event, so
+        // when the FALL_RESOLVED itself is reverted the only record of the
+        // pre-fall world is that event's own payload. Seed the pre-fall
+        // position ("dropped_from") and pre-fall HP ("hp_before", with
+        // consciousness derived as hp > 0 — a disclosed approximation: an
+        // already-dying creature rewinds to conscious-but-wounded).
+        // `or_insert` keeps any surviving later event authoritative.
+        for ev in reverted.iter().filter(|e| e.event_type == "FALL_RESOLVED") {
+            let Some(id) = ev
+                .payload
+                .get("entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            if let Some(from) = parse_payload_position(ev.payload.get("dropped_from")) {
+                pos_state.entry(id).or_insert(from);
+            }
+            if let Some(hp) = ev.payload.get("hp_before").and_then(|v| v.as_i64()) {
+                let hp = hp as i32;
+                hp_state.entry(id).or_insert((hp, hp > 0, false));
             }
         }
         // Last-seen post-rest exhaustion level per entity, from surviving
@@ -1517,8 +1542,46 @@ impl GameSession {
                         _ => {}
                     }
                 }
-                _ => {}
-            }
+                // Tactical falls (iteration 53): a surviving FALL_RESOLVED
+                // re-applies its landing point, post-fall HP/consciousness and
+                // the Prone grant, so rewinding past a fall cannot leave a
+                // wound, a prone token or a changed elevation behind. A
+                // MASSIVE_DAMAGE outcome replays as dead exactly like
+                // DAMAGE_APPLIED does; `knocked_prone: false` leaves any
+                // earlier Prone grant untouched (last surviving grant wins).
+                "FALL_RESOLVED" => {
+                    if let Some(id) = ev
+                        .payload
+                        .get("entity_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        if let Some(to) = parse_payload_position(ev.payload.get("landed_at")) {
+                            pos_state.insert(id, to);
+                        }
+                        if let Some(hp) = ev.payload.get("hp_remaining").and_then(|v| v.as_i64()) {
+                            let hp = hp as i32;
+                            hp_state.insert(
+                                id,
+                                (
+                                    hp,
+                                    ev.payload
+                                        .get("is_conscious")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(hp > 0),
+                                    ev.payload
+                                        .get("instant_death")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                ),
+                            );
+                        }
+                        if ev.payload.get("knocked_prone").and_then(|v| v.as_bool()) == Some(true) {
+                            condition_state.insert(id, Condition::Prone);
+                        }
+                    }
+                }
+                _ => {}            }
         }
 
         // 3. Apply restored state to live entities.
@@ -1563,8 +1626,8 @@ impl GameSession {
         // Contest-condition replay: strip Grappled/Prone everywhere first (the
         // live grants came from events that may just have been reverted), then
         // re-apply exactly what the surviving ledger still vouches for. Both
-        // conditions are granted ONLY by the grapple/shove contest endpoints,
-        // so nothing else can be lost by the sweep.
+        // conditions are granted ONLY by the grapple/shove contest endpoints
+        // and the fall route, so nothing else can be lost by the sweep.
         for entity in self.entities.values_mut() {
             entity.remove_condition(&Condition::Grappled);
             entity.remove_condition(&Condition::Prone);

@@ -2290,3 +2290,178 @@ fn test_bound_hands_helpers_round_trip() {
     e.conditions.push(Condition::Blinded);
     assert!(e.is_blinded());
 }
+
+// --- Tactical falls (iteration 53, PILLAR-3 gap) ------------------------------
+//
+// SRD 5e falling: a fall of 10 ft or more deals 1d6 bludgeoning per 10 ft
+// fallen (max 20d6) and the creature lands Prone; a DC 15 Acrobatics check
+// (approximated here as a supplied save total) lets it land on its feet.
+// Damage that drops a creature to 0 HP and exceeds max HP is instant death,
+// exactly like every other damage source in this engine.
+
+use vtt_core::actions::{FallOutcome, LandingSurface};
+
+#[test]
+fn test_fall_safe_drop_is_a_no_op() {
+    let mut dice = DiceEngine::with_seed(7);
+    let res = ActionResolver::resolve_fall(
+        5.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        30,
+        30,
+        None,
+    )
+    .expect("a 5 ft drop is legal");
+    assert_eq!(res.drop_feet, 5.0);
+    assert_eq!(res.outcome, FallOutcome::SafeDrop);
+    assert_eq!(res.raw_damage, 0, "under 10 ft deals no damage");
+    assert_eq!(res.damage_taken, 0);
+    assert!(!res.knocked_prone, "a safe drop does not knock the faller prone");
+    assert_eq!(res.hp_remaining, 30);
+    assert!(res.is_conscious);
+    assert!(!res.instant_death);
+}
+
+#[test]
+fn test_fall_10ft_knocks_prone_and_deals_1d6() {
+    let mut dice = DiceEngine::with_seed(11);
+    let res = ActionResolver::resolve_fall(
+        10.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        30,
+        30,
+        None,
+    )
+    .expect("a 10 ft fall is legal");
+    assert_eq!(res.outcome, FallOutcome::InjuredLanding);
+    assert!(res.raw_damage >= 1 && res.raw_damage <= 6, "exactly one d6: {}", res.raw_damage);
+    assert_eq!(res.damage_taken, res.raw_damage, "normal terrain applies full damage");
+    assert!(res.knocked_prone, "a 10 ft+ fall lands you prone without a save");
+    assert_eq!(res.hp_remaining, 30 - res.damage_taken);
+}
+
+#[test]
+fn test_fall_dc15_acrobatics_lands_on_feet_but_still_hurts() {
+    let mut dice = DiceEngine::with_seed(3);
+    let res = ActionResolver::resolve_fall(
+        20.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        30,
+        30,
+        Some(15),
+    )
+    .expect("a 20 ft fall is legal");
+    assert_eq!(res.outcome, FallOutcome::InjuredLanding);
+    assert!(res.raw_damage >= 2 && res.raw_damage <= 12, "two d6: {}", res.raw_damage);
+    assert!(!res.knocked_prone, "a passed DC 15 check lands the faller on their feet");
+}
+
+#[test]
+fn test_fall_damage_scales_per_10ft_and_caps_at_20d6() {
+    // A 200 ft drop is exactly the 20d6 cap; a 500 ft drop must not exceed it.
+    let mut dice = DiceEngine::with_seed(9);
+    let capped = ActionResolver::resolve_fall(
+        200.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        300,
+        300,
+        None,
+    )
+    .unwrap();
+    assert!(capped.raw_damage >= 20 && capped.raw_damage <= 120, "20d6 range: {}", capped.raw_damage);
+
+    let mut dice = DiceEngine::with_seed(9);
+    let absurd = ActionResolver::resolve_fall(
+        500.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        300,
+        300,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        absurd.raw_damage, capped.raw_damage,
+        "50d6 would-be damage clamps to the same 20d6 roll"
+    );
+}
+
+#[test]
+fn test_fall_soft_landing_halves_damage_deterministically() {
+    let mut hard = DiceEngine::with_seed(21);
+    let hard_res = ActionResolver::resolve_fall(
+        40.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut hard,
+        60,
+        60,
+        None,
+    )
+    .unwrap();
+    let mut soft = DiceEngine::with_seed(21);
+    let soft_res = ActionResolver::resolve_fall(
+        40.0,
+        0.0,
+        LandingSurface::Soft,
+        &mut soft,
+        60,
+        60,
+        None,
+    )
+    .unwrap();
+    assert_eq!(soft_res.raw_damage, hard_res.raw_damage, "same seed, same raw roll");
+    assert_eq!(soft_res.damage_taken, hard_res.raw_damage / 2, "soft terrain halves (floor)");
+    assert!(soft_res.knocked_prone, "a soft landing still leaves the faller prone");
+}
+
+#[test]
+fn test_fall_massive_damage_is_instant_death() {
+    // 100 ft = 10d6, minimum roll 10; threshold for instant death at 5/5 HP
+    // is damage >= current_hp + max_hp = 10, so EVERY seed dies instantly.
+    let mut dice = DiceEngine::with_seed(4);
+    let res = ActionResolver::resolve_fall(
+        100.0,
+        0.0,
+        LandingSurface::Normal,
+        &mut dice,
+        5,
+        5,
+        None,
+    )
+    .unwrap();
+    assert_eq!(res.outcome, FallOutcome::MassiveDamage);
+    assert!(res.instant_death);
+    assert_eq!(res.hp_remaining, 0);
+    assert!(!res.is_conscious);
+}
+
+#[test]
+fn test_fall_rejects_non_finite_elevation_and_upward_motion() {
+    let mut dice = DiceEngine::with_seed(1);
+    assert_eq!(
+        ActionResolver::resolve_fall(f32::NAN, 0.0, LandingSurface::Normal, &mut dice, 10, 10, None)
+            .unwrap_err(),
+        "NON_FINITE_ELEVATION"
+    );
+    assert_eq!(
+        ActionResolver::resolve_fall(0.0, f32::INFINITY, LandingSurface::Normal, &mut dice, 10, 10, None)
+            .unwrap_err(),
+        "NON_FINITE_ELEVATION"
+    );
+    // Rising is not falling.
+    assert_eq!(
+        ActionResolver::resolve_fall(0.0, 10.0, LandingSurface::Normal, &mut dice, 10, 10, None)
+            .unwrap_err(),
+        "NO_DOWNWARD_DROP"
+    );
+}

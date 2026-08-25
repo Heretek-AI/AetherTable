@@ -8232,3 +8232,416 @@ async fn nested_pouch_contents_are_enforced_transitively_via_http() {
     let body: serde_json::Value = test::read_body_json(res).await;
     assert_eq!(body["error"], "CONTAINER_OVERFILLED");
 }
+
+// --- Tactical falls (iteration 53, PILLAR-3 gap) ------------------------------
+
+async fn post_fall(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/fall", session_id))
+        .insert_header(bearer(token))
+        .set_json(body)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value =
+        serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+/// A hero standing `z` feet up.
+async fn elevated_duel(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    hero_hp: i32,
+    start_z: f64,
+) -> (Uuid, Uuid, Uuid) {
+    let session_id = create_session_as(app, token).await;
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Ledge Hero", hero_hp, 14, 0, "1d4");
+    hero["position"] = serde_json::json!([2.5, 2.5, start_z]);
+    let spectator_id = Uuid::new_v4();
+    let mut watcher = entity_json(spectator_id, "Bystander", 20, 12, 0, "1d4");
+    watcher["position"] = serde_json::json!([8.0, 8.0, 0.0]);
+    spawn(app, token, session_id, hero).await;
+    spawn(app, token, session_id, watcher).await;
+    (session_id, hero_id, spectator_id)
+}
+
+fn fall_events(snap: &serde_json::Value) -> Vec<&serde_json::Value> {
+    snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("FALL_RESOLVED"))
+        .collect()
+}
+
+#[actix_web::test]
+async fn fall_safe_drop_changes_elevation_only() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 30, 5.0).await;
+
+    // A 5 ft step-down: under the SRD 10 ft damage threshold.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["outcome"], serde_json::json!("safe_drop"));
+    assert_eq!(body["drop_feet"], serde_json::json!(5.0));
+    assert_eq!(body["damage_taken"], serde_json::json!(0));
+    assert_eq!(body["knocked_prone"], serde_json::json!(false));
+    assert_eq!(body["landed_at"], serde_json::json!([2.5, 2.5, 0.0]));
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    let hero = &snap["entities"][hero_id.to_string()];
+    assert_eq!(hero["position"], serde_json::json!([2.5, 2.5, 0.0]));
+    assert_eq!(
+        hero["conditions"].as_array().unwrap().len(),
+        0,
+        "a safe drop grants nothing: {}",
+        hero["conditions"]
+    );
+    assert_eq!(hero["current_hp"].as_i64().unwrap(), 30);
+    // Movement cost: the vertical descent comes out of the speed budget
+    // (disclosed approximation), but an Action is never spent by gravity.
+    assert_eq!(hero["action_budget"]["movement_remaining_feet"], serde_json::json!(25.0));
+
+    let falls = fall_events(&snap);
+    assert_eq!(falls.len(), 1, "exactly one FALL_RESOLVED expected");
+    assert_eq!(falls[0]["payload"]["outcome"], serde_json::json!("safe_drop"));
+}
+
+#[actix_web::test]
+async fn fall_10ft_knocks_prone_and_deals_damage() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 30, 10.0).await;
+
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["outcome"], serde_json::json!("injured_landing"));
+    let dmg = body["damage_taken"].as_i64().unwrap();
+    assert!((1..=6).contains(&dmg), "a 10 ft fall is exactly one d6: {}", dmg);
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    let conditions = snap["entities"][hero_id.to_string()]["conditions"]
+        .as_array()
+        .unwrap();
+    assert!(
+        conditions.contains(&serde_json::json!("prone")),
+        "prone on landing: {}",
+        conditions[0]
+    );
+}
+
+#[actix_web::test]
+async fn fall_lethal_height_instant_death() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    // 105 ft = 10d6 (min roll 10) against a 5/5 HP creature whose instant-death
+    // threshold is exactly 10 — every seed kills.
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 5, 105.0).await;
+
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["outcome"], serde_json::json!("massive_damage"));
+    assert_eq!(body["instant_death"], serde_json::json!(true));
+    assert_eq!(body["hp_remaining"], serde_json::json!(0));
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    let hero = &snap["entities"][hero_id.to_string()];
+    assert_eq!(hero["current_hp"].as_i64().unwrap(), 0);
+    assert_eq!(hero["is_dead"], serde_json::json!(true));
+    assert_eq!(hero["is_conscious"], serde_json::json!(false));
+}
+
+#[actix_web::test]
+async fn fall_route_spectator_forbidden_and_no_state_change() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    let spec = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 30, 20.0).await;
+
+    let (status, body) = post_fall(
+        &app,
+        &spec,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["position"],
+        serde_json::json!([2.5, 2.5, 20.0]),
+        "a forbidden fall must not move anyone"
+    );
+    assert!(fall_events(&snap).is_empty());
+}
+
+#[actix_web::test]
+async fn fall_route_rejects_upward_mismatched_and_smuggled_payloads() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 30, 10.0).await;
+
+    // Rising is not falling.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 15.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("NO_DOWNWARD_DROP"));
+
+    // Client-declared drop that disagrees with the board is refused: the
+    // engine measures the fall from authoritative positions only.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": hero_id,
+            "target_z": 0.0,
+            "declared_drop_feet": 100.0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("DROP_MISMATCH"));
+
+    // Unknown fields stay structurally impossible, like every other action:
+    // `deny_unknown_fields` fails deserialization before the handler runs.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/fall", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "target_z": 0.0,
+            "fall_damage": "20d6"
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert!(
+        res.status() == StatusCode::UNPROCESSABLE_ENTITY || res.status() == StatusCode::BAD_REQUEST,
+        "client-supplied fall math must be rejected (400/422), got {}",
+        res.status()
+    );
+
+    // No rejected attempt may leave a ledger scar.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(fall_events(&snap).is_empty());
+}
+
+#[actix_web::test]
+async fn fall_legacy_flat_token_can_drop_below_ground_level() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    // A legacy token that never carried elevation data sits at z = 0.
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id, entity_json(hero_id, "Flat Token", 30, 14, 0, "1d4")).await;
+
+    // Falling into a pit BELOW ground level works exactly like any other fall.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": -30.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    let dmg = body["damage_taken"].as_i64().unwrap();
+    assert!((3..=18).contains(&dmg), "a 30 ft fall is three d6: {}", dmg);
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["position"],
+        serde_json::json!([2.5, 2.5, -30.0])
+    );
+
+    // Climbing back out is not a fall.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("NO_DOWNWARD_DROP"));
+}
+
+#[actix_web::test]
+async fn rewind_past_fall_restores_hp_prone_and_elevation() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fall", "gm", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 40, 50.0).await;
+    let seq_before_fall: u64 = {
+        let snap = snapshot_as(&app, &gm, session_id).await;
+        snap["ledger"]["current_sequence"].as_u64().unwrap()
+    };
+
+    // 50 ft = 5d6 (max 30) against 40 HP: survivable, prone, wounded.
+    let (status, body) = post_fall(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({"entity_id": hero_id, "target_z": 0.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    let dmg = body["damage_taken"].as_i64().unwrap();
+    assert!(dmg > 0 && dmg < 40, "wounding but survivable: {}", dmg);
+
+    // X-card rewind to just before the fall undoes ALL of its side effects:
+    // the wound, the Prone grant AND the elevation change.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "player_id": "gm-fall",
+            "topic": "rewind",
+            "target_sequence_id": seq_before_fall
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    let hero = &snap["entities"][hero_id.to_string()];
+    assert_eq!(hero["current_hp"].as_i64().unwrap(), 40, "the wound rewinds");
+    assert_eq!(
+        hero["conditions"].as_array().unwrap().len(),
+        0,
+        "Prone must not survive the rewind"
+    );
+    assert_eq!(
+        hero["position"],
+        serde_json::json!([2.5, 2.5, 50.0]),
+        "the faller is back on the ledge"
+    );
+    assert!(fall_events(&snap).iter().all(|e| e["is_reverted"] == serde_json::json!(true)));
+}
+
+#[actix_web::test]
+async fn shove_push_over_ledge_resolves_a_fall_instead_of_a_slide() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-ledge", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    // Both duelists stand ON the ledge at z = 20; the floor beyond is far down.
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let mut hero = entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10);
+    hero["position"] = serde_json::json!([2.5, 2.5, 20.0]);
+    let mut orc = entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8);
+    orc["position"] = serde_json::json!([2.6, 2.6, 20.0]);
+    spawn(&app, &token, session_id, hero).await;
+    spawn(&app, &token, session_id, orc).await;
+
+    let seed = contest_seed(5, -1, true);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/shove", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "ledge_target_z": -10.0,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["success"], serde_json::json!(true));
+    let fall = &body["fall"];
+    assert_eq!(fall["drop_feet"], serde_json::json!(30.0), "body: {}", body);
+    let dmg = fall["damage_taken"].as_i64().unwrap();
+    assert!((3..=18).contains(&dmg), "three d6 off the ledge: {}", dmg);
+    assert_eq!(fall["knocked_prone"], serde_json::json!(true));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let orc = &snap["entities"][orc_id.to_string()];
+    let orc_pos = orc["position"].as_array().unwrap().clone();
+    assert_eq!(
+        orc_pos[2], serde_json::json!(-10.0),
+        "the shoved creature lands at the ledge floor: {}",
+        orc_pos[2]
+    );
+    let slide = ((orc_pos[0].as_f64().unwrap() - 2.6).powi(2)
+        + (orc_pos[1].as_f64().unwrap() - 2.6).powi(2))
+    .sqrt();
+    assert!(
+        (4.9..=5.1).contains(&slide),
+        "horizontal travel stays the shove's 5 ft push: {slide}"
+    );
+    assert!(orc["current_hp"].as_i64().unwrap() < 20);
+    assert!(orc["conditions"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("prone")));
+
+    // Two ledger records: the won contest AND the fall it caused, so a rewind
+    // past either undoes its own half of the story.
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| e["event_type"] == serde_json::json!("SHOVE_ATTEMPTED")));
+    let falls = fall_events(&snap);
+    assert_eq!(falls.len(), 1);
+    assert_eq!(falls[0]["payload"]["drop_feet"], serde_json::json!(30.0));
+
+    // The ledge convention is push-only: a prone-shove cannot carry it.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/shove", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "prone",
+            "ledge_target_z": -10.0,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert!(
+        res.status() == StatusCode::UNPROCESSABLE_ENTITY || res.status() == StatusCode::CONFLICT,
+        "a prone-shove cannot carry the ledge convention, got {}",
+        res.status()
+    );
+}
