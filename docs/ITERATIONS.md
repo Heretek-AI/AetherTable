@@ -324,3 +324,9 @@ Lesson recorded: perimeter claims in commit messages must match diff scope.
 ### Iteration 19 — cc25eae — feat(client): honest offline rolls, derived modifiers, transport re-probe — vitest 141
 ### Iteration 20 — this wave — feat(spatial): elevation-aware 8-ray cover bundle — cargo 285/18
 ### Iteration 21 — 024c140 — fix(routing): apostrophe-free classifier prompt (live-LLM probe find) — live suite 6/6
+### Iteration 22 — dfa97ce — fix(playtest): seeded RNG for reproducible benchmark sampling — pytest 712
+### Iteration 23 — b4eb9e3 — feat(client): wall-occluded spatial audio (P9 occluders) — vitest 159
+### Iteration 24 — 5551a32 — feat(gateway): DirectorAgent on real tension signals (P5) — pytest 747
+### Iteration 25 — c055901 — feat(spatial): visibility polygon engine + route (P4) — cargo 295/18
+### Iteration 26 — c8cf376 — feat(infra): coturn TURN service + PeerJS ICE plumbing — vitest 168
+### Iteration 27 — this wave — feat(compendium): spell damage coverage 73→82 + upcast metadata — pytest 764
