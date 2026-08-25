@@ -1132,14 +1132,137 @@ async def campaign_restore(
     }
 
 
+# --- Automatic rumor capture (Pillar 7) --------------------------------------------
+
+# Verb patterns mapping improvised player phrasing onto canon-graph relations,
+# mirroring the auditor's narrative triple extraction so a captured rumor and
+# an audited draft speak the same predicate vocabulary.
+_RUMOR_PREDICATE_PATTERNS = (
+    (re.compile(r"\b(?:possess\w*|wield\w*|carri\w*|hold\w*|own\w*)\b", re.IGNORECASE), "POSSESSES"),
+    (re.compile(r"\b(?:rules?|ruled|reign\w*|govern\w*)\b", re.IGNORECASE), "RULES"),
+    (re.compile(r"\b(?:attacks?|strikes?|slay\w*|fight\w*|murder\w*)\b", re.IGNORECASE), "ATTACKS"),
+    (re.compile(r"\bspeaks? with\b|\btalks? to\b|\bconverses? with\b", re.IGNORECASE), "SPEAKS_WITH"),
+)
+
+# Reflexive relations ("the keep still stands") pair the subject with itself.
+_RUMOR_REFLEXIVE = frozenset({"IS_ALIVE", "IS_INTACT"})
+_RUMOR_ALIVE_PATTERN = re.compile(r"\b(?:is alive|still lives|walks the earth)\b", re.IGNORECASE)
+_RUMOR_INTACT_PATTERN = re.compile(r"\b(?:is intact|still stands)\b", re.IGNORECASE)
+
+
+def derive_rumor_triple(utterance: str) -> Optional[Dict[str, str]]:
+    """Derive one (subject, predicate, object) candidate from free speech.
+
+    Known canon node names are matched positionally against the utterance and
+    paired across the nearest predicate verb — the same windowed heuristic the
+    pre-commit auditor applies to narrative drafts. Returns None when no
+    known-entity pair around a predicate exists; callers treat that as "not
+    capturable" rather than inventing entities.
+    """
+    lowered = (utterance or "").lower()
+    mentions: List[Tuple[int, int, str]] = []
+    for node in lore_graph.nodes.values():
+        name = node.get("name")
+        if not name:
+            continue
+        start = 0
+        while True:
+            idx = lowered.find(name.lower(), start)
+            if idx < 0:
+                break
+            mentions.append((idx, idx + len(name), node["id"]))
+            start = idx + len(name)
+
+    def _pair(subj: Tuple[int, int, str], obj: Tuple[int, int, str],
+              relation: str, match: re.Match) -> Optional[Tuple[str, str, str]]:
+        if subj[2] == obj[2] and relation not in _RUMOR_REFLEXIVE:
+            return None
+        if match.start() - subj[1] > 60:
+            return None
+        if obj[0] - match.end() > 60:
+            return None
+        return {"subject": subj[2], "predicate": relation, "object": obj[2]}  # type: ignore[return-value]
+
+    candidates: List[Tuple[str, str, str]] = []
+    reflexive_hits = (
+        [(m, "IS_ALIVE") for m in _RUMOR_ALIVE_PATTERN.finditer(utterance)]
+        + [(m, "IS_INTACT") for m in _RUMOR_INTACT_PATTERN.finditer(utterance)]
+    )
+    for match, relation in reflexive_hits:
+        before = [m for m in mentions if m[1] <= match.start()]
+        if not before:
+            continue
+        subj = max(before, key=lambda m: m[1])
+        candidate = _pair(subj, subj, relation, match)
+        if candidate:
+            candidates.append(candidate)
+
+    for pattern, relation in _RUMOR_PREDICATE_PATTERNS:
+        for match in pattern.finditer(utterance):
+            before = [m for m in mentions if m[1] <= match.start()]
+            after = [m for m in mentions if m[0] >= match.end()]
+            if not before or not after:
+                continue
+            subj = max(before, key=lambda m: m[1])
+            obj = min(after, key=lambda m: m[0])
+            candidate = _pair(subj, obj, relation, match)
+            if candidate:
+                candidates.append(candidate)
+
+    return candidates[0] if candidates else None
+
+
+def capture_rumor_from_utterance(utterance: str, speaker_id: str) -> Dict[str, Any]:
+    """Stage an improvised assertion into the rumor pipeline.
+
+    Pillar-7 multi-tier lore mutability only works if improvised claims ever
+    REACH it. This hook runs after classification labels an utterance
+    LORE_ASSERTION: the derived triple enters at SUBJECTIVE_RUMOR (never above
+    — capture stages, promotion stays behind POST /api/v1/lore/assert's role
+    gate) through the same paradox-reviewed submit path as a manual POST.
+    Every failure mode degrades to an honest non-staged verdict; capture never
+    raises into classification.
+    """
+    triple = derive_rumor_triple(utterance)
+    if triple is None:
+        return {"status": "NOT_CAPTURABLE"}
+    try:
+        result = lore_graph.submit_assertion(LoreAssertionPayload(
+            proposing_entity_id=speaker_id or "unknown_speaker",
+            subject_node_id=triple["subject"],
+            predicate_relation=triple["predicate"],
+            object_node_id=triple["object"],
+            confidence_score=0.5,
+            epistemic_tier=EpistemicTier.SUBJECTIVE_RUMOR,
+            context_sentence=utterance[:500],
+        ))
+    except Exception as exc:  # pragma: no cover - defensive, never raise upward
+        return {"status": "CAPTURE_FAILED", "detail": str(exc)[:200]}
+    return {
+        "status": result.get("status"),
+        "epistemic_tier": EpistemicTier.SUBJECTIVE_RUMOR.value,
+        **triple,
+    }
+
+
 @app.post("/api/v1/intent/classify", response_model=IntentClassificationResult)
 def classify_intent(
-    req: ClassifyRequest, token: str = Depends(_require_auth)
+    req: ClassifyRequest, response: Response, token: str = Depends(_require_auth)
 ):
     # Any authenticated seat may classify (players narrate too), but the call
     # is metered in the `llm` bucket — see _bucket_for_path.
-    _caller_actor(token)
-    return router.classify_utterance(req.utterance, req.speaker_id)
+    actor = _caller_actor(token)
+    result = router.classify_utterance(req.utterance, req.speaker_id)
+
+    # Automatic rumor capture (Pillar-7): a classified LORE_ASSERTION flows
+    # straight into the rumor pipeline instead of evaporating. The verdict is
+    # attached as an out-of-band header because the declared response model is
+    # IntentClassificationResult; FastAPI would silently strip any extra body
+    # field.
+    if result.intent_type is IntentType.LORE_ASSERTION:
+        capture = capture_rumor_from_utterance(req.utterance, req.speaker_id or actor["user_id"])
+        response.headers["X-Rumor-Capture"] = json.dumps(capture, default=str)
+    return result
 
 
 # --- Handouts ---------------------------------------------------------------------
