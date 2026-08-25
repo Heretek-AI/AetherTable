@@ -60,8 +60,24 @@ import {
 
 interface CharacterSheetProps {
   activeToken: Token | null;
-  onExecuteAttack: (actionName: string, damageFormula: string, damageType: string) => void;
-  onCastSpell: (spellId: string, spellName: string, level: number) => void;
+  /**
+   * `toHitBonus` is the REAL attack bonus this sheet already displays
+   * (ability modifier + proficiency from the bound character record). It used
+   * to be dropped here and re-invented as a hardcoded "+7"/"+8" in App.tsx;
+   * passing it keeps every displayed number traceable to stored data.
+   */
+  onExecuteAttack: (
+    actionName: string,
+    damageFormula: string,
+    damageType: string,
+    toHitBonus?: number
+  ) => void;
+  onCastSpell: (
+    spellId: string,
+    spellName: string,
+    level: number,
+    toHitBonus?: number
+  ) => void;
   onRollCheck: (skillName: string, modifier: number, dc: number) => void;
   onOpenGrimoire?: () => void;
   isCollapsed: boolean;
@@ -1198,7 +1214,14 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
           <div className="space-y-3">
             <div className="space-y-2">
               <button
-                onClick={() => onExecuteAttack('Greataxe Slash', `1d12 + ${derived!.mods.str}`, 'slashing')}
+                onClick={() =>
+                  onExecuteAttack(
+                    'Greataxe Slash',
+                    `1d12 + ${derived!.mods.str}`,
+                    'slashing',
+                    derived!.mods.str + derived!.profBonus
+                  )
+                }
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">
@@ -1219,7 +1242,14 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               </button>
 
               <button
-                onClick={() => onExecuteAttack('Shortbow Shot', `1d8 + ${derived!.mods.dex}`, 'piercing')}
+                onClick={() =>
+                  onExecuteAttack(
+                    'Shortbow Shot',
+                    `1d8 + ${derived!.mods.dex}`,
+                    'piercing',
+                    derived!.mods.dex + derived!.profBonus
+                  )
+                }
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">
@@ -1314,7 +1344,14 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
             {/* Spells List */}
             <div className="space-y-2">
               <button
-                onClick={() => onCastSpell('spell_fireball', 'Fireball', 3)}
+                onClick={() =>
+                  onCastSpell(
+                    'spell_fireball',
+                    'Fireball',
+                    3,
+                    derived!.mods.int + derived!.profBonus
+                  )
+                }
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">
@@ -1334,7 +1371,14 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               </button>
 
               <button
-                onClick={() => onCastSpell('spell_magic_missile', 'Magic Missile', 1)}
+                onClick={() =>
+                  onCastSpell(
+                    'spell_magic_missile',
+                    'Magic Missile',
+                    1,
+                    derived!.mods.int + derived!.profBonus
+                  )
+                }
                 className="vtt-btn vtt-btn-secondary w-full text-left"
               >
                 <span className="flex items-center justify-between w-full">

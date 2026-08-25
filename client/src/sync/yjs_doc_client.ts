@@ -14,10 +14,10 @@
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
-// Bundled transitively by y-websocket (^1.0.5). Resolved from the hoisted
-// node_modules root under the project's `moduleResolution: node` tsconfig and
-// Vite's export-map resolution alike. If it ever stops being a transitive dep,
-// promote `y-protocols` to an explicit dependency in client/package.json.
+// Declared explicitly in client/package.json (`y-protocols` ^1.0.7, the
+// version y-websocket ^2 itself depends on). It was previously resolved only
+// transitively through y-websocket, which broke the moment the hoisting shape
+// changed; iteration-19 promoted it to a direct dependency.
 import { Awareness } from 'y-protocols/awareness';
 import { AtmosphereSelection, normalizeAtmosphereId } from '../theme/atmospheres';
 import {

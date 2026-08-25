@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, Suspense, laz
 // Eager: only what first paint needs — landing page (default route), navbar,
 // and the Cmd+K palette. Everything else is code-split below.
 import { Navbar, SaaSView } from './components/Navbar';
+import { AlertCircle } from 'lucide-react';
 import {
   applyAtmosphereToDocument,
   loadStoredAtmosphereId,
@@ -70,7 +71,7 @@ const ChunkFallback = ({ label }: { label: string }) => (
 import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
-import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
+import { engineAttack, engineCheck, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import { authHeaders, getStoredToken } from './api/auth_headers';
 import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
@@ -86,7 +87,11 @@ import type { CampaignWizardConfig } from './components/CampaignWizardModal';
 import { listSaves, loadCampaign } from './api/campaign_store';
 import { computeLocalRewindPlan, parseEngineRewind } from './ui/safetyXCard';
 import { triggerXCard } from './api/safety_xcard';
-import { canMoveTokensOnTransport } from './sync/transport_gate';
+import { canMoveTokensOnTransport, type BoundTransport } from './sync/transport_gate';
+import {
+  REPROBE_INTERVAL_MS,
+  shouldAttemptReprobe,
+} from './sync/transport_reprobe';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
 import type { CombatantEntry } from './components/InitiativeTracker';
 
@@ -305,23 +310,35 @@ export function App() {
   // Transport the active syncClientRef is bound to. `null` while the Yjs
   // bootstrap is still racing the 3.5s fallback timer. Drives the
   // canMoveTokensOnTransport gate (see sync/transport_gate.ts).
-  const [transportKind, setTransportKind] = useState<'YJS' | 'LEGACY_LWW' | null>(null);
+  const [transportKind, setTransportKind] = useState<BoundTransport>(null);
   useEffect(() => {
-    const env = (import.meta as any).env ?? {};
-    const engineWsUrl = env.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
+    const engineWsUrl = import.meta.env.VITE_ENGINE_WS_URL || 'ws://localhost:8088';
     // Yjs is the DEFAULT transport; the legacy engine LWW relay is the
     // fallback when no CRDT relay is reachable.
-    const ysyncUrl = (env.VITE_YSYNC_WS_URL as string | undefined) ?? 'ws://localhost:6380';
+    const ysyncUrl = import.meta.env.VITE_YSYNC_WS_URL ?? 'ws://localhost:6380';
     let disposed = false;
+    /** The live Yjs client while THIS effect has bound it; null on fallback. */
+    let activeYjs: YjsCrdtClient | null = null;
+    let unsubscribeYjs: (() => void) | null = null;
+    let unsubscribeCursors: (() => void) | null = null;
+    /** Set once a successful re-probe has migrated us back onto Yjs. */
+    let reprobedToYjs = false;
 
     const startLegacyRelay = () => {
       if (disposed) return;
-      syncClientRef.current?.disconnect();
+      // Tear down the Yjs side first so its subscriptions stop firing into
+      // token state behind the legacy relay's back.
+      unsubscribeYjs?.();
+      unsubscribeCursors?.();
+      unsubscribeYjs = null;
+      unsubscribeCursors = null;
+      activeYjs?.destroy();
+      activeYjs = null;
+      yjsClientRef.current = null;
+      setYjsClient(null);
       // The engine LWW relay carries no presence protocol: peer cursors are
       // honestly empty on this transport.
       setRemoteCursors([]);
-      yjsClientRef.current = null;
-      setYjsClient(null);
       setTransportKind('LEGACY_LWW');
       const client = new VttCrdtSyncClient(engineWsUrl, 'aethertable-live');
       client.connect();
@@ -336,47 +353,100 @@ export function App() {
       });
     };
 
-    const yjs = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
-    yjs.connect();
-    yjsClientRef.current = yjs;
-    setYjsClient(yjs);
-    setTransportKind('YJS');
-    // Stamp the signed-in identity into awareness so peers see who this cursor is.
-    yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
-    syncClientRef.current = {
-      connect: () => yjs.connect(),
-      disconnect: () => yjs.destroy(),
-      get isConnected() {
-        return yjs.isConnected;
-      },
-      onRemoteTokenUpdate: yjs.onRemoteTokenUpdate.bind(yjs),
-      updateTokenPosition: yjs.updateTokenPosition.bind(yjs),
-    } as VttCrdtSyncClient;
+    /**
+     * Bind the CRDT relay as the active transport. Used both at mount and by
+     * the periodic re-probe below, so an upgraded session goes through exactly
+     * the same wiring as a fresh one — fog layers, remote cursors, atmosphere
+     * and the speech ledger are all re-adopted through the existing observe*
+     * subscriptions (each fires immediately with current Y.Doc state), never
+     * copied by hand.
+     */
+    const startYjsRelay = () => {
+      const yjs = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
+      yjs.connect();
+      activeYjs = yjs;
+      yjsClientRef.current = yjs;
+      setYjsClient(yjs);
+      setTransportKind('YJS');
+      // Stamp the signed-in identity into awareness so peers see who this cursor is.
+      yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
+      syncClientRef.current = {
+        connect: () => yjs.connect(),
+        disconnect: () => yjs.destroy(),
+        get isConnected() {
+          return yjs.isConnected;
+        },
+        onRemoteTokenUpdate: yjs.onRemoteTokenUpdate.bind(yjs),
+        updateTokenPosition: yjs.updateTokenPosition.bind(yjs),
+      } as VttCrdtSyncClient;
 
-    const unsubscribeYjs = yjs.onRemoteTokenUpdate((update: TokenTransformData) => {
-      setTokens((prev) =>
-        prev.map((t) => (t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t))
-      );
-    });
+      unsubscribeYjs = yjs.onRemoteTokenUpdate((update: TokenTransformData) => {
+        setTokens((prev) =>
+          prev.map((t) => (t.id === update.tokenId ? { ...t, x: update.x, y: update.y } : t))
+        );
+      });
 
-    // Peer cursors stream straight off awareness — empty list when solo.
-    const unsubscribeCursors = yjs.onRemoteCursors(setRemoteCursors);
+      // Peer cursors stream straight off awareness — empty list when solo.
+      unsubscribeCursors = yjs.onRemoteCursors(setRemoteCursors);
+    };
+
+    startYjsRelay();
 
     // If the CRDT relay never connects, fall back to the engine relay.
     const fallbackTimer = setTimeout(() => {
-      if (!disposed && !yjs.isConnected) {
+      if (!disposed && !activeYjs?.isConnected) {
         console.warn('[Sync] Yjs relay unreachable — falling back to engine LWW relay.');
         startLegacyRelay();
       }
     }, 3500);
 
+    // Periodic re-probe (iteration-19): the 3.5s fallback above used to be a
+    // ONE-WAY downgrade — a relay that was down during app mount kept every
+    // client on LWW until a manual reload. While we sit on the fallback, retry
+    // the CRDT relay every REPROBE_INTERVAL_MS; when an attempt actually
+    // connects, migrate back through the same startYjsRelay path used at
+    // mount. Fog / cursors / atmosphere / speech hand off via each observer's
+    // immediate-fire snapshot (see yjs_doc_client.ts conventions), so nothing
+    // is duplicated or lost in transit. A probe that fails just leaves the
+    // legacy relay running — no state churn.
+    const reprobeTimer = setInterval(() => {
+      if (
+        reprobedToYjs ||
+        disposed ||
+        !shouldAttemptReprobe({
+          transportKind: 'LEGACY_LWW',
+          hasYsyncUrl: Boolean(ysyncUrl),
+          stopped: disposed,
+        })
+      ) {
+        return;
+      }
+      const probe = new YjsCrdtClient(ysyncUrl, 'aethertable-live');
+      probe.connect();
+      // Same settle window as the mount-time fallback race: enough for a TCP +
+      // y-websocket handshake, not so long that a healthy relay waits long.
+      setTimeout(() => {
+        const reachable = probe.isConnected;
+        probe.destroy();
+        if (disposed || reprobedToYjs || !reachable) return;
+        if (activeYjs?.isConnected) return; // already back on CRDT somehow
+        reprobedToYjs = true;
+        console.info('[Sync] Yjs relay reachable again — migrating off the LWW fallback.');
+        addSystemMessage(
+          'CRDT sync restored: the table migrated from the legacy relay back to the live Yjs room.'
+        );
+        startYjsRelay();
+      }, 3500);
+    }, REPROBE_INTERVAL_MS);
+
     return () => {
       disposed = true;
       clearTimeout(fallbackTimer);
-      unsubscribeYjs();
-      unsubscribeCursors();
+      clearInterval(reprobeTimer);
+      unsubscribeYjs?.();
+      unsubscribeCursors?.();
       setRemoteCursors([]);
-      yjs.destroy();
+      activeYjs?.destroy();
       yjsClientRef.current = null;
       setYjsClient(null);
       syncClientRef.current = null;
@@ -781,6 +851,67 @@ export function App() {
     ]);
   };
 
+  /**
+   * Honest failure state when the rules engine cannot resolve an action
+   * (iteration-19). The previous fallback FABRICATED a hit plus random damage
+   * client-side, which contradicted "clients never send combat math" and
+   * desynced every other seat from this screen. Now nothing resolves: no HP
+   * changes, no roll entry, no chat theatre. Instead a floating banner over
+   * the canvas explains the failure and offers Retry (re-fires the exact same
+   * action) or Dismiss.
+   */
+  const [pendingActionRetry, setPendingActionRetry] = useState<{
+    what: 'attack' | 'spell' | 'check';
+    label: string;
+    retry: () => void;
+  } | null>(null);
+  const setEngineUnreachable = (
+    what: 'attack' | 'spell' | 'check',
+    label: string,
+    retry: () => void
+  ) => {
+    setPendingActionRetry({ what, label, retry });
+  };
+  const renderEngineUnreachableBanner = () => {
+    if (!pendingActionRetry) return null;
+    return (
+      <div
+        role="alert"
+        data-testid="engine-unreachable-banner"
+        className="absolute top-14 left-1/2 -translate-x-1/2 flex items-center gap-3 px-3 py-2 rounded-lg bg-tavern-surface/95 backdrop-blur border border-tavern-border shadow-lg"
+        style={{ zIndex: 'var(--z-chrome)' }}
+      >
+        <AlertCircle className="w-4 h-4 shrink-0" style={{ color: 'var(--state-danger)' }} aria-hidden="true" />
+        <span className="text-xs text-[var(--rp-parchment-200)] font-prose">
+          {pendingActionRetry.label} was not resolved — the rules engine is unreachable.
+          No damage was applied.
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            const retry = pendingActionRetry.retry;
+            setPendingActionRetry(null);
+            retry();
+          }}
+          className="vtt-btn vtt-btn-primary px-2 py-1 text-xs shrink-0"
+        >
+          Retry
+        </button>
+        <button
+          type="button"
+          onClick={() => setPendingActionRetry(null)}
+          aria-label="Dismiss unresolved action notice"
+          className="vtt-badge shrink-0 cursor-pointer"
+        >
+          Dismiss
+        </button>
+      </div>
+    );
+  };
+
+  /** "+5" / "-1" / "+0" — display form of a real derived attack bonus. */
+  const formatSignedModifier = (mod: number): string => (mod >= 0 ? `+${mod}` : `${mod}`);
+
   const handleTokenMove = (tokenId: string, newX: number, newY: number) => {
     // Transport-aware authorization gate (iteration 4 follow-up): the legacy
     // engine LWW relay fails closed for non-GM tokens in non-session rooms.
@@ -1079,24 +1210,49 @@ export function App() {
     }
   };
 
-  const handleExecuteAttack = async (actionName: string, damageFormula: string, damageType: string) => {
+  const handleExecuteAttack = async (
+    actionName: string,
+    damageFormula: string,
+    damageType: string,
+    toHitBonus?: number
+  ) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
 
-    // Authoritative resolution via the Rust rules engine; local dice fallback offline.
+    // Authoritative resolution via the Rust rules engine. Iteration-19: the
+    // old fallback INVENTED damage (`Math.random()*12+4`) and a fake hit when
+    // the engine was unreachable — fabricated combat math that never touched
+    // the ledger and desynced every other seat. Now an unreachable engine is
+    // an honest failure state: nothing resolves, nothing applies, and the
+    // player gets a retry affordance in chat.
     const result = await engineAttack({
       attackerId: selectedToken?.id || 'thorin',
       targetId: target.id,
     });
-    const isHit = result?.is_hit ?? true;
-    const isCritical = result?.is_critical_hit ?? false;
-    const naturalRoll = result?.natural_roll ?? localD20();
-    const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 12) + 4 : 0;
+    if (!result) {
+      setEngineUnreachable('attack', `${actionName} by ${selectedToken?.name || 'Hero'}`, () => {
+        void handleExecuteAttack(actionName, damageFormula, damageType, toHitBonus);
+      });
+      return;
+    }
+
+    // Display-only to-hit bonus from THIS sheet's bound character record
+    // (ability modifier + proficiency). When no record binds, the sheet never
+    // showed a to-hit number either — so the chat line shows the natural d20
+    // alone instead of inventing a modifier.
+    const displayToHit = typeof toHitBonus === 'number' ? toHitBonus : null;
+    const isHit = result.is_hit;
+    const isCritical = result.is_critical_hit;
+    const naturalRoll = result.natural_roll;
+    const dmg = isHit ? result.total_damage : 0;
 
     // Audit trail: every engine-resolved attack lands in the roll history panel.
     addRollEntry({
       kind: 'attack',
       label: `${selectedToken?.name || 'Hero'} → ${actionName}`,
-      expression: `1d20+7 / ${damageFormula} ${damageType}`,
+      expression:
+        displayToHit !== null
+          ? `1d20${formatSignedModifier(displayToHit)} / ${damageFormula} ${damageType}`
+          : `${damageFormula} ${damageType} (engine-resolved)`,
       natural: naturalRoll,
       total: dmg,
       outcome: isCritical ? 'crit' : isHit ? 'hit' : 'miss',
@@ -1124,15 +1280,22 @@ export function App() {
       ...prev,
       {
         id: `msg_${Date.now()}`,
-        sender: selectedToken?.name || 'Thorin Oakenshield',
+        sender: selectedToken?.name || 'Hero',
         role: 'player',
         content: `I swing with my ${actionName} (${damageFormula} ${damageType})!`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        diceRollDetails: {
-          total: naturalRoll + 7,
-          expression: `1d20 + 7`,
-          rolls: [naturalRoll],
-        },
+        diceRollDetails:
+          displayToHit !== null
+            ? {
+                total: naturalRoll + displayToHit,
+                expression: `1d20${formatSignedModifier(displayToHit)}`,
+                rolls: [naturalRoll],
+              }
+            : {
+                total: naturalRoll,
+                expression: `1d20 (no bound sheet — engine-resolved)`,
+                rolls: [naturalRoll],
+              },
       },
       {
         id: dmMsgId,
@@ -1151,23 +1314,40 @@ export function App() {
     );
   };
 
-  const handleCastSpell = async (spellId: string, spellName: string, level: number) => {
+  const handleCastSpell = async (
+    spellId: string,
+    spellName: string,
+    level: number,
+    toHitBonus?: number
+  ) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
-    // Approximate spell damage as a scaling fireball-style burst resolved by the engine.
+    // The engine resolves this as its own attack pipeline; the sheet's damage
+    // formula stays DISPLAY metadata only — no client-side math is applied.
     const spellDamageExpression = `${Math.max(1, 2 * level - 1)}d6`;
     const result = await engineAttack({
       attackerId: selectedToken?.id || 'lyra',
       targetId: target.id,
     });
-    const isHit = result?.is_hit ?? true;
-    const naturalRoll = result?.natural_roll ?? localD20();
-    const dmg = isHit ? result?.total_damage ?? Math.floor(Math.random() * 24) + 12 : 0;
+    if (!result) {
+      setEngineUnreachable('spell', `${spellName} (Lvl ${level})`, () => {
+        void handleCastSpell(spellId, spellName, level, toHitBonus);
+      });
+      return;
+    }
+
+    const displayToHit = typeof toHitBonus === 'number' ? toHitBonus : null;
+    const isHit = result.is_hit;
+    const naturalRoll = result.natural_roll;
+    const dmg = isHit ? result.total_damage : 0;
 
     // Audit trail: spell attacks are logged with their upcast level for context.
     addRollEntry({
       kind: 'spell',
       label: `${spellName} (Lvl ${level})`,
-      expression: `1d20+8 / ${spellDamageExpression}`,
+      expression:
+        displayToHit !== null
+          ? `1d20${formatSignedModifier(displayToHit)} / ${spellDamageExpression}`
+          : `Spell attack (engine-resolved) / ${spellDamageExpression}`,
       natural: naturalRoll,
       total: dmg,
       outcome: isHit ? 'hit' : 'miss',
@@ -1195,15 +1375,22 @@ export function App() {
       ...prev,
       {
         id: `msg_${Date.now()}`,
-        sender: selectedToken?.name || 'Lyra Moonshadow',
+        sender: selectedToken?.name || 'Caster',
         role: 'player',
         content: `I invoke the arcane weave and unleash ${spellName} (Level ${level})!`,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        diceRollDetails: {
-          total: naturalRoll + 8,
-          expression: `1d20 + 8`,
-          rolls: [naturalRoll],
-        },
+        diceRollDetails:
+          displayToHit !== null
+            ? {
+                total: naturalRoll + displayToHit,
+                expression: `1d20${formatSignedModifier(displayToHit)}`,
+                rolls: [naturalRoll],
+              }
+            : {
+                total: naturalRoll,
+                expression: `1d20 (no bound sheet — engine-resolved)`,
+                rolls: [naturalRoll],
+              },
       },
       {
         id: dmMsgId,
@@ -1223,11 +1410,19 @@ export function App() {
   };
 
   const handleRollCheck = async (skillName: string, modifier: number, dc: number) => {
-    // Authoritative d20 resolution via the rules engine (local fallback offline).
+    // Authoritative d20 resolution via the rules engine. Iteration-19: like the
+    // attack path above, an unreachable engine no longer rolls locally and
+    // grades itself — that fabricated a success/failure the ledger never saw.
     const result = await engineCheck({ modifier, dc });
-    const roll = result?.roll ?? localD20();
-    const total = result?.total ?? roll + modifier;
-    const passed = result ? ['SUCCESS', 'CRITICAL_SUCCESS', 'SUCCESS_AT_A_COST'].includes(result.outcome) : total >= dc;
+    if (!result) {
+      setEngineUnreachable('check', `${skillName} check (DC ${dc})`, () => {
+        void handleRollCheck(skillName, modifier, dc);
+      });
+      return;
+    }
+    const roll = result.roll;
+    const total = result.total;
+    const passed = ['SUCCESS', 'CRITICAL_SUCCESS', 'SUCCESS_AT_A_COST'].includes(result.outcome);
 
     // Audit trail: ability checks log natural d20 so crits/fumbles stand out.
     addRollEntry({
@@ -1594,14 +1789,24 @@ export function App() {
     advDis: 'normal' | 'advantage' | 'disadvantage'
   ) => {
     // Resolve the macro's d20 through the engine, honoring advantage state.
+    // Iteration-19: no local-dice fallback — an unreachable engine surfaces
+    // the same honest retry banner as attacks/spells instead of a self-rolled
+    // d20 the authoritative ledger never recorded.
+    const modifier = formulaModifier(formula);
     const result = await engineCheck({
-      modifier: formulaModifier(formula),
+      modifier,
       dc: 10,
       advantage: advDis === 'advantage',
       disadvantage: advDis === 'disadvantage',
     });
-    const d20Roll = result?.roll ?? localD20();
-    const macroTotal = result?.total ?? d20Roll + formulaModifier(formula);
+    if (!result) {
+      setEngineUnreachable('check', `${macroName} (${formula})`, () => {
+        void handleMacroRoll(macroName, formula, isWhisper, advDis);
+      });
+      return;
+    }
+    const d20Roll = result.roll;
+    const macroTotal = result.total;
 
     // Audit trail: quickbar macros resolve through the engine like any other roll.
     addRollEntry({
@@ -1728,6 +1933,10 @@ export function App() {
 
             {/* Tabletop Center Workspace */}
             <div className="flex-1 flex overflow-hidden relative min-h-0">
+              {/* Honest engine-failure affordance (iteration-19): replaces the
+                  old fabricated random-damage fallback. Renders only while an
+                  attack/spell is waiting on an unreachable engine. */}
+              {renderEngineUnreachableBanner()}
               {/* Left Dock: Initiative Tracker — receives the same
                   spectator-filtered list as the canvas so hidden entities are
                   absent from turn order too (not merely invisible on map). */}

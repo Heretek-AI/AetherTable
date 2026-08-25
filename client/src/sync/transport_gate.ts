@@ -20,6 +20,13 @@ import type { UserRole } from '../types/auth';
 
 export type TransportKind = 'YJS' | 'LEGACY_LWW';
 
+/**
+ * Which sync transport this browser session currently has bound (mirror of
+ * App.tsx's `transportKind` state, kept in a module-shared alias so the
+ * re-probe policy in transport_reprobe.ts speaks the same vocabulary).
+ */
+export type BoundTransport = TransportKind | null;
+
 /** What the UI shows when canMove === false; absent when the move is allowed. */
 export interface TokenMoveBlocked {
   reason:
