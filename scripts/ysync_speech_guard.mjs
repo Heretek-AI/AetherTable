@@ -1,46 +1,58 @@
 /**
- * Speech-map authorization for the Yjs CRDT relay (audit A2 finding #4).
+ * Speech-map authorization for the Yjs CRDT relay (audit A2 finding #4;
+ * hardened audit A3 finding #3).
  *
  * WHY THIS EXISTS
  * The speech ledger keys entries per owner (`user:<userId>`); the convention
  * is that only a peer's own devices write that key. Nothing in the CRDT
- * enforces it: any connected peer can write huge segment sets under ANY
+ * enforced it: any connected peer can write huge segment sets under ANY
  * user's key and inflate that user's weightedSeconds, distorting Pillar-11
  * spotlight balancing on every replica.
  *
- * HOW WRITERS ARE IDENTIFIED (per-connection attribution)
- * y-websocket routes every connection of a room into ONE shared WSSharedDoc,
- * and by the time a sync delta reaches the doc's `update` event the
- * originating socket is no longer attached to it. What IS stable on the wire
- * is the WRITING CLIENT ID: every struct in a Yjs update carries
- * `struct.id.client`, which equals the writing Y.Doc instance's clientID —
- * and that same clientID is what the peer publishes in its AWARENESS state.
- * So attribution works in two steps:
+ * HOW WRITERS ARE IDENTIFIED — DELIVERY-TIME CONNECTION ORIGIN ONLY
  *
- *   1. AWARENESS CLAIM BINDING. When awareness updates arrive, the relay maps
- *      each claimed clientID -> user_id. It accepts the claim ONLY if the
- *      claimed user_id equals the HMAC-verified identity of the connection
- *      that sent it (claims are otherwise trivially spoofable). Unverifiable
- *      claims are rejected: the clientID never becomes speech-authoritative.
- *   2. DELTA CHECK. For each doc update we decode the delta, extract which
- *      `user:<id>` speech keys its structs write, and attribute each writing
- *      clientID through step 1. Any key whose writer is not its rightful
- *      owner is EVICTED from the room doc; the eviction itself emits a
- *      corrective delete-set update that y-websocket fans out to every
- *      connection, repairing replicas that already merged the poison.
+ * The FIRST version of this guard attributed writes via awareness-claim
+ * binding: a peer published its Yjs clientID plus a user_id claim in its
+ * awareness state, and the relay bound clientID -> user only when the claim
+ * matched the connection's HMAC identity. Audit A3 finding #3 broke that
+ * binding exactly as it broke the atmosphere guard's: a Yjs clientID is an
+ * attacker-chosen 32-bit value that every struct in an update carries
+ * (`struct.id.client`), so once VICTIM's clientID was legitimately bound,
+ * any peer could craft deltas CLAIMING it and write under
+ * `user:<victim>` with full authorization. The claim check validated what
+ * a peer said about itself over its own connection — never the bytes of
+ * the delta it later delivered.
+ *
+ * The fix binds authorization to what the relay actually verified at
+ * DELIVERY time. y-websocket passes the originating conn object as the Yjs
+ * transaction origin for every remote frame, and scripts/ysync-server.mjs
+ * registers each conn's HMAC-verified (userId, role) at upgrade. Now a
+ * speech key may be written ONLY over a connection whose verified user_id
+ * equals the key's owner; every struct in the delta is attributed to the
+ * connection that delivered it, regardless of which clientID it claims.
+ *
+ *   DELTA CHECK — every REMOTE doc update is decoded; each `user:<id>` key
+ *   it touches is evicted unless `userOfConnection(origin)` resolves to
+ *   exactly that id. Unresolvable origins fail closed.
  *
  * Documented RESIDUAL threat model (honest limits of this layer):
- *   - Re-poisoning with a fresh clock re-triggers eviction each time:
- *     poisoning becomes loud and futile rather than impossible; the
- *     client-side weight ceiling (speech_ledger.ts,
+ *   - Eviction is post-commit: an unauthorized write exists briefly at the
+ *     relay before the corrective update repairs replicas that already
+ *     merged it. Poisoning becomes loud and futile rather than impossible.
+ *     The client-side weight ceiling (speech_ledger.ts,
  *     SPOTLIGHT_WEIGHT_WINDOW_FACTOR) bounds any residue between evictions.
- *   - A peer whose awareness claim was rejected cannot get speech writes
- *     attributed at all, so ALL of its speech keys are evicted — including
- *     honest ones until it fixes its claim (fail-closed).
- *   - Deletes of foreign keys are flagged like inserts: nobody may touch
- *     another user's ledger entry.
+ *   - Pure DELETIONS ride the update's delete-set with NO struct authorship,
+ *     so this guard cannot see who deleted a foreign key from committed
+ *     state alone. Deleting another user's ledger entry is therefore NOT
+ *     gated here (pre-existing gap, unchanged by this hardening); the
+ *     atmosphere guard's vanished-key tracking pattern is the model for a
+ *     future fix.
+ *   - Corrective broadcasts are themselves amplification; per-connection
+ *     budget + disconnect live in scripts/ysync_relay_throttle.mjs (audit A3
+ *     finding #4).
  *   - Non-speech maps (tokens/fog/atmosphere) are NOT validated here; their
- *     authorization story lives elsewhere (audit findings #1-#3).
+ *     authorization stories live elsewhere (Rust relay RBAC for tokens/fog,
+ *     ysync_atmosphere_guard.mjs for atmosphere).
  */
 import { createRequire } from 'module';
 // yjs lives in client/node_modules (the relay script resolves its other deps
@@ -55,10 +67,11 @@ export const SPEECH_MAP_NAME = 'speech';
 export const SPEECH_KEY_PREFIX = 'user:';
 
 /**
- * Decode a raw Y.Doc update and return the set of WRITING CLIENT IDs plus the
- * userIds whose speech-map keys the delta touches. Tolerates malformed input
- * by returning an empty result rather than throwing — the relay must never
- * crash on hostile bytes.
+ * Decode a raw Y.Doc update and return the userIds whose speech-map keys the
+ * delta touches (plus the raw writing clientIDs, kept for diagnostics only —
+ * they are NOT used for authorization; see the header). Tolerates malformed
+ * input by returning an empty result rather than throwing — the relay must
+ * never crash on hostile bytes.
  */
 export function inspectSpeechWrites(update) {
   const empty = { writers: [], owners: [] };
@@ -85,25 +98,16 @@ export function inspectSpeechWrites(update) {
 }
 
 /**
- * Pure authorization decision for one decoded delta: given the writing client
- * ids, the speech user-ids they touch, and a resolver mapping client id ->
- * verified user id (or null when unattributed), return the foreign keys that
- * must be evicted. An UNATTRIBUTED writer (no validated awareness claim) may
- * not write ANY speech key — fail closed.
+ * Pure authorization decision for one decoded delta delivered over a
+ * connection whose HMAC-verified user id is `senderUserId`: return the
+ * touched owner ids whose keys must be evicted. Struct-level clientIDs are
+ * deliberately NOT an input (audit A3 finding #3: they are attacker-chosen).
+ * An unknown sender fails closed for every key it touches; a sender may only
+ * ever touch its OWN ledger key.
  */
-export function foreignSpeechKeys(writers, touchedOwners, attributedUserOf) {
-  const foreign = [];
-  for (const owner of touchedOwners) {
-    let legit = false;
-    for (const clientId of writers) {
-      if (attributedUserOf(clientId) === owner) {
-        legit = true;
-        break;
-      }
-    }
-    if (!legit) foreign.push(owner);
-  }
-  return foreign;
+export function foreignSpeechKeys(touchedOwners, senderUserId) {
+  if (!touchedOwners?.length) return [];
+  return touchedOwners.filter((owner) => owner !== senderUserId);
 }
 
 /**
@@ -138,59 +142,57 @@ export function evictForeignSpeechEntries(roomDoc, foreignKeys) {
  * Install the speech guard on one room doc.
  *
  * @param {import('yjs').Doc} roomDoc the shared WSSharedDoc for the room
+ * @param {{
+ *   userOfConnection?: (origin: unknown) => string|null,
+ *   onUnauthorizedWrite?: (origin: unknown) => void,
+ * }} [options]
+ *   `userOfConnection` resolves the HMAC-verified user_id of the CONNECTION
+ *   that delivered a frame (y-websocket passes its conn object as the
+ *   transaction origin; the server registers verified identities at
+ *   upgrade). REQUIRED for authorization — unresolvable origins fail closed.
+ *   `onUnauthorizedWrite` fires once per eviction event so the relay can rate
+ *   limit corrective-broadcast amplification and disconnect abusive
+ *   connections (audit A3 finding #4).
  * @returns {{
  *   evictions: number,
  *   evictedKeys: string[],
- *   bindClaim(connKey: string, clientId: number, claimedUserId: string): boolean,
- *   dropConn(connKey: string): void,
- *   checkUpdate(update: Uint8Array): void,
+ *   checkUpdate(update: Uint8Array, origin?: unknown): void,
  * }}
  *
- * - `bindClaim` is called when an awareness update arrives over connection
- *   `connKey`: it records clientID -> verifiedUserId ONLY when the claimed
- *   user matches the connection's HMAC-verified identity. Returns whether the
- *   claim was accepted.
- * - `dropConn` forgets everything a closed connection contributed.
- * - `checkUpdate` is called for every doc update (post-commit); it evicts
- *   foreign speech writes as described above.
+ * `checkUpdate` is called for every REMOTE doc update (post-commit); it
+ * evicts foreign speech writes as described above.
  */
-export function installSpeechGuard(roomDoc) {
-  /** clientID -> verified user_id (only accepted claims live here) */
-  const attribution = new Map();
+export function installSpeechGuard(roomDoc, options = {}) {
   const handle = {
     evictions: 0,
     evictedKeys: [],
     /**
-     * Record an awareness claim from connection `connKey`. `verifiedUserId`
-     * is what the relay's HMAC verification says this connection IS;
-     * `claimedUserId` is what the awareness payload CLAIMS. Only matching
-     * claims are bound.
+     * Post-commit authorization of one doc update.
+     *
+     * WIRING CONTRACT: call this ONLY for updates that arrived over a remote
+     * connection. Null-origin (relay-local corrective) transactions carry no
+     * speech structs, but gating them out keeps both guards symmetric and
+     * makes the fail-closed path unreachable for our own repairs.
      */
-    bindClaim(verifiedUserId, clientId, claimedUserId) {
-      if (claimedUserId === verifiedUserId) {
-        attribution.set(clientId, verifiedUserId);
-        return true;
-      }
-      return false; // spoofed or mismatched claim — never authoritative
-    },
-    /** Forget attributions when a connection goes away. */
-    dropConn() {
-      /* attribution persists for the doc lifetime: a clientID is globally
-         unique per Y.Doc instance, so stale entries can only ever bless their
-         OWN original writer, never a new attacker. Cheap and safe. */
-    },
-    /** Post-commit authorization of one doc update. */
-    checkUpdate(update) {
+    checkUpdate(update, origin) {
       const { writers, owners } = inspectSpeechWrites(update);
       if (!owners.length) return;
-      const foreign = foreignSpeechKeys(writers, owners, (id) => attribution.get(id) ?? null);
+      const senderUserId =
+        origin == null ? null : options.userOfConnection?.(origin) ?? null;
+      const foreign = foreignSpeechKeys(owners, senderUserId);
       if (!foreign.length) return;
       handle.evictions += foreign.length;
       handle.evictedKeys.push(...foreign);
       console.warn(
-        `[ysync] speech-guard: evicted ${foreign.length} foreign speech entr${foreign.length === 1 ? 'y' : 'ies'} (${foreign.map((f) => `user:${f}`).join(', ')})`,
+        `[ysync] speech-guard: evicted ${foreign.length} foreign speech entr${foreign.length === 1 ? 'y' : 'ies'} (${foreign.map((f) => `user:${f}`).join(', ')}) from ${writers.length} claimed writer clientID(s); delivering origin user='${senderUserId ?? 'unknown'}'`,
       );
-      evictForeignSpeechEntries(roomDoc, foreign);
+      try {
+        evictForeignSpeechEntries(roomDoc, foreign);
+      } finally {
+        // Report AFTER the repair so a throwing eviction cannot skip the
+        // amplifier accounting (audit A3 finding #4).
+        options.onUnauthorizedWrite?.(origin);
+      }
     },
   };
   return handle;

@@ -6,6 +6,32 @@
  * gateway-signed HMAC session token (?token=...), verified with the shared
  * AUTH_SECRET — the same credential contract as the Rust engine.
  *
+ * AUTHORIZATION MODEL (audit A3 findings #3 and #4)
+ *
+ * Every remote doc frame is authorized by the DELIVERING CONNECTION's
+ * HMAC-verified identity, never by the clientIDs its structs claim. y-websocket
+ * passes the originating conn object as the Yjs transaction origin, so the
+ * connIdentity registry below (populated at upgrade from the verified token)
+ * is the single source of truth for both guards:
+ *
+ *   - atmosphere (scripts/ysync_atmosphere_guard.mjs): only gm/admin
+ *     connections may write or delete the 'atmosphere' map;
+ *   - speech (scripts/ysync_speech_guard.mjs): a connection may write only
+ *     its own `user:<userId>` ledger key.
+ *
+ * Struct clientIDs are attacker-chosen 32-bit values on the wire; treating
+ * them as identity let any peer forge deltas claiming an already-bound GM or
+ * victim clientID (audit A3 finding #3). Awareness claims are no longer part
+ * of any authorization decision — the relay still parses awareness frames,
+ * but only to keep them out of attribution entirely (fail closed by absence).
+ *
+ * AMPLIFICATION CONTROLS (audit A3 finding #4): each guard reports every
+ * eviction to a per-connection token bucket; once a connection exhausts its
+ * corrective-broadcast budget it is DISCONNECTED instead of being allowed to
+ * trigger further repairs. Persistence is dirty-flag + 1s debounce so bursts
+ * of updates coalesce into ONE whole-document disk write instead of one
+ * synchronous write per update.
+ *
  * Run from client/ where the y-websocket dependency is installed:
  *   node scripts/ysync-server.mjs
  */
@@ -23,9 +49,13 @@ const wsModule = require('ws');
 const WebSocketServer = wsModule.WebSocketServer || wsModule.Server;
 const { setupWSConnection, setPersistence, getYDoc } = require('y-websocket/bin/utils');
 const Y = require('yjs');
-const decoding = require('lib0/decoding');
 import { installSpeechGuard } from './ysync_speech_guard.mjs';
 import { installAtmosphereGuard } from './ysync_atmosphere_guard.mjs';
+import {
+  createCorrectiveRateLimiter,
+  createCorrectiveEventGate,
+  createDebouncedPersister,
+} from './ysync_relay_throttle.mjs';
 
 const PORT = process.env.PORT || 6380;
 const DATA_DIR = process.env.YSYNC_DATA_DIR || path.join(process.cwd(), 'ydata');
@@ -33,10 +63,32 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const docPath = (room) => path.join(DATA_DIR, `${room.replace(/[^\w-]/g, '_')}.ydoc`);
 
-// Simple file persistence: bindYDoc on load, flush on update.
+// --- Persistence: debounced whole-document flushes (audit A3 #4) ------------
+
+function persistDoc(roomName, ydoc) {
+  try {
+    fs.writeFileSync(docPath(roomName), Buffer.from(Y.encodeStateAsUpdate(ydoc)));
+  } catch (e) {
+    console.warn(`[ysync] persistence flush failed for '${roomName}':`, e);
+  }
+}
+
+/** room name -> debounced persister handle */
+const persisters = new Map();
+
+function persisterFor(roomName, ydoc) {
+  let p = persisters.get(roomName);
+  if (!p) {
+    p = createDebouncedPersister(() => persistDoc(roomName, ydoc));
+    persisters.set(roomName, p);
+  }
+  return p;
+}
+
+// Simple file persistence: bindYDoc on load, coalesced flush on update.
 const persistence = {
-  bindState: async (_docName, ydoc) => {
-    const file = docPath(_docName);
+  bindState: async (docName, ydoc) => {
+    const file = docPath(docName);
     if (fs.existsSync(file)) {
       try {
         Y.applyUpdate(ydoc, new Uint8Array(fs.readFileSync(file)));
@@ -45,15 +97,42 @@ const persistence = {
       }
     }
     ydoc.on('update', () => {
-      fs.writeFileSync(file, Buffer.from(Y.encodeStateAsUpdate(ydoc)));
+      // Dirty-flag + 1s debounce: a burst of updates (including every guard
+      // eviction broadcast) collapses into one synchronous whole-doc write.
+      persisterFor(docName, ydoc).markDirty();
     });
   },
-  writeState: async (_docName, ydoc) => {
-    fs.writeFileSync(docPath(_docName), Buffer.from(Y.encodeStateAsUpdate(ydoc)));
+  writeState: async (docName, ydoc) => {
+    const p = persisters.get(docName);
+    if (p) p.flushNow();
+    else persistDoc(docName, ydoc);
   },
 };
 
 setPersistence(persistence);
+
+// --- Corrective-broadcast amplification gate (audit A3 #4) -------------------
+
+/**
+ * Per-connection token bucket over corrective-broadcast events. ~5 events/min
+ * refilling continuously; an exhausted budget disconnects the offending
+ * connection instead of allowing further amplification. The CURRENT event's
+ * repair always happens first (correctness before rate limiting).
+ */
+const correctiveLimiter = createCorrectiveRateLimiter();
+const correctiveGate = createCorrectiveEventGate({
+  limiter: correctiveLimiter,
+  disconnect: (conn) => {
+    console.warn(
+      '[ysync] throttle: corrective-broadcast budget exhausted; disconnecting abusive connection',
+    );
+    try {
+      conn.close(4008, 'corrective-write budget exhausted');
+    } catch {
+      /* already dead */
+    }
+  },
+});
 
 // --- HMAC token verification (mirrors vtt-server/src/auth.rs) ---------------
 
@@ -95,52 +174,45 @@ const server = http.createServer((_req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', setupWSConnection);
 
-// --- Speech-map authorization (audit A2 finding #4) -------------------------
+// --- Delivery-time identity registry ----------------------------------------
 //
-// Every speech-ledger entry lives under a per-owner key (`user:<userId>`);
-// only that user's own devices may write it. The relay enforces this with
-// per-writer attribution:
-//
-//   1. AWARENESS CLAIM BINDING — each peer's awareness state carries its
-//      clientID and a `user_id` claim. On every awareness update we bind
-//      clientID -> user_id ONLY when the claim matches the connection's
-//      HMAC-verified identity; spoofed claims never become authoritative.
-//   2. DELTA CHECK — every doc update is decoded; speech keys touched are
-//      attributed to their writing clientIDs via step 1. Foreign or
-//      unattributed writes are EVICTED from the room doc, and the corrective
-//      delete-set update repairs every replica that already merged them.
-//
-// RESIDUAL threat model (documented honestly in scripts/ysync_speech_guard.mjs):
-// re-poisoning with a fresh clock re-triggers eviction each time (loud, not
-// silent); unattributed writers fail closed; non-speech maps are out of scope.
+// conn object -> { userId, role }: populated at upgrade time from the
+// HMAC-verified token. y-websocket passes this same conn object as the Yjs
+// transaction origin for every remote frame, so BOTH guards authorize against
+// what the relay VERIFIED at delivery time — not against struct clientIDs
+// (attacker-chosen) and not against awareness claims (spoofable self-labels).
 
 /** room name -> { speech, atmosphere } guard handles */
 const speechGuards = new Map();
 
 // conn object -> { userId, role }: populated at upgrade time from the
-// HMAC-verified token. y-websocket uses the conn object itself as the Yjs
-// transaction origin for frames that connection sends, so this registry is
-// how delta-time authorization learns WHO delivered a frame — required for
-// atmosphere deletes (delete-sets carry no struct authorship).
+// HMAC-verified token (declared before the guards that capture it).
 const connIdentity = new WeakMap();
 
 function guardForRoom(roomName) {
   let guard = speechGuards.get(roomName);
   if (!guard) {
     const doc = getYDoc(roomName);
-    const speechGuard = installSpeechGuard(doc);
+    const speechGuard = installSpeechGuard(doc, {
+      userOfConnection: (origin) => connIdentity.get(origin)?.userId ?? null,
+      onUnauthorizedWrite: (origin) => {
+        if (origin != null) correctiveGate(origin);
+      },
+    });
     const atmosphereGuard = installAtmosphereGuard(doc, {
       roleOfConnection: (origin) => connIdentity.get(origin)?.role ?? null,
+      onUnauthorizedWrite: (origin) => {
+        if (origin != null) correctiveGate(origin);
+      },
     });
     doc.on('update', (update, origin) => {
       try {
-        // Speech authorization is purely struct-attributed; it sees every
-        // update including the guards' own corrective transactions (which
-        // carry no speech structs and are ignored).
-        speechGuard.checkUpdate(update);
-        // Atmosphere authorization must NOT re-check relay-local corrective
-        // transactions (null origin) — see the guard's WIRING CONTRACT.
-        if (origin != null) atmosphereGuard.checkUpdate(update, origin);
+        // Both guards are gated on the DELIVERING connection's verified
+        // identity. Relay-local corrective transactions have a null origin
+        // and must not be re-checked — see each guard's WIRING CONTRACT.
+        if (origin == null) return;
+        speechGuard.checkUpdate(update, origin);
+        atmosphereGuard.checkUpdate(update, origin);
       } catch (e) {
         console.warn(`[ysync] guard delta check failed for '${roomName}':`, e);
       }
@@ -149,51 +221,6 @@ function guardForRoom(roomName) {
     speechGuards.set(roomName, guard);
   }
   return guard;
-}
-
-/**
- * Validate an awareness update against the connection's verified identity.
- * The payload layout mirrors y-protocols/awareness#applyAwarenessUpdate:
- * [varUint count] then per entry [varUint clientID][varUint clock][string JSON].
- * Claims that match the connection's HMAC-verified identity are bound to
- * their clientID for speech attribution; mismatched claims are rejected so
- * they can never bless a foreign speech write.
- */
-function processAwarenessClaims(roomName, connKey, identity, payloadBytes) {
-  const verifiedUserId = identity?.userId;
-  if (!verifiedUserId || !payloadBytes?.length) return;
-  const guards = guardForRoom(roomName);
-  try {
-    const decoder = decoding.createDecoder(payloadBytes);
-    const len = decoding.readVarUint(decoder);
-    for (let i = 0; i < len; i++) {
-      const clientId = decoding.readVarUint(decoder);
-      decoding.readVarUint(decoder); // clock — informational only here
-      let claimed;
-      try {
-        const state = JSON.parse(decoding.readVarString(decoder));
-        claimed = state && typeof state === 'object' ? state.user_id : null;
-      } catch {
-        claimed = null; // unparsable state: treat as no claim
-      }
-      if (!guards.speech.bindClaim(verifiedUserId, clientId, claimed)) {
-        console.warn(
-          `[ysync] speech-guard: rejected awareness claim '${claimed}' from conn '${connKey}' (verified as '${verifiedUserId}')`,
-        );
-      }
-      // Same binding feeds atmosphere authorization: clientID -> VERIFIED
-      // role, so policy is always decided from the token the relay checked,
-      // never from a self-reported claim.
-      guards.atmosphere.bindClaim(
-        verifiedUserId,
-        identity.role ?? null,
-        clientId,
-        claimed,
-      );
-    }
-  } catch {
-    /* malformed awareness payload: leave attribution untouched (fail closed) */
-  }
 }
 
 server.on('upgrade', (request, socket, head) => {
@@ -213,34 +240,20 @@ server.on('upgrade', (request, socket, head) => {
   // setupWSConnection uses as the Y.Doc name).
   const roomName = decodeURIComponent(url.pathname.slice(1).split('?')[0]);
   try {
-    guardForRoom(roomName); // ensure the guard exists before any traffic flows
+    guardForRoom(roomName); // ensure the guards exist before any traffic flows
   } catch (e) {
-    console.warn(`[ysync] speech-guard install failed for '${roomName}':`, e);
+    console.warn(`[ysync] guard install failed for '${roomName}':`, e);
   }
   wss.handleUpgrade(request, socket, head, (ws) => {
-    const connKey = `${roomName}#${identity.user_id}`;
-    // Register the verified identity for delta-time authorization: y-websocket
-    // passes this conn object as the Yjs transaction origin, so the atmosphere
-    // guard can resolve WHO delivered a frame (needed because delete-sets
-    // carry no struct authorship).
-    connIdentity.set(ws, { userId: identity.user_id, role: identity.role ?? null });
-    // Inspect awareness frames BEFORE y-websocket applies them, so claims are
-    // validated against this connection's HMAC-verified identity.
-    ws.on('message', (data, _isBinary) => {
-      try {
-        const bytes = new Uint8Array(data);
-        if (bytes.length === 0 || bytes[0] !== 1 /* messageAwareness */) return;
-        // Frame layout: [messageType][varUint8Array payload]
-        const decoder = decoding.createDecoder(bytes.subarray(1));
-        processAwarenessClaims(
-          roomName,
-          connKey,
-          { userId: identity.user_id, role: identity.role ?? null },
-          decoding.readVarUint8Array(decoder),
-        );
-      } catch {
-        /* malformed frame: y-websocket's own handler will reject it too */
-      }
+    // Register the verified identity under the conn object itself. y-websocket
+    // passes this object as the transaction origin of every frame the
+    // connection sends, making it the authorization key for both guards.
+    const verifiedIdentity = { userId: identity.user_id, role: identity.role ?? null };
+    connIdentity.set(ws, verifiedIdentity);
+    ws.on('close', () => {
+      connIdentity.delete(ws);
+      // Free the connection's rate-budget slot with it.
+      correctiveLimiter.forget(ws);
     });
     wss.emit('connection', ws, request);
   });

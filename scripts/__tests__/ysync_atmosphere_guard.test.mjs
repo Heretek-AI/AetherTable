@@ -1,21 +1,21 @@
 /**
- * Relay-side table-atmosphere authorization tests (loop-1 iteration 63 defect:
- * "No atmosphere write policy at the relay").
+ * Relay-side table-atmosphere authorization tests (loop-1 iteration 63 defect,
+ * hardened for audit A3 finding #3).
  *
  * The room-wide atmosphere preset lives under ONE Y.Map key ('current') inside
  * every room doc's 'atmosphere' map (client/src/sync/yjs_doc_client.ts,
  * ATMOSPHERE_KEY). GOALS.md Pillar 2 assigns theme selection to the HOST, so
  * only GM/admin-authenticated peers may write it; players and spectators are
- * read-only consumers. Before this guard the relay accepted the write from ANY
- * role (the old yjs_doc_client POLICY NOTE said exactly that).
+ * read-only consumers.
  *
  * These tests exercise the guard against real Y.Docs the same way the live
  * relay wires it:
- *   - inspectAtmosphereWrites decodes raw deltas into writing clientIDs +
- *     atmosphere keys touched,
- *   - bindClaim binds clientID -> verified role only for non-spoofed claims,
- *   - checkUpdate evicts non-GM atmosphere writes and emits corrective updates
- *     that repair replicas which already merged them.
+ *   - inspectAtmosphereWrites decodes raw deltas into atmosphere keys touched,
+ *   - unauthorizedAtmosphereWrites gates every touched key on the DELIVERING
+ *     CONNECTION's HMAC-verified role — struct clientIDs are attacker-chosen
+ *     and are NOT an authorization input (audit A3 finding #3),
+ *   - checkUpdate evicts non-host atmosphere writes and emits corrective
+ *     updates that repair replicas which already merged them.
  */
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -30,10 +30,27 @@ import {
 } from '../ysync_atmosphere_guard.mjs';
 
 /** Build an encoded update writing one atmosphere key from a throwaway doc. */
-function writeAtmosphere(key = ATMOSPHERE_KEY, value = { id: 'gothic-horror' }) {
+function writeAtmosphere(key = ATMOSPHERE_KEY, value = { id: 'gothic-horror' }, clientId) {
   const d = new Y.Doc();
+  if (clientId !== undefined) d.clientID = clientId;
   d.getMap(ATMOSPHERE_MAP_NAME).set(key, value);
   return { update: Y.encodeStateAsUpdate(d), clientId: d.clientID };
+}
+
+/**
+ * Forge an update AS IF written by `victimClientId`, with the local clock
+ * advanced past `clockFloor`. This is exactly what audit A3 finding #3
+ * describes: clientIDs are attacker-chosen 32-bit values, and a forger must
+ * ALSO pick a higher clock than the victim's current item or yjs discards
+ * the incoming struct as a duplicate item id instead of letting it win LWW.
+ */
+function forgeAs(victimClientId, clockFloor, write) {
+  const d = new Y.Doc();
+  d.clientID = victimClientId;
+  const noise = d.getMap('noise');
+  for (let i = 0; i <= clockFloor; i++) noise.set(`n${i}`, i);
+  write(d);
+  return Y.encodeStateAsUpdate(d);
 }
 
 describe('inspectAtmosphereWrites', () => {
@@ -74,38 +91,38 @@ describe('inspectAtmosphereWrites', () => {
 });
 
 describe('unauthorizedAtmosphereWrites (pure decision)', () => {
-  it('passes a write whose writer holds a host role', () => {
-    expect(unauthorizedAtmosphereWrites([101], [ATMOSPHERE_KEY], () => 'gm')).toEqual([]);
-    expect(unauthorizedAtmosphereWrites([102], [ATMOSPHERE_KEY], () => 'admin')).toEqual([]);
+  it('passes any touched set when the delivering connection is host-role', () => {
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], 'gm')).toEqual([]);
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], 'admin')).toEqual([]);
   });
 
-  it('flags player and spectator writers', () => {
-    expect(unauthorizedAtmosphereWrites([201], [ATMOSPHERE_KEY], () => 'player')).toEqual([
+  it('flags every touched key when the delivering connection is player or spectator', () => {
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], 'player')).toEqual([
       ATMOSPHERE_KEY,
     ]);
-    expect(unauthorizedAtmosphereWrites([202], [ATMOSPHERE_KEY], () => 'spectator')).toEqual([
-      ATMOSPHERE_KEY,
-    ]);
-  });
-
-  it('fails closed on an unattributed writer (no validated awareness claim)', () => {
-    expect(unauthorizedAtmosphereWrites([999], [ATMOSPHERE_KEY], () => null)).toEqual([
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], 'spectator')).toEqual([
       ATMOSPHERE_KEY,
     ]);
   });
 
-  it('accepts when ANY riding writer of a merged delta is a host', () => {
-    // One delta carrying structs from a player AND the GM who legitimately
-    // changed the theme stays legitimate.
-    expect(
-      unauthorizedAtmosphereWrites([301, 302], [ATMOSPHERE_KEY], (id) =>
-        id === 301 ? 'player' : 'gm'
-      )
-    ).toEqual([]);
+  it('fails closed when the delivering connection cannot be resolved', () => {
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], null)).toEqual([ATMOSPHERE_KEY]);
+    expect(unauthorizedAtmosphereWrites([ATMOSPHERE_KEY], undefined)).toEqual([
+      ATMOSPHERE_KEY,
+    ]);
+  });
+
+  it('does NOT consult struct clientIDs at all (audit A3 finding #3)', () => {
+    // A forged GM clientID in the delta's structs changes nothing: the only
+    // inputs are the touched keys and the verified sender role. This is the
+    // regression pin for the spoofable-clientID hole.
+    expect(unauthorizedAtmosphereWrites.length).toBe(2); // (touchedKeys, senderRole)
+    expect(unauthorizedAtmosphereWrites(['current'], 'player')).toEqual(['current']);
   });
 
   it('is safe on empty input', () => {
-    expect(unauthorizedAtmosphereWrites([], [], () => 'gm')).toEqual([]);
+    expect(unauthorizedAtmosphereWrites([], 'player')).toEqual([]);
+    expect(unauthorizedAtmosphereWrites([], null)).toEqual([]);
   });
 });
 
@@ -159,14 +176,14 @@ describe('evictUnauthorizedAtmosphereEntries (post-commit repair)', () => {
 describe('installAtmosphereGuard (relay wiring)', () => {
   function makeRoom() {
     const room = new Y.Doc();
-    // Origin -> HMAC-verified role, mirroring the live relay's connection
-    // registry in scripts/ysync-server.mjs.
+    // Origin -> HMAC-verified role, mirroring the live relay's connIdentity
+    // registry in scripts/ysync-server.mjs (populated from the token at
+    // upgrade time).
     const roleByOrigin = new Map([
       ['conn-gm', 'gm'],
       ['conn-admin', 'admin'],
       ['conn-player', 'player'],
       ['conn-spec', 'spectator'],
-      ['conn-ghost', null],
     ]);
     const guard = installAtmosphereGuard(room, {
       roleOfConnection: (origin) => roleByOrigin.get(origin) ?? null,
@@ -185,7 +202,6 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('lets a GM peer publish the room-wide preset', () => {
     const { room, guard } = makeRoom();
     const gmDoc = new Y.Doc();
-    guard.bindClaim('gm-1', 'gm', gmDoc.clientID, 'gm-1');
     gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'eldritch-mystery' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
     expect(guard.evictions).toBe(0);
@@ -197,7 +213,6 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('evicts a player attempt to rewrite shared atmosphere state', () => {
     const { room, guard } = makeRoom();
     const playerDoc = new Y.Doc();
-    guard.bindClaim('p-1', 'player', playerDoc.clientID, 'p-1');
     playerDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'clown-fiesta' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(playerDoc), 'conn-player');
     expect(guard.evictions).toBe(1);
@@ -208,19 +223,65 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('evicts a spectator write identically to a player write', () => {
     const { room, guard } = makeRoom();
     const specDoc = new Y.Doc();
-    guard.bindClaim('s-1', 'spectator', specDoc.clientID, 's-1');
     specDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'spectator-theme' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(specDoc), 'conn-spec');
     expect(guard.evictions).toBe(1);
     expect([...room.getMap(ATMOSPHERE_MAP_NAME).keys()]).toEqual([]);
   });
 
-  it('binds a clientID to the verified role ONLY when the awareness claim matches the verified identity', () => {
+  // ---- audit A3 finding #3: forged clientIDs carry no privilege ----------
+
+  it('F-A3#3: evicts a delta whose structs claim the GM clientID over a player connection', () => {
     const { room, guard } = makeRoom();
-    const spoofed = new Y.Doc();
-    // Mallory's connection is VERIFIED as mallory/player but CLAIMS gm-1.
-    expect(guard.bindClaim('mallory', 'player', spoofed.clientID, 'gm-1')).toBe(false);
-    void room;
+    // The GM publishes once so any clientID-label scheme would have this id
+    // bound as 'gm'.
+    const gmDoc = new Y.Doc({ gc: false });
+    gmDoc.clientID = 111111111;
+    gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'high-fantasy' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
+    expect(guard.evictions).toBe(0);
+
+    // Mallory (verified player) forges the GM's identity: same clientID, and
+    // a clock high enough to WIN last-writer-wins on the shared item.
+    const forged = forgeAs(gmDoc.clientID, 50, (d) =>
+      d.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'clown-fiesta' })
+    );
+    Y.applyUpdate(room, forged, 'conn-player');
+
+    // The forged frame is structurally genuine: its structs really do claim
+    // the GM's clientID and really do touch the host-owned key. Eviction is
+    // synchronous inside applyUpdate, so the poisoned value is never
+    // observable AFTER the call — this decoding step is what proves the
+    // attack frame itself (not just a rejected no-op) was processed.
+    const decodedFrame = inspectAtmosphereWrites(forged);
+    expect(decodedFrame.writers).toContain(gmDoc.clientID);
+    expect(decodedFrame.keys).toEqual([ATMOSPHERE_KEY]);
+
+    expect(guard.evictions).toBe(1);
+    // ...and eviction restored the last host-authored value.
+    expect(room.getMap(ATMOSPHERE_MAP_NAME).get(ATMOSPHERE_KEY)).toMatchObject({
+      id: 'high-fantasy',
+    });
+  });
+
+  it('F-A3#3: evicts a forged-clientID write even when NO GM ever connected', () => {
+    const { room, guard } = makeRoom();
+    const forged = writeAtmosphere(ATMOSPHERE_KEY, { id: 'ghost-gm-poison' }, 999999999);
+    Y.applyUpdate(room, forged.update, 'conn-player');
+    expect(guard.evictions).toBe(1);
+    expect([...room.getMap(ATMOSPHERE_MAP_NAME).keys()]).toEqual([]);
+  });
+
+  it('F-A3#3: a host-role connection may use ANY clientID it likes (no false positives)', () => {
+    const { room, guard } = makeRoom();
+    // A GM device whose Yjs doc picked some fresh random clientID — no prior
+    // binding exists anywhere — still publishes successfully.
+    const gmDoc = writeAtmosphere(ATMOSPHERE_KEY, { id: 'brand-new-device' }, 7777777);
+    Y.applyUpdate(room, gmDoc.update, 'conn-gm');
+    expect(guard.evictions).toBe(0);
+    expect(room.getMap(ATMOSPHERE_MAP_NAME).get(ATMOSPHERE_KEY)).toMatchObject({
+      id: 'brand-new-device',
+    });
   });
 
   it('repairs peers that received the poisoned frame before eviction landed', () => {
@@ -232,15 +293,14 @@ describe('installAtmosphereGuard (relay wiring)', () => {
     const corrections = [];
     room.on('update', (u) => corrections.push(u));
     Y.applyUpdate(room, poison, 'conn-player');
-    guard.checkUpdate(poison);
 
     Y.applyUpdate(earlyPeer, Y.mergeUpdates(corrections));
     expect(earlyPeer.getMap(ATMOSPHERE_MAP_NAME).get(ATMOSPHERE_KEY)).toBeUndefined();
   });
 
-  it('fails closed: a writer with no validated awareness claim cannot write atmosphere', () => {
+  it('fails closed: an unresolvable connection origin cannot write atmosphere', () => {
     const { room, guard } = makeRoom();
-    const ghost = new Y.Doc(); // never sent a validated awareness claim
+    const ghost = new Y.Doc();
     ghost.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'ghost-theme' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(ghost), 'conn-unknown');
     expect(guard.evictions).toBe(1);
@@ -250,7 +310,6 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('does not interfere with player speech, token, or fog traffic', () => {
     const { room, guard } = makeRoom();
     const playerDoc = new Y.Doc();
-    guard.bindClaim('p-1', 'player', playerDoc.clientID, 'p-1');
     playerDoc.getMap('speech').set('user:p-1', { segments: [] });
     playerDoc.getMap('tokens').set('t1', { x: 5 });
     playerDoc.getMap('fog').set('fog:p-1', new Uint8Array([3]));
@@ -264,12 +323,10 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('keeps a GM write durable while a later player overwrite is reverted', () => {
     const { room, guard } = makeRoom();
     const gmDoc = new Y.Doc();
-    guard.bindClaim('gm-1', 'gm', gmDoc.clientID, 'gm-1');
     gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'high-fantasy' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
 
     const playerDoc = new Y.Doc();
-    guard.bindClaim('p-1', 'player', playerDoc.clientID, 'p-1');
     playerDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'hijacked' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(playerDoc), 'conn-player');
 
@@ -284,14 +341,12 @@ describe('installAtmosphereGuard (relay wiring)', () => {
   it('reverts a player attempt to DELETE the shared selection', () => {
     const { room, guard } = makeRoom();
     const gmDoc = new Y.Doc();
-    guard.bindClaim('gm-1', 'gm', gmDoc.clientID, 'gm-1');
     gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'eldritch-mystery' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
 
-    // Deletions ride the delete-set with no struct authorship, so this is
-    // authorized via the SENDING CONNECTION's verified role.
+    // Deletions ride the delete-set with no struct authorship; authorized via
+    // the SENDING CONNECTION's verified role (the only mechanism now).
     const playerDoc = new Y.Doc();
-    guard.bindClaim('p-1', 'player', playerDoc.clientID, 'p-1');
     Y.applyUpdate(playerDoc, Y.encodeStateAsUpdate(gmDoc));
     playerDoc.getMap(ATMOSPHERE_MAP_NAME).delete(ATMOSPHERE_KEY);
     Y.applyUpdate(
@@ -306,25 +361,31 @@ describe('installAtmosphereGuard (relay wiring)', () => {
     });
   });
 
-  it('does not resurrect poison when a hijack has no legitimate predecessor', () => {
+  it('lets a host legitimately delete the shared selection', () => {
     const { room, guard } = makeRoom();
-    const ghost = new Y.Doc(); // unattributed first write — nothing to revert to
-    ghost.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'ghost-theme' });
-    Y.applyUpdate(room, Y.encodeStateAsUpdate(ghost), 'conn-unknown');
-    expect(guard.evictions).toBe(1);
+    const gmDoc = new Y.Doc();
+    gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'gothic-horror' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
+    // Host deliberately clears the selection (the clearing doc must carry the
+    // original item first so its update encodes a real tombstone).
+    const clearDoc = new Y.Doc();
+    Y.applyUpdate(clearDoc, Y.encodeStateAsUpdate(gmDoc));
+    clearDoc.getMap(ATMOSPHERE_MAP_NAME).delete(ATMOSPHERE_KEY);
+    Y.applyUpdate(
+      room,
+      Y.encodeStateAsUpdate(clearDoc, Y.encodeStateVector(gmDoc)),
+      'conn-gm'
+    );
+    expect(guard.evictions).toBe(0);
     expect([...room.getMap(ATMOSPHERE_MAP_NAME).keys()]).toEqual([]);
   });
 
   it('stops reverting once a host legitimately clears the key', () => {
     const { room, guard } = makeRoom();
     const gmDoc = new Y.Doc();
-    guard.bindClaim('gm-1', 'gm', gmDoc.clientID, 'gm-1');
     gmDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'gothic-horror' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(gmDoc), 'conn-gm');
-    // Host deliberately clears the selection (the clearing doc must carry the
-    // original item first so its update encodes a real tombstone).
     const clearDoc = new Y.Doc();
-    guard.bindClaim('gm-1', 'gm', clearDoc.clientID, 'gm-1');
     Y.applyUpdate(clearDoc, Y.encodeStateAsUpdate(gmDoc));
     clearDoc.getMap(ATMOSPHERE_MAP_NAME).delete(ATMOSPHERE_KEY);
     Y.applyUpdate(
@@ -336,10 +397,59 @@ describe('installAtmosphereGuard (relay wiring)', () => {
 
     // A later hijack stays cleared instead of restoring the stale preset.
     const playerDoc = new Y.Doc();
-    guard.bindClaim('p-1', 'player', playerDoc.clientID, 'p-1');
     playerDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'hijacked' });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(playerDoc), 'conn-player');
     expect([...room.getMap(ATMOSPHERE_MAP_NAME).keys()]).toEqual([]);
+  });
+
+  it('does not resurrect poison when a hijack has no legitimate predecessor', () => {
+    const { room, guard } = makeRoom();
+    const ghost = new Y.Doc(); // first write is already unauthorized
+    ghost.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'ghost-theme' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(ghost), 'conn-unknown');
+    expect(guard.evictions).toBe(1);
+    expect([...room.getMap(ATMOSPHERE_MAP_NAME).keys()]).toEqual([]);
+  });
+
+  it('never re-checks its own corrective transactions (no eviction loop)', () => {
+    const { room, guard } = makeRoom();
+    const playerDoc = new Y.Doc();
+    playerDoc.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'hijacked' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(playerDoc), 'conn-player');
+    const countAfterFirst = guard.evictions;
+    expect(countAfterFirst).toBe(1);
+    // The restore write itself emitted updates; if they were re-checked the
+    // eviction count would climb without any further remote traffic.
+    expect(guard.evictions).toBe(countAfterFirst);
+  });
+
+  it('reports every eviction to the amplifier accounting hook (audit A3 #4)', () => {
+    const room = new Y.Doc();
+    const reported = [];
+    const roles = new Map([
+      ['conn-player', 'player'],
+      ['conn-gm', 'gm'],
+    ]);
+    const guard = installAtmosphereGuard(room, {
+      roleOfConnection: (origin) => roles.get(origin) ?? null,
+      onUnauthorizedWrite: (origin) => reported.push(origin),
+    });
+    room.on('update', (u, origin) => {
+      if (origin == null) return;
+      guard.checkUpdate(u, origin);
+    });
+    const a = new Y.Doc();
+    a.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'x1' });
+    const b = new Y.Doc();
+    b.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'x2' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(a), 'conn-player');
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(b), 'conn-player');
+    expect(reported).toEqual(['conn-player', 'conn-player']);
+    // Legitimate host traffic never trips the hook.
+    const g = new Y.Doc();
+    g.getMap(ATMOSPHERE_MAP_NAME).set(ATMOSPHERE_KEY, { id: 'ok' });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(g), 'conn-gm');
+    expect(reported).toEqual(['conn-player', 'conn-player']);
   });
 });
 

@@ -1,20 +1,22 @@
 /**
- * Relay-side speech-map authorization tests (audit A2 finding #4).
+ * Relay-side speech-map authorization tests (audit A2 finding #4; hardened
+ * for audit A3 finding #3).
  *
  * The relay is the only component that KNOWS which user_id an authenticated
  * connection belongs to (it HMAC-verifies the gateway token on upgrade and
  * reads the `user_id` claim). These tests exercise the guard's core against
  * real Y.Docs the same way the live relay uses it:
  *
- *   - inspectSpeechWrites decodes raw deltas into writing clientIDs + speech
- *     keys touched,
- *   - bindClaim binds clientID -> verified user only for non-spoofed claims,
+ *   - inspectSpeechWrites decodes raw deltas into speech keys touched,
+ *   - foreignSpeechKeys gates each touched key on the DELIVERING
+ *     CONNECTION's HMAC-verified user_id — struct clientIDs are
+ *     attacker-chosen and are NOT an authorization input (audit A3 #3),
  *   - checkUpdate evicts foreign speech writes and emits corrective updates
- *     that repair replicas which already merged the poison.
+ *     that repair replicas which already merged them.
  *
  * Threat model covered: a peer writing speech segments under ANOTHER user's
- * key gets its write evicted on every replica, even when it spoofs awareness
- * claims or replays raw frames.
+ * key gets its write evicted on every replica, even when its structs claim
+ * the victim's clientID or replay raw frames.
  */
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -28,8 +30,9 @@ import {
 } from '../ysync_speech_guard.mjs';
 
 /** Build an encoded update writing one speech key from a throwaway doc. */
-function writeSpeech(key, value) {
+function writeSpeech(key, value, clientId) {
   const d = new Y.Doc();
+  if (clientId !== undefined) d.clientID = clientId;
   const map = d.getMap(SPEECH_MAP_NAME);
   if (value === undefined) map.delete(key);
   else map.set(key, value);
@@ -75,36 +78,30 @@ describe('inspectSpeechWrites', () => {
 });
 
 describe('foreignSpeechKeys (pure decision)', () => {
-  it('passes a write whose writer is bound to the key owner', () => {
-    const verdict = foreignSpeechKeys([101], ['alice'], (id) =>
-      id === 101 ? 'alice' : null
-    );
-    expect(verdict).toEqual([]);
+  it('passes a write whose delivering connection IS the key owner', () => {
+    expect(foreignSpeechKeys(['alice'], 'alice')).toEqual([]);
   });
 
-  it('rejects an unattributed writer (no validated claim) — fail closed', () => {
-    expect(foreignSpeechKeys([999], ['alice'], () => null)).toEqual(['alice']);
+  it('rejects every touched owner when the sender cannot be resolved — fail closed', () => {
+    expect(foreignSpeechKeys(['alice'], null)).toEqual(['alice']);
+    expect(foreignSpeechKeys(['alice'], undefined)).toEqual(['alice']);
   });
 
-  it('rejects a writer bound to a DIFFERENT user', () => {
-    const verdict = foreignSpeechKeys([202], ['alice'], (id) =>
-      id === 202 ? 'mallory' : null
-    );
-    expect(verdict).toEqual(['alice']);
+  it('rejects a sender verified as a DIFFERENT user', () => {
+    expect(foreignSpeechKeys(['alice'], 'mallory')).toEqual(['alice']);
   });
 
-  it('accepts when ANY riding writer is the rightful owner', () => {
-    // A merged delta may carry structs from several writers; if the rightful
-    // owner contributed the write, the key is legitimate.
-    expect(
-      foreignSpeechKeys([202, 303], ['alice'], (id) =>
-        id === 303 ? 'alice' : 'mallory'
-      )
-    ).toEqual([]);
+  it('does NOT consult struct clientIDs at all (audit A3 finding #3)', () => {
+    // The decision takes exactly two inputs: touched owners and the verified
+    // sending identity. This is the regression pin for the spoofable-clientID
+    // hole.
+    expect(foreignSpeechKeys.length).toBe(2); // (touchedOwners, senderUserId)
+    expect(foreignSpeechKeys(['alice'], 'mallory')).toEqual(['alice']);
   });
 
   it('is safe on empty input', () => {
-    expect(foreignSpeechKeys([], [], () => null)).toEqual([]);
+    expect(foreignSpeechKeys([], null)).toEqual([]);
+    expect(foreignSpeechKeys([], 'alice')).toEqual([]);
   });
 });
 
@@ -152,40 +149,93 @@ describe('evictForeignSpeechEntries (post-commit repair)', () => {
 describe('installSpeechGuard (relay wiring)', () => {
   function makeRoom() {
     const room = new Y.Doc();
-    const guard = installSpeechGuard(room);
-    room.on('update', (u) => guard.checkUpdate(u));
+    // Origin -> HMAC-verified user_id, mirroring the live relay's connIdentity
+    // registry in scripts/ysync-server.mjs (populated from the token at
+    // upgrade time).
+    const usersByOrigin = new Map([
+      ['conn-alice', 'alice'],
+      ['conn-bob', 'bob'],
+      ['conn-mallory', 'mallory'],
+    ]);
+    const guard = installSpeechGuard(room, {
+      userOfConnection: (origin) => usersByOrigin.get(origin) ?? null,
+    });
+    // Mirrors the live relay wiring: only remote updates (non-null origin)
+    // are checked.
+    room.on('update', (u, origin) => {
+      if (origin == null) return;
+      guard.checkUpdate(u, origin);
+    });
     return { room, guard };
   }
 
-  it('lets a peer publish under its OWN validated identity', () => {
+  it('lets a peer publish under its OWN verified identity (fresh clientID, no binding step)', () => {
     const { room, guard } = makeRoom();
     const honest = new Y.Doc();
     honest.getMap(SPEECH_MAP_NAME).set('user:alice', { user_id: 'alice', name: 'A', segments: [] });
-    guard.bindClaim('alice', honest.clientID, 'alice'); // claim matches verified id
-    Y.applyUpdate(room, Y.encodeStateAsUpdate(honest), 'conn-1');
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(honest), 'conn-alice');
     expect(guard.evictions).toBe(0);
     expect(Array.from(room.getMap(SPEECH_MAP_NAME).keys())).toEqual(['user:alice']);
-  });
-
-  it('binds a clientID only when the awareness claim MATCHES the verified identity', () => {
-    const { room, guard } = makeRoom();
-    const spoofed = new Y.Doc();
-    // Mallory's connection is VERIFIED as mallory but CLAIMS alice.
-    expect(guard.bindClaim('mallory', spoofed.clientID, 'alice')).toBe(false);
-    expect(guard.bindClaim('mallory', spoofed.clientID, 'mallory')).toBe(true);
-    void room;
   });
 
   it('evicts and counts a foreign-key write arriving over another peer’s connection', () => {
     const { room, guard } = makeRoom();
     const mallory = new Y.Doc();
     // Mallory is verified as mallory but writes under bob's key.
-    guard.bindClaim('mallory', mallory.clientID, 'mallory');
     mallory.getMap(SPEECH_MAP_NAME).set('user:bob', { user_id: 'bob', name: 'B', segments: [] });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(mallory), 'conn-mallory');
     expect(guard.evictions).toBe(1);
     expect(guard.evictedKeys).toEqual(['bob']);
     expect(Array.from(room.getMap(SPEECH_MAP_NAME).keys())).toEqual([]);
+  });
+
+  it('F-A3#3: evicts a delta whose structs claim the VICTIM\'s clientID over the attacker\'s connection', () => {
+    const { room, guard } = makeRoom();
+    // Alice publishes once over her own connection so any clientID-label
+    // scheme would have this id bound as 'alice'.
+    const aliceDoc = new Y.Doc({ gc: false });
+    aliceDoc.clientID = 424242;
+    aliceDoc.getMap(SPEECH_MAP_NAME).set('user:alice', { user_id: 'alice', segments: [] });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(aliceDoc), 'conn-alice');
+    expect(guard.evictions).toBe(0);
+
+    // Mallory forges ALICE'S identity: same clientID, and a clock high enough
+    // to WIN last-writer-wins on the shared item.
+    const d = new Y.Doc();
+    d.clientID = aliceDoc.clientID;
+    const noise = d.getMap('noise');
+    for (let i = 0; i <= 50; i++) noise.set(`n${i}`, i);
+    d.getMap(SPEECH_MAP_NAME).set('user:alice', {
+      user_id: 'alice',
+      segments: [{ s: 0, e: 9_999_000 }],
+    });
+    Y.applyUpdate(room, Y.encodeStateAsUpdate(d), 'conn-mallory');
+
+    // The forged frame is structurally genuine: its structs really do claim
+    // alice's clientID and really do touch HER ledger key. Eviction is
+    // synchronous inside applyUpdate, so the inflated value is never
+    // observable AFTER the call — this decoding step is what proves the
+    // attack frame itself (not just a rejected no-op) was processed.
+    const decodedFrame = inspectSpeechWrites(Y.encodeStateAsUpdate(d));
+    expect(decodedFrame.writers).toContain(aliceDoc.clientID);
+    expect(decodedFrame.owners).toEqual(['alice']);
+
+    expect(guard.evictions).toBe(1);
+    expect(Array.from(room.getMap(SPEECH_MAP_NAME).keys())).toEqual([]);
+  });
+
+  it('F-A3#3: a verified user may use ANY clientID with no prior binding (no false positives)', () => {
+    const { room, guard } = makeRoom();
+    // Bob's second device picked some fresh random clientID — nothing bound
+    // anywhere — and still publishes his own ledger successfully.
+    const fresh = writeSpeech(
+      'user:bob',
+      { user_id: 'bob', name: 'B2', segments: [] },
+      987654321,
+    );
+    Y.applyUpdate(room, fresh.update, 'conn-bob');
+    expect(guard.evictions).toBe(0);
+    expect(Array.from(room.getMap(SPEECH_MAP_NAME).keys())).toEqual(['user:bob']);
   });
 
   it('repairs peers that received the poison before the eviction landed', () => {
@@ -197,22 +247,21 @@ describe('installSpeechGuard (relay wiring)', () => {
     const corrections = [];
     room.on('update', (u) => corrections.push(u));
     Y.applyUpdate(room, poison, 'conn-mallory');
-    guard.checkUpdate(poison);
 
     Y.applyUpdate(earlyPeer, Y.mergeUpdates(corrections));
     expect(Array.from(earlyPeer.getMap(SPEECH_MAP_NAME).keys())).toEqual([]);
   });
 
-  it('fails closed: an unattributed writer cannot write any speech key', () => {
+  it('fails closed: an unresolvable connection cannot write any speech key', () => {
     const { room, guard } = makeRoom();
-    const ghost = new Y.Doc(); // never sent a validated awareness claim
+    const ghost = new Y.Doc(); // no registered identity for this origin
     ghost.getMap(SPEECH_MAP_NAME).set('user:someone', { user_id: 'someone', segments: [] });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(ghost), 'conn-unknown');
     expect(guard.evictions).toBe(1);
     expect(Array.from(room.getMap(SPEECH_MAP_NAME).keys())).toEqual([]);
   });
 
-  it('does not interfere with token, fog, atmosphere, or awareness traffic', () => {
+  it('does not interfere with token, fog, or atmosphere traffic', () => {
     const { room, guard } = makeRoom();
     const other = new Y.Doc();
     other.getMap('tokens').set('t1', { x: 1 });
@@ -228,8 +277,6 @@ describe('installSpeechGuard (relay wiring)', () => {
     const { room, guard } = makeRoom();
     const aliceDoc = new Y.Doc();
     const bobDoc = new Y.Doc();
-    guard.bindClaim('alice', aliceDoc.clientID, 'alice');
-    guard.bindClaim('bob', bobDoc.clientID, 'bob');
     aliceDoc.getMap(SPEECH_MAP_NAME).set('user:alice', { user_id: 'alice', segments: [] });
     bobDoc.getMap(SPEECH_MAP_NAME).set('user:bob', { user_id: 'bob', segments: [] });
     Y.applyUpdate(room, Y.encodeStateAsUpdate(aliceDoc), 'conn-alice');
@@ -239,6 +286,32 @@ describe('installSpeechGuard (relay wiring)', () => {
       'user:alice',
       'user:bob',
     ]);
+  });
+
+  it('reports every eviction to the amplifier accounting hook (audit A3 #4)', () => {
+    const room = new Y.Doc();
+    const reported = [];
+    const users = new Map([
+      ['conn-alice', 'alice'],
+      ['conn-mallory', 'mallory'],
+    ]);
+    const guard = installSpeechGuard(room, {
+      userOfConnection: (origin) => users.get(origin) ?? null,
+      onUnauthorizedWrite: (origin) => reported.push(origin),
+    });
+    room.on('update', (u, origin) => {
+      if (origin == null) return;
+      guard.checkUpdate(u, origin);
+    });
+    const a = writeSpeech('user:bob', { v: 1 }, 11).update;
+    const b = writeSpeech('user:bob', { v: 2 }, 12).update;
+    Y.applyUpdate(room, a, 'conn-mallory');
+    Y.applyUpdate(room, b, 'conn-mallory');
+    expect(reported).toEqual(['conn-mallory', 'conn-mallory']);
+    // Legitimate own-key traffic never trips the hook.
+    const ok = writeSpeech('user:alice', { v: 3 }, 13).update;
+    Y.applyUpdate(room, ok, 'conn-alice');
+    expect(reported).toEqual(['conn-mallory', 'conn-mallory']);
   });
 });
 
@@ -251,7 +324,7 @@ describe('wire conventions', () => {
   });
 
   it('exposes no test-only surface in production code', () => {
-    // The guard's public surface is inspect/bind/check/evict only.
+    // The guard's public surface is inspect/decision/check/evict only.
     expect(inspectSpeechWrites).toBeTypeOf('function');
     expect(foreignSpeechKeys).toBeTypeOf('function');
     expect(installSpeechGuard).toBeTypeOf('function');
