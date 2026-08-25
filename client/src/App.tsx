@@ -100,6 +100,15 @@ import {
 } from './sync/transport_reprobe';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
 import type { CombatantEntry } from './components/InitiativeTracker';
+import {
+  TransientSaveToast,
+} from './components/ConcentrationBadge';
+import {
+  extractConcentrationSaves,
+  formatConcentrationSaveLine,
+  parseConcentrationFromSessionState,
+  type ConcentrationInfo,
+} from './api/concentration_state';
 
 /**
  * Authoritative engine combat state, mirrored from GET /api/v1/engine/session-state
@@ -625,6 +634,16 @@ export function App() {
   // InitiativeTracker verbatim; it parses the additive disclosure fields (OA
   // provocations, concentration saves) itself and displays only what arrived.
   const [lastTurnResponse, setLastTurnResponse] = useState<unknown>(null);
+  // Per-entity active concentration, parsed from the same session-state
+  // snapshot the 15s poll already fetches (so no extra request). Absent /
+  // unrecognised fields mean "engine did not say" — the surface stays empty.
+  const [concentrationByEntity, setConcentrationByEntity] = useState<
+    Record<string, ConcentrationInfo>
+  >({});
+  // Transient line for the most recent damage-triggered concentration save
+  // (auto-dismissing toast). Cleared when a fresh disclosure arrives so the
+  // next one takes over instead of stacking.
+  const [concentrationToast, setConcentrationToast] = useState<string | null>(null);
   // Engine session this browser talks to through the orchestrator proxies;
   // null while the engine is unreachable (tracker then shows its empty state).
   const [combatSessionId, setCombatSessionId] = useState<string | null>(null);
@@ -1003,6 +1022,10 @@ export function App() {
         turn_index: Number(c.turn_index ?? 0),
         order: Array.isArray(c.order) ? c.order : [],
       });
+      // Iteration 58: same snapshot also mirrors per-entity concentration
+      // (`entities[id].concentration = {spell_id, started_round}`). Parsed
+      // defensively; a projection that omits the field leaves the badge off.
+      setConcentrationByEntity(parseConcentrationFromSessionState(snap));
     } catch {
       /* engine unreachable — keep showing last known state */
     }
@@ -1145,6 +1168,21 @@ export function App() {
             }
             const body = await resp.json().catch(() => null);
             setLastTurnResponse(body);
+            // Iteration 58: any damage-triggered concentration save the engine
+            // disclosed on this advance surfaces as a transient toast line.
+            // formatConcentrationSaveLine renders only fields the response
+            // actually carried (DC, total, verdict) and says "outcome
+            // reported" when it omitted the verdict — nothing is invented.
+            const lines = extractConcentrationSaves(body)
+              .map((save) =>
+                formatConcentrationSaveLine(save, (id) => {
+                  const fromOrder = combat.order.find((c) => c.entity_id === id);
+                  if (fromOrder) return fromOrder.name;
+                  return tokens.find((t) => t.id === id)?.name;
+                }),
+              )
+              .filter((l): l is string => l !== null);
+            setConcentrationToast(lines.length > 0 ? lines.join('\n') : null);
           })
           .then(() => refreshCombatState())
           .catch(() => {
@@ -2094,6 +2132,7 @@ export function App() {
                   particleFXRef={particleFXRef}
                   diceBoxRef={diceBoxRef}
                   spectatorMode={isSpectator}
+                  concentrationByToken={concentrationByEntity}
                 />
 
                 {/* Session dice audit log — floats over the map's free corner */}
@@ -2112,6 +2151,9 @@ export function App() {
                 onOpenGrimoire={() => setIsSpellbookOpen(true)}
                 isCollapsed={isRightDockCollapsed}
                 onToggleCollapse={() => setIsRightDockCollapsed(!isRightDockCollapsed)}
+                concentration={
+                  selectedToken ? concentrationByEntity[selectedToken.id] ?? null : null
+                }
               />
             </div>
 
@@ -2320,6 +2362,14 @@ export function App() {
       <ShortcutsModal
         isOpen={isShortcutsOpen}
         onClose={() => setIsShortcutsOpen(false)}
+      />
+
+      {/* Iteration 58: transient concentration-save notice. Renders only when
+          the engine's last advance actually disclosed a save; auto-dismisses
+          (see TransientSaveToast) so it never impersonates a permanent state. */}
+      <TransientSaveToast
+        message={concentrationToast}
+        onDismiss={() => setConcentrationToast(null)}
       />
       </Suspense>
     </div>

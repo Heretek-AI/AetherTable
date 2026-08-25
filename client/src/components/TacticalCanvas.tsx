@@ -37,6 +37,8 @@ import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
 import type { YjsCrdtClient } from '../sync/yjs_doc_client';
 import { User } from '../types/auth';
+import { ConcentrationBadge, concentrationBadgeLabel } from './ConcentrationBadge';
+import type { ConcentrationInfo } from '../api/concentration_state';
 
 export interface Token {
   id: string;
@@ -106,6 +108,12 @@ interface TacticalCanvasProps {
    * spectator isolation needs the relay to withhold non-party fog layers.
    */
   spectatorMode?: boolean;
+  /**
+   * Per-token active-concentration map, derived from engine session-state
+   * (see `parseConcentrationFromSessionState`). Entries with no projection
+   * simply don't render — absence of data is not painted as "not concentrating".
+   */
+  concentrationByToken?: Record<string, ConcentrationInfo>;
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
@@ -131,6 +139,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   diceBoxRef,
   syncClient = null,
   spectatorMode = false,
+  concentrationByToken = {},
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -942,6 +951,29 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                     title={`Active Conditions: ${token.conditions.join(', ')}`}
                   />
                 )}
+
+                {/* Concentration ring accent (iteration 58). Solid violet —
+                    deliberately NOT dashed/spinning so it never reads as the
+                    condition ring. Label comes verbatim from engine
+                    session-state (`concentration.spell_id`); a token with no
+                    projection simply gets nothing here. */}
+                {(() => {
+                  const conc = concentrationByToken[token.id];
+                  if (!conc) return null;
+                  return (
+                    <>
+                      <div
+                        data-testid="concentration-ring"
+                        className="absolute -inset-[3px] rounded-full border-2 border-violet-400/90 pointer-events-none z-30"
+                        style={{ boxShadow: '0 0 8px rgba(167,139,250,0.55)' }}
+                        title={concentrationBadgeLabel(conc) ?? undefined}
+                      />
+                      <div className="absolute -top-1.5 -right-1 z-40 pointer-events-none">
+                        <ConcentrationBadge info={conc} variant="token" />
+                      </div>
+                    </>
+                  );
+                })()}
 
                 {isSelected && (
                   <div className="absolute inset-0.5 rounded-full border-2 border-tavern-accent animate-pulse-glow" />

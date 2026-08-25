@@ -27,6 +27,8 @@ import {
   BookOpen
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
+import { ConcentrationBadge } from './ConcentrationBadge';
+import type { ConcentrationInfo } from '../api/concentration_state';
 import { authHeaders, getStoredToken } from '../api/auth_headers';
 import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
 import {
@@ -90,6 +92,13 @@ interface CharacterSheetProps {
    * is literally `engineSessionId={combatSessionId}` in App.tsx.
    */
   engineSessionId?: string | null;
+  /**
+   * Iteration 58: this token's active concentration, parsed verbatim from the
+   * engine session-state projection (`entities[id].concentration`, see
+   * api/concentration_state.ts). Null/undefined = the projection did not
+   * expose it — the sheet renders no line rather than guessing.
+   */
+  concentration?: ConcentrationInfo | null;
 }
 
 /* Design-token shorthands (official-5e-book system). */
@@ -107,6 +116,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   isCollapsed,
   onToggleCollapse,
   engineSessionId,
+  concentration,
 }) => {
   const [activeTab, setActiveTab] = useState<'actions' | 'spells' | 'inventory' | 'features'>('actions');
 
@@ -747,6 +757,23 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Active concentration (iteration 58) — straight from the engine's
+            session-state projection. Rendered only when the projection actually
+            carried a `concentration` field for this token; no line means "the
+            engine did not say", never "definitely not concentrating". */}
+        {concentration && (
+          <div
+            data-testid="sheet-concentration-line"
+            className="rounded-md px-2 py-1.5 flex items-center gap-2"
+            style={{
+              border: `1px solid ${LEATHER_HAIRLINE}`,
+              background: 'color-mix(in srgb, var(--parchment-paper-aged) 30%, transparent)',
+            }}
+          >
+            <ConcentrationBadge info={concentration} />
+          </div>
+        )}
 
         {/* Quick Vitals Grid — red-washed attribute strip cells */}
         <div className="grid grid-cols-3 gap-2 text-center">
