@@ -355,6 +355,86 @@ class TestPartialImports:
         assert result["skipped"] == 1
         assert any("LevelDB" in w for w in result["warnings"])
 
+    def test_manifest_pack_path_escape_is_skipped_with_warning(self, tmp_path):
+        """F-A3#2: a manifest-controlled ``path`` that escapes the module dir
+        ("../ydata/room.ydoc") must never be read from outside the tree — the
+        pack is skipped with a warning and the remaining packs still import."""
+        manifest = {
+            "id": "demo-module",
+            "title": "Demo Module",
+            "version": "1.0.0",
+            "packs": [
+                {"name": "escape", "label": "E",
+                 "path": "../ydata/room.ydoc", "type": "Actor"},
+                {"name": "bestiary", "label": "B",
+                 "path": "packs/bestiary.db", "type": "Actor"},
+            ],
+        }
+        build_module(tmp_path, manifest=manifest,
+                     packs={"bestiary.db": [goblin_actor()]})
+        # The file the escape would reach exists OUTSIDE the module dir —
+        # reading it would already be a containment failure.
+        ydata = tmp_path / "ydata"
+        ydata.mkdir(parents=True, exist_ok=True)
+        (ydata / "room.ydoc").write_text(
+            "\n".join(json.dumps(goblin_actor("act_outside"))) + "\n",
+            encoding="utf-8",
+        )
+
+        result = FoundryModuleImporter().import_module(tmp_path / "demo-module")
+
+        assert result["imported"] == 1
+        assert [m["source_id"] for m in result["monsters"]] == ["act_goblin"]
+        assert result["skipped"] == 1
+        escape_warnings = [
+            w for w in result["warnings"]
+            if "escape" in w and ("escapes" in w or "outside" in w)
+        ]
+        assert len(escape_warnings) == 1
+
+    def test_manifest_absolute_pack_path_is_skipped_with_warning(self, tmp_path):
+        """An absolute ``path`` is equally out-of-bounds for a module dir."""
+        manifest = {
+            "id": "demo-module",
+            "title": "Demo Module",
+            "version": "1.0.0",
+            "packs": [
+                {"name": "steal", "label": "S",
+                 "path": "/etc/passwd", "type": "Item"},
+                {"name": "gear", "label": "G",
+                 "path": "packs/gear.db", "type": "Item"},
+            ],
+        }
+        build_module(tmp_path, manifest=manifest, packs={"gear.db": [potion_item()]})
+        result = FoundryModuleImporter().import_module(tmp_path / "demo-module")
+        assert result["imported"] == 1
+        assert [i["source_id"] for i in result["items"]] == ["itm_potion"]
+        assert result["skipped"] == 1
+        assert any("/etc/passwd" in w for w in result["warnings"])
+
+    def test_manifest_deeply_nested_but_contained_path_is_allowed(self, tmp_path):
+        """Containment is about staying INSIDE the module dir, not path depth:
+        a legitimate nested pack path keeps importing."""
+        manifest = {
+            "id": "demo-module",
+            "title": "Demo Module",
+            "version": "1.0.0",
+            "packs": [
+                {"name": "nested", "label": "N",
+                 "path": "packs/nested/deep/bestiary.db", "type": "Actor"},
+            ],
+        }
+        build_module(tmp_path, manifest=manifest)
+        deep = tmp_path / "demo-module" / "packs" / "nested" / "deep"
+        deep.mkdir(parents=True, exist_ok=True)
+        (deep / "bestiary.db").write_text(
+            json.dumps(goblin_actor()) + "\n", encoding="utf-8"
+        )
+        result = FoundryModuleImporter().import_module(tmp_path / "demo-module")
+        assert len(result["monsters"]) == 1
+        assert result["skipped"] == 0
+        assert result["warnings"] == []
+
     def test_document_without_name_is_skipped_with_warning(self, tmp_path):
         anon = goblin_actor()
         anon["name"] = ""

@@ -577,6 +577,120 @@ def test_foundry_upload_archive_without_manifest_honest_422():
     assert "module.json" in resp.json()["detail"]
 
 
+# --- F-A3#1: cumulative zip-bomb defense ----------------------------------------------
+#
+# The expansion bound is a WHOLE-ARCHIVE budget, not a per-entry allowance:
+# (a) the declared uncompressed sizes are summed before anything is extracted,
+# (b) the streamed copy enforces one running total across every entry, so a
+# header that understates its real size is caught the moment the cumulative
+# bytes cross the line, not N entries later.
+
+
+def test_foundry_upload_many_honest_entries_cumulative_rejection(monkeypatch):
+    """An archive of several HONEST entries, each well under the bound, still
+    cannot expand past it in aggregate."""
+    monkeypatch.setattr(server, "_MAX_FOUNDRY_EXTRACTED_BYTES", 100 * 1024)
+    payload = _zip_with_entries([
+        ("demo-module/module.json", json.dumps(_module_manifest())),
+        ("demo-module/packs/a.db", b"A" * (40 * 1024)),
+        ("demo-module/packs/b.db", b"B" * (40 * 1024)),
+        ("demo-module/packs/c.db", b"C" * (40 * 1024)),
+    ])
+    resp = _upload_foundry(payload, _gm_token())
+    assert resp.status_code == 422, resp.text
+
+
+def _lying_entry_reader(declared, actual_bytes):
+    """A duck-typed stand-in for ``ZipFile.open(info)`` whose header claims
+    ``declared`` bytes but whose stream yields ``len(actual_bytes)``. CPython's
+    zipfile caps reads at the DECLARED size, so a real archive cannot express
+    this lie through ZipExtFile — but hand-rolled or patched writers can, and
+    the copier must not trust that gap. Returns a zero-arg opener."""
+
+    class _LyingStream:
+        def __init__(self):
+            self._buf = io.BytesIO(actual_bytes)
+
+        def read(self, n=-1):
+            return self._buf.read(n)
+
+    return lambda: _LyingStream()
+
+
+def test_copy_bounded_running_total_trips_mid_copy_on_lying_stream(tmp_path, monkeypatch):
+    """F-A3#1 core: one entry whose stream is far larger than its declared
+    header must be cut off MID-COPY by the cumulative budget — not granted a
+    fresh per-entry allowance."""
+    monkeypatch.setattr(server, "_MAX_FOUNDRY_EXTRACTED_BYTES", 64 * 1024)
+    src = server._lying_entry_reader(declared=8, actual_bytes=b"Z" * (512 * 1024))()
+    dst = tmp_path / "bomb.bin"
+    with open(dst, "wb") as fh, pytest.raises(ValueError) as exc:
+        server._copy_bounded(src, fh)
+    assert "cumulative" in str(exc.value).lower()
+    # Cut off mid-copy: at most the budget was ever written to disk.
+    assert dst.stat().st_size <= 64 * 1024
+
+
+def test_copy_bounded_budget_is_cumulative_across_entries(tmp_path, monkeypatch):
+    """Two entries, each individually tiny against the budget: the SECOND must
+    still be refused because together they cross the line. The extraction loop
+    shares one draw-down budget across every entry, exactly as the upload
+    route wires it."""
+    monkeypatch.setattr(server, "_MAX_FOUNDRY_EXTRACTED_BYTES", 64 * 1024)
+    first_src = server._lying_entry_reader(declared=48 * 1024,
+                                           actual_bytes=b"A" * (48 * 1024))()
+    second_src = server._lying_entry_reader(declared=48 * 1024,
+                                            actual_bytes=b"B" * (48 * 1024))()
+
+    class _Dst:
+        def __init__(self):
+            self.written = 0
+
+        def write(self, chunk):
+            self.written += len(chunk)
+
+    dst = _Dst()
+    shared_budget = [64 * 1024]
+    copied = server._copy_bounded(first_src, dst, shared_budget)
+    assert copied == 48 * 1024
+    assert shared_budget[0] == 16 * 1024
+    with pytest.raises(ValueError) as exc:
+        server._copy_bounded(second_src, dst, shared_budget)
+    assert "cumulative" in str(exc.value).lower()
+    # The second entry wrote nothing beyond what fit in the remaining budget.
+    assert dst.written <= 64 * 1024
+
+
+def test_foundry_upload_declared_sizes_over_budget_refused_before_extraction(monkeypatch):
+    """Headers that OVERSTATE their size get caught up front: once the sum of
+    declared uncompressed sizes crosses the bound the upload is refused before
+    any entry is extracted (the distinct 'declared' refusal)."""
+    monkeypatch.setattr(server, "_MAX_FOUNDRY_EXTRACTED_BYTES", 200 * 1024)
+    payload = _zip_with_entries([
+        ("demo-module/module.json",
+         json.dumps(_module_manifest()) + "\n" + " " * (120 * 1024)),
+        ("demo-module/packs/a.db", "a" * (120 * 1024)),
+    ])
+    resp = _upload_foundry(payload, _gm_token())
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"].lower()
+    assert "declares" in detail and "bound" in detail
+
+
+def test_foundry_upload_normal_module_within_budget_still_imports(monkeypatch):
+    """Guard against over-blocking: a real module whose declared and actual
+    sizes sit comfortably inside the bound flows through untouched."""
+    monkeypatch.setattr(server, "_MAX_FOUNDRY_EXTRACTED_BYTES", 100 * 1024)
+    payload = _zip_with_entries([
+        ("demo-module/module.json", json.dumps(_module_manifest())),
+        ("demo-module/packs/bestiary.db", _ndjson([_goblin_actor()])),
+        ("demo-module/packs/gear.db", _ndjson([_potion_item()])),
+    ])
+    resp = _upload_foundry(payload, _gm_token())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["imported"] == 2
+
+
 def test_foundry_upload_accepts_module_at_zip_root():
     """Zips whose module.json sits at the archive root (no wrapper directory)
     are equally valid."""

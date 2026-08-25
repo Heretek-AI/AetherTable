@@ -3948,9 +3948,14 @@ _MAX_IMPORT_BODY_BYTES = 2 * 1024 * 1024
 # every data-bearing module while refusing accidental dumps and abuse.
 _MAX_FOUNDRY_UPLOAD_BYTES = 64 * 1024 * 1024
 
-# Cumulative uncompressed size the archive may expand to inside the temp dir
-# (zip-bomb defense: declared per-entry sizes are checked up front AND the
-# streamed copy is bounded, since zip headers can lie).
+# Cumulative uncompressed size the WHOLE archive may expand to inside the
+# temp dir (zip-bomb defense, enforced two ways):
+#   1. up front: the sum of every entry's DECLARED uncompressed size must fit
+#      this budget before a single byte is extracted;
+#   2. during extraction: ONE running total spans all entries, so each entry
+#      gets whatever is left of the same budget — never its own fresh
+#      allowance (a header that understates its real size trips the running
+#      total mid-copy).
 _MAX_FOUNDRY_EXTRACTED_BYTES = 256 * 1024 * 1024
 
 _ABILITY_ORDER = ("STR", "DEX", "CON", "INT", "WIS", "CHA")
@@ -4157,22 +4162,73 @@ def _reject_unsafe_zip_entry(name: str) -> Optional[str]:
     return None
 
 
-def _copy_bounded(src, dst, limit: int) -> int:
-    """Stream ``src`` into ``dst`` refusing to write more than ``limit``
-    bytes. Zip headers can understate real sizes, so the copy itself — not
-    just the declared metadata — enforces the expansion bound."""
+def _copy_bounded(src, dst, budget_remaining: Optional[List[int]] = None) -> int:
+    """Stream ``src`` into ``dst`` refusing to let this entry's bytes push the
+    ARCHIVE's running total past ``_MAX_FOUNDRY_EXTRACTED_BYTES``.
+
+    The bound is cumulative across every entry of one extraction, not a
+    per-entry allowance: each entry draws down whatever is left of the same
+    budget via ``budget_remaining`` (a 1-element list acting as shared state,
+    so the caller's loop carries the total forward). Zip headers can
+    understate real sizes, so the streamed copy — not just declared metadata —
+    enforces the line; an entry that lies is cut off MID-COPY.
+    """
+    if budget_remaining is None:
+        budget_remaining = [_MAX_FOUNDRY_EXTRACTED_BYTES]
     copied = 0
     while True:
         chunk = src.read(1024 * 1024)
         if not chunk:
-            return copied
-        copied += len(chunk)
-        if copied > limit:
+            break
+        if len(chunk) > budget_remaining[0]:
+            # Write only what remains, then stop: never exceed the total.
+            if budget_remaining[0] > 0:
+                dst.write(chunk[: budget_remaining[0]])
+                budget_remaining[0] = 0
             raise ValueError(
-                f"archive expands beyond the {_MAX_FOUNDRY_EXTRACTED_BYTES} byte "
-                "extraction bound (zip-bomb protection)"
+                f"archive exceeds its cumulative {_MAX_FOUNDRY_EXTRACTED_BYTES} "
+                "byte extraction bound mid-entry (zip-bomb protection); "
+                "extraction stopped"
             )
         dst.write(chunk)
+        copied += len(chunk)
+        budget_remaining[0] -= len(chunk)
+    return copied
+
+
+def _lying_entry_reader(declared: int, actual_bytes: bytes):
+    """Test seam: a duck-typed ``ZipFile.open(info)`` replacement whose header
+    claims ``declared`` uncompressed bytes but whose stream yields all of
+    ``actual_bytes``. CPython's zipfile caps reads at the declared size, so no
+    real archive can express that gap through ``ZipExtFile`` — which is why
+    this helper exists for tests instead of being reachable from a crafted
+    upload."""
+    class _LyingStream:
+        def __init__(self):
+            self._buf = io.BytesIO(actual_bytes)
+
+        def read(self, n=-1):
+            return self._buf.read(n)
+
+    return lambda: _LyingStream()
+
+
+def _reject_declared_size_overrun(archive) -> None:
+    """Sum every entry's DECLARED uncompressed size and refuse the archive up
+    front when the sum alone would blow the extraction budget. This is the
+    cheap first gate; the streamed copy still re-checks honestly because
+    headers can also UNDERSTATE their real size."""
+    declared_total = 0
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        declared_total += info.file_size
+        if declared_total > _MAX_FOUNDRY_EXTRACTED_BYTES:
+            raise ValueError(
+                f"archive declares {declared_total} cumulative uncompressed "
+                f"bytes, over the {_MAX_FOUNDRY_EXTRACTED_BYTES} byte "
+                f"extraction bound (zip-bomb protection)"
+            )
 
 
 @app.post("/api/v1/import/foundry/upload")
@@ -4210,15 +4266,26 @@ async def import_foundry_upload(
                 f"(declared {declared}); is this the right file?"
             ),
         )
-    payload = await file.read()
-    if len(payload) > cap:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Foundry module upload exceeds the {cap} byte sanity bound "
-                f"(received {len(payload)}); is this the right file?"
-            ),
-        )
+    # Stream the multipart body in chunks with a running size check, so a
+    # client that lies about Content-Length cannot buffer an unbounded body
+    # in memory before the bound is applied.
+    chunks: List[bytes] = []
+    received = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        received += len(chunk)
+        if received > cap:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Foundry module upload exceeds the {cap} byte sanity "
+                    f"bound (received {received}); is this the right file?"
+                ),
+            )
+        chunks.append(chunk)
+    payload = b"".join(chunks)
 
     try:
         archive = zipfile.ZipFile(io.BytesIO(payload))
@@ -4232,6 +4299,11 @@ async def import_foundry_upload(
         extract_dir = os.path.join(workdir, "module")
         os.makedirs(extract_dir, exist_ok=True)
         try:
+            # Cheap first gate: refuse before extracting anything if the
+            # DECLARED sizes alone already exceed the budget. The streamed
+            # copy below re-checks honestly because headers can understate.
+            _reject_declared_size_overrun(archive)
+            budget_remaining = [_MAX_FOUNDRY_EXTRACTED_BYTES]
             for info in archive.infolist():
                 reason = _reject_unsafe_zip_entry(info.filename)
                 if reason:
@@ -4255,7 +4327,7 @@ async def import_foundry_upload(
                     continue
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with archive.open(info) as src, open(target, "wb") as dst:
-                    _copy_bounded(src, dst, _MAX_FOUNDRY_EXTRACTED_BYTES)
+                    _copy_bounded(src, dst, budget_remaining)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
 

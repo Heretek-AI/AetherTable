@@ -251,7 +251,14 @@ class FoundryModuleImporter:
                 warnings.append(f"unsupported pack type '{pack_type}' in pack {label}")
                 continue
 
-            pack_abs = os.path.normpath(os.path.join(module_dir, str(pack["path"])))
+            pack_abs = self._contained_pack_path(module_dir, str(pack["path"]))
+            if pack_abs is None:
+                skipped += 1
+                warnings.append(
+                    f"pack {label}: path escapes or sits outside the module "
+                    f"directory and was not read: {pack['path']}"
+                )
+                continue
             if os.path.isdir(pack_abs):
                 skipped += 1
                 warnings.append(
@@ -296,6 +303,23 @@ class FoundryModuleImporter:
             "imported": imported,
             "skipped": skipped,
         }
+
+    # --- Manifest path containment ---------------------------------------------------
+
+    @staticmethod
+    def _contained_pack_path(module_dir: str, pack_path: str) -> Optional[str]:
+        """Resolve a manifest-controlled ``pack.path`` against ``module_dir``
+        and return the absolute target ONLY when it stays inside the module
+        directory; return None when it escapes (``../``, an absolute path, or
+        any other shape that resolves outside the tree). The manifest is
+        attacker-controlled input for uploaded modules, so containment is
+        checked on the RESOLVED path — the same discipline the extraction
+        layer applies to entry names."""
+        resolved = os.path.normpath(os.path.join(module_dir, pack_path))
+        root = os.path.abspath(module_dir)
+        if os.path.commonpath([root, os.path.abspath(resolved)]) != root:
+            return None
+        return resolved
 
     # --- NDJSON reading -------------------------------------------------------------
 

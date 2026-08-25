@@ -15,7 +15,39 @@ from vtt_orchestrator.schemas.models import (
 )
 
 
+import os
+
+import pytest
+from vtt_orchestrator.compendium.srd_importer import (
+    SRDSpellParser,
+    SRDMonsterParser,
+    SRDClassParser,
+    SRDEquipmentParser,
+    SRDRulesParser,
+)
+from vtt_orchestrator.schemas.models import (
+    SRDSpellDefinition,
+    SRDMonsterDefinition,
+    SRDClassDefinition,
+    SRDEquipmentItem,
+    SRDConditionDefinition,
+)
+
+# The full-corpus assertions need the cloned 5.1 SRD markdown tree the
+# parsers default to; without it they fall back to a tiny hardcoded sample
+# (their own designed behavior), so skip instead of failing on environments
+# that never checked out the research corpus.
+_SRD_SPELLS_DIR = "/tmp/research_repos/dnd.srd.5.1/07_Spells/Spells_Each"
+_SRD_MONSTERS_DIR = "/tmp/research_repos/dnd.srd.5.1/10_Monsters/Monsters_Each"
+
+
+def _require_corpus(path: str) -> None:
+    if not os.path.isdir(path):
+        pytest.skip(f"SRD markdown corpus not present: {path}")
+
+
 def test_srd_spell_parser_and_pydantic_validation():
+    _require_corpus(_SRD_SPELLS_DIR)
     parser = SRDSpellParser()
     spells = parser.parse_all_spells()
     assert len(spells) >= 300
@@ -32,6 +64,7 @@ def test_srd_spell_parser_and_pydantic_validation():
 
 
 def test_srd_monster_parser_and_pydantic_validation():
+    _require_corpus(_SRD_MONSTERS_DIR)
     parser = SRDMonsterParser()
     monsters = parser.parse_all_monsters()
     assert len(monsters) >= 300
