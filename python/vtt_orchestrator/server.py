@@ -23,7 +23,7 @@ from .routing.engine_client import EngineRejectedError, EngineUnavailableError
 from .storage import MemoryStore, PostgresStore, init_storage, public_user
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
-from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
+from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent
 from .agents.tool_agent import EngineToolAgent
 from .simulation.faction_simulation import FactionSimulationGOAP
 from .simulation.spotlight_tracker import VoiceSpotlightTracker

@@ -2,30 +2,6 @@ from typing import Dict, Any, List, Optional
 from ..schemas.models import EncounterDMContextUpdate
 
 
-class ConcordiaNPCComponent:
-    def __init__(self, name: str, role: str):
-        self.name = name
-        self.role = role
-        self.memory: List[str] = []
-        self.goals: List[str] = []
-        self.social_norms: List[str] = []
-        self.persona: Dict[str, str] = {
-            "tone": "mysterious",
-            "temperament": "cautious",
-            "voice_style": "archaic English",
-        }
-
-    def add_memory(self, memory_text: str):
-        self.memory.append(memory_text)
-
-    def formulate_dialogue(self, player_utterance: str) -> str:
-        goal = self.goals[0] if self.goals else "Survive and guard the ancient sanctum"
-        return (
-            f"[{self.name} speaks with {self.persona['tone']} demeanor]: "
-            f"'You speak of \"{player_utterance[:30]}\", but my purpose remains clear: {goal}.'"
-        )
-
-
 class DirectorAgent:
     """
     Macro-level narrative pacing and dramatic tension manager.

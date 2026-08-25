@@ -7,7 +7,7 @@ from vtt_orchestrator.routing.intent_router import IntentClassificationRouter
 from vtt_orchestrator.routing.llm_client import LLMStreamingGateway, LLMConfig
 from vtt_orchestrator.lore.epistemic_graph import EpistemicLoreGraphManager
 from vtt_orchestrator.auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
-from vtt_orchestrator.agents.agent_hierarchy import EncounterDMAgent, DirectorAgent, ConcordiaNPCComponent
+from vtt_orchestrator.agents.agent_hierarchy import EncounterDMAgent, DirectorAgent
 from vtt_orchestrator.simulation.spotlight_tracker import VoiceSpotlightTracker
 from vtt_orchestrator.simulation.safety_gateway import SafetyGateway
 from vtt_orchestrator.playtest.synthetic_playtest import SyntheticPlaytestRunner

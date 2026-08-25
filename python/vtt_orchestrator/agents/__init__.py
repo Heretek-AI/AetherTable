@@ -1,1 +1,1 @@
-from .agent_hierarchy import ConcordiaNPCComponent, DirectorAgent, EncounterDMAgent
+from .agent_hierarchy import DirectorAgent, EncounterDMAgent
