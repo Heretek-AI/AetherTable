@@ -347,3 +347,15 @@ pass real z" was wrong — proven wrong by test, fixed, tracker noted.
 ### Iteration 34 — 0f76cea — feat(server): rule-version preference persisted and exposed — cargo 302/18
 ### Iteration 35 — d9ffac5 — feat(client): lobby ready/character UI on iteration-33 contracts — vitest 224
 ### Iteration 36 — this commit — fix(server): per-seat WS token-delta projection (closes stat-field wire leak) — cargo 307/18
+### Iteration 37 — 04f9e31 — feat(gateway): per-session rule-version corpus branching — pytest 796
+### Iteration 38 — 9452e96 — feat(client): visual elevation model on the board — vitest 236
+
+## Iteration-40 checkpoint (run at it.38)
+GOALS.md re-review: P4 fully implemented (vision modes, lighting zones,
+visibility polygons, elevation cover+render); P9 occluders + elevation done,
+glTF miniatures still absent (documented); P11 VAD spotlight real, transcript
+still absent; P7 hybrid RAG real; P2 rule-version persisted end-to-end;
+P4 infra: Redis limiters, coturn, per-seat projection, atmosphere policy all
+landed. Remaining known gaps tracked for iterations 40-50: Whisper-in-browser
+transcript→intent, glTF miniatures evaluation, SonarCloud wiring, Foundry
+multipart import.
