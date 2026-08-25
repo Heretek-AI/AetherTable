@@ -297,3 +297,22 @@ every 10 iterations; adversarial audit sweeps ~every 10.
 ### Iteration 2 — this commit — feat(gateway): strict typed EngineSpawnEntity schema; deploy-math residue disclosed (P1.2) — pytest 569
 ### Iteration 3 — (next commit) — feat(gateway,client): mandatory auth on all engine proxies + client token completion (P1.3) — pytest 578, vitest 75, benchmarks ALL PASSED
 ### Iteration 4 — 0bd7df5 — fix(server): exact public paths, fail-closed room control, per-user WS cap (P1.7) — cargo 242/18
+### Iteration 5 — f6ee77c — feat(gateway): epistemic ladder + x-card/spotlight authorization (P1.4/P1.5) — pytest 607
+### Iteration 6 — 0944393 — fix(server): server-seeded rolls, role gates, migration parity (P1.6/P1.8) — cargo 247/18
+### Iteration 7 — a12ec8a — feat(client): authenticated lore/x-card flows, legacy-transport gating (P1.3 client) — vitest 96
+### Iteration 8 — b7bb40b — feat(gateway): durability-bridge auth + header-first legacy routes — pytest 618
+### Iteration 9 — 3747bba — feat(engine): vision modes + lighting zones in LoS (Phase 3 P4 start) — cargo 262/18
+### Iteration 10 — fa18ebf — feat(gateway,client): agent/dynasty/simulation/LLM route auth + spend buckets — pytest 651, vitest 102
+### Iteration 11 — 25929f1 — fix(server): seed policy on all seven combat dice routes — cargo 270/18
+### Iteration 12 — 4e8477d — feat(gateway): admin bootstrap allowlist, fail-closed secret, lobby membership gate — pytest 672
+### Iteration 13 — c683511 — feat(client): Bearer headers everywhere, tokens out of URLs — vitest 104
+
+## Audit sweep A1 (~it.10) — findings and disposition
+
+Adversarial sweep graded iterations 1-9 harshly and correctly: four shipped
+route-perimeter blockers (F1-F4), two commit-message overclaims (F5 seed policy
+half-landed; F10 schema blocked unknown fields but not magnitudes), projection
+leaks via ingress_stack/combat.order (F7), lobby invite leak undermining three
+gates (F8), self-selected admin signup + dev-secret fallback (F6). ALL of
+F1-F8 remediated by iteration 13 (commits fa18ebf, 25929f1, 4e8477d, c683511).
+Lesson recorded: perimeter claims in commit messages must match diff scope.
