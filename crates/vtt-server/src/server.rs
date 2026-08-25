@@ -855,6 +855,11 @@ async fn resolve_cast_spell(
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
     }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE the spell slot
+    // can be spent — a rejected cast must cost nothing.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
 
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
@@ -1127,6 +1132,12 @@ async fn resolve_attack(
     let role = Role::from_identity(&identity);
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): a pinned seed is a determinism
+    // opt-in for privileged principals only, and it must be refused BEFORE any
+    // validation side effect (Action spend, ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
     }
 
     if let Some(session_lock) = data.sessions.get(&session_id) {
@@ -1555,6 +1566,11 @@ async fn resolve_grapple_action(
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
     }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE any validation
+    // side effect (Action spend, ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
 
     let req = req.into_inner();
     if let Some(session_lock) = data.sessions.get(&session_id) {
@@ -1645,6 +1661,11 @@ async fn resolve_shove_action(
     let role = Role::from_identity(&identity);
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE any validation
+    // side effect (Action spend, ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
     }
 
     let req = req.into_inner();
@@ -2059,6 +2080,11 @@ async fn resolve_stabilize(
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
     }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE the healer's
+    // Action can be spent.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
 
     let req = req.into_inner();
     if let Some(session_lock) = data.sessions.get(&session_id) {
@@ -2230,6 +2256,11 @@ async fn resolve_offhand_action(
     let role = Role::from_identity(&identity);
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE the Bonus Action
+    // can be spent.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
     }
 
     let req = req.into_inner();
@@ -2607,6 +2638,11 @@ async fn apply_damage(
     let role = Role::from_identity(&identity);
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE the damage is
+    // applied and its concentration save rolled.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
     }
 
     if let Some(session_lock) = data.sessions.get(&session_id) {
@@ -3021,10 +3057,15 @@ pub struct CheckActionReq {
     pub seed: Option<u64>,
 }
 
-/// Shared seed policy for the stateless roll routes (see [`CheckActionReq`]):
-/// returns the 422 rejection when a non-privileged caller tried to pin one.
-/// Policy (refuse) and mechanics (build the engine) stay separate so the hot
-/// path never wraps a large response in a Result.
+/// Shared seed policy for EVERY route that consumes a caller-supplied seed —
+/// the stateless roll routes (`/actions/check|save`, see [`CheckActionReq`])
+/// and the session-scoped dice routes (`attack`, `cast-spell`, `grapple`,
+/// `shove`, `stabilize`, `offhand`, `damage`) alike: returns the 422 rejection
+/// when a non-privileged caller tried to pin one. Policy (refuse) and
+/// mechanics (build the engine) stay separate so the hot path never wraps a
+/// large response in a Result. Call it at the TOP of each handler, before any
+/// validation side effect (budget spends, ledger appends), so a refused
+/// request costs its caller nothing.
 fn refuse_client_seed(
     data: &AppState,
     identity: &AuthIdentity,

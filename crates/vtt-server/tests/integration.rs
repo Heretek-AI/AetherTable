@@ -630,8 +630,7 @@ async fn rbac_enforcement_spectator_player_gm() {
         .insert_header(player_auth.clone())
         .set_json(serde_json::json!({
             "attacker_id": hero_id,
-            "target_id": other_id,
-            "seed": 3
+            "target_id": other_id
         }))
         .to_request();
     let res = test::call_service(&app, req).await;
@@ -647,8 +646,7 @@ async fn rbac_enforcement_spectator_player_gm() {
         .insert_header(player_auth.clone())
         .set_json(serde_json::json!({
             "attacker_id": other_id,
-            "target_id": hero_id,
-            "seed": 3
+            "target_id": hero_id
         }))
         .to_request();
     let res = test::call_service(&app, req).await;
@@ -4749,7 +4747,7 @@ async fn offhand_enforces_rbac_target_gates_and_payload_shape() {
         &app,
         &player,
         claimed_session,
-        serde_json::json!({"attacker_id": claimed_hero, "target_id": claimed_orc, "seed": 7}),
+        serde_json::json!({"attacker_id": claimed_hero, "target_id": claimed_orc}),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -5681,6 +5679,538 @@ async fn privileged_principals_still_pin_deterministic_rolls() {
     .await;
     assert_eq!(body["natural_roll"], serde_json::json!(20), "{body}");
     assert_eq!(body["passed"], serde_json::json!(true));
+}
+
+// --- Session dice routes honor the same seed policy (audit F5) ---------------
+//
+// The session-scoped action routes (attack / cast-spell / grapple / shove /
+// stabilize / offhand / damage) also consume a caller-supplied `seed` when
+// present. The same offline-brute-force argument that got `/actions/check`
+// its SEED_NOT_PERMITTED gate applies verbatim: a direct-to-engine caller can
+// scan seeds for nat-20s before sending. Contract pinned here:
+//   - a non-privileged caller supplying `seed` gets 422 SEED_NOT_PERMITTED,
+//     with NO roll fields leaked in the rejection body;
+//   - GM-role and orchestrator-service principals keep determinism opt-in on
+//     every one of these routes (same seed ⇒ identical outcome);
+//   - omitting `seed` keeps the server-derived session-scoped fallback.
+
+/// A player-role token (the least privileged caller allowed to act).
+fn player_token() -> String {
+    sign_token_with_role("p-seed", "player", TEST_SECRET)
+}
+
+/// Asserts the canonical seed-policy rejection shape: 422 + error code +
+/// no roll fields leaked (a rejected request must not reveal any outcome).
+fn assert_seed_rejected(status: StatusCode, body: &serde_json::Value) {
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "non-privileged seed must be refused: {body}"
+    );
+    assert_eq!(body["error"], serde_json::json!("SEED_NOT_PERMITTED"));
+    // No outcome leakage: every roll-bearing field of these routes stays null.
+    for key in [
+        "is_hit", "total_damage", "roll", "natural_roll",
+        "attacker_natural_roll", "defender_natural_roll",
+        "success", "result", "concentration_check",
+    ] {
+        assert!(
+            body.get(key).map(|v| v.is_null()).unwrap_or(true),
+            "rejected request leaked `{key}`: {body}"
+        );
+    }
+}
+
+/// POST as a GM-role token with an arbitrary body; returns status + decoded
+/// JSON. Used for the privileged determinism spot-checks.
+async fn post_as_gm_seed_tester(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    path: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    post_raw(
+        app,
+        &sign_token_with_role("gm-seed", "gm", TEST_SECRET),
+        path,
+        payload,
+    )
+    .await
+}
+
+/// Attack route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn attack_route_enforces_seed_policy_for_non_privileged_callers() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-attack", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3")).await;
+    spawn(&app, &token, session_id, entity_at(entity_json(orc_id, "Orc", 20, 10, 0, "1d4"), 3.5, 3.5)).await;
+
+    let lucky = seed_producing_roll(20);
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": orc_id,
+            "seed": lucky
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    // The refusal happens BEFORE any budget spend or ledger append: the hero
+    // still has their Action and no ATTACK_RESOLVED exists.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "a seed-refused attack must not burn the Action"
+    );
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    assert!(
+        !events.iter().any(|e| e["event_type"] == serde_json::json!("ATTACK_RESOLVED")),
+        "no attack may be resolved under a refused seed"
+    );
+
+    // Privileged path stays deterministic: with the SAME pinned seed the
+    // engine MUST roll exactly what `DiceEngine::with_seed(seed)` rolls
+    // locally — that identity is the whole contract determinism harnesses
+    // rely on.
+    let path = format!("/api/v1/sessions/{}/action/attack", session_id);
+    let payload = serde_json::json!({"attacker_id": hero_id, "target_id": orc_id, "seed": lucky});
+    let (status, body) = post_as_gm_seed_tester(&app, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["natural_roll"],
+        serde_json::json!(vtt_core::DiceEngine::with_seed(lucky).roll_d20()),
+        "{body}"
+    );
+    assert_eq!(body["natural_roll"], serde_json::json!(20));
+}
+
+/// Cast-spell route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn cast_spell_route_enforces_seed_policy_for_non_privileged_callers() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-spell", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let caster_id = Uuid::new_v4();
+    let mut caster = entity_json(caster_id, "Wizard", 20, 12, 0, "1d4");
+    caster["spell_slots_remaining"] = serde_json::json!({"3": 9});
+    spawn(&app, &token, session_id, caster).await;
+
+    let fireball = serde_json::json!({
+        "spell": {
+            "spell_id": "fireball", "name": "Fireball", "level": 3,
+            "school": "Evocation", "casting_time": "1 action", "range_feet": 150,
+            "area_of_effect_shape": "sphere", "area_of_effect_size_feet": 20,
+            "verbal_component": true, "somatic_component": true,
+            "material_component_desc": null, "save_attribute": "DEXTERITY",
+            "damage_formula": "8d6", "damage_type": "fire",
+            "duration_rounds": 0, "is_concentration": false, "is_ritual": false
+        },
+        "caster_id": caster_id,
+        "cast_level": 3,
+        "seed": 12345
+    });
+
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", session_id))
+        .insert_header(player_auth)
+        .set_json(fireball.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    // No slot was spent by the refused cast.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][caster_id.to_string()]["spell_slots_remaining"]["3"],
+        serde_json::json!(9),
+        "a seed-refused cast must not spend the slot"
+    );
+    assert!(
+        caster_concentration(&snap, caster_id).await.is_null(),
+        "no concentration can have started"
+    );
+
+    // Privileged path stays deterministic: the pinned seed decides the damage
+    // dice exactly as a local `DiceEngine::with_seed(seed)` would.
+    let path = format!("/api/v1/sessions/{}/action/cast-spell", session_id);
+    let (status, body) =
+        post_as_gm_seed_tester(&app, &path, fireball).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["slot_level_used"], serde_json::json!(3));
+}
+
+/// Grapple route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn grapple_route_enforces_seed_policy_for_non_privileged_callers() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-grapple", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 2.5, 2.6)).await;
+
+    let winning = contest_seed(5, -1, true);
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/grapple", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "defender_skill": "acrobatics",
+            "seed": winning
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let conditions = &snap["entities"][orc_id.to_string()]["conditions"];
+    assert_eq!(
+        conditions.as_array().unwrap().len(),
+        0,
+        "a refused grapple applies nothing"
+    );
+
+    let path = format!("/api/v1/sessions/{}/action/grapple", session_id);
+    let payload = serde_json::json!({
+        "attacker_id": hero_id, "defender_id": orc_id,
+        "defender_skill": "acrobatics", "seed": winning
+    });
+    let (status, body) = post_as_gm_seed_tester(&app, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The pinned seed decides BOTH d20s exactly as the local engine does.
+    let mut local = vtt_core::DiceEngine::with_seed(winning);
+    assert_eq!(
+        body["attacker_natural_roll"],
+        serde_json::json!(local.roll_d20()),
+        "{body}"
+    );
+    assert_eq!(
+        body["defender_natural_roll"],
+        serde_json::json!(local.roll_d20()),
+        "{body}"
+    );
+    assert_eq!(body["success"], serde_json::json!(true));
+}
+
+/// Shove route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn shove_route_enforces_seed_policy_for_non_privileged_callers() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-shove", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 2.5, 2.6)).await;
+
+    let winning = contest_seed(5, -1, true);
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/shove", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "prone",
+            "seed": winning
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let conditions = &snap["entities"][orc_id.to_string()]["conditions"];
+    assert_eq!(
+        conditions.as_array().unwrap().len(),
+        0,
+        "a refused shove applies nothing"
+    );
+
+    let path = format!("/api/v1/sessions/{}/action/shove", session_id);
+    let payload = serde_json::json!({
+        "attacker_id": hero_id, "defender_id": orc_id,
+        "shove_effect": "prone", "seed": winning
+    });
+    let (status, body) = post_as_gm_seed_tester(&app, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut local = vtt_core::DiceEngine::with_seed(winning);
+    assert_eq!(
+        body["attacker_natural_roll"],
+        serde_json::json!(local.roll_d20()),
+        "{body}"
+    );
+    assert_eq!(
+        body["defender_natural_roll"],
+        serde_json::json!(local.roll_d20()),
+        "{body}"
+    );
+    assert_eq!(body["success"], serde_json::json!(true));
+}
+
+/// Stabilize route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn stabilize_route_enforces_seed_policy_for_non_privileged_callers() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-stab", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let healer_id = Uuid::new_v4();
+    let dying_id = Uuid::new_v4();
+    let healer = entity_json(healer_id, "Medic", 20, 12, 0, "1d4"); // Wis 12 => +1
+    let mut dying = entity_at(entity_json(dying_id, "Dying Ally", 20, 12, 0, "1d4"), 2.6, 2.5);
+    dying["current_hp"] = serde_json::json!(0);
+    dying["is_conscious"] = serde_json::json!(false);
+    dying["death_saves"] = serde_json::json!({
+        "successes": 0, "failures": 0, "is_stabilized": false, "is_dead": false
+    });
+    spawn(&app, &token, session_id, healer).await;
+    spawn(&app, &token, session_id, dying).await;
+
+    let natural15 = seed_producing_roll(15);
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/stabilize", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({"healer_id": healer_id, "target_id": dying_id, "seed": natural15}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let saves = &snap["entities"][dying_id.to_string()]["death_saves"];
+    assert_eq!(
+        saves["successes"], serde_json::json!(0),
+        "a refused stabilize tallies nothing"
+    );
+
+    // Privileged path stays deterministic: the pinned seed decides the
+    // Medicine d20 exactly as the local engine does.
+    let path = format!("/api/v1/sessions/{}/action/stabilize", session_id);
+    let payload = serde_json::json!({"healer_id": healer_id, "target_id": dying_id, "seed": natural15});
+    let (status, body) = post_as_gm_seed_tester(&app, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["natural_roll"],
+        serde_json::json!(vtt_core::DiceEngine::with_seed(natural15).roll_d20()),
+        "{body}"
+    );
+    assert_eq!(body["natural_roll"], serde_json::json!(15));
+    assert_eq!(body["success"], serde_json::json!(true));
+}
+
+/// Offhand route: a player's seed is refused; a GM's seed is deterministic.
+#[actix_web::test]
+async fn offhand_route_enforces_seed_policy_for_non_privileged_callers() {
+    let (app, token, session_id, hero_id, orc_id) = setup_twf_duel().await;
+    // Two-Weapon Fighting presupposes the Attack action was already taken.
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK, "main-hand attack must resolve first");
+
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/offhand", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": orc_id,
+            "offhand_index": 1,
+            "seed": 7
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_refused_offhand(status, &body);
+
+    // Bonus Action untouched by the refusal.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["action_budget"]["bonus_action"],
+        serde_json::json!(true),
+        "a seed-refused off-hand swing keeps the Bonus Action"
+    );
+
+    // The GM principal still gets deterministic off-hand resolution: fresh
+    // round, spend the Attack action again, then swing off-hand.
+    advance_turn(&app, &token, session_id).await;
+    let (status, _) = attack(&app, &token, session_id, hero_id, orc_id, 7).await;
+    assert_eq!(status, StatusCode::OK);
+    let path = format!("/api/v1/sessions/{}/action/offhand", session_id);
+    let payload = serde_json::json!({
+        "attacker_id": hero_id, "target_id": orc_id,
+        "offhand_index": 1, "seed": 42
+    });
+    let (status, body) = post_as_gm_seed_tester(&app, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["natural_roll"],
+        serde_json::json!(vtt_core::DiceEngine::with_seed(42).roll_d20()),
+        "pinned seed must decide the off-hand d20: {body}"
+    );
+}
+
+/// Off-hand refusals share the generic shape but the route has no `success`
+/// field to leak-check against; kept separate so the leak list matches the
+/// route's actual response vocabulary.
+fn assert_seed_refused_offhand(status: StatusCode, body: &serde_json::Value) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], serde_json::json!("SEED_NOT_PERMITTED"));
+    for key in ["is_hit", "total_damage"] {
+        assert!(
+            body.get(key).map(|v| v.is_null()).unwrap_or(true),
+            "rejected request leaked `{key}`: {body}"
+        );
+    }
+}
+
+/// Damage route (concentration challenge): a player's seed is refused; a
+/// GM's seed pins the CON save exactly as before.
+#[actix_web::test]
+async fn damage_route_enforces_seed_policy_for_non_privileged_callers() {
+    let (app, token, session_id, caster_id, golem_id) = concentration_fixture().await;
+
+    // Find a surviving hit and apply it WITHOUT a seed first (server entropy)
+    // to obtain a source event sequence.
+    let mut seq_and_dmg = None;
+    for seed in 1..=200u64 {
+        let (status, body) = attack(&app, &token, session_id, golem_id, caster_id, seed).await;
+        if status == StatusCode::OK && body["is_hit"] == true && body["concentration_check"]["passed"] == true {
+            seq_and_dmg = Some((body["event_sequence"].as_u64().unwrap(), body["total_damage"].as_i64().unwrap()));
+            break;
+        }
+        if status == StatusCode::OK {
+            advance_turn(&app, &token, session_id).await;
+        }
+    }
+    let (seq, amount) = seq_and_dmg.expect("fixture must produce a surviving hit");
+
+    // Player-supplied seed on /damage → refused, nothing applied.
+    let player_auth = bearer(&player_token());
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(player_auth)
+        .set_json(serde_json::json!({
+            "target_id": caster_id,
+            "source_event_sequence": seq,
+            "seed": seed_producing_roll(1)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    // Concentration intact — the refused request challenged nothing.
+    let snap = session_snapshot(&app, &token, session_id).await;
+    assert_eq!(
+        caster_concentration(&snap, caster_id).await["spell_id"],
+        "hold_person"
+    );
+    assert_eq!(break_events(&snap).len(), 0);
+
+    // Privileged determinism: nat-1 save breaks concentration exactly once,
+    // reproducibly from a fresh fixture with the same pinned seed.
+    let (status, body) = post_damage_as_gm(
+        &app,
+        &token,
+        session_id,
+        caster_id,
+        seq,
+        seed_producing_roll(1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let check = body.get("concentration_check").expect("check must fire");
+    assert_eq!(check["passed"], false);
+    assert_eq!(check["broken"], true);
+    assert_eq!(check["dc"], std::cmp::max(10, amount / 2));
+}
+
+/// POSTs /damage with a seed AS THE GM TOKEN (privileged path).
+async fn post_damage_as_gm(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+    target_id: Uuid,
+    seq: u64,
+    seed: u64,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({
+            "target_id": target_id,
+            "source_event_sequence": seq,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+/// The orchestrator service principal (role-less canonical id) keeps its
+/// determinism privilege on the session routes too — spot-check via grapple.
+#[actix_web::test]
+async fn service_principal_keeps_seed_privilege_on_session_routes() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-seed-svc", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 2.5, 2.6)).await;
+
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+
+    // The pinned seed decides BOTH d20s exactly as the local engine does.
+    let winning = contest_seed(5, -1, true);
+    let mut local = vtt_core::DiceEngine::with_seed(winning);
+    let expected_attacker = local.roll_d20();
+    let expected_defender = local.roll_d20();
+    assert!(
+        expected_attacker + 5 > expected_defender - 1,
+        "contest seed must be attacker-winning"
+    );
+
+    let payload = serde_json::json!({
+        "attacker_id": hero_id, "defender_id": orc_id,
+        "defender_skill": "athletics", "seed": winning
+    });
+    let path = format!("/api/v1/sessions/{}/action/grapple", session_id);
+    let (status, body) =
+        post_raw(&app, &service, &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["attacker_natural_roll"], serde_json::json!(expected_attacker), "{body}");
+    assert_eq!(body["defender_natural_roll"], serde_json::json!(expected_defender), "{body}");
+    assert_eq!(body["success"], serde_json::json!(true));
 }
 
 #[actix_web::test]
