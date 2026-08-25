@@ -21,6 +21,7 @@ from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
 from .routing.engine_client import EngineRejectedError, EngineUnavailableError
 from .storage import MemoryStore, PostgresStore, init_storage, public_user
+from . import ratelimit
 from .lore.epistemic_graph import EpistemicLoreGraphManager
 from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent
@@ -359,6 +360,9 @@ storage_backend: Any = MemoryStore()
 async def _init_storage_backend():
     global storage_backend
     storage_backend = await init_storage()
+    # Resolve the rate-limit backend eagerly so a REDIS_URL misconfiguration is
+    # reported once, at startup, instead of on the first request.
+    _get_rate_backend()
 
 
 class AuthSignupRequest(BaseModel):
@@ -2501,20 +2505,21 @@ import logging as _logging
 _logging.basicConfig(level=_logging.INFO)
 http_logger = _logging.getLogger("aethertable.http")
 
-_RATE_LIMITS = {  # bucket -> (max_events, window_seconds)
-    "auth": (30, 60),
-    "agent": (60, 60),
-    # LLM-spend routes (classify / orchestrator turns / narrative streams):
-    # every hit can cost model tokens, so the cap sits below the agent bucket
-    # — a player mashing "narrate" must not mint a model bill.
-    "llm": (30, 60),
-    # Empirical benchmark: each accepted call runs 10-1000 encounter
-    # simulations in-process. Tightest cap of all; even GMs have no business
-    # hammering it.
-    "benchmark": (5, 60),
-    "default": (600, 60),
-}
-_rate_windows: Dict[tuple, List[float]] = {}
+_RATE_LIMITS = ratelimit.RATE_LIMITS
+
+# The limiter is no longer purely process-local: when REDIS_URL points at a
+# reachable Redis, every replica draws from ONE shared set of sorted-set
+# windows instead of each minting its own full budget (quota multiplication).
+# Selection/failure rules live in ratelimit.build_backend: unset URL → memory;
+# unreachable Redis → memory + one warning; mid-flight Redis error → permanent
+# soft fallback to this same shared memory backend + one warning. The in-memory
+# table stays module state (``_rate_windows``, same dict object the backend
+# uses) because the test harness resets it between tests.
+_memory_limiter = ratelimit.MemoryWindowBackend(
+    max_keys_provider=lambda: _MAX_TRACKED_KEYS
+)
+_rate_windows: Dict[tuple, List[float]] = _memory_limiter.windows
+_rate_backend: Any = None
 
 #: Hard cap on tracked ``(client_ip, bucket)`` keys so an attacker rotating
 #: spoofed source addresses cannot grow the table without bound. Mirrors
@@ -2522,28 +2527,30 @@ _rate_windows: Dict[tuple, List[float]] = {}
 #: keys whose windows are fully expired past the staleness factor below are
 #: swept. Module-level so tests can inject a tiny cap.
 _MAX_TRACKED_KEYS = 100_000
-#: A key is stale once every recorded hit is older than this multiple of its
-#: bucket's window (i.e. it could not affect any current verdict).
-_STALE_KEY_SWEEP_FACTOR = 2.0
 
 
 def _sweep_stale_rate_keys(now: float) -> None:
     """Drop ``_rate_windows`` entries whose hits all predate the staleness bound.
 
-    A key is swept when its newest hit is older than
-    ``_STALE_KEY_SWEEP_FACTOR * window`` — such a key cannot contribute to any
-    active sliding-window verdict, so dropping it never changes admission
-    decisions. Mirrors the ``retain`` guard in the Rust twin's
-    ``SlidingWindows::check`` (``crates/vtt-server/src/ratelimit.rs``).
+    A key is swept when its newest hit is older than twice its bucket's window
+    — such a key cannot contribute to any active sliding-window verdict, so
+    dropping it never changes admission decisions. Mirrors the ``retain`` guard
+    in the Rust twin's ``SlidingWindows::check``
+    (``crates/vtt-server/src/ratelimit.rs``).
     """
-    stale = [
-        key
-        for key, hits in _rate_windows.items()
-        if not hits
-        or now - max(hits) > _STALE_KEY_SWEEP_FACTOR * _RATE_LIMITS[key[1]][1]
-    ]
-    for key in stale:
-        _rate_windows.pop(key, None)
+    _memory_limiter.sweep_stale_keys(now)
+
+
+def _get_rate_backend() -> Any:
+    """Resolve the limiter backend once: Redis when configured and reachable,
+    otherwise the in-process window table."""
+    global _rate_backend
+    if _rate_backend is None:
+        _rate_backend = ratelimit.build_backend(
+            os.environ.get("REDIS_URL", ""),
+            fallback=_memory_limiter,
+        )
+    return _rate_backend
 
 
 def _bucket_for_path(path: str) -> str:
@@ -2574,21 +2581,14 @@ async def rate_limit_middleware(request, call_next):
     limit, window = _RATE_LIMITS[bucket]
     client_ip = request.client.host if request.client else "unknown"
     key = (client_ip, bucket)
-    now = time.time()
-    hits = [t for t in _rate_windows.get(key, []) if now - t < window]
-    if len(hits) >= limit:
-        retry_after = max(1, int(window - (now - hits[0])) + 1)
+    retry_after = _get_rate_backend().check(key, limit, window, time.time())
+    if retry_after is not None:
         return Response(
             content=json.dumps({"error": "RATE_LIMITED", "retry_after_s": retry_after}),
             status_code=429,
             media_type="application/json",
             headers={"Retry-After": str(retry_after)},
         )
-    hits.append(now)
-    _rate_windows[key] = hits
-    # Bound memory against spoofed-source floods (same shape as the Rust twin).
-    if len(_rate_windows) > _MAX_TRACKED_KEYS:
-        _sweep_stale_rate_keys(now)
     return await call_next(request)
 
 
