@@ -316,3 +316,11 @@ leaks via ingress_stack/combat.order (F7), lobby invite leak undermining three
 gates (F8), self-selected admin signup + dev-secret fallback (F6). ALL of
 F1-F8 remediated by iteration 13 (commits fa18ebf, 25929f1, 4e8477d, c683511).
 Lesson recorded: perimeter claims in commit messages must match diff scope.
+### Iteration 14 — 875d4df — fix(engine): projection redaction + honest ingress validation (F7/F11) — cargo 280/18
+### Iteration 15 — 312ab23 — feat(gateway): spawn magnitude bounds, damage grammar, typed ingress (F10) — pytest 690
+### Iteration 16 — 8123d6e — refactor(gateway): dead fabricating modules deleted (Phase 2) — pytest 690
+### Iteration 17 — 6dbc162 — feat(client): spotlight weights from VAD over CRDT (Pillar 11 real) — vitest 136
+### Iteration 18 — 5f47c5a — feat(gateway): fastembed hybrid dense+sparse RAG (Pillar 7 real) — pytest 713
+### Iteration 19 — cc25eae — feat(client): honest offline rolls, derived modifiers, transport re-probe — vitest 141
+### Iteration 20 — this wave — feat(spatial): elevation-aware 8-ray cover bundle — cargo 285/18
+### Iteration 21 — 024c140 — fix(routing): apostrophe-free classifier prompt (live-LLM probe find) — live suite 6/6
