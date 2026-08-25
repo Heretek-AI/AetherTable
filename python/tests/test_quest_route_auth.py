@@ -18,14 +18,19 @@ client = TestClient(app)
 
 
 @pytest.fixture()
-def gm_token(request):
+def gm_token(request, monkeypatch):
+    # Staff roles are not self-service-grantable (audit F6a); this exercises
+    # the operator bootstrap path instead: a VTT_ADMIN_EMAILS address is
+    # created as admin at signup and the quest gate accepts gm OR admin.
     email = f"gm_quest_{abs(hash(request.node.name)) % 10**8}@example.com"
+    monkeypatch.setenv("VTT_ADMIN_EMAILS", email)
     signup = client.post(
         "/api/v1/auth/signup",
         json={"email": email, "username": email.split("@")[0], "display_name": "Quest GM",
-              "password": "dice-dice", "role": "gm"},
+              "password": "dice-dice"},
     )
     assert signup.status_code == 200, signup.text
+    assert signup.json()["user"]["role"] == "admin", signup.text
     return signup.json()["token"]
 
 

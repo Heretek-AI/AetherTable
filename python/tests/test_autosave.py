@@ -33,14 +33,17 @@ def _live_state() -> dict:
 
 @pytest.fixture()
 def gm_token(request):
-    email = f"gm_auto_{abs(hash(request.node.name)) % 10**8}@example.com"
-    signup = client.post(
-        "/api/v1/auth/signup",
-        json={"email": email, "username": email.split("@")[0], "display_name": "Autosave GM",
-              "password": "dice-dice", "role": "gm"},
-    )
-    assert signup.status_code == 200, signup.text
-    return signup.json()["token"]
+    # Minted directly rather than via /signup: staff roles are no longer
+    # self-service-grantable (audit F6a), and this module asserts the GM role
+    # verbatim as it travels to the engine. Other modules exercise the
+    # VTT_ADMIN_EMAILS bootstrap path instead.
+    from vtt_orchestrator.server import _sign_token
+
+    import time as _time
+
+    user_id = f"gm_auto_{abs(hash(request.node.name)) % 10**8}"
+    return _sign_token({"user_id": user_id, "role": "gm",
+                        "exp": _time.time() + 600})
 
 
 @pytest.fixture()

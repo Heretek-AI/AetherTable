@@ -155,7 +155,9 @@ class CampaignSimPlayer:
         self.name = name
         self.index = index
         self.password = password
-        # Host (seat 0) signs up as GM so it can spawn the encounter target.
+        # Host (seat 0) is a staff seat so it can spawn the encounter target.
+        # It cannot CLAIM 'gm' at signup — see authenticate(): the address is
+        # bootstrapped via VTT_ADMIN_EMAILS and the gateway grants admin.
         self.role = role
         # Unique per-run address by default; pass a fixed email to exercise the
         # login-instead-of-signup path.
@@ -173,11 +175,45 @@ class CampaignSimPlayer:
     # -- lifecycle ----------------------------------------------------------
 
     async def authenticate(self) -> None:
-        """Signup on a fresh address, login when the email already exists."""
-        signup = await self.http.request("POST", "/api/v1/auth/signup",
-                                         {"email": self.email, "username": self.name,
-                                          "display_name": self.display_name,
-                                          "password": self.password, "role": self.role})
+        """Signup on a fresh address, login when the email already exists.
+
+        Staff seats (the host) are provisioned through the documented admin
+        bootstrap contract (audit F6a): the seat's address is listed in
+        VTT_ADMIN_EMAILS for the duration of THIS signup request only, then
+        the previous value is restored. In-process harnesses (pytest ASGI
+        transport) share the gateway's environment, so this just works there.
+        Against a REMOTE gateway the operator must list the seat address in
+        the server's own VTT_ADMIN_EMAILS instead — a 422 from signup says
+        exactly that rather than silently degrading the seat to a player.
+        """
+        previous: Optional[str] = None
+        touched_env = False
+        # Staff seats never CLAIM a staff role (the API rejects that outright);
+        # they sign up as a plain player and are granted admin because their
+        # address appears in VTT_ADMIN_EMAILS during this signup request.
+        requested_role = self.role
+        if self.role in ("gm", "admin"):
+            requested_role = "player"
+            previous = os.environ.get("VTT_ADMIN_EMAILS")
+            entries = {e.strip().lower() for e in (previous or "").split(",") if e.strip()}
+            if self.email.lower() not in entries:
+                touched_env = True
+                os.environ["VTT_ADMIN_EMAILS"] = (
+                    f"{previous},{self.email}" if previous else self.email
+                )
+        try:
+            signup = await self.http.request(
+                "POST", "/api/v1/auth/signup",
+                {"email": self.email, "username": self.name,
+                 "display_name": self.display_name,
+                 "password": self.password, "role": requested_role},
+            )
+        finally:
+            if touched_env:
+                if previous is None:
+                    os.environ.pop("VTT_ADMIN_EMAILS", None)
+                else:
+                    os.environ["VTT_ADMIN_EMAILS"] = previous
         if signup["status"] == 200:
             self._adopt_auth(signup["body"])
             return
@@ -188,6 +224,12 @@ class CampaignSimPlayer:
                 raise CampaignSimError(f"{self.name}: login failed: {login['body']}")
             self._adopt_auth(login["body"])
             return
+        if signup["status"] == 422 and self.role in ("gm", "admin"):
+            raise CampaignSimError(
+                f"{self.name}: staff seat '{self.role}' was refused at signup "
+                f"({signup['body']}). When driving a REMOTE gateway, list this "
+                f"seat's address ({self.email}) in the server's VTT_ADMIN_EMAILS."
+            )
         raise CampaignSimError(f"{self.name}: signup failed ({signup['status']}): {signup['body']}")
 
     def _adopt_auth(self, body: Dict[str, Any]) -> None:

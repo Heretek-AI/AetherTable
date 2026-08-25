@@ -39,8 +39,20 @@ def _signup(name: str, role: str = "player") -> dict:
 
 
 @pytest.fixture()
-def gm():
-    return _signup("durabot_gm", "gm")
+def gm(monkeypatch):
+    # Staff roles are not self-service-grantable (audit F6a); this exercises
+    # the operator bootstrap path instead (VTT_ADMIN_EMAILS -> admin at signup).
+    email = f"durabot_gm_{abs(hash(str(time.time()))) % 10**8}@example.com"
+    monkeypatch.setenv("VTT_ADMIN_EMAILS", email)
+    resp = client.post(
+        "/api/v1/auth/signup",
+        json={"email": email, "username": "durabot_gm", "display_name": "Durabot Gm",
+              "password": "dice-dice"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["user"]["role"] == "admin", body
+    return body
 
 
 @pytest.fixture()

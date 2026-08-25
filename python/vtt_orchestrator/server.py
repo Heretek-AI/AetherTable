@@ -326,7 +326,30 @@ def health_check():
 # Dual-mode storage: Postgres (asyncpg) when DATABASE_URL is reachable,
 # in-memory fallback otherwise. HMAC-signed session tokens (AUTH_SECRET env).
 
-AUTH_SECRET = os.environ.get("AUTH_SECRET", "aethertable-dev-secret")
+def _resolve_auth_secret() -> str:
+    """Returns the HMAC signing secret, or REFUSES to start.
+
+    Session tokens are signed with this secret and carry the caller's RBAC
+    role, so a known secret means anyone can mint an admin token. There is no
+    safe default: falling back to a hardcoded dev value (the old behavior)
+    turned "forgot to set AUTH_SECRET" into silent token forgery. This mirrors
+    the Rust engine, which aborts startup for the same reason
+    (crates/vtt-server/src/auth.rs). Either AUTH_SECRET or VTT_ENGINE_SECRET
+    satisfies the check — they are the same credential contract.
+    """
+    secret = os.environ.get("AUTH_SECRET") or os.environ.get("VTT_ENGINE_SECRET")
+    if not secret:
+        raise RuntimeError(
+            "Refusing to start: no signing secret configured. Set AUTH_SECRET "
+            "(or VTT_ENGINE_SECRET) to a long random value — session tokens "
+            "are HMAC-signed with it and carry RBAC roles, so a default or "
+            "guessable secret would let anyone forge admin tokens. Generate "
+            "one with: python -c 'import secrets; print(secrets.token_hex(32))'"
+        )
+    return secret
+
+
+AUTH_SECRET = _resolve_auth_secret()
 TOKEN_TTL_SECONDS = 12 * 3600
 
 storage_backend: Any = MemoryStore()
@@ -343,7 +366,31 @@ class AuthSignupRequest(BaseModel):
     username: str = ""
     display_name: str = ""
     password: str
+    # Only self-service-grantable roles are accepted; staff roles are rejected
+    # by the handler (see _SELF_SERVICE_ROLES / VTT_ADMIN_EMAILS).
     role: str = "player"
+
+
+# Roles a person may claim for themselves. 'gm'/'admin' are NOT here on
+# purpose: every staff RBAC gate in this gateway and in the Rust engine keys
+# off the role inside the signed token, so honoring a client-chosen 'admin'
+# at signup was self-service privilege escalation.
+_SELF_SERVICE_ROLES = ("player", "spectator")
+
+
+def _bootstrap_admin_emails() -> frozenset:
+    """Operator-provisioned admin allowlist, read at request time so it can be
+    rotated without a code change.
+
+    Bootstrap contract (the ONLY way a staff account comes into existence via
+    the API): set VTT_ADMIN_EMAILS to a comma-separated list of addresses;
+    any signup whose (lowercased, trimmed) email appears in that list is
+    created with role='admin'. Everyone else gets exactly what they asked for
+    among _SELF_SERVICE_ROLES. GM accounts are provisioned the same way or
+    via AETHERTABLE_SEED_GM_EMAIL/AETHERTABLE_SEED_GM_PASSWORD on login.
+    """
+    raw = os.environ.get("VTT_ADMIN_EMAILS", "")
+    return frozenset(addr.strip().lower() for addr in raw.split(",") if addr.strip())
 
 
 class AuthLoginRequest(BaseModel):
@@ -460,15 +507,29 @@ async def auth_signup(req: AuthSignupRequest):
     key = req.email.strip().lower()
     if not key or "@" not in key or len(req.password) < 4:
         raise HTTPException(status_code=400, detail="Valid email and password (4+ chars) required")
+    requested_role = (req.role or "").strip().lower()
+    if requested_role not in _SELF_SERVICE_ROLES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid role '{req.role}'. Self-service signup grants only "
+                "'player' or 'spectator'; staff roles ('gm', 'admin') cannot "
+                "be self-assigned. An operator bootstraps admins by listing "
+                "their email in the VTT_ADMIN_EMAILS environment variable "
+                "(comma-separated); matching addresses are created as admin "
+                "when they sign up."
+            ),
+        )
     if await storage_backend.get_user_by_email(key) is not None:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
+    assigned_role = "admin" if key in _bootstrap_admin_emails() else requested_role
     record = await storage_backend.create_user(
         email=key,
         username=req.username or key.split("@")[0],
         display_name=req.display_name or req.username or key.split("@")[0],
-        role=req.role if req.role in ("gm", "player", "spectator", "admin") else "player",
+        role=assigned_role,
         password=req.password,
-        assigned_token_ids=[],
+        assigned_token_ids=["*"] if assigned_role == "admin" else [],
     )
     return _auth_response(public_user(record))
 
@@ -1220,8 +1281,22 @@ async def join_lobby(lobby_id: str, req: LobbyJoinRequest, token: str = Depends(
 
 @app.get("/api/v1/lobbies/{lobby_id}")
 async def get_lobby(lobby_id: str, token: str = Depends(_require_auth)):
-    _require_user_id(token)
+    """Reads ONE lobby — but only for its members or staff.
+
+    The lobby record carries the invite_code, and the invite code is the sole
+    gate on join_lobby; lobby membership in turn authorizes x-card rewind,
+    durability-bridge access and agent turns. Handing any authenticated user
+    any lobby's full record therefore leaked three downstream authorization
+    gates at once. Non-members get the same 403 whether the id exists or not,
+    so this route cannot be probed as an existence oracle for other tables.
+    """
+    actor = _caller_actor(token)
     lobby = await storage_backend.get_lobby(lobby_id)
+    is_member = lobby is not None and any(
+        member["user_id"] == actor["user_id"] for member in lobby["members"]
+    )
+    if not is_member and actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="Lobby not accessible")
     if lobby is None:
         raise HTTPException(status_code=404, detail="Lobby not found")
     return lobby

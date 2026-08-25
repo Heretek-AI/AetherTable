@@ -16,6 +16,13 @@ individual test has to duplicate the guard.
 
 import os
 
+# The gateway now REFUSES to start without a signing secret (audit F6b: the
+# old hardcoded dev fallback made session tokens forgeable). Production and
+# every launcher script export AUTH_SECRET explicitly; the suite pins the
+# well-known dev value here for exactly the same reason — deliberately, not
+# by silent fallback inside server.py.
+os.environ.setdefault("AUTH_SECRET", "aethertable-dev-secret")
+
 import pytest
 
 
