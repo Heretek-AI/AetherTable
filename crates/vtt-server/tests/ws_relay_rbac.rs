@@ -559,6 +559,56 @@ async fn spectator_cannot_inject_token_moves() {
     );
 }
 
+// --- Atmosphere wire boundary -------------------------------------------------
+//
+// Table atmosphere (theme/palette/audio preset selection) does NOT travel over
+// this relay at all. It rides the separate yjs Y.Doc relay
+// (`scripts/ysync-server.mjs` on VITE_YSYNC_WS_URL) as binary Y.Doc deltas,
+// where GM/admin-only write enforcement lives
+// (`scripts/ysync_atmosphere_guard.mjs`, loop-1 iteration 63 defect fix).
+//
+// This test pins the Rust side of that contract shut: `CrdtSyncMessage` has no
+// atmosphere variant and `ws_sync`'s dispatch has NO generic passthrough arm,
+// so an atmosphere-shaped frame injected here is dropped and fanned out to
+// nobody. If a future refactor introduces generic relay-through for unknown
+// message types, this test goes red before the unauthenticated atmosphere-
+// write hole can reappear at this boundary.
+
+#[actix_web::test]
+async fn atmosphere_shaped_frames_have_no_passthrough_at_the_rust_relay() {
+    let (app, table) = start_table().await;
+    let session_id = create_session(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut player =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+    read_initial_snapshot(&mut gm).await;
+    read_initial_snapshot(&mut player).await;
+
+    // A player injects an atmosphere-shaped frame over the engine's sync
+    // channel — the shape a naive client would send if atmosphere "rode the
+    // same relay" as tokens.
+    send_json(
+        &mut player,
+        serde_json::json!({
+            "type": "AtmosphereUpdate",
+            "payload": {"id": "clown-fiesta", "set_by": "player-a"}
+        }),
+    )
+    .await;
+
+    // Nobody hears about it: not other peers...
+    let gm_frame = next_delta_frame(&mut gm, 400).await;
+    assert!(
+        gm_frame.is_none(),
+        "atmosphere-shaped frames must not be fanned out, got {:?}",
+        gm_frame
+    );
+    // ...and no echo back to the sender either.
+    let player_frame = next_delta_frame(&mut player, 400).await;
+    assert!(player_frame.is_none(), "sender must get no echo, got {:?}", player_frame);
+}
+
 // --- Party-merged fog for spectators ------------------------------------------
 //
 // Relay-audit structural limit #1: composing users' masks into one unioned

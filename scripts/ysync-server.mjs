@@ -25,6 +25,7 @@ const { setupWSConnection, setPersistence, getYDoc } = require('y-websocket/bin/
 const Y = require('yjs');
 const decoding = require('lib0/decoding');
 import { installSpeechGuard } from './ysync_speech_guard.mjs';
+import { installAtmosphereGuard } from './ysync_atmosphere_guard.mjs';
 
 const PORT = process.env.PORT || 6380;
 const DATA_DIR = process.env.YSYNC_DATA_DIR || path.join(process.cwd(), 'ydata');
@@ -113,21 +114,38 @@ wss.on('connection', setupWSConnection);
 // re-poisoning with a fresh clock re-triggers eviction each time (loud, not
 // silent); unattributed writers fail closed; non-speech maps are out of scope.
 
-/** room name -> guard handle */
+/** room name -> { speech, atmosphere } guard handles */
 const speechGuards = new Map();
+
+// conn object -> { userId, role }: populated at upgrade time from the
+// HMAC-verified token. y-websocket uses the conn object itself as the Yjs
+// transaction origin for frames that connection sends, so this registry is
+// how delta-time authorization learns WHO delivered a frame — required for
+// atmosphere deletes (delete-sets carry no struct authorship).
+const connIdentity = new WeakMap();
 
 function guardForRoom(roomName) {
   let guard = speechGuards.get(roomName);
   if (!guard) {
     const doc = getYDoc(roomName);
-    guard = installSpeechGuard(doc);
-    doc.on('update', (update) => {
+    const speechGuard = installSpeechGuard(doc);
+    const atmosphereGuard = installAtmosphereGuard(doc, {
+      roleOfConnection: (origin) => connIdentity.get(origin)?.role ?? null,
+    });
+    doc.on('update', (update, origin) => {
       try {
-        guard.checkUpdate(update);
+        // Speech authorization is purely struct-attributed; it sees every
+        // update including the guards' own corrective transactions (which
+        // carry no speech structs and are ignored).
+        speechGuard.checkUpdate(update);
+        // Atmosphere authorization must NOT re-check relay-local corrective
+        // transactions (null origin) — see the guard's WIRING CONTRACT.
+        if (origin != null) atmosphereGuard.checkUpdate(update, origin);
       } catch (e) {
-        console.warn(`[ysync] speech-guard delta check failed for '${roomName}':`, e);
+        console.warn(`[ysync] guard delta check failed for '${roomName}':`, e);
       }
     });
+    guard = { speech: speechGuard, atmosphere: atmosphereGuard };
     speechGuards.set(roomName, guard);
   }
   return guard;
@@ -141,9 +159,10 @@ function guardForRoom(roomName) {
  * their clientID for speech attribution; mismatched claims are rejected so
  * they can never bless a foreign speech write.
  */
-function processAwarenessClaims(roomName, connKey, verifiedUserId, payloadBytes) {
+function processAwarenessClaims(roomName, connKey, identity, payloadBytes) {
+  const verifiedUserId = identity?.userId;
   if (!verifiedUserId || !payloadBytes?.length) return;
-  const guard = guardForRoom(roomName);
+  const guards = guardForRoom(roomName);
   try {
     const decoder = decoding.createDecoder(payloadBytes);
     const len = decoding.readVarUint(decoder);
@@ -157,11 +176,20 @@ function processAwarenessClaims(roomName, connKey, verifiedUserId, payloadBytes)
       } catch {
         claimed = null; // unparsable state: treat as no claim
       }
-      if (!guard.bindClaim(verifiedUserId, clientId, claimed)) {
+      if (!guards.speech.bindClaim(verifiedUserId, clientId, claimed)) {
         console.warn(
           `[ysync] speech-guard: rejected awareness claim '${claimed}' from conn '${connKey}' (verified as '${verifiedUserId}')`,
         );
       }
+      // Same binding feeds atmosphere authorization: clientID -> VERIFIED
+      // role, so policy is always decided from the token the relay checked,
+      // never from a self-reported claim.
+      guards.atmosphere.bindClaim(
+        verifiedUserId,
+        identity.role ?? null,
+        clientId,
+        claimed,
+      );
     }
   } catch {
     /* malformed awareness payload: leave attribution untouched (fail closed) */
@@ -191,6 +219,11 @@ server.on('upgrade', (request, socket, head) => {
   }
   wss.handleUpgrade(request, socket, head, (ws) => {
     const connKey = `${roomName}#${identity.user_id}`;
+    // Register the verified identity for delta-time authorization: y-websocket
+    // passes this conn object as the Yjs transaction origin, so the atmosphere
+    // guard can resolve WHO delivered a frame (needed because delete-sets
+    // carry no struct authorship).
+    connIdentity.set(ws, { userId: identity.user_id, role: identity.role ?? null });
     // Inspect awareness frames BEFORE y-websocket applies them, so claims are
     // validated against this connection's HMAC-verified identity.
     ws.on('message', (data, _isBinary) => {
@@ -202,7 +235,7 @@ server.on('upgrade', (request, socket, head) => {
         processAwarenessClaims(
           roomName,
           connKey,
-          identity.user_id,
+          { userId: identity.user_id, role: identity.role ?? null },
           decoding.readVarUint8Array(decoder),
         );
       } catch {
