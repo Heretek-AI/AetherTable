@@ -75,6 +75,11 @@ import { authHeaders, getStoredToken } from './api/auth_headers';
 import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
+import {
+  computeSpotlightWeights,
+  LocalSpeechLedger,
+  type SpotlightView,
+} from './sync/speech_ledger';
 import type { CampaignSnapshot } from './api/campaign_store';
 import type { Lobby } from './api/lobby_store';
 import type { CampaignWizardConfig } from './components/CampaignWizardModal';
@@ -385,6 +390,90 @@ export function App() {
     yjs.setLocalUser({ user_id: currentUser.id, name: currentUser.displayName });
   }, [currentUser]);
 
+  // Adopt converged spotlight weights from the CRDT speech ledger for as long
+  // as the Yjs transport exists. The subscription fires immediately with any
+  // existing ledger (late joiner / IndexedDB restore), then on every local or
+  // remote VAD publication — all clients recompute from the same merged data,
+  // so everyone sees the same balance.
+  useEffect(() => {
+    if (!yjsClient) return undefined;
+    return yjsClient.observeSpotlight(setSpotlightView);
+  }, [yjsClient]);
+
+  // --- Pillar-11: local mic → speech ledger ---------------------------------
+  // This browser's own VAD bursts accumulate here; NarrativeChat forwards the
+  // raw Silero callbacks (its mic button is the only capture entry point).
+  const localSpeechLedgerRef = useRef<LocalSpeechLedger>(new LocalSpeechLedger());
+
+  /**
+   * Feed one closed VAD burst into the ledger and publish it to the room.
+   * On the Yjs transport this lands under our `user:<id>` key so every peer's
+   * weights converge on real talking time. Without that transport there is NO
+   * cross-client channel, so we recompute a LOCAL-ONLY view instead of
+   * pretending the numbers synced — labeled `local-only` in the UI.
+   */
+  const handleLocalSpeechSegment = useCallback(
+    (_audio: Float32Array) => {
+      const now = Date.now();
+      const ledger = localSpeechLedgerRef.current;
+      if (!ledger.noteSpeechEnd(now)) return;
+
+      const yjs = yjsClientRef.current;
+      // Only claim room scope when the CRDT relay is ACTUALLY carrying writes;
+      // signed-out sockets are rejected by the relay, so that is local-only.
+      if (yjs && yjs.isConnected) {
+        yjs.publishSpeech(currentUser.id, currentUser.displayName, ledger.snapshot(now));
+        setSpotlightView(yjs.getSpotlightView(now));
+        return;
+      }
+      // Legacy LWW fallback / signed-out: honest local-only accumulation.
+      setSpotlightView({
+        scope: 'local-only',
+        shares: computeSpotlightWeights(
+          [{ user_id: currentUser.id, name: currentUser.displayName, segments: ledger.snapshot(now) }],
+          { nowMs: now },
+        ),
+      });
+    },
+    [currentUser.id, currentUser.displayName],
+  );
+
+  /** Open-burst live tail, throttled by the Yjs client (2s) for publication. */
+  const publishLiveSpeechTail = useCallback(() => {
+    const yjs = yjsClientRef.current;
+    if (!yjs || !yjs.isConnected || !currentUser.id) return;
+    yjs.scheduleLiveSpeechPublish(
+      currentUser.id,
+      currentUser.displayName,
+      () => localSpeechLedgerRef.current.snapshot(Date.now()),
+    );
+  }, [currentUser.id, currentUser.displayName]);
+
+  /** VAD said speech started: mark it open and begin throttled tail publishes. */
+  const handleLocalSpeechStart = useCallback(() => {
+    localSpeechLedgerRef.current.noteSpeechStart(Date.now());
+    publishLiveSpeechTail();
+  }, [publishLiveSpeechTail]);
+
+  /** Mic released: drop any burst that never saw onSpeechEnd, then republish. */
+  const handleLocalCaptureStop = useCallback(() => {
+    localSpeechLedgerRef.current.cancelOpenBurst();
+    const now = Date.now();
+    const yjs = yjsClientRef.current;
+    if (yjs && yjs.isConnected) {
+      yjs.publishSpeech(currentUser.id, currentUser.displayName, localSpeechLedgerRef.current.snapshot(now));
+      setSpotlightView(yjs.getSpotlightView(now));
+      return;
+    }
+    setSpotlightView({
+      scope: 'local-only',
+      shares: computeSpotlightWeights(
+        [{ user_id: currentUser.id, name: currentUser.displayName, segments: localSpeechLedgerRef.current.snapshot(now) }],
+        { nowMs: now },
+      ),
+    });
+  }, [currentUser.id, currentUser.displayName]);
+
   // Publish our pointer to peers as the canvas reports hovered cells.
   // No-op on the legacy relay fallback, where yjsClientRef is cleared.
   const handleLocalCursorMove = useCallback((boardX: number, boardY: number) => {
@@ -463,7 +552,11 @@ export function App() {
   // Engine session this browser talks to through the orchestrator proxies;
   // null while the engine is unreachable (tracker then shows its empty state).
   const [combatSessionId, setCombatSessionId] = useState<string | null>(null);
-  const [spotlightWeights, setSpotlightWeights] = useState({ Thorin: 0.55, Lyra: 0.45 });
+  // Pillar-11 spotlight balance is DERIVED, never stored. The old hardcoded
+  // { Thorin: 0.55, Lyra: 0.55→0.45 } demo weights are gone; this view now
+  // comes only from the CRDT speech ledger (real Silero VAD seconds per peer,
+  // see sync/speech_ledger.ts). Empty until somebody actually talks.
+  const [spotlightView, setSpotlightView] = useState<SpotlightView>({ scope: 'room', shares: [] });
   const [isStreamingResponse, setIsStreamingResponse] = useState(false);
 
   // Chat & Narrative Messages
@@ -1209,12 +1302,12 @@ export function App() {
   };
 
   const getCampaignSnapshot = (): CampaignSnapshot => ({
+    schemaVersion: 2,
     tokens,
     customWalls,
     messages,
     roundNumber,
     currentTurnIndex,
-    spotlightWeights,
   });
 
   const applyCampaignSnapshot = (snapshot: CampaignSnapshot) => {
@@ -1223,7 +1316,10 @@ export function App() {
     setMessages(snapshot.messages as ChatMessage[]);
     setRoundNumber(snapshot.roundNumber ?? 1);
     setCurrentTurnIndex(snapshot.currentTurnIndex ?? 0);
-    setSpotlightWeights((snapshot.spotlightWeights ?? { Thorin: 0.55, Lyra: 0.45 }) as { Thorin: number; Lyra: number });
+    // Spotlight weights are NOT restored — deliberately. They are live VAD
+    // session state in the CRDT speech ledger, not save-file state. v1
+    // snapshots carried fabricated { Thorin, Lyra } numbers; that legacy
+    // field is ignored here and never resurrected into the view.
     addSystemMessage('Campaign state restored from database save.');
   };
 
@@ -1699,7 +1795,10 @@ export function App() {
             <NarrativeChat
               messages={spectatorMessages}
               onSendMessage={handleSendMessage}
-              spotlightWeights={spotlightWeights}
+              spotlightView={spotlightView}
+              onSpeechStart={handleLocalSpeechStart}
+              onSpeechSegment={handleLocalSpeechSegment}
+              onCaptureStop={handleLocalCaptureStop}
               isStreamingResponse={isStreamingResponse}
               activePeerTyping={activePeerTyping}
               onBroadcastPing={handleBroadcastPing}

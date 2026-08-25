@@ -20,6 +20,13 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 // promote `y-protocols` to an explicit dependency in client/package.json.
 import { Awareness } from 'y-protocols/awareness';
 import { AtmosphereSelection, normalizeAtmosphereId } from '../theme/atmospheres';
+import {
+  computeSpotlightWeights,
+  sanitizeSegments,
+  type LedgerEntry,
+  type SpotlightView,
+  type SpeechSegment,
+} from './speech_ledger';
 
 export interface TokenTransformData {
   tokenId: string;
@@ -58,9 +65,16 @@ interface CursorAwarenessState {
 type RemoteTokenListener = (payload: TokenTransformData) => void;
 type RemoteCursorListener = (cursors: RemoteCursor[]) => void;
 type AtmosphereListener = (selection: AtmosphereSelection) => void;
+type SpotlightListener = (view: SpotlightView) => void;
 
 /** Fixed Y.Map key holding the room-wide AtmosphereSelection. */
 const ATMOSPHERE_KEY = 'current';
+
+/** Y.Map holding the speech ledger; keys follow the fog convention. */
+const SPEECH_MAP_NAME = 'speech';
+
+/** How often an open burst's live tail is republished to the room (ms). */
+export const SPEECH_PUBLISH_THROTTLE_MS = 2_000;
 
 /**
  * Validate a raw `atmosphere` map entry into an AtmosphereSelection, or null
@@ -105,10 +119,18 @@ export class YjsCrdtClient {
   private tokens: Y.Map<Record<string, unknown>>;
   private fog: Y.Map<Uint8Array>;
   private atmosphere: Y.Map<unknown>;
+  private speech: Y.Map<unknown>;
   private remoteListeners = new Set<RemoteTokenListener>();
   private tokenObservers = new Map<string, () => void>();
   private cursorListeners = new Set<RemoteCursorListener>();
   private atmosphereListeners = new Set<AtmosphereListener>();
+  private spotlightListeners = new Set<SpotlightListener>();
+  /** user_id of the signed-in local peer; speech is published under this key. */
+  private localUserId = '';
+  private localUserName = '';
+  /** Throttle for republishing the open burst's growing tail. */
+  private pendingSpeechPublish = false;
+  private speechThrottleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Presence protocol instance. The provider owns one; we only create our own for local-only mode. */
   private awareness: Awareness | null = null;
   private ownAwareness = false;
@@ -125,6 +147,7 @@ export class YjsCrdtClient {
     this.tokens = this.doc.getMap('tokens');
     this.fog = this.doc.getMap('fog');
     this.atmosphere = this.doc.getMap('atmosphere');
+    this.speech = this.doc.getMap(SPEECH_MAP_NAME);
 
     // Offline persistence: mirror the Y.Doc into IndexedDB so a room survives
     // page reloads even when the relay is unreachable. Scoped per room.
@@ -185,6 +208,15 @@ export class YjsCrdtClient {
       const selection = this.getAtmosphereId();
       if (selection) this.atmosphereListeners.forEach((listener) => listener(selection));
     });
+
+    // Recompute spotlight weights from the MERGED ledger whenever any peer's
+    // speech entry changes — ours or theirs. Every replica runs the same pure
+    // function over the same CRDT-converged data, so all clients agree.
+    this.speech.observe(() => {
+      if (!this.spotlightListeners.size) return;
+      const view = this.getSpotlightView();
+      this.spotlightListeners.forEach((listener) => listener(view));
+    });
   }
 
   public connect(): void {
@@ -214,6 +246,8 @@ export class YjsCrdtClient {
    * signed-in user changes; the current pointer position (if any) is kept.
    */
   public setLocalUser(user: { user_id: string; name: string; color?: string }): void {
+    this.localUserId = user.user_id;
+    this.localUserName = user.name;
     if (!this.awareness) return;
     this.localUser = {
       user_id: user.user_id,
@@ -414,12 +448,117 @@ export class YjsCrdtClient {
     };
   }
 
+  // --- Speech ledger (Pillar-11 spotlight balancing) -----------------------
+
+  /**
+   * Publish THIS user's VAD speech segments to the shared Y.Doc.
+   *
+   * CONVENTION (mirrors the fog layers above): one key per owner,
+   * `user:<userId>`. A peer's entry is written only by that peer's own
+   * devices, so concurrent writes never target the same key and cross-player
+   * merges are conflict-free — the CRDT converges every replica on the same
+   * per-peer segment lists. Weights themselves are NEVER stored: each client
+   * recomputes them locally with the pure function in speech_ledger.ts from
+   * the merged ledger, so there is no LWW fight over a single weight object
+   * (the failure mode of the old hardcoded `{ Thorin: 0.55, Lyra: 0.45 }`
+   * snapshot field).
+   *
+   * Signed-out note: the Yjs relay rejects unauthenticated sockets, so with
+   * no session token the provider never connects and this write lands only
+   * in our local Y.Doc + IndexedDB — a genuinely local-only ledger, which is
+   * exactly what App.tsx labels it as.
+   */
+  public publishSpeech(userId: string, name: string, segments: SpeechSegment[]): void {
+    const clean = sanitizeSegments(segments);
+    this.speech.set(`user:${userId}`, {
+      user_id: userId,
+      name,
+      segments: clean,
+      // Informational stamp (same status as AtmosphereSelection.ts): merge
+      // order comes from the CRDT, not this clock.
+      ts: Date.now(),
+    } satisfies LedgerEntry & { ts: number });
+  }
+
+  /** The full merged ledger, validated entry by entry. */
+  public getSpeechLedger(): LedgerEntry[] {
+    return Array.from(this.speech.keys())
+      .map((key) => this.readSpeechEntry(this.speech.get(key)))
+      .filter((entry): entry is LedgerEntry => entry !== null);
+  }
+
+  /**
+   * Compute the room spotlight view from the merged ledger right now.
+   * `shares` is empty until real VAD segments exist — callers render that
+   * honestly instead of substituting demo speakers.
+   */
+  public getSpotlightView(nowMs: number = Date.now()): SpotlightView {
+    return {
+      scope: 'room',
+      shares: computeSpotlightWeights(this.getSpeechLedger(), { nowMs }),
+    };
+  }
+
+  /**
+   * Subscribe to converged spotlight updates. Fires immediately with the
+   * current view (covering late joiners + IndexedDB restore), then on every
+   * local or remote ledger change. Returns an unsubscribe function.
+   */
+  public observeSpotlight(cb: SpotlightListener): () => void {
+    this.spotlightListeners.add(cb);
+    cb(this.getSpotlightView());
+    return () => {
+      this.spotlightListeners.delete(cb);
+    };
+  }
+
+  /**
+   * Throttled publication of an open burst's live tail: at most one write per
+   * SPEECH_PUBLISH_THROTTLE_MS while someone is mid-sentence, so the balance
+   * bar moves without hammering the relay on every animation frame.
+   */
+  public scheduleLiveSpeechPublish(
+    userId: string,
+    name: string,
+    snapshotFn: () => SpeechSegment[],
+  ): void {
+    if (this.speechThrottleTimer !== null) {
+      this.pendingSpeechPublish = true;
+      return;
+    }
+    this.publishSpeech(userId, name, snapshotFn());
+    this.speechThrottleTimer = setTimeout(() => {
+      this.speechThrottleTimer = null;
+      if (this.pendingSpeechPublish) {
+        this.pendingSpeechPublish = false;
+        this.scheduleLiveSpeechPublish(userId, name, () => snapshotFn());
+      }
+    }, SPEECH_PUBLISH_THROTTLE_MS);
+  }
+
+  /** True when this browser has an open (un-ended) VAD burst. */
+  private readSpeechEntry(raw: unknown): LedgerEntry | null {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const rec = raw as Record<string, unknown>;
+    if (typeof rec.user_id !== 'string' || rec.user_id === '') return null;
+    return {
+      user_id: rec.user_id,
+      name: typeof rec.name === 'string' && rec.name !== '' ? rec.name : rec.user_id,
+      segments: sanitizeSegments(rec.segments),
+    };
+  }
+
   public destroy(): void {
     this.tokenObservers.forEach((off) => off());
     if (this.cursorFlushTimer !== null) {
       clearTimeout(this.cursorFlushTimer);
       this.cursorFlushTimer = null;
     }
+    if (this.speechThrottleTimer !== null) {
+      clearTimeout(this.speechThrottleTimer);
+      this.speechThrottleTimer = null;
+    }
+    this.spotlightListeners.clear();
     // Announce departure so peers drop our cursor immediately instead of
     // waiting out the awareness stale timeout.
     try {

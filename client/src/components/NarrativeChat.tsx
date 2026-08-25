@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { globalVoiceCapture } from '../render/voice_capture';
 import { globalAudio } from '../render/audio_manager';
+import type { SpotlightView } from '../sync/speech_ledger';
 
 export type ChatChannel = 'all' | 'party' | 'gm' | 'combat';
 
@@ -42,7 +43,18 @@ export interface ChatMessage {
 interface NarrativeChatProps {
   messages: ChatMessage[];
   onSendMessage: (text: string, channel?: ChatChannel, recipient?: string) => void;
-  spotlightWeights: { Thorin: number; Lyra: number; [key: string]: number };
+  /**
+   * REAL spotlight balance derived from accumulated VAD speech seconds
+   * (sync/speech_ledger.ts). `shares` is empty until somebody actually talks;
+   * scope 'local-only' means no sync transport is carrying it to peers.
+   */
+  spotlightView: SpotlightView;
+  /** Silero VAD burst started on this client's mic. */
+  onSpeechStart?: () => void;
+  /** Silero VAD burst ended; carries the raw audio buffer. */
+  onSpeechSegment?: (audio: Float32Array) => void;
+  /** Capture stopped (mic released) so any open burst can be closed out. */
+  onCaptureStop?: () => void;
   isStreamingResponse?: boolean;
   activePeerTyping?: string | null;
   onBroadcastPing?: () => void;
@@ -51,10 +63,28 @@ interface NarrativeChatProps {
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
 const INK_MUTED = 'color-mix(in srgb, var(--parchment-ink) 65%, transparent)';
 
+/**
+ * Tiny inline glyph for the speaker-balance readout: a pulsing dot while real
+ * speech data is flowing, a hollow one when the ledger is honestly empty.
+ */
+const BalanceGlyph: React.FC<{ active: boolean }> = ({ active }) => (
+  <span
+    aria-hidden="true"
+    className={`w-1.5 h-1.5 rounded-full ${active ? 'animate-pulse' : ''}`}
+    style={{
+      backgroundColor: active ? 'var(--state-success)' : 'transparent',
+      border: active ? 'none' : '1px solid var(--rp-parchment-300)',
+    }}
+  />
+);
+
 export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   messages,
   onSendMessage,
-  spotlightWeights,
+  spotlightView,
+  onSpeechStart,
+  onSpeechSegment,
+  onCaptureStop,
   isStreamingResponse = false,
   activePeerTyping = null,
   onBroadcastPing,
@@ -86,9 +116,17 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       globalAudio.playTurnAdvance();
       const started = await globalVoiceCapture.startRecording({
         onVolumeUpdate: (volume) => setVoiceVolume(volume),
-        // Real Silero VAD speech events — drive an honest indicator only.
-        onSpeechStart: () => setIsSpeechActive(true),
-        onSpeechEnd: () => setIsSpeechActive(false),
+        // Real Silero VAD speech events: drive the live indicator AND the
+        // speech ledger that powers spotlight balance (App accumulates and
+        // syncs them; we never fabricate utterance text).
+        onSpeechStart: () => {
+          setIsSpeechActive(true);
+          onSpeechStart?.();
+        },
+        onSpeechEnd: (audio) => {
+          setIsSpeechActive(false);
+          onSpeechSegment?.(audio);
+        },
       });
       if (!started) {
         // Microphone inaccessible — do not pretend a session is live.
@@ -101,6 +139,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       setIsRecording(false);
       setIsSpeechActive(false);
       globalVoiceCapture.stopRecording();
+      // Let the ledger drop any burst that never saw onSpeechEnd, so no
+      // phantom live tail keeps accruing after the mic is off.
+      onCaptureStop?.();
       setVoiceVolume(0);
       // No transcription backend exists in this client, so a recorded segment
       // produces NO chat text. Never fabricate utterances on the player's behalf.
@@ -159,12 +200,40 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
             </button>
           )}
 
-          <div className="flex items-center gap-1.5 text-[10px] text-[var(--rp-parchment-300)]">
-            <span
-              className="w-1.5 h-1.5 rounded-full animate-pulse"
-              style={{ backgroundColor: 'var(--state-success)' }}
-            />
-            <span>Thorin (50%) · Lyra (50%)</span>
+          {/* Speaker-balance indicator — real VAD-derived shares, or an honest
+              empty state. Never seeded with demo speakers. */}
+          <div
+            className="flex items-center gap-1.5 text-[10px] text-[var(--rp-parchment-300)]"
+            title={
+              spotlightView.shares.length === 0
+                ? 'Speaker balance: no speech detected yet'
+                : 'Speaker balance from detected speech time' +
+                  (spotlightView.scope === 'local-only' ? ' (this device only — not synced)' : '')
+            }
+          >
+            <BalanceGlyph active={spotlightView.shares.length > 0} />
+            {spotlightView.shares.length === 0 ? (
+              <span className="opacity-60">No speech yet</span>
+            ) : (
+              <>
+                {spotlightView.shares.slice(0, 3).map((w) => (
+                  <span key={w.userId} className="whitespace-nowrap">
+                    {w.name} ({Math.round(w.share * 100)}%)
+                  </span>
+                ))}
+                {spotlightView.shares.length > 3 && (
+                  <span className="opacity-60">+{spotlightView.shares.length - 3}</span>
+                )}
+                {spotlightView.scope === 'local-only' && (
+                  <span
+                    className="vtt-badge"
+                    style={{ fontSize: '9px', padding: '0.05rem 0.4rem', textTransform: 'uppercase' }}
+                  >
+                    local only
+                  </span>
+                )}
+              </>
+            )}
           </div>
         </div>
       </div>

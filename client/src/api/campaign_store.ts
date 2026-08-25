@@ -16,12 +16,19 @@ export interface CampaignSaveMeta {
 }
 
 export interface CampaignSnapshot {
+  /**
+   * Snapshot schema version. v2 drops the old fabricated
+   * `spotlightWeights` ({ Thorin, Lyra }) field: spotlight balance is now
+   * DERIVED from real VAD speech seconds in the CRDT speech ledger
+   * (sync/speech_ledger.ts), so it is session-live state, not save-file
+   * state. Loaders ignore the legacy field on v1 snapshots.
+   */
+  schemaVersion: 2;
   tokens: unknown[];
   customWalls: { x: number; y: number }[];
   messages: unknown[];
   roundNumber: number;
   currentTurnIndex: number;
-  spotlightWeights: Record<string, number>;
 }
 
 const getToken = getStoredToken;
