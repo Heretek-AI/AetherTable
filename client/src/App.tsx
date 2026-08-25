@@ -838,6 +838,15 @@ export function App() {
       globalSpatialAudio.setListenerPosition(BOARD_CENTER_FALLBACK.x, BOARD_CENTER_FALLBACK.y);
     }
   }, [tokens, currentUser, resolveTokenForUser]);
+
+  // Pillar-9 occlusion: hand the session's wall cells to the spatial engine so
+  // peer voices and one-shot cues attenuate behind intervening walls. Re-runs
+  // whenever the wall set changes (layer editor strokes, WFC import, campaign
+  // restore) — the engine recomputes every live voice path on receipt.
+  useEffect(() => {
+    globalSpatialAudio.setWalls(customWalls);
+  }, [customWalls]);
+
   const addSystemMessage = (text: string) => {
     setMessages((prev) => [
       ...prev,

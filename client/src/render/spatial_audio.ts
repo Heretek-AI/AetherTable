@@ -19,16 +19,30 @@
  *    off; callers must fall back to plain element playback in that case.
  *  - Sources are positioned on the same plane as the listener (y = 1.5 world
  *    height for both), so elevation differences between tokens are NOT modeled.
+ *
+ * Occlusion (Pillar 9, implemented): every source path additionally attenuates
+ * by the WALL CELLS standing between the listener token and the source token.
+ * The wall data is the session's existing `{x, y}` cell list (`customWalls` in
+ * App.tsx — the same cells pixi_board renders and RaycastLighting blocks LoS
+ * with), pushed in via `setWalls`. The pure grid-walk + dB model lives in
+ * `./occlusion`; this class recomputes each live voice's occluded gain whenever
+ * the listener moves, a peer token moves (~10 Hz mesh feed), or the wall set
+ * changes. See that module for the acoustic model documentation (-6 dB per
+ * intervening wall, clamped, stacked on inverse-distance rolloff).
  */
+
+import { computeOccludedDistanceGain, countWallsOnSegment, wallCountToGainFactor, wallKey } from './occlusion';
 
 interface VoiceSourceNodes {
   tap: MediaStreamAudioSourceNode;
-  /** Per-source volume/mute stage feeding the panner. */
+  /** Per-source stage feeding the panner: userVolume × occlusion factor. */
   gain: GainNode;
   /** HRTF panner, null when only a dry gain path could be built. */
   panner: PannerNode | null;
   x: number;
   y: number;
+  /** Mixer-slider loudness requested by the caller (occlusion multiplies it). */
+  userVolume: number;
 }
 
 export class SpatialAudioEngine {
@@ -45,6 +59,56 @@ export class SpatialAudioEngine {
    * not back at the listener.
    */
   private desiredPositions = new Map<string, { x: number; y: number }>();
+  /**
+   * Current session wall cells as "x:y" keys (pixi_board convention). Empty
+   * until `setWalls` is called; an empty set means zero occlusion everywhere.
+   */
+  private walls = new Set<string>();
+
+  /**
+   * Replaces the session wall set and re-applies occlusion to every live voice
+   * source. Call whenever the session map's walls change (layer editor, WFC
+   * import, campaign restore). Cells use the same `{x, y}` shape the board and
+   * raycast lighting already consume.
+   */
+  public setWalls(cells: Iterable<{ x: number; y: number }>): void {
+    const next = new Set<string>();
+    for (const c of cells) next.add(wallKey(c.x, c.y));
+    this.walls = next;
+    this.reapplyOcclusionToAllSources();
+  }
+
+  /** Current wall keys (diagnostic/mixer display). */
+  public getWallCount(): number {
+    return this.walls.size;
+  }
+
+  /** Intervening wall cells between the listener and a board point. */
+  public countOccludingWalls(x: number, y: number): number {
+    return countWallsOnSegment(this.walls, this.listenerPos.x, this.listenerPos.y, x, y);
+  }
+
+  /**
+   * Recomputes one voice's gain stage = userVolume × occlusion factor for its
+   * current source position. Smoothed so a token sliding behind a wall fades
+   * rather than steps.
+   */
+  private applyOcclusionToSource(s: VoiceSourceNodes): void {
+    if (!this.ctx) return;
+    // Distance attenuation for voices is handled natively by the HRTF
+    // PannerNode's inverse model; the gain stage carries userVolume × the
+    // occlusion factor only.
+    const occluded = s.userVolume * wallCountToGainFactor(this.countOccludingWalls(s.x, s.y));
+    s.gain.gain.setTargetAtTime(
+      Math.max(0, Math.min(1, occluded)),
+      this.ctx.currentTime,
+      SpatialAudioEngine.POSITION_SMOOTHING_TC,
+    );
+  }
+
+  private reapplyOcclusionToAllSources(): void {
+    for (const s of this.voiceSources.values()) this.applyOcclusionToSource(s);
+  }
 
   constructor() {
     // Lazy initialized on first user interaction
@@ -90,6 +154,9 @@ export class SpatialAudioEngine {
       this.ctx.listener.positionX.setValueAtTime(x, t);
       this.ctx.listener.positionZ.setValueAtTime(y, t);
     }
+    // Every voice's occlusion is measured from the listener token, so moving
+    // our token re-evaluates all peer paths (e.g. stepping around a wall).
+    this.reapplyOcclusionToAllSources();
   }
 
   public getListenerPosition(): { x: number; y: number } {
@@ -140,9 +207,17 @@ export class SpatialAudioEngine {
 
       this.detachSource(id);
       const start = this.desiredPositions.get(id) ?? { ...this.listenerPos };
+      const userVolume = Math.max(0, Math.min(1, opts?.volume ?? 1));
       const tap = ctx.createMediaStreamSource(stream);
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(Math.max(0, Math.min(1, opts?.volume ?? 1)), ctx.currentTime);
+      // Seed with the occluded value; the source record below keeps the
+      // un-occluded userVolume so later recomputes stay correct.
+      gain.gain.setValueAtTime(
+        Math.max(0, Math.min(1, userVolume * wallCountToGainFactor(
+          countWallsOnSegment(this.walls, this.listenerPos.x, this.listenerPos.y, start.x, start.y),
+        ))),
+        ctx.currentTime,
+      );
 
       let panner: PannerNode | null = null;
       if (ctx.createPanner) {
@@ -160,7 +235,7 @@ export class SpatialAudioEngine {
       }
       tap.connect(gain);
 
-      this.voiceSources.set(id, { tap, gain, panner, x: start.x, y: start.y });
+      this.voiceSources.set(id, { tap, gain, panner, x: start.x, y: start.y, userVolume });
       return true;
     } catch {
       return false;
@@ -197,13 +272,18 @@ export class SpatialAudioEngine {
     s.x = x;
     s.y = y;
     if (s.panner) this.writePannerPosition(s.panner, x, y);
+    // The peer's token moved (~10 Hz mesh feed): its wall count may have
+    // changed, so re-derive the occluded gain stage for the new position.
+    this.applyOcclusionToSource(s);
   }
 
   /** Per-source loudness (mixer slider); no-op for unknown sources. */
   public setSourceVolume(id: string, volume: number): void {
     const s = this.voiceSources.get(id);
     if (!s || !this.ctx) return;
-    s.gain.gain.setTargetAtTime(Math.max(0, Math.min(1, volume)), this.ctx.currentTime, 0.03);
+    s.userVolume = Math.max(0, Math.min(1, volume));
+    // Occlusion stacks on top of the new slider value.
+    this.applyOcclusionToSource(s);
   }
 
   private writePannerPosition(panner: PannerNode, x: number, y: number): void {
@@ -235,21 +315,25 @@ export class SpatialAudioEngine {
     // distance and tokens far off-axis still shift subtly further out.
     const pan = Math.tanh(dx / 6.0);
 
-    // Inverse Distance Rolloff: 1 / (1 + 0.15 * d)
-    const gain = Math.max(0.08, Math.min(1.0, 1.0 / (1.0 + distance * 0.15)));
+    // Inverse Distance Rolloff: 1 / (1 + 0.15 * d), multiplied by the Pillar-9
+    // occlusion factor for the wall cells standing on the listener→source ray
+    // (-6 dB each, clamped). With no intervening walls this is exactly the
+    // pre-existing rolloff value.
+    const wallCount = countWallsOnSegment(this.walls, this.listenerPos.x, this.listenerPos.y, sourceX, sourceY);
+    const gain = computeOccludedDistanceGain(distance, wallCount);
 
     return { pan, gain, distance };
   }
 
   /**
    * Builds a true 3D spatialization chain for one-shot cues:
-   *   input gain -> PannerNode (HRTF binaural, inverse-distance rolloff,
-   *   occluder-free plane) -> master.
+   *   input gain -> PannerNode (HRTF binaural, inverse-distance rolloff) -> master.
    *
-   * The PannerNode handles azimuth AND attenuation natively from world
-   * coordinates, replacing the legacy tanh StereoPanner math. Where
-   * PannerNode is unavailable (or spatial is disabled) we fall back to the
-   * original stereo-pan + computed-gain path so behavior never regresses.
+   * The PannerNode handles azimuth natively from world coordinates; distance
+   * attenuation and wall occlusion are folded into the returned gain, which
+   * drives the cue's envelope. Where PannerNode is unavailable (or spatial is
+   * disabled) we fall back to the stereo-pan + computed-gain path so behavior
+   * never regresses.
    */
   private buildSpatialChain(
     sourceX: number,
@@ -299,7 +383,8 @@ export class SpatialAudioEngine {
     const { gain } = this.calculateSpatialParameters(sourceX, sourceY);
     const { input: soundGain } = this.buildSpatialChain(sourceX, sourceY);
     const now = this.ctx.currentTime;
-    void gain; // attenuation is handled natively by the HRTF PannerNode
+    // `gain` (distance rolloff × wall occlusion) drives the envelope below;
+    // the PannerNode adds azimuth on top.
 
     // 8 ms linear attack before the decay: starting at full amplitude causes
     // an audible click (hard waveform onset); ramping up from near-silence
