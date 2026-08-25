@@ -487,6 +487,42 @@ impl PeerRegistry {
         self.broadcast_if(room_id, except_peer, text, |_| true).await;
     }
 
+    /// Per-seat fan-out (iteration 36): every recipient gets the projection
+    /// computed for ITS [`DeliveryView`] rather than a single role-filtered
+    /// choice between "the raw frame" and "nothing". `projections` memoizes at
+    /// most ONE projection per view class per call, so N sockets sharing a
+    /// class cost exactly one projection plus N sends — never one projection
+    /// per socket. Ordering matches `broadcast_if`: a single pass over the
+    /// registry, each peer's frame written before the next peer is considered,
+    /// so relative delivery order between peers is unchanged.
+    async fn broadcast_per_seat<F>(
+        &self,
+        room_id: &str,
+        except_peer: u64,
+        projections: &PerFrameProjections,
+        project: F,
+    ) where
+        F: Fn(DeliveryView, &serde_json::Value) -> Option<String>,
+    {
+        if let Some(peers) = self.rooms.get(room_id) {
+            for entry in peers.iter() {
+                if *entry.key() == except_peer {
+                    continue;
+                }
+                let view = DeliveryView::of(entry.value().role);
+                // The memoized string is cloned BEFORE the await so no RefCell
+                // borrow is ever held across a socket write.
+                let Some(text) =
+                    projections.for_view(view, || project(view, projections.frame()))
+                else {
+                    continue; // this view's projection dropped the whole frame
+                };
+                let mut peer_session = entry.value().socket.clone();
+                let _ = peer_session.text(text).await;
+            }
+        }
+    }
+
     fn count(&self, room_id: &str) -> usize {
         self.rooms.get(room_id).map(|p| p.len()).unwrap_or(0)
     }
@@ -495,6 +531,86 @@ impl PeerRegistry {
 impl Default for PeerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Recipient view classes for per-seat delta fan-out (iteration 36). Every
+/// authenticated role maps onto exactly one view; all connections within a
+/// view are entitled to byte-identical deltas, which is what makes per-class
+/// caching sound — a projection computed once per (frame, view) can be reused
+/// across every socket in that class without any seat seeing another seat's
+/// data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeliveryView {
+    /// GMs/admins: full authoritative deltas, verbatim.
+    Gm,
+    /// Players: hidden tokens dropped, surviving payloads reduced to
+    /// board-token geometry (snapshot parity with `project_snapshot_for_role`).
+    Player,
+    /// Spectators: same projection as players.
+    Spectator,
+}
+
+impl DeliveryView {
+    fn of(role: Role) -> Self {
+        if role.is_gm() {
+            Self::Gm
+        } else if role == Role::Spectator {
+            Self::Spectator
+        } else {
+            Self::Player
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Gm => 0,
+            Self::Player => 1,
+            Self::Spectator => 2,
+        }
+    }
+}
+
+/// Per-frame projection cache: one instance lives for exactly ONE relayed
+/// frame and memoizes each view's projected wire text the first time a peer of
+/// that view asks for it. Slots are `None` until computed; the inner
+/// `Option<String>` distinguishes "projected frame" (`Some(text)`) from
+/// "dropped entirely for this view" (`None`).
+struct PerFrameProjections {
+    frame: serde_json::Value,
+    slots: [std::cell::RefCell<Option<Option<String>>>; 3],
+}
+
+impl PerFrameProjections {
+    fn new(frame: serde_json::Value) -> Self {
+        Self {
+            frame,
+            slots: [
+                std::cell::RefCell::new(None),
+                std::cell::RefCell::new(None),
+                std::cell::RefCell::new(None),
+            ],
+        }
+    }
+
+    /// The unprojected frame this cache was built around.
+    fn frame(&self) -> &serde_json::Value {
+        &self.frame
+    }
+
+    /// Returns the projected text for `view`, computing it at most once. The
+    /// returned `String` is cloned out so no borrow survives the call (the
+    /// caller awaits socket writes immediately after).
+    fn for_view(
+        &self,
+        view: DeliveryView,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let mut slot = self.slots[view.index()].borrow_mut();
+        if slot.is_none() {
+            *slot = Some(compute());
+        }
+        slot.as_ref().and_then(|text| text.as_ref()).cloned()
     }
 }
 
@@ -4431,6 +4547,60 @@ fn token_is_hidden(data: &AppState, room_id: &str, token_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The payload fields a non-GM seat is entitled to on a TokenUpdate delta —
+/// exactly the transform geometry a client needs to render movement. Anything
+/// else a sender's client stuffs into the frame (HP, conditions, AC,
+/// abilities...) is stat-block data that `project_snapshot_for_role` already
+/// refuses to show non-GM seats for someone else's entity; per-seat projection
+/// (iteration 36) applies the same rule to live deltas.
+const TOKEN_UPDATE_PUBLIC_FIELDS: &[&str] = &[
+    "tokenId",
+    "x",
+    "y",
+    "z",
+    "rotation",
+    "scale",
+    "elevation",
+    "timestamp",
+];
+
+/// Projects one relayed frame for a single recipient view class.
+///
+/// - GM views get the frame verbatim: they are entitled to the full
+///   authoritative state, including hidden tokens and any extra fields the
+///   sending client attached.
+/// - Player/spectator views get snapshot-parity projection:
+///   `TokenUpdate` frames for HIDDEN tokens are dropped entirely (`None`), and
+///   surviving frames are rebuilt down to board-token geometry so nothing the
+///   sender attached beyond the transform can leak onto their wire.
+/// - Unknown/unresolvable tokens stay visible (same fail-open as
+///   `token_is_hidden`: we never invent a restriction the data cannot back),
+///   but their payloads are still field-projected.
+fn project_frame_for_view(
+    data: &AppState,
+    room_id: &str,
+    frame: &serde_json::Value,
+    view: DeliveryView,
+) -> Option<String> {
+    if view == DeliveryView::Gm {
+        return Some(frame.to_string());
+    }
+    if frame.get("type").and_then(|t| t.as_str()) != Some("TokenUpdate") {
+        // Only token deltas carry entity-derived data today; fog/cursor frames
+        // keep their existing dedicated delivery paths.
+        return Some(frame.to_string());
+    }
+    let name = payload_token_name(frame)?;
+    if token_is_hidden(data, room_id, name) {
+        return None;
+    }
+    let mut projected = frame.clone();
+    if let Some(payload) = projected.get_mut("payload").and_then(|p| p.as_object_mut()) {
+        payload.retain(|key, _| TOKEN_UPDATE_PUBLIC_FIELDS.contains(&key.as_str()));
+    }
+    Some(projected.to_string())
+}
+
 /// Whether this SENDER may drive the token identified by display name — the
 /// relay-path counterpart of the ownership gate on HTTP `POST /move`
 /// (`may_control_entity`): GMs control everything; players control only the
@@ -4805,27 +4975,24 @@ async fn ws_sync(
                                     );
                                 // Validate movement, then relay only updates that win LWW arbitration.
                                 } else if accept_token_update(&app_state, &hub, &rid, &value) {
-                                    // Delivery RBAC: hidden-token transforms go
-                                    // to GM peers ONLY. This matches the initial
-                                    // snapshot policy — non-GM snapshots never
-                                    // contain hidden entities, so delivering
-                                    // their live deltas to players/spectators
-                                    // would leak both existence and movement of
-                                    // what they cannot see. Hiddenness is read
-                                    // from the authoritative session state (the
-                                    // frame carries no visibility field).
-                                    let hidden = payload_token_name(&value)
-                                        .map(|name| token_is_hidden(&app_state, &rid, name))
-                                        .unwrap_or(false);
-                                    if hidden {
-                                        peers
-                                            .broadcast_if(&rid, peer_id, &text, |peer| {
-                                                peer.role.is_gm()
-                                            })
-                                            .await;
-                                    } else {
-                                        peers.broadcast(&rid, peer_id, &text).await;
-                                    }
+                                    // Per-seat delivery (iteration 36): instead of one class-wide
+                                    // decision between "raw frame" and "GM-only", each recipient
+                                    // gets the projection for ITS view — GMs verbatim, non-GMs
+                                    // through the same visibility rules as their SyncStep2
+                                    // snapshot (hidden tokens dropped entirely; surviving payloads
+                                    // reduced to board-token geometry so nothing the sender's
+                                    // client attached beyond the transform leaks onto player
+                                    // wire). Hiddenness still comes from the authoritative session
+                                    // state: the frame carries no visibility field.
+                                    //
+                                    // The projection runs at most ONCE per view class per frame
+                                    // (`PerFrameProjections`), never per socket.
+                                    let projections = PerFrameProjections::new(value.clone());
+                                    peers
+                                        .broadcast_per_seat(&rid, peer_id, &projections, |view, frame| {
+                                            project_frame_for_view(&app_state, &rid, frame, view)
+                                        })
+                                        .await;
                                 }
                             }
                             Some("FogUpdate") => {
@@ -5246,4 +5413,66 @@ pub async fn run() -> std::io::Result<()> {
     .bind(("0.0.0.0", port))?
     .run()
     .await
+}
+
+// --- Per-seat projection cache unit tests ------------------------------------
+
+#[cfg(test)]
+mod per_seat_projection_tests {
+    use super::*;
+
+    /// The whole point of `PerFrameProjections`: a view's projection is
+    /// computed AT MOST ONCE per frame, no matter how many sockets of that
+    /// class ask for it — fan-out cost is one projection per (frame, class),
+    /// not one per literal connection.
+    #[test]
+    fn projections_are_memoized_per_view_class() {
+        let frame = serde_json::json!({"type": "TokenUpdate", "payload": {"tokenId": "Orc"}});
+        let cache = PerFrameProjections::new(frame);
+
+        let computes = std::cell::Cell::new(0u32);
+        let compute = |view: DeliveryView| -> Option<String> {
+            computes.set(computes.get() + 1);
+            Some(format!("{:?}", view))
+        };
+
+        // Three "sockets" in the player class, two in the GM class.
+        let _ = cache.for_view(DeliveryView::Player, || compute(DeliveryView::Player));
+        let _ = cache.for_view(DeliveryView::Player, || compute(DeliveryView::Player));
+        let _ = cache.for_view(DeliveryView::Player, || compute(DeliveryView::Player));
+        assert_eq!(computes.get(), 1, "player-class projection must be cached");
+
+        let _ = cache.for_view(DeliveryView::Gm, || compute(DeliveryView::Gm));
+        let _ = cache.for_view(DeliveryView::Gm, || compute(DeliveryView::Gm));
+        assert_eq!(computes.get(), 2, "each class computes exactly once");
+
+        // The spectator slot was never touched.
+        let spectator =
+            cache.for_view(DeliveryView::Spectator, || compute(DeliveryView::Spectator));
+        assert_eq!(spectator.as_deref(), Some("Spectator"));
+        assert_eq!(computes.get(), 3);
+    }
+
+    /// A dropped projection (`None`) is memoized too: a hidden token stays
+    /// hidden for every subsequent peer of that class within the same frame,
+    /// without re-consulting session state per socket.
+    #[test]
+    fn dropped_projections_are_memoized_as_none() {
+        let frame = serde_json::json!({"type": "TokenUpdate", "payload": {"tokenId": "Orc"}});
+        let cache = PerFrameProjections::new(frame);
+
+        let first = cache.for_view(DeliveryView::Player, || None);
+        let second = cache.for_view(DeliveryView::Player, || Some("leaked".to_string()));
+        assert!(first.is_none() && second.is_none());
+    }
+
+    /// Role-to-view mapping is total: every role lands in exactly one class,
+    /// and the admin role CLAIM (which folds into `Role::Gm` in
+    /// `Role::from_identity`) therefore lands in the GM view too.
+    #[test]
+    fn every_role_maps_to_one_delivery_view() {
+        assert_eq!(DeliveryView::of(Role::Gm), DeliveryView::Gm);
+        assert_eq!(DeliveryView::of(Role::Player), DeliveryView::Player);
+        assert_eq!(DeliveryView::of(Role::Spectator), DeliveryView::Spectator);
+    }
 }

@@ -406,6 +406,107 @@ async fn hidden_token_transform_reaches_gm_peers_only() {
     );
 }
 
+// --- Per-seat delta projection (iteration 36) -----------------------------------
+//
+// Defect: relay fan-out is per-frame role-filtered (`broadcast_if`), not
+// per-seat projected. Two consequences pinned here:
+//
+// 1. A HIDDEN token's move must yield NO position data for player/spectator
+//    seats while every GM seat receives the real delta verbatim.
+// 2. A VISIBLE token's move must reach non-GM seats PROJECTED through the same
+//    rules as their SyncStep2 snapshot: board-token geometry only. Today the
+//    sender's raw frame text is fanned out verbatim to everyone, so any extra
+//    payload fields a client attaches (HP, conditions, AC — whatever a buggy
+//    or hostile client stuffs into the frame) leak straight onto the player
+//    wire even though the snapshot projection strips them.
+
+#[actix_web::test]
+async fn hidden_token_move_yields_no_position_data_for_players_and_real_delta_for_gm() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut gm2 = connect_ws(&table, session_id, &sign_token_with_role("gm-2", "gm")).await;
+    let mut player =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+
+    // GM moves the hidden Orc to a tactically meaningful spot.
+    send_json(&mut gm, token_update("Orc", 8.0, 8.0)).await;
+
+    // GM seats receive the REAL delta, coordinates included.
+    let gm_frame = next_delta_frame(&mut gm2, 1500).await.expect(
+        "GM peers must receive the hidden token's real movement delta",
+    );
+    let value: serde_json::Value = serde_json::from_str(&gm_frame).expect("valid JSON");
+    assert_eq!(value["type"].as_str(), Some("TokenUpdate"));
+    assert_eq!(value["payload"]["tokenId"].as_str(), Some("Orc"));
+    assert_eq!(value["payload"]["x"].as_f64(), Some(8.0));
+
+    // Player and spectator seats get NO position data for the hidden token —
+    // not a redacted echo, nothing.
+    for (who, stream) in [("player", &mut player), ("spectator", &mut spectator)] {
+        let frame = next_delta_frame(stream, 400).await;
+        assert!(
+            frame.is_none(),
+            "{} seat must receive no position data for a hidden token's move, got {:?}",
+            who,
+            frame
+        );
+    }
+}
+
+#[actix_web::test]
+async fn visible_token_delta_is_field_projected_for_non_gm_seats_verbatim_for_gm() {
+    let (app, table) = start_table().await;
+    let session_id = seed_hidden_and_visible_entities(&app).await;
+
+    let mut gm = connect_ws(&table, session_id, &sign_token_with_role("gm-1", "gm")).await;
+    let mut gm2 = connect_ws(&table, session_id, &sign_token_with_role("gm-2", "gm")).await;
+    let mut player =
+        connect_ws(&table, session_id, &sign_token_with_role("player-a", "player")).await;
+    let mut spectator =
+        connect_ws(&table, session_id, &sign_token_with_role("watcher", "spectator")).await;
+
+    // The GM's client moves the visible Hero but attaches stat-block fields to
+    // the transform payload — exactly what the snapshot projection refuses to
+    // show non-GM seats for someone else's entity.
+    let mut frame = token_update("Hero", 7.0, 3.0);
+    frame["payload"]["current_hp"] = serde_json::json!(3);
+    frame["payload"]["conditions"] = serde_json::json!(["Frightened"]);
+    send_json(&mut gm, frame).await;
+
+    // GM seats see the frame verbatim.
+    let gm_frame = next_delta_frame(&mut gm2, 1500)
+        .await
+        .expect("GM peers must receive the visible-token delta");
+    let gm_value: serde_json::Value = serde_json::from_str(&gm_frame).expect("valid JSON");
+    assert_eq!(gm_value["payload"]["current_hp"].as_i64(), Some(3));
+
+    // Non-GM seats still learn WHERE the hero went...
+    for (who, stream) in [("player", &mut player), ("spectator", &mut spectator)] {
+        let seat_frame = next_delta_frame(stream, 1500).await.unwrap_or_else(|| {
+            panic!("{} seat must still receive visible-token movement", who)
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&seat_frame).expect("valid JSON");
+        assert_eq!(value["type"].as_str(), Some("TokenUpdate"));
+        assert_eq!(value["payload"]["tokenId"].as_str(), Some("Hero"));
+        assert_eq!(value["payload"]["x"].as_f64(), Some(7.0));
+        // ...but NOTHING beyond board-token geometry survives projection.
+        for leaked in ["current_hp", "conditions", "ac", "abilities"] {
+            assert!(
+                value["payload"].get(leaked).is_none(),
+                "{} seat must not receive '{}' on a token delta (snapshot parity), got {}",
+                who,
+                leaked,
+                seat_frame
+            );
+        }
+    }
+}
+
 // --- TokenUpdate ownership gate ------------------------------------------------
 //
 // Relay audit HIGH: the relay arm gated only spectators, so any PLAYER could
