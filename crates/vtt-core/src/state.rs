@@ -1881,6 +1881,61 @@ impl GameSession {
                 entity.position = pos;
             }
         }
+        // Inventory-placement replay (audit F-A4#7): ITEM_TRANSFERRED moves an
+        // item WITHOUT any MOVE_ENTITY/DAMAGE_APPLIED-style trace elsewhere, so
+        // a rewind past one used to leave the item wherever the transfer had
+        // put it — the rewind-blind-spot class again. Seed placements from the
+        // REVERTED transfers' own payloads ("from_container_id" = where the
+        // item lived before; explicit null = root), then let every SURVIVING
+        // transfer re-assert its destination last-event-wins, mirroring the
+        // position seeding above. Legacy payloads that predate the field carry
+        // no prior placement and are left untouched rather than guessed at.
+        let mut item_placements: HashMap<Uuid, (Uuid, Option<Uuid>)> = HashMap::new();
+        for ev in reverted.iter().filter(|e| e.event_type == "ITEM_TRANSFERRED") {
+            let Some(item_id) = ev
+                .payload
+                .get("item_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            if ev.payload.get("from_container_id").is_none() {
+                continue;
+            }
+            let prior = ev
+                .payload
+                .get("from_container_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            item_placements.entry(item_id).or_insert((ev.actor_id, prior));
+        }
+        for ev in self
+            .ledger
+            .events
+            .iter()
+            .filter(|e| !e.is_reverted && e.event_type == "ITEM_TRANSFERRED")
+        {
+            let parse = |key: &str| {
+                ev.payload
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+            };
+            if let (Some(item_id), Some(container_id)) = (parse("item_id"), parse("container_id")) {
+                item_placements.insert(item_id, (ev.actor_id, Some(container_id)));
+            }
+        }
+        for (item_id, (owner_id, parent)) in item_placements {
+            if let Some(stored) = self
+                .entities
+                .get_mut(&owner_id)
+                .and_then(|entity| entity.inventory.items.get_mut(&item_id))
+            {
+                stored.parent_container_id = parent;
+                restored += 1;
+            }
+        }
         // Death-save tallies replay after HP so the last surviving save event
         // wins (its counters already reflect any heal-reset at save time).
         for (id, tally) in death_save_state {

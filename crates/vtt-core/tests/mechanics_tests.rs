@@ -2328,6 +2328,153 @@ fn test_safety_rewind_past_help_check_clears_the_token() {
     assert!(!session.consume_help_check_advantage(ally_id));
 }
 
+// --- Audit iterations 61-62 / F-A4#7: ITEM_TRANSFERRED is rewind-blind -------
+
+use vtt_core::inventory::Item;
+
+fn plain_item(id: uuid::Uuid, name: &str, weight_lbs: f32) -> Item {
+    Item {
+        id,
+        compendium_id: format!("item_{}", name.to_lowercase().replace(' ', "_")),
+        name: name.to_string(),
+        base_weight_lbs: weight_lbs,
+        quantity: 1,
+        is_container: false,
+        container_capacity_lbs: None,
+        container_volume_cu_ft: None,
+        volume_cu_ft: 0.1,
+        parent_container_id: None,
+        is_equipped: false,
+        is_attuned: false,
+        is_cursed: false,
+        is_curse_revealed: false,
+        true_state: serde_json::json!({}),
+        perceived_state: serde_json::json!({}),
+    }
+}
+
+/// Rewinding past an ITEM_TRANSFERRED must move the item BACK to where the
+/// event's "from_container_id" says it lived (root here), exactly like a
+/// rewind past a shove restores the pre-push position.
+#[test]
+fn test_safety_rewind_past_item_transfer_restores_prior_placement() {
+    let mut session = session_with_pair();
+    let (owner, _other): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let chest_id = uuid::Uuid::new_v4();
+    let sword_id = uuid::Uuid::new_v4();
+    let mut chest = plain_item(chest_id, "Chest", 5.0);
+    chest.is_container = true;
+    let owner_entity = session.entities.get_mut(&owner).unwrap();
+    owner_entity.inventory.add_item(chest);
+    owner_entity.inventory.add_item(plain_item(sword_id, "Sword", 3.0));
+
+    let baseline_seq = session.ledger.current_sequence;
+    append_and_seq(
+        &mut session,
+        owner,
+        "ITEM_TRANSFERRED",
+        serde_json::json!({
+            "item_id": sword_id.to_string(),
+            "container_id": chest_id.to_string(),
+            "from_container_id": null,
+        }),
+    );
+    // The live transfer really moved it.
+    session
+        .entities
+        .get_mut(&owner)
+        .unwrap()
+        .inventory
+        .items
+        .get_mut(&sword_id)
+        .unwrap()
+        .parent_container_id = Some(chest_id);
+
+    session.safety_rewind(baseline_seq);
+
+    assert_eq!(
+        session.entities[&owner].inventory.items[&sword_id].parent_container_id,
+        None,
+        "rewind past the transfer must put the sword back at the root"
+    );
+}
+
+/// A transfer that SURVIVES the rewind keeps its effect; only transfers past
+/// the rewind point are undone (last-surviving-event-wins).
+#[test]
+fn test_safety_rewind_between_transfers_keeps_the_surviving_placement() {
+    let mut session = session_with_pair();
+    let (owner, _other): (uuid::Uuid, uuid::Uuid) = {
+        let ids: Vec<uuid::Uuid> = session.entities.keys().copied().collect();
+        (ids[0], ids[1])
+    };
+
+    let (chest_a, chest_b, ring) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let mut containers: Vec<Item> = [chest_a, chest_b]
+        .iter()
+        .map(|id| {
+            let mut c = plain_item(*id, "Chest", 5.0);
+            c.is_container = true;
+            c
+        })
+        .collect();
+    containers.push(plain_item(ring, "Ring", 0.1));
+    {
+        let inv = &mut session.entities.get_mut(&owner).unwrap().inventory;
+        for c in containers {
+            inv.add_item(c);
+        }
+    }
+
+    // First transfer survives the rewind; second is rewound past.
+    append_and_seq(
+        &mut session,
+        owner,
+        "ITEM_TRANSFERRED",
+        serde_json::json!({
+            "item_id": ring.to_string(),
+            "container_id": chest_a.to_string(),
+            "from_container_id": null,
+        }),
+    );
+    let seq_after_first = session.ledger.current_sequence;
+    append_and_seq(
+        &mut session,
+        owner,
+        "ITEM_TRANSFERRED",
+        serde_json::json!({
+            "item_id": ring.to_string(),
+            "container_id": chest_b.to_string(),
+            "from_container_id": chest_a.to_string(),
+        }),
+    );
+    let set_parent = |session: &mut GameSession, parent: Option<uuid::Uuid>| {
+        session
+            .entities
+            .get_mut(&owner)
+            .unwrap()
+            .inventory
+            .items
+            .get_mut(&ring)
+            .unwrap()
+            .parent_container_id = parent;
+    };
+    set_parent(&mut session, Some(chest_a));
+    set_parent(&mut session, Some(chest_b));
+
+    session.safety_rewind(seq_after_first);
+
+    assert_eq!(
+        session.entities[&owner].inventory.items[&ring].parent_container_id,
+        Some(chest_a),
+        "the surviving first transfer stays authoritative after the rewind"
+    );
+}
+
 // --- Audit iteration 14 / F11: validate_ingress must enforce its docstring ---
 
 use vtt_core::SessionMap;

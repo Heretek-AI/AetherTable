@@ -2273,12 +2273,15 @@ async fn resolve_shove_action(
         // Ledge-convention gates run BEFORE the Action is spent: a malformed
         // ledge request must never consume the turn.
         if let Some(ledge_z) = req.ledge_target_z {
-            if !ledge_z.is_finite() {
+            if !landing_z_in_bounds(ledge_z) {
                 return reject(
                     &data,
                     422,
                     "INVALID_LEDGE_Z",
-                    "ledge_target_z must be a finite elevation",
+                    &format!(
+                        "ledge_target_z must be a finite elevation between {MIN_LANDING_Z_FEET} and {MAX_LANDING_Z_FEET} feet (got {})",
+                        ledge_z
+                    ),
                 );
             }
             if req.shove_effect != ShoveEffectChoice::Push5Feet {
@@ -2574,6 +2577,21 @@ async fn resolve_fall_action(
                 422,
                 "NON_FINITE_POSITION",
                 "the entity's stored position is not finite",
+            );
+        }
+
+        if !landing_z_in_bounds(req.target_z) {
+            // Off-map landings are refused, not resolved: a target_z of
+            // -10000 used to come back as a guaranteed instant death (audit
+            // F-A4#6). Pits below ground stay legal inside the bounded stack.
+            return reject(
+                &data,
+                422,
+                "INVALID_TARGET_Z",
+                &format!(
+                    "target_z must be a finite elevation between {MIN_LANDING_Z_FEET} and {MAX_LANDING_Z_FEET} feet (got {})",
+                    req.target_z
+                ),
             );
         }
 
@@ -3966,8 +3984,19 @@ async fn transfer_item(
             return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
         }
 
-        // Engine-owned verdict: weight AND volume limits, nested contents
-        // included. A refusal here leaves the inventory untouched.
+        // Where the item lives NOW, recorded in the ledger event so an X-card
+        // rewind past the transfer can put it back (audit F-A4#7). Null =
+        // it was loose at the root.
+        let prior_placement = session
+            .entities
+            .get(&req.entity_id)
+            .and_then(|entity| entity.inventory.items.get(&req.item_id))
+            .map(|item| item.parent_container_id)
+            .unwrap_or(None);
+
+        // Engine-owned verdict: weight AND volume limits, nested contents AND
+        // every ancestor's limits included. A refusal here leaves the
+        // inventory untouched.
         let outcome = {
             let entity = session.entities.get_mut(&req.entity_id).expect("checked above");
             entity.inventory.reparent_item_into_container(&req.item_id, &req.container_id)
@@ -3984,6 +4013,7 @@ async fn transfer_item(
                     serde_json::json!({
                         "item_id": req.item_id.to_string(),
                         "container_id": req.container_id.to_string(),
+                        "from_container_id": prior_placement,
                     }),
                 );
                 HttpResponse::Ok().json(serde_json::json!({
@@ -3991,16 +4021,26 @@ async fn transfer_item(
                     "entity_id": req.entity_id,
                     "item_id": req.item_id,
                     "container_id": req.container_id,
+                    "from_container_id": prior_placement,
                 }))
             }
             Err(e) => {
+                // Every refusal counts exactly once against the rejection
+                // metric — numeric overfills and structural refusals alike
+                // (audit F-A4#9) — so count here instead of relying on the
+                // shared `reject` helper in only one of the two branches.
+                data.count_rejected();
                 if e.violations.is_empty() {
                     // Structural refusals (unknown container / not a container /
-                    // self-nesting): distinct codes, still a client error.
+                    // self-nesting / parent cycle): distinct codes, still a
+                    // client error.
                     let status = if e.code == "ITEM_NOT_FOUND" { 404 } else { 422 };
-                    reject(&data, status, &e.code, &e.summary())
+                    HttpResponse::build(
+                        actix_web::http::StatusCode::from_u16(status)
+                            .unwrap_or(actix_web::http::StatusCode::BAD_REQUEST),
+                    )
+                    .json(serde_json::json!({"error": e.code, "detail": e.summary()}))
                 } else {
-                    data.count_rejected();
                     HttpResponse::build(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY)
                         .json(serde_json::json!({
                             "error": e.code,
@@ -4949,6 +4989,19 @@ macro_rules! validated_grid_or_reject {
 /// Feet per cell assumed by every stateless spatial route payload (world
 /// coordinates in these requests are plain feet on a 5 ft grid).
 const SPATIAL_CELL_SIZE_FEET: f32 = 5.0;
+
+/// Inclusive elevation bounds (feet) for any client-supplied fall or ledge
+/// landing elevation. Tied to the same budget as [`MAX_SPATIAL_Z`]: one
+/// stack of layers `SPATIAL_CELL_SIZE_FEET` thick above and below the ground
+/// plane. Anything outside is off-map — a `-10000` "ledge" used to resolve as
+/// a guaranteed-death fall instead of an honest 422 (audit F-A4#6).
+pub const MIN_LANDING_Z_FEET: f32 = -(MAX_SPATIAL_Z as f32) * SPATIAL_CELL_SIZE_FEET;
+pub const MAX_LANDING_Z_FEET: f32 = (MAX_SPATIAL_Z as f32) * SPATIAL_CELL_SIZE_FEET;
+
+/// True when a client-supplied landing elevation is finite and on-map.
+fn landing_z_in_bounds(z: f32) -> bool {
+    z.is_finite() && (MIN_LANDING_Z_FEET..=MAX_LANDING_Z_FEET).contains(&z)
+}
 
 /// Upper bound on elevated-voxel entries so a `z_layers > 1` payload cannot
 /// smuggle past the flat-list ceiling via `solid_cells_3d`.

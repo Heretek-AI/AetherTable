@@ -8241,6 +8241,357 @@ async fn nested_pouch_contents_are_enforced_transitively_via_http() {
     assert_eq!(body["error"], "CONTAINER_OVERFILLED");
 }
 
+// --- Iterations 61-62 (audit F-A4#4/#5/#6/#7/#9) -----------------------------
+
+/// F-A4#4 over the wire: filling a pouch INSIDE a chest must be refused by the
+/// CHEST once its limit would blow, and the refusal must name the chest.
+#[actix_web::test]
+async fn item_transfer_that_overfills_an_ancestor_names_the_ancestor() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-61", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(10.0), Some(100.0));
+    // The pouch carries NO limits of its own — only the ancestor can catch this.
+    let pouch = container_json(Uuid::new_v4(), "Pouch", 0.5, None, None);
+    let sword = item_json(Uuid::new_v4(), "Sword", 3.0, 1);
+    let mace = item_json(Uuid::new_v4(), "Mace", 8.0, 1);
+    let (session_id, hero_id) = spawn_hero_with_inventory(
+        &app,
+        &auth,
+        vec![chest.clone(), pouch.clone(), sword.clone(), mace.clone()],
+    )
+    .await;
+
+    async fn transfer(
+        app: &impl Service<
+            actix_http::Request,
+            Response = ServiceResponse<EitherBody<BoxBody>>,
+            Error = actix_web::Error,
+        >,
+        auth: &(actix_web::http::header::HeaderName, String),
+        session_id: Uuid,
+        hero_id: Uuid,
+        item_id: &Uuid,
+        container_id: &Uuid,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": hero_id,
+                "item_id": item_id,
+                "container_id": container_id
+            }))
+            .to_request();
+        let res = test::call_service(app, req).await;
+        let status = res.status();
+        let raw = test::read_body(res).await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+        (status, value)
+    }
+
+    // Nest the pouch into the chest first (spawn lays everything at the root).
+    let (status, body) = transfer(
+        &app,
+        &auth,
+        session_id,
+        hero_id,
+        &pouch["id"].as_str().unwrap().parse().unwrap(),
+        &chest["id"].as_str().unwrap().parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // Sword into the pouch: chest projected at 0.5 + 3 = 3.5 <= 10. Fine.
+    let (status, body) = transfer(
+        &app,
+        &auth,
+        session_id,
+        hero_id,
+        &sword["id"].as_str().unwrap().parse().unwrap(),
+        &pouch["id"].as_str().unwrap().parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // Mace into the pouch: the POUCH has no limit, but the CHEST would sit at
+    // 0.5 + 3 + 8 = 11.5 > 10. Refused, naming the chest as the violator.
+    let chest_id: Uuid = chest["id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = transfer(
+        &app,
+        &auth,
+        session_id,
+        hero_id,
+        &mace["id"].as_str().unwrap().parse().unwrap(),
+        &pouch["id"].as_str().unwrap().parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], "CONTAINER_OVERFILLED");
+    assert_eq!(
+        body["container_id"], serde_json::json!(chest_id),
+        "the refusal must name the violating ANCESTOR, not the pouch"
+    );
+}
+
+/// F-A4#5 over the wire: moving a container into its own descendant is a 422
+/// CONTAINER_CYCLE even when nothing involved carries capacity limits.
+#[actix_web::test]
+async fn item_transfer_into_own_descendant_is_422_container_cycle() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-61", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let bag = container_json(Uuid::new_v4(), "Bag", 1.0, None, None);
+    let box_ = container_json(Uuid::new_v4(), "Box", 1.0, None, None);
+    let gem = item_json(Uuid::new_v4(), "Gem", 2.0, 1);
+    let (session_id, hero_id) = spawn_hero_with_inventory(
+        &app,
+        &auth,
+        vec![bag.clone(), box_.clone(), gem.clone()],
+    )
+    .await;
+
+    // Box into the bag first: legal nesting.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": box_["id"],
+            "container_id": bag["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Bag INTO ITS OWN BOX: would forge A -> B -> A and vanish from the
+    // encumbrance totals. Must be refused on structure alone.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": bag["id"],
+            "container_id": box_["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "CONTAINER_CYCLE");
+
+    // Nothing moved: the bag still sits at the root.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let items = &snap["entities"][&hero_id.to_string()]["inventory"]["items"];
+    assert_eq!(items[&bag["id"].as_str().unwrap()]["parent_container_id"], serde_json::Value::Null);
+    assert_eq!(
+        items[&box_["id"].as_str().unwrap()]["parent_container_id"],
+        serde_json::json!(bag["id"])
+    );
+}
+
+/// F-A4#6: a landing elevation far below the map's bounded stack is refused
+/// with an honest 422 instead of resolving as guaranteed death.
+#[actix_web::test]
+async fn fall_route_rejects_below_map_and_above_stack_target_z() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-fallz", "gm", TEST_SECRET);
+    let (session_id, hero_id, _) = elevated_duel(&app, &gm, 30, 10.0).await;
+
+    for absurd_z in [-10_000.0f64, 10_000.0] {
+        let (status, body) = post_fall(
+            &app,
+            &gm,
+            session_id,
+            serde_json::json!({"entity_id": hero_id, "target_z": absurd_z}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "target_z {} must be refused: {}",
+            absurd_z,
+            body
+        );
+        assert_eq!(body["error"], "INVALID_TARGET_Z", "body: {}", body);
+    }
+
+    // No ledger scar, no displacement: the fall never happened.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(fall_events(&snap).is_empty());
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["position"],
+        serde_json::json!([2.5, 2.5, 10.0]),
+        "the refused fall leaves the creature standing where it was"
+    );
+}
+
+/// F-A4#6: the shove-over-ledge convention is bounded like every other
+/// client-supplied elevation.
+#[actix_web::test]
+async fn shove_ledger_target_z_beyond_bounds_is_refused() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-ledgez", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // Adjacent duelists on a ledge at z = 20 (same staging as the working
+    // ledge-convention test).
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let mut hero = entity_with_abilities(entity_json(hero_id, "Shover", 30, 14, 0, "1d4"), 20, 10);
+    hero["position"] = serde_json::json!([2.5, 2.5, 20.0]);
+    let mut orc = entity_with_abilities(entity_json(orc_id, "Shoved", 20, 11, 0, "1d4"), 8, 8);
+    orc["position"] = serde_json::json!([2.6, 2.6, 20.0]);
+    spawn(&app, &gm, session_id, hero).await;
+    spawn(&app, &gm, session_id, orc).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/shove", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "defender_id": orc_id,
+            "shove_effect": "push_5ft",
+            "ledge_target_z": -10000.0,
+            "seed": contest_seed(5, -1, true)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "INVALID_LEDGE_Z");
+
+    // The gate runs BEFORE the Action is spent and no event was written.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(fall_events(&snap).is_empty());
+}
+
+/// F-A4#7 end-to-end: an X-card rewind past an ITEM_TRANSFERRED puts the item
+/// back where the event says it came from.
+#[actix_web::test]
+async fn rewind_past_item_transfer_restores_prior_placement() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-xfer-rewind", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(50.0), Some(50.0));
+    let sword = item_json(Uuid::new_v4(), "Sword", 3.0, 1);
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![chest.clone(), sword.clone()]).await;
+
+    let baseline_seq: u64 = {
+        let snap = snapshot_as(&app, &token, session_id).await;
+        snap["ledger"]["current_sequence"].as_u64().unwrap()
+    };
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": sword["id"],
+            "container_id": chest["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "player_id": "gm-xfer-rewind",
+            "topic": "content",
+            "target_sequence_id": baseline_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["inventory"]["items"]
+            [&sword["id"].as_str().unwrap()]["parent_container_id"],
+        serde_json::Value::Null,
+        "rewinding past the transfer must take the sword back OUT of the chest"
+    );
+}
+
+/// F-A4#9: EVERY transfer refusal counts against the rejection metric —
+/// the numeric overfill refusals AND the structural ones alike.
+#[actix_web::test]
+async fn structural_and_overfill_transfer_refusals_both_count_as_rejected() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-counts", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let rock = item_json(Uuid::new_v4(), "Rock", 1.0, 1);
+    let pebble = item_json(Uuid::new_v4(), "Pebble", 0.2, 1);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(1.0), Some(100.0));
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![rock.clone(), pebble.clone(), chest.clone()])
+            .await;
+
+    let rejected_before: u64 = {
+        let req = test::TestRequest::get().uri("/metrics").to_request();
+        let res = test::call_service(&app, req).await;
+        let body: serde_json::Value = test::read_body_json(res).await;
+        body["rejected_actions"].as_u64().unwrap()
+    };
+
+    // Structural refusal: a rock has no interior (no violations listed).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": pebble["id"],
+            "container_id": rock["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Numeric refusal: 0.2 lb pebble fits the 1 lb chest; the 1 lb rock on
+    // top blows it (0.2 + 1 = 1.2 > 1).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": pebble["id"],
+            "container_id": chest["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "pebble fits the chest");
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": rock["id"],
+            "container_id": chest["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "1.2 lbs of contents blows the 1 lb chest"
+    );
+
+    let req = test::TestRequest::get().uri("/metrics").to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let rejected_after = body["rejected_actions"].as_u64().unwrap();
+    assert!(
+        rejected_after >= rejected_before + 2,
+        "one structural AND one numeric refusal must both count: {} -> {}",
+        rejected_before,
+        rejected_after
+    );
+}
+
 // --- Tactical falls (iteration 53, PILLAR-3 gap) ------------------------------
 
 async fn post_fall(
