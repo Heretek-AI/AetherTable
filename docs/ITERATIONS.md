@@ -389,3 +389,10 @@ unknown session. Gates at this point: cargo 316/18 · pytest 839 pass/27 skip
 
 ## Iteration-60 checkpoint approaching: next = audit sweep A4 (~it.60), SonarCloud wiring,
 starter-adventure depth, live-LLM checkpoint ~it.60.
+### Iteration 59 — 024448e — fix(gateway): death audit top-level actor_id (A4 F1 blocker) — pytest 899
+### Iteration 60 — this commit — fix(server): inspiration fiat gate + grapple attribution (A4 #2/#3) — cargo 379/19
+
+## Audit sweep A4 (~it.58) — verdict: no security blockers; F1 feature-inertia blocker fixed (it.59)
+Remaining A4 design items queued: #4 ancestor-chain capacity, #5 reparent
+cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
+#8 forced-escape attribution, #9 metrics consistency.
