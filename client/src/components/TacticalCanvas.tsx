@@ -29,6 +29,10 @@ import {
 } from '../render/fog_overlay';
 import { WeatherEffectsManager, WeatherType } from '../render/weather_effects';
 import { PixiBoard } from '../render/pixi_board';
+import {
+  elevationOffsetPx,
+  groundShadowFor,
+} from '../render/elevation_projection';
 import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
 import type { YjsCrdtClient } from '../sync/yjs_doc_client';
@@ -845,6 +849,16 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             const isSelected = selectedTokenId === token.id;
             const isDragging = draggedTokenId === token.id;
 
+            // Pillar 9 elevation projection (render/elevation_projection.ts):
+            // pure 2.5D convention — sprite stack lifts by ~4px/ft while a soft
+            // ground shadow stays pinned to the board cell and shrinks/fades.
+            // PRESENTATION ONLY: lighting, fog seeding, occlusion and spatial
+            // audio all consume raw grid coords below and must never see these
+            // pixel offsets (they are applied exactly once, here).
+            const elevationFeet = token.elevationFeet ?? 0;
+            const elevationOffset = elevationOffsetPx(elevationFeet);
+            const groundShadow = groundShadowFor(elevationFeet, cellSize);
+
             return (
               <div
                 key={token.id}
@@ -876,8 +890,38 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   top: `${token.y * cellSize}px`,
                   width: `${cellSize}px`,
                   height: `${cellSize}px`,
+                  // Airborne tokens read above grounded ones; the selected rung
+                  // (z-30 class) still wins, so selection styling is untouched.
+                  zIndex: !isSelected && elevationOffset > 0 ? 20 : undefined,
                 }}
               >
+                {/* Ground shadow ellipse: pinned to the board cell (NOT lifted
+                    with the sprite) so the gap between shadow and token body
+                    is what reads as altitude. Deterministic from elevation. */}
+                {elevationFeet > 0 && (
+                  <div
+                    className="absolute rounded-[50%] bg-black pointer-events-none"
+                    aria-hidden="true"
+                    style={{
+                      width: `${groundShadow.widthPx}px`,
+                      height: `${groundShadow.heightPx}px`,
+                      left: `${(cellSize - groundShadow.widthPx) / 2}px`,
+                      top: `${cellSize - groundShadow.heightPx / 2 - cellSize * 0.14}px`,
+                      opacity: groundShadow.opacity,
+                      filter: 'blur(3px)',
+                    }}
+                  />
+                )}
+
+                {/* Lifted sprite stack: everything that belongs to the token
+                    body (rings, badge, disc, hp bar, label) translates up by
+                    the projected offset; the shadow above does not move. */}
+                <div
+                  className="absolute inset-0 flex flex-col items-center justify-center transition-transform duration-200 ease-out"
+                  style={{
+                    transform: `translateY(-${elevationOffset}px)`,
+                  }}
+                >
                 {/* Dynamic Token Aura Field (10ft Paladin Aura / Spirit Guardians) */}
                 {isSelected && (
                   <div
@@ -934,6 +978,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 <span className="text-[10px] font-mono font-semibold text-parchment-aged px-1.5 py-0.5 bg-black/70 border border-tavern-border rounded mt-0.5 backdrop-blur-md whitespace-nowrap shadow">
                   {token.name}
                 </span>
+                </div>
               </div>
             );
           })}
