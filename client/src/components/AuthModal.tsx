@@ -250,11 +250,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 onChange={(e) => setRole(e.target.value as UserRole)}
                 className="vtt-select w-full text-xs"
               >
+                {/* Self-service roles only (server _SELF_SERVICE_ROLES): the
+                    gateway 422s any attempt to self-assign 'gm' or 'admin' —
+                    staff roles are bootstrapped via VTT_ADMIN_EMAILS. */}
                 <option value="player">Player Character (Hero)</option>
-                <option value="gm">Dungeon Master (GM)</option>
-                <option value="admin">Platform Administrator</option>
                 <option value="spectator">Spectator / Viewer</option>
               </select>
+              <p className="text-[10px] text-[var(--rp-parchment-300)] mt-1">
+                GM and admin seats are provisioned by your table's operator, not self-assigned.
+              </p>
             </div>
 
             <button

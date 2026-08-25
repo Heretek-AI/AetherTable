@@ -3,8 +3,8 @@
  *
  * Iteration-5 gateway hardening made POST /api/v1/safety/x-card require an
  * HMAC session token (`token: str = Depends(_require_auth)` in server.py).
- * The wrapper MUST append ?token= exactly like api/rules_engine.ts and
- * api/lore_store.ts do — header-only auth would still 401.
+ * Iteration-13 (F14) flipped the transport: the token rides the Authorization:
+ * Bearer header — NEVER the URL, which proxy/access logs record verbatim.
  *
  * The wrapper surfaces NOT_SIGNED_IN / HTTP_ERROR / UNREACHABLE so the UI
  * can render honest states instead of a generic "Intervention recorded
@@ -62,7 +62,7 @@ describe('safety X-card identity contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('appends ?token= and posts the x-card body verbatim', async () => {
+  it('sends the Bearer header (never a URL token) and posts the x-card body verbatim', async () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => ({
       ok: true,
@@ -82,7 +82,11 @@ describe('safety X-card identity contract', () => {
     });
     expect(result.kind).toBe('OK');
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe(`/api/v1/safety/x-card?token=${encodeURIComponent(TOKEN)}`);
+    expect(calls[0].url).toBe('/api/v1/safety/x-card');
+    // F14: identity rides the Authorization header, never the query string.
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      `Bearer ${TOKEN}`,
+    );
     expect(calls[0].init.method).toBe('POST');
     const body = JSON.parse(String(calls[0].init.body));
     expect(body).toMatchObject({
@@ -91,6 +95,19 @@ describe('safety X-card identity contract', () => {
       current_sequence_id: 50,
       engine_session_id: 'sess-abc',
     });
+  });
+
+  it('honors an explicitly-passed token over stored state (still header-only)', async () => {
+    store.set('aethertable_token', TOKEN);
+    const calls = stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    await triggerXCard(
+      { player_id: 'p', topic: 't', current_sequence_id: 1, engine_session_id: null },
+      'override.sig.token',
+    );
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      'Bearer override.sig.token',
+    );
+    expect(calls[0].url).toBe('/api/v1/safety/x-card');
   });
 
   it('treats an anonymous 401 from the gateway as HTTP_ERROR', async () => {

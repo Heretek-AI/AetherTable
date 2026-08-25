@@ -3,10 +3,11 @@
  *
  * Iteration-5 gateway hardening: POST /api/v1/safety/x-card now requires an
  * HMAC session token (`token: str = Depends(_require_auth)` in server.py) and
- * 401s anonymous callers. The token rides the standard `?token=` query
- * parameter — every other authenticated gateway call in this codebase
- * (heal/rest/maneuvers/lore/assert/engine/*) uses the same pattern, so we
- * stay consistent instead of inventing a new auth header.
+ * 401s anonymous callers. The token rides the standard `Authorization: Bearer`
+ * header — every other authenticated HTTP gateway call in this codebase uses
+ * the same helper (api/auth_headers.ts), and tokens never ride the query
+ * string on HTTP flows because URLs leak into proxy/access logs (WebSocket
+ * clients are the documented exception).
  *
  * The response body shape is unchanged: the engine's
  * `safety_rewind`/`XCardRequest` flow returns 200 with an `engine_rewind`
@@ -16,7 +17,7 @@
  * rest of api/*.
  */
 
-import { getStoredToken } from './auth_headers';
+import { authHeaders, getStoredToken } from './auth_headers';
 
 export interface XCardRequestBody {
   player_id: string;
@@ -33,8 +34,8 @@ export type XCardFailure =
 
 /**
  * POST an x-card intervention to the gateway with the caller's stored
- * session token in the query string. Returns the parsed body on success or a
- * structured failure so callers can render honest UI states.
+ * session token in the Authorization header. Returns the parsed body on
+ * success or a structured failure so callers can render honest UI states.
  */
 export async function triggerXCard(
   body: XCardRequestBody,
@@ -53,14 +54,13 @@ export async function triggerXCard(
   }
 
   try {
-    const resp = await fetch(
-      `/api/v1/safety/x-card?token=${encodeURIComponent(sessionToken)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      },
-    );
+    const resp = await fetch('/api/v1/safety/x-card', {
+      method: 'POST',
+      // The caller's (possibly explicitly-passed) token rides the Bearer
+      // header; authHeaders() alone would ignore the override argument.
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify(body),
+    });
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try {

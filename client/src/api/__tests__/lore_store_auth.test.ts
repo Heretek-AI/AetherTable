@@ -2,9 +2,10 @@
  * Unit tests for the identity + tier contract of src/api/lore_store.ts.
  *
  * Iteration-5 gateway hardening pinned two policies:
- *  - POST /api/v1/lore/assert requires an HMAC session token; ?token= like
- *    every other authenticated gateway call (the endpoint reads the token
- *    out of a REQUIRED QUERY PARAM in server.py).
+ *  - POST /api/v1/lore/assert requires an HMAC session token, resolved by the
+ *    gateway's `_require_auth` (Bearer header first, query back-compat).
+ *    Iteration-13 (F14) sends the Authorization: Bearer header — the URL is
+ *    logged verbatim by proxies, so tokens must never ride in it.
  *  - Server-side epistemic ladder: every assertion ENTERS at SUBJECTIVE_RUMOR.
  *    A non-GM caller posting PROPOSED_FACT receives 403 LORE_TIER_FORBIDDEN
  *    (an honest refusal, never a silent downgrade). The client must default
@@ -61,7 +62,7 @@ describe('lore assert identity contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('appends ?token= and defaults epistemic_tier to SUBJECTIVE_RUMOR', async () => {
+  it('sends the Bearer header (never a URL token) and defaults epistemic_tier to SUBJECTIVE_RUMOR', async () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => ({
       ok: true,
@@ -75,7 +76,11 @@ describe('lore assert identity contract', () => {
     const result = await assertLore('house_vane', 'sworn_enemy_of', 'house_silverpeak');
     expect(result).toMatchObject({ outcome: 'STAGED', epistemicTier: 'SUBJECTIVE_RUMOR' });
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe(`/api/v1/lore/assert?token=${encodeURIComponent(TOKEN)}`);
+    expect(calls[0].url).toBe('/api/v1/lore/assert');
+    // F14: identity rides the Authorization header, never the query string.
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      `Bearer ${TOKEN}`,
+    );
     expect(calls[0].init.method).toBe('POST');
     const body = JSON.parse(String(calls[0].init.body));
     expect(body).toMatchObject({

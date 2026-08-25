@@ -71,7 +71,7 @@ import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, localD20, formulaModifier, ensureEngineSession } from './api/rules_engine';
-import { getStoredToken } from './api/auth_headers';
+import { authHeaders, getStoredToken } from './api/auth_headers';
 import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
@@ -734,14 +734,14 @@ export function App() {
         setCombatSessionId(sessionId);
       }
       // The gateway's read proxy is authenticated (_require_auth: Bearer
-      // header or ?token= back-compat);
-      // the stored session token rides in the query string like every other
-      // /api/v1/engine/* browser call (see api/rules_engine.ts).
+      // header first, legacy ?token= back-compat); the stored session token
+      // rides in the Authorization header like every other /api/v1/engine/*
+      // browser HTTP call (see api/rules_engine.ts).
       const token = getStoredToken();
-      const authSuffix = token ? `?token=${encodeURIComponent(token)}` : '';
-      const resp = await fetch(`/api/v1/engine/session-state${authSuffix}`, {
+      if (!token) return;
+      const resp = await fetch('/api/v1/engine/session-state', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ session_id: sessionId }),
       });
       if (!resp.ok) return;
@@ -788,9 +788,9 @@ export function App() {
         addSystemMessage('🔒 Sign in to roll initiative — the engine proxies require a session token.');
         return;
       }
-      const resp = await fetch(`/api/v1/engine/combat/begin?token=${encodeURIComponent(beginToken)}`, {
+      const resp = await fetch('/api/v1/engine/combat/begin', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ session_id: sessionId }),
       });
       if (!resp.ok) {
@@ -830,9 +830,9 @@ export function App() {
           addSystemMessage('🔒 Sign in to end combat — the engine proxies require a session token.');
           return;
         }
-        const resp = await fetch(`/api/v1/engine/combat/end?token=${encodeURIComponent(endToken)}`, {
+        const resp = await fetch('/api/v1/engine/combat/end', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify({ session_id: combatSessionId }),
         });
         if (!resp.ok) {
@@ -875,16 +875,16 @@ export function App() {
     // include (opportunity-attack provocations, concentration saves) — is
     // captured raw and handed to InitiativeTracker, which displays only what
     // is actually present. The previous fire-and-forget version also sent NO
-    // session token, so the gateway's `token: str = Query(...)` route 401'd
-    // every call and nothing ever converged.
+    // session token, so the (then query-param-only) gateway route 401'd every
+    // call and nothing ever converged; identity now rides the Bearer header.
     if (combat.in_combat && combatSessionId) {
       const nextToken = getStoredToken();
       if (!nextToken) {
         addSystemMessage('🔒 Sign in so turn advances reach the authoritative engine.');
       } else {
-        void fetch(`/api/v1/engine/turn-next?token=${encodeURIComponent(nextToken)}`, {
+        void fetch('/api/v1/engine/turn-next', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify({ session_id: combatSessionId }),
         })
           .then(async (resp) => {
@@ -916,10 +916,10 @@ export function App() {
     try {
       // Iteration-10 gateway hardening: the stream endpoint requires an HMAC
       // session token (any seat may narrate — this is a model-spend gate, and
-      // anonymous calls now 401). openNarrativeStream appends ?token= exactly
-      // like api/rules_engine.ts / api/safety_xcard.ts and surfaces
-      // NOT_SIGNED_IN / HTTP_ERROR honestly instead of stalling the "..."
-      // DM bubble forever.
+      // anonymous calls now 401). openNarrativeStream sends the Authorization
+      // Bearer header exactly like api/rules_engine.ts / api/safety_xcard.ts
+      // and surfaces NOT_SIGNED_IN / HTTP_ERROR honestly instead of stalling
+      // the "..." DM bubble forever.
       const opened = await openNarrativeStream({
         user_intent: userIntent,
         engine_execution_payload: enginePayload,
@@ -1257,8 +1257,8 @@ export function App() {
     // Apply the rewind against the authoritative engine ledger when online.
     const sessionId = await ensureEngineSession();
     // Iteration 5: the x-card endpoint requires an HMAC session token;
-    // triggerXCard appends ?token= exactly like heal/rest/maneuvers in
-    // api/rules_engine.ts and surfaces NOT_SIGNED_IN / HTTP_ERROR honestly.
+    // triggerXCard sends the Bearer header exactly like heal/rest/maneuvers
+    // in api/rules_engine.ts and surfaces NOT_SIGNED_IN / HTTP_ERROR honestly.
     triggerXCard({
       player_id: currentUser.id,
       topic,

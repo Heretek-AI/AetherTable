@@ -7,10 +7,10 @@
  *
  * Endpoint notes (python/vtt_orchestrator/server.py):
  * - GET  /api/v1/npc/        public persona metadata (id/name/role only).
- * - POST /api/v1/lore/assert requires an HMAC session token, and unlike most
- *   routes in this gateway the token arrives as a REQUIRED QUERY PARAM
- *   (`token: str = Query(...)`), not the Authorization header. We therefore
- *   send `?token=` here; header auth alone would 422.
+ * - POST /api/v1/lore/assert requires an HMAC session token, resolved through
+ *   `_require_auth` (Authorization: Bearer header first; the legacy `?token=`
+ *   query param remains as back-compat). We send the header — tokens in URLs
+ *   leak into proxy/access logs.
  *
  * Tier policy (server-enforced, never overridden client-side): every
  * assertion ENTERS at SUBJECTIVE_RUMOR; the gateway's auth model rejects any
@@ -31,7 +31,7 @@
  * results surfaced verbatim to the UI via the AssertLoreResult union.
  */
 
-import { getStoredToken } from './auth_headers';
+import { getStoredToken } from './auth_headers'; // header built inline below (token may be passed explicitly)
 
 export interface NpcPersona {
   id: string;
@@ -121,10 +121,13 @@ export async function assertLore(
   };
 
   try {
-    // Token rides the query string because that is where THIS endpoint reads it.
-    const resp = await fetch(`/api/v1/lore/assert?token=${encodeURIComponent(sessionToken)}`, {
+    // Token rides the Authorization header (the gateway's `_token_from`
+    // resolves Bearer first); it never lands in the URL, which proxy and
+    // access logs record verbatim. Built inline because callers may pass an
+    // explicit token that overrides stored state.
+    const resp = await fetch('/api/v1/lore/assert', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
       body: JSON.stringify(body),
     });
 

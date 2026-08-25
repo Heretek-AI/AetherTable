@@ -19,7 +19,7 @@
  * otherwise.
  */
 
-import { getStoredToken } from './auth_headers';
+import { authHeaders, getStoredToken } from './auth_headers';
 
 /* --- Live compendium ------------------------------------------------------ */
 
@@ -351,10 +351,10 @@ export function buildMonsterEntity(
 
 /**
  * Spawn ONE monster into an engine session through the gateway proxy. The
- * route declares `token: str = Query(...)`, so the gateway session token is
- * appended to the URL (same convention as engineHeal/engineRest in
- * rules_engine.ts). A GM seat is required: the engine rejects monster spawns
- * from non-GM seats with MONSTER_SPAWN_FORBIDDEN. Rejections come back
+ * caller's identity rides the Authorization: Bearer header (same convention
+ * as engineHeal/engineRest in rules_engine.ts; tokens never ride the query
+ * string on HTTP flows). A GM seat is required: the engine rejects monster
+ * spawns from non-GM seats with MONSTER_SPAWN_FORBIDDEN. Rejections come back
  * verbatim in the outcome union — including FORBIDDEN_ROLE,
  * MONSTER_SPAWN_FORBIDDEN and OWNERSHIP_CLAIM_FORBIDDEN — and NOTHING is
  * applied locally on failure.
@@ -390,9 +390,9 @@ export async function spawnMonsterToEngine(params: {
     };
   }
   try {
-    const resp = await fetch(`/api/v1/engine/spawn?token=${encodeURIComponent(token)}`, {
+    const resp = await fetch('/api/v1/engine/spawn', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         session_id: params.sessionId,
         entity: built.entity,

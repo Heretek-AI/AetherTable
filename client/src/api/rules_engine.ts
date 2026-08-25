@@ -6,11 +6,14 @@
  * the engine is unreachable so callers can fall back to local rolling and the
  * demo never hard-blocks.
  *
- * EVERY /api/v1/engine/* call carries the caller's identity (?token= like all
- * other engine calls in this file) — the gateway 401s anonymous requests
- * instead of resolving combat under its service principal. Signed-out callers
- * get the local-dice fallback for read-style helpers, and an explicit
- * NOT_AUTHENTICATED rejection on mutating ones.
+ * EVERY /api/v1/engine/* call carries the caller's identity via the
+ * Authorization: Bearer header (like every other HTTP call in api/*) — the
+ * gateway 401s anonymous requests instead of resolving combat under its
+ * service principal. Signed-out callers get the local-dice fallback for
+ * read-style helpers, and an explicit NOT_AUTHENTICATED rejection on mutating
+ * ones. Tokens never ride the query string: URLs leak into proxy/access logs,
+ * which is exactly what gateway docstrings warn about (WebSocket clients are
+ * the documented exception — browsers cannot set headers on the handshake).
  *
  * Mutating actions (heal/rest) additionally report WHY they failed — the
  * gateway surfaces the engine's authoritative rejection verbatim (see
@@ -18,7 +21,7 @@
  * honest feedback like CANNOT_HEAL_DEAD instead of a silent no-op.
  */
 
-import { getStoredToken } from './auth_headers';
+import { authHeaders, getStoredToken } from './auth_headers';
 
 export interface EngineAttackResult {
   attack_roll: number;
@@ -40,18 +43,18 @@ export interface EngineCheckResult {
 
 /**
  * POST an authenticated engine-proxy call. The stored session token rides in
- * the query string exactly like every other /api/v1/engine/* call in this
- * file (heal/rest/maneuvers); the gateway 401s tokenless requests rather than
- * resolving anything anonymously. Returns null when signed out or unreachable
- * so dice helpers can fall back to local rolling.
+ * the Authorization: Bearer header exactly like every other /api/v1/engine/*
+ * HTTP call in this file (heal/rest/maneuvers); the gateway 401s tokenless
+ * requests rather than resolving anything anonymously. Returns null when
+ * signed out or unreachable so dice helpers can fall back to local rolling.
  */
 async function enginePost<T>(path: string, body: unknown): Promise<T | null> {
   const token = getStoredToken();
   if (!token) return null;
   try {
-    const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
+    const resp = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(body),
     });
     if (!resp.ok) return null;
@@ -180,13 +183,13 @@ function rejectionFrom(status: number, payload: unknown): EngineActionOutcome<ne
  * POST variant used by mutating actions. Every gateway engine proxy resolves
  * its caller through `_require_auth` (Authorization Bearer header first,
  * legacy ?token= query param as back-compat); like all other calls in this
- * file these append ?token= so the request stays attributable either way.
+ * file these send the Bearer header so the token never lands in a URL.
  */
 async function engineActionPost<T>(path: string, body: unknown): Promise<EngineActionOutcome<T>> {
   try {
     const resp = await fetch(path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(body),
     });
     const payload: unknown = await resp.json().catch(() => null);
@@ -221,7 +224,7 @@ export async function engineHeal(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineHealResult>(
-    `/api/v1/engine/heal?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/heal`,
     {
       session_id: params.sessionId,
       entity_id: params.entityId,
@@ -242,7 +245,7 @@ export async function engineRest(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineRestResult>(
-    `/api/v1/engine/rest?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/rest`,
     {
       session_id: params.sessionId,
       kind: params.kind,
@@ -256,8 +259,8 @@ export async function engineRest(params: {
  * the engine rolls the contests against server-side stat blocks and either
  * applies them to its ledger or refuses with a machine code the UI quotes
  * verbatim (ATTACKER_NOT_FOUND, OUT_OF_REACH, ACTION_ECONOMY_EXHAUSTED, …).
- * These calls append ?token= exactly like engineHeal/engineRest so the gateway
- * forwards the real caller to the engine's RBAC.
+ * These calls carry the Bearer header exactly like engineHeal/engineRest so
+ * the gateway forwards the real caller to the engine's RBAC.
  */
 
 /** Verbatim body of POST /api/v1/sessions/{id}/action/grapple. */
@@ -352,7 +355,7 @@ export async function engineGrapple(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineGrappleResult>(
-    `/api/v1/engine/grapple?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/grapple`,
     {
       session_id: params.sessionId,
       attacker_id: params.attackerId,
@@ -372,7 +375,7 @@ export async function engineShove(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineShoveResult>(
-    `/api/v1/engine/shove?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/shove`,
     {
       session_id: params.sessionId,
       attacker_id: params.attackerId,
@@ -390,7 +393,7 @@ export async function engineDodge(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineStandardActionResult>(
-    `/api/v1/engine/dodge?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/dodge`,
     { session_id: params.sessionId, entity_id: params.entityId },
   );
 }
@@ -403,7 +406,7 @@ export async function engineDash(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineStandardActionResult>(
-    `/api/v1/engine/dash?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/dash`,
     { session_id: params.sessionId, entity_id: params.entityId },
   );
 }
@@ -416,7 +419,7 @@ export async function engineDisengage(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineStandardActionResult>(
-    `/api/v1/engine/disengage?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/disengage`,
     { session_id: params.sessionId, entity_id: params.entityId },
   );
 }
@@ -430,7 +433,7 @@ export async function engineStabilize(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineStabilizeResult>(
-    `/api/v1/engine/stabilize?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/stabilize`,
     {
       session_id: params.sessionId,
       healer_id: params.healerId,
@@ -486,7 +489,7 @@ export async function engineOffhandAttack(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineOffhandResult>(
-    `/api/v1/engine/offhand?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/offhand`,
     {
       session_id: params.sessionId,
       attacker_id: params.attackerId,
@@ -509,7 +512,7 @@ export async function engineHelp(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN;
   return engineActionPost<EngineHelpResult>(
-    `/api/v1/engine/help?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/help`,
     {
       session_id: params.sessionId,
       helper_id: params.helperId,
@@ -670,7 +673,7 @@ export async function engineCastSpell(params: {
     result?: EngineCastSpellOutcome;
     target_was_present?: boolean;
   }>(
-    `/api/v1/engine/cast-spell?token=${encodeURIComponent(token)}`,
+    `/api/v1/engine/cast-spell`,
     {
       session_id: params.sessionId,
       caster_id: params.casterId,
@@ -755,7 +758,7 @@ export async function engineSessionRoster(
   if (!token) return NOT_SIGNED_IN;
   const outcome = await engineActionPost<{
     entities?: Record<string, Record<string, unknown>>;
-  }>(`/api/v1/engine/session-state?token=${encodeURIComponent(token)}`, {
+  }>(`/api/v1/engine/session-state`, {
     session_id: sessionId,
   });
   if (outcome.kind === 'applied') {
@@ -797,8 +800,9 @@ export type EngineMapGenerateOutcome =
  * Generate a dungeon through the authoritative WFC solver. Same seed ⇒
  * byte-identical tile grid (engine-side RNG); omitting the seed lets the
  * engine apply its documented default (1337). Authenticated like every other
- * engine call: the stored session token rides in ?token= and a signed-out
- * caller gets an explicit NOT_AUTHENTICATED rejection (no anonymous map gen).
+ * engine call: the stored session token rides in the Authorization header and
+ * a signed-out caller gets an explicit NOT_AUTHENTICATED rejection (no
+ * anonymous map gen).
  *
  * Failure mapping note: vtt-server answers a fully-exhausted solver with HTTP
  * 500 `{"error": "WFC_CONTRADICTION_EXHAUSTED after N attempts"}`, which the
@@ -823,9 +827,9 @@ export async function engineGenerateMap(params: {
   const token = getStoredToken();
   if (!token) return NOT_SIGNED_IN_MAP;
   try {
-    const resp = await fetch(`/api/v1/engine/map/generate?token=${encodeURIComponent(token)}`, {
+    const resp = await fetch('/api/v1/engine/map/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         width: params.width,
         height: params.height,
@@ -894,7 +898,7 @@ export async function engineSessionEntities(
   const outcome = await engineActionPost<{
     session_id: string;
     entities?: Record<string, Record<string, unknown>>;
-  }>(`/api/v1/engine/session-state?token=${encodeURIComponent(token)}`, {
+  }>(`/api/v1/engine/session-state`, {
     session_id: sessionId,
   });
   if (outcome.kind === 'applied') {

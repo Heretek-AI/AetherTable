@@ -1,14 +1,33 @@
 /**
  * Unit tests for the identity contract of src/api/rules_engine.ts.
  *
- * Audit remediation regression guard: every browser-originated
- * /api/v1/engine/* call must carry the caller's stored session token
- * (?token= like heal/rest), and a signed-out caller must NEVER hit the
- * gateway anonymously — dice helpers fall back to null (local dice) and
- * mutating ones surface an explicit NOT_AUTHENTICATED rejection.
+ * Audit remediation regression guard (F14): every browser-originated HTTP
+ * /api/v1/engine/* call must carry the caller's stored session token in the
+ * Authorization: Bearer header — NEVER in the URL, which proxy/access logs
+ * record verbatim. A signed-out caller must NEVER hit the gateway anonymously:
+ * dice helpers fall back to null (local dice) and mutating ones surface an
+ * explicit NOT_AUTHENTICATED rejection. WebSocket clients are exempt (they
+ * keep ?token= because browsers cannot set headers on the WS handshake).
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { engineAttack, engineCheck, engineGenerateMap } from '../rules_engine';
+import {
+  engineAttack,
+  engineCastSpell,
+  engineCheck,
+  engineDash,
+  engineDisengage,
+  engineDodge,
+  engineGenerateMap,
+  engineGrapple,
+  engineHeal,
+  engineHelp,
+  engineOffhandAttack,
+  engineRest,
+  engineSessionEntities,
+  engineSessionRoster,
+  engineShove,
+  engineStabilize,
+} from '../rules_engine';
 
 const TOKEN = 'sig.payload.token';
 const store = new Map<string, string>();
@@ -47,7 +66,7 @@ describe('engine proxy identity contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('creates an attributed session, then attacks through it (?token= on both)', async () => {
+  it('creates an attributed session, then attacks through it (Bearer header on both)', async () => {
     store.set('aethertable_token', TOKEN);
     const calls: FetchCall[] = [];
     let n = 0;
@@ -69,14 +88,17 @@ describe('engine proxy identity contract', () => {
     ).resolves.toMatchObject({ is_hit: true });
     expect(calls).toHaveLength(2); // session create + attack, both attributed
     for (const call of calls) {
-      expect(call.url).toContain(`token=${encodeURIComponent(TOKEN)}`);
+      expect((call.init.headers as Record<string, string>).Authorization).toBe(
+        `Bearer ${TOKEN}`,
+      );
+      expect(call.url).not.toContain('token=');
       expect(call.init.method).toBe('POST');
     }
-    expect(calls[0].url).toContain('/api/v1/engine/session?');
-    expect(calls[1].url).toContain('/api/v1/engine/attack?');
+    expect(calls[0].url).toBe('/api/v1/engine/session');
+    expect(calls[1].url).toBe('/api/v1/engine/attack');
   });
 
-  it('appends ?token= to the check proxy call', async () => {
+  it('sends the Bearer header (never a URL token) to the check proxy', async () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => ({
       ok: true,
@@ -85,7 +107,10 @@ describe('engine proxy identity contract', () => {
     await expect(engineCheck({ modifier: 3, dc: 12 })).resolves.toMatchObject({
       total: 17,
     });
-    expect(calls[0].url).toBe(`/api/v1/engine/check?token=${encodeURIComponent(TOKEN)}`);
+    expect(calls[0].url).toBe('/api/v1/engine/check');
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      `Bearer ${TOKEN}`,
+    );
   });
 
   it('refuses map generation outright when signed out', async () => {
@@ -100,7 +125,7 @@ describe('engine proxy identity contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('appends ?token= to the map generation proxy call', async () => {
+  it('sends the Bearer header (never a URL token) to the map generation proxy', async () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => ({
       ok: true,
@@ -108,7 +133,10 @@ describe('engine proxy identity contract', () => {
     }));
     const outcome = await engineGenerateMap({ width: 16, height: 12, seed: 42 });
     expect(outcome.kind).toBe('applied');
-    expect(calls[0].url).toBe(`/api/v1/engine/map/generate?token=${encodeURIComponent(TOKEN)}`);
+    expect(calls[0].url).toBe('/api/v1/engine/map/generate');
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      `Bearer ${TOKEN}`,
+    );
   });
 
   it('treats an anonymous 401 from the gateway as a rejection, not a crash', async () => {
@@ -121,5 +149,63 @@ describe('engine proxy identity contract', () => {
     const outcome = await engineGenerateMap({ width: 16, height: 12 });
     expect(outcome).toMatchObject({ kind: 'rejected', status: 401 });
     expect(calls).toHaveLength(1);
+  });
+
+  it('carries the Bearer header on EVERY mutating helper and no URL token anywhere (F14 sweep)', async () => {
+    store.set('aethertable_token', TOKEN);
+    const calls: FetchCall[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, init: (init ?? {}) as RequestInit });
+        return { ok: true, json: async () => ({}) } as unknown as Response;
+      }),
+    );
+    // cache-buster: ensureEngineSession memoizes its id across tests
+    await engineHeal({ sessionId: 's1', entityId: 'e1', amount: 5 });
+    await engineRest({ sessionId: 's1', kind: 'short' });
+    await engineGrapple({ sessionId: 's1', attackerId: 'a', defenderId: 'b', defenderSkill: 'athletics' });
+    await engineShove({ sessionId: 's1', attackerId: 'a', defenderId: 'b', shoveEffect: 'prone' });
+    await engineDodge({ sessionId: 's1', entityId: 'e1' });
+    await engineDash({ sessionId: 's1', entityId: 'e1' });
+    await engineDisengage({ sessionId: 's1', entityId: 'e1' });
+    await engineStabilize({ sessionId: 's1', healerId: 'h', targetId: 't' });
+    await engineOffhandAttack({ sessionId: 's1', attackerId: 'a', targetId: 'b' });
+    await engineHelp({ sessionId: 's1', helperId: 'h', targetEntityId: 't' });
+    await engineCastSpell({
+      sessionId: 's1',
+      casterId: 'c',
+      spell: {
+        spell_id: 'magic_missile',
+        name: 'Magic Missile',
+        level: 1,
+        school: 'evocation',
+        casting_time: '1 action',
+        range_feet: 120,
+        area_of_effect_shape: null,
+        area_of_effect_size_feet: null,
+        verbal_component: true,
+        somatic_component: true,
+        material_component_desc: null,
+        material_component_costly: false,
+        concentration: false,
+        ritual: false,
+        duration_concentration: false,
+        duration: 'Instantaneous',
+      } as never,
+      castLevel: 1,
+    });
+    await engineSessionRoster('s1');
+    await engineSessionEntities('s1');
+    expect(calls.length).toBeGreaterThanOrEqual(13);
+    for (const call of calls) {
+      expect(call.url.startsWith('/api/v1/')).toBe(true);
+      // The load-bearing assertion: NO HTTP request may put the raw token in
+      // the URL (proxy/access-log leak) — identity rides the header only.
+      expect(call.url).not.toContain('token=');
+      expect((call.init.headers as Record<string, string>).Authorization).toBe(
+        `Bearer ${TOKEN}`,
+      );
+    }
   });
 });

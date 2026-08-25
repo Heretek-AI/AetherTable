@@ -5,9 +5,9 @@
  * requires an HMAC session token (`token: str = Depends(_require_auth)` in
  * server.py) — any seat may narrate (players narrate too), but the token is
  * the model-spend gate and anonymous calls now 401. The stored token rides
- * the standard `?token=` query parameter exactly like every other
- * authenticated gateway call in this codebase (rules_engine, safety_xcard,
- * lore_store).
+ * the standard `Authorization: Bearer` header exactly like every other
+ * authenticated HTTP gateway call in this codebase (rules_engine, safety_xcard,
+ * lore_store) so it never lands in a logged URL.
  *
  * This module performs the fetch with credentials and hands the caller the
  * raw Response body plus a structured failure reason; UI concerns (chat
@@ -28,9 +28,9 @@ export type NarrativeStreamOpen =
   | { kind: 'ERROR'; failure: NarrativeStreamFailure };
 
 /**
- * Open the narrated-turn SSE stream with the caller's stored session token.
- * Returns a structured result so callers can render honest states instead of
- * silently stalling a "..." DM bubble forever.
+ * Open the narrated-turn SSE stream with the caller's stored session token in
+ * the Authorization header. Returns a structured result so callers can render
+ * honest states instead of silently stalling a "..." DM bubble forever.
  */
 export async function openNarrativeStream(
   payload: {
@@ -53,17 +53,17 @@ export async function openNarrativeStream(
 
   let resp: Response;
   try {
-    resp = await fetch(
-      `/api/v1/orchestrator/narrative/stream?token=${encodeURIComponent(sessionToken)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          user_intent: payload.user_intent,
-          engine_execution_payload: payload.engine_execution_payload,
-        }),
-      },
-    );
+    // Bearer header, not ?token= — the SSE handshake is plain HTTP here and
+    // query-string tokens leak into proxy/access logs. Built inline because
+    // callers may pass an explicit token overriding stored state.
+    resp = await fetch('/api/v1/orchestrator/narrative/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify({
+        user_intent: payload.user_intent,
+        engine_execution_payload: payload.engine_execution_payload,
+      }),
+    });
   } catch {
     // Network-level failure surfaces as a thrown TypeError upstream of here;
     // rethrow so callers keep their own catch semantics for unreachable hosts.

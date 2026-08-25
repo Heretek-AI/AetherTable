@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Skull } from 'lucide-react';
-import { getStoredToken } from '../api/auth_headers';
+import { authHeaders, getStoredToken } from '../api/auth_headers';
 
 /**
  * One entity exactly as POST /api/v1/engine/session-state projects it for THE
@@ -105,14 +105,11 @@ export const BossHealthBar: React.FC<BossHealthBarProps> = ({
         return;
       }
       try {
-        const resp = await fetch(
-          `/api/v1/engine/session-state?token=${encodeURIComponent(token)}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: sessionId }),
-          }
-        );
+        const resp = await fetch('/api/v1/engine/session-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
         if (!resp.ok) return; // keep last known snapshot (matches App's poll policy)
         const snap = (await resp.json()) as { entities?: unknown };
         if (!cancelled) setRoster(parseProjectedEntities(snap?.entities));

@@ -3,9 +3,10 @@
  *
  * Iteration-10 gateway hardening made POST
  * /api/v1/orchestrator/narrative/stream require an HMAC session token
- * (`token: str = Depends(_require_auth)` in server.py). The wrapper MUST
- * append ?token= exactly like api/rules_engine.ts and api/safety_xcard.ts —
- * a signed-out caller must NEVER hit the gateway anonymously, and an HTTP
+ * (`token: str = Depends(_require_auth)` in server.py). Iteration-13 (F14)
+ * sends it as the Authorization: Bearer header — like api/rules_engine.ts and
+ * api/safety_xcard.ts — because tokens in URLs leak into proxy/access logs.
+ * A signed-out caller must NEVER hit the gateway anonymously, and an HTTP
  * rejection must surface honestly instead of stalling the "..." DM bubble.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,7 +68,7 @@ describe('narrative stream identity contract', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('appends ?token= and posts the turn payload verbatim', async () => {
+  it('sends the Bearer header (never a URL token) and posts the turn payload verbatim', async () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => sseResponse());
     const body = { action_name: 'Greataxe', is_hit: true, total_damage: 11 };
@@ -77,8 +78,10 @@ describe('narrative stream identity contract', () => {
     });
     expect(result.kind).toBe('OK');
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe(
-      `/api/v1/orchestrator/narrative/stream?token=${encodeURIComponent(TOKEN)}`,
+    expect(calls[0].url).toBe('/api/v1/orchestrator/narrative/stream');
+    // F14: identity rides the Authorization header, never the query string.
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      `Bearer ${TOKEN}`,
     );
     expect(calls[0].init.method).toBe('POST');
     expect(JSON.parse(String(calls[0].init.body))).toEqual({
@@ -129,10 +132,13 @@ describe('narrative stream identity contract', () => {
     await expect(openNarrativeStream(payload)).rejects.toThrow(/unreachable/i);
   });
 
-  it('accepts an explicit token argument over stored state', async () => {
+  it('accepts an explicit token argument over stored state (still header-only)', async () => {
     const calls = stubFetch(() => sseResponse());
     const result = await openNarrativeStream(payload, 'explicit.sig.token');
     expect(result.kind).toBe('OK');
-    expect(calls[0].url).toContain('token=explicit.sig.token');
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
+      'Bearer explicit.sig.token',
+    );
+    expect(calls[0].url).toBe('/api/v1/orchestrator/narrative/stream');
   });
 });

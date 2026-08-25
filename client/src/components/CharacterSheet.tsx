@@ -27,7 +27,7 @@ import {
   BookOpen
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
-import { getStoredToken } from '../api/auth_headers';
+import { authHeaders, getStoredToken } from '../api/auth_headers';
 import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../api/lobby_store';
 import {
   EngineActionOutcome,
@@ -379,14 +379,11 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
       return;
     }
     try {
-      const resp = await fetch(
-        `/api/v1/engine/session-state?token=${encodeURIComponent(token)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: maneuverSessionId }),
-        },
-      );
+      const resp = await fetch('/api/v1/engine/session-state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ session_id: maneuverSessionId }),
+      });
       if (!resp.ok) {
         setReadiedDescription(null);
         return;
@@ -438,9 +435,9 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
       }
       let resp: Response;
       try {
-        resp = await fetch(`/api/v1/engine/ready?token=${encodeURIComponent(token)}`, {
+        resp = await fetch('/api/v1/engine/ready', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify({
             session_id: maneuverSessionId,
             entity_id: activeToken.id,
