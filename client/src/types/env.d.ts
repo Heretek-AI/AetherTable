@@ -37,6 +37,30 @@ interface ImportMetaEnv {
    * (/ws/sessions/{id}/sync). Only used when the CRDT relay is unreachable.
    */
   readonly VITE_ENGINE_WS_URL?: string;
+
+  /**
+   * TURN server URL for the WebRTC mesh ICE configuration, e.g.
+   * `turn:turn.example.com:3478?transport=udp`. Empty/unset ⇒ the mesh ships
+   * public STUN only and peers behind symmetric NAT keep failing honestly
+   * (see webrtc_mesh.ts — no fake-success path exists). Baked at build time
+   * by Vite; pair with VITE_TURN_USERNAME / VITE_TURN_CREDENTIAL.
+   */
+  readonly VITE_TURN_URL?: string;
+
+  /**
+   * TURN username. For a static-auth-secret coturn deploy this must be the
+   * REST-API-shaped `"<unix-expiry-timestamp>:<userid>"` combo, NOT a fixed
+   * account name. Never hardcode credentials here or in code.
+   */
+  readonly VITE_TURN_USERNAME?: string;
+
+  /**
+   * TURN credential: for static-auth-secret coturn this is
+   * base64(hmac_sha1(secret, username)) minted out-of-band from AUTH_SECRET
+   * / COTURN_TURN_SECRET. Time-limited by construction; regenerate per
+   * deployment rather than baking a long-lived value.
+   */
+  readonly VITE_TURN_CREDENTIAL?: string;
 }
 
 interface ImportMeta {

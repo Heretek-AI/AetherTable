@@ -6,6 +6,17 @@ FROM node:22-alpine as builder
 
 WORKDIR /app
 
+# ICE-server plumbing for the WebRTC mesh (client/src/render/webrtc_mesh.ts).
+# Declared so `docker compose build vtt-client` build args actually reach
+# Vite as environment variables. Empty by default => STUN-only bundle.
+# No hardcoded credentials anywhere; values come from compose/host env.
+ARG VITE_PEERJS_URL=http://localhost:9000
+ARG VITE_PEERJS_ROOM=aethertable-live
+ARG VITE_YSYNC_WS_URL=ws://localhost:6380
+ARG VITE_TURN_URL
+ARG VITE_TURN_USERNAME
+ARG VITE_TURN_CREDENTIAL
+
 COPY client/package*.json ./
 RUN npm install
 

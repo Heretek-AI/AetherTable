@@ -204,10 +204,76 @@ services:
     networks:
       - vtt-net
 
+  vtt-coturn:
+    # STUN + TURN relay for the WebRTC video mesh (Pillar 9). Without a TURN
+    # hop, peers behind symmetric NAT can never complete ICE and the mesh
+    # reports honest 'signaling-down'/'connection failed' states instead of
+    # media — this service is the fix path, not a fake-success shim.
+    #
+    # Auth: static-auth-secret (TURN REST API / time-limited HMAC creds) —
+    # see the full rationale in database/coturn/turnserver.conf. The secret is
+    # AUTH_SECRET, reused from the rest of this self-hosted stack so there is
+    # exactly ONE secret to rotate. Override with COTURN_SECRET if you must
+    # split it.
+    image: coturn/coturn:4.17.2-alpine
+    container_name: vtt-coturn
+    restart: unless-stopped
+    command:
+      - -c=/etc/coturn/turnserver.conf
+      - --log-file=stdout
+      # $$ = a literal $ after Compose interpolation; the coturn/coturn
+      # ENTRYPOINT bash-evals each argument at runtime, so $COTURN_SECRET is
+      # expanded INSIDE the container from `environment:` below — the secret
+      # never appears in the checked-in config file nor in the compose spec.
+      - --static-auth-secret=$${COTURN_SECRET}
+      # Auto-detect the host's public IP (needed when this host sits behind
+      # NAT so relay allocations advertise a reachable address). Honors
+      # REAL_EXTERNAL_IP if you need to pin it; fails the container fast if
+      # no DNS provider answers rather than advertising a broken address.
+      - --external-ip=$$(detect-external-ip)
+    environment:
+      COTURN_SECRET: ${COTURN_TURN_SECRET:-${AUTH_SECRET:?set AUTH_SECRET (openssl rand -hex 32)}}
+      # Optional override consumed by the image's detect-external-ip helper
+      # (pin the advertised public IP instead of DNS auto-detection).
+      REAL_EXTERNAL_IP: ${REAL_EXTERNAL_IP:-}
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      # Relay window — must match min-port/max-port in turnserver.conf.
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./database/coturn:/etc/coturn:ro,z
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "turnutils_stunclient -p 3478 127.0.0.1 >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vtt-net
+
   vtt-client:
     build:
       context: .
       dockerfile: Dockerfile.client
+      args:
+        # Vite bakes VITE_* vars at BUILD time — set these before
+        # `docker compose build vtt-client`. ICE servers for the WebRTC mesh
+        # (see client/src/render/webrtc_mesh.ts): unset/empty VITE_TURN_*
+        # ships public STUN only and symmetric-NAT pairs keep failing
+        # honestly (no fake success). When set, point at the `vtt-coturn`
+        # service above; credentials must be REST-API-shaped HMAC values
+        # minted from AUTH_SECRET / COTURN_TURN_SECRET. No hardcoded
+        # credentials anywhere.
+        VITE_PEERJS_URL: ${VITE_PEERJS_URL:-http://localhost:9000}
+        VITE_PEERJS_ROOM: ${VITE_PEERJS_ROOM:-aethertable-live}
+        VITE_YSYNC_WS_URL: ${VITE_YSYNC_WS_URL:-ws://localhost:6380}
+        VITE_TURN_URL: ${VITE_TURN_URL:-}
+        VITE_TURN_USERNAME: ${VITE_TURN_USERNAME:-}
+        VITE_TURN_CREDENTIAL: ${VITE_TURN_CREDENTIAL:-}
     container_name: vtt-client
     restart: unless-stopped
     environment:
@@ -235,6 +301,8 @@ services:
       vtt-peerjs:
         condition: service_healthy
       ysync-relay:
+        condition: service_healthy
+      vtt-coturn:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/ || exit 1"]

@@ -103,6 +103,50 @@ const SIGNALING_BASE = import.meta.env.VITE_PEERJS_URL ?? 'http://localhost:9000
 const LOBBY_ID = import.meta.env.VITE_PEERJS_ROOM ?? 'aethertable-live';
 const SIGNAING_KEY = 'aethertable';
 const SIGNAING_PATH = '/peerjs';
+
+/**
+ * ICE configuration (iteration 26 — closes the "no TURN/STUN config" gap).
+ *
+ * PeerJS's DEFAULT `config` ships exactly one public Google STUN server and
+ * no TURN at all, so peers behind symmetric NAT could never complete ICE and
+ * the mesh just reported honest failures forever. We now build the ICE list:
+ *  - public STUN is always present (harmless, free server-reflexive hints);
+ *  - a TURN hop is appended ONLY when all three of VITE_TURN_URL /
+ *    VITE_TURN_USERNAME / VITE_TURN_CREDENTIAL are provided at build time.
+ * Credentials are never hardcoded and never defaulted: an incomplete or
+ * missing TURN setup degrades to STUN-only, which keeps the honest-failure
+ * contract intact (a broken TURN candidate simply fails to allocate and ICE
+ * reports real failure through onStatus — there is no fake success path).
+ */
+const PUBLIC_STUN_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+export interface IceServerConfig {
+  iceServers: RTCIceServer[];
+}
+
+/**
+ * Builds the `config.iceServers` array handed to the RTCPeerConnection via
+ * the Peer constructor. Pure + exported for unit coverage; no network I/O.
+ * TURN entries require URL + username + credential TOGETHER — anything less
+ * is treated as "no TURN configured" rather than half-configured guesswork.
+ */
+export function buildIceServers(
+  turnUrl?: string,
+  turnUsername?: string,
+  turnCredential?: string
+): RTCIceServer[] {
+  const servers: RTCIceServer[] = [...PUBLIC_STUN_SERVERS];
+  if (turnUrl && turnUsername && turnCredential) {
+    servers.push({ urls: turnUrl, username: turnUsername, credential: turnCredential });
+  }
+  return servers;
+}
+
+const ICE_SERVERS = buildIceServers(
+  import.meta.env.VITE_TURN_URL,
+  import.meta.env.VITE_TURN_USERNAME,
+  import.meta.env.VITE_TURN_CREDENTIAL
+);
 /** Roster refresh cadence against the signaling server's discovery endpoint. */
 const ROSTER_POLL_MS = 5000;
 /** Mic RMS threshold matching the previous voice-detection behaviour. */
@@ -229,6 +273,10 @@ export class WebRTCMeshManager {
           path: `${SIGNAING_PATH}/`,
           key: SIGNAING_KEY,
           debug: 1,
+          // ICE servers reach the underlying RTCPeerConnection here (peerjs
+          // ~1.5.x `config` option). STUN-only by default; TURN appended when
+          // VITE_TURN_* build args are provided.
+          config: { iceServers: ICE_SERVERS },
         });
 
         this.peer.on('open', (id: string) => {
