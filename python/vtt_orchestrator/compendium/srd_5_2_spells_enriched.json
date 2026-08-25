@@ -75,9 +75,11 @@
     "upcast": "The damage (both initial and later) increases by 1d4 for each spell slot level above 2.",
     "full_text": "#### Acid Arrow\n\n_Level 2 Evocation (Wizard)_\n\n**Casting Time:** Action\n**Range:** 90 feet\n**Components:** V, S, M (powdered rhubarb leaf)\n**Duration:** Instantaneous\n\nA shimmering green arrow streaks toward a target within range and bursts in a spray of acid. Make a ranged spell attack against the target. On a hit, the target takes 4d4 Acid damage and 2d4 Acid damage at the end of its next turn. On a miss, the arrow splashes the target with acid for half as much of the initial damage only.\n\n_Using a Higher-Level Spell Slot._ The damage (both initial and later) increases by 1d4 for each spell slot level above 2.\n\n",
     "is_concentration": false,
+    "damage_formula": "4d4",
+    "damage_type": "acid",
     "duration_rounds": 0,
     "extraction_warnings": [
-      "multiple_damage_formulas_ambiguous: 4d4 acid, 2d4 acid"
+      "conjunctive_components_collapsed_to_primary: '4d4 acid, 2d4 acid' are typed components of one hit; only the first is reported"
     ]
   },
   {
@@ -103,6 +105,11 @@
     "damage_formula": "1d6",
     "damage_type": "acid",
     "save_ability": "DEX",
+    "upcast_level_tiers": [
+      "2d6",
+      "3d6",
+      "4d6"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -497,9 +504,11 @@
     "upcast": "",
     "full_text": "#### Arcane Sword\n\n_Level 7 Evocation (Bard, Wizard)_\n\n**Casting Time:** Action\n**Range:** 90 feet\n**Components:** V, S, M (a miniature sword worth 250+ GP)\n**Duration:** Concentration, up to 1 minute\n\nYou create a spectral sword that hovers within range. It lasts for the duration.\n\nWhen the sword appears, you make a melee spell attack against a target within 5 feet of the sword. On a hit, the target takes Force damage equal to 4d12 plus your spellcasting ability modifier.\n\nOn your later turns, you can take a Bonus Action to move the sword up to 30 feet to a spot you can see and repeat the attack against the same target or a different one.\n\n",
     "is_concentration": true,
+    "damage_formula": "4d12",
+    "damage_type": "force",
     "duration_rounds": 10,
     "extraction_warnings": [
-      "variable_formula_derived_from_modifier: '<type> damage equal to <dice> plus spellcasting modifier' not reduced to dice"
+      "modifier_derived_damage_dice_only: emitting '4d12 force' excludes the spellcasting-ability modifier named in the description"
     ]
   },
   {
@@ -875,6 +884,8 @@
     "damage_formula": "8d8",
     "damage_type": "necrotic",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 4,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -973,6 +984,8 @@
     "damage_formula": "3d6",
     "damage_type": "fire",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -998,6 +1011,8 @@
     "damage_formula": "3d10",
     "damage_type": "lightning",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 3,
     "duration_rounds": 100,
     "extraction_warnings": []
   },
@@ -1134,6 +1149,11 @@
     "is_concentration": false,
     "damage_formula": "1d10",
     "damage_type": "necrotic",
+    "upcast_level_tiers": [
+      "2d10",
+      "3d10",
+      "4d10"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -1186,6 +1206,8 @@
     "damage_formula": "8d8",
     "damage_type": "necrotic",
     "save_ability": "CON",
+    "upcast_damage_increment": "2d8",
+    "upcast_base_slot_level": 6,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -1259,6 +1281,8 @@
     "damage_formula": "5d8",
     "damage_type": "poison",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 5,
     "duration_rounds": 100,
     "extraction_warnings": []
   },
@@ -1429,6 +1453,8 @@
     "damage_formula": "8d8",
     "damage_type": "cold",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 5,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -1480,6 +1506,8 @@
     "is_concentration": true,
     "damage_formula": "3d10",
     "damage_type": "slashing",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 3,
     "duration_rounds": 100,
     "extraction_warnings": [
       "multiple_save_abilities_ambiguous: Dexterity, Strength"
@@ -1552,9 +1580,13 @@
     "upcast": "The damage increases by 1d12 for each spell slot level above 6.",
     "full_text": "#### Conjure Fey\n\n_Level 6 Conjuration (Druid)_\n\n**Casting Time:** Action\n**Range:** 60 feet\n**Components:** V, S\n**Duration:** Concentration, up to 10 minutes\n\nYou conjure a Medium spirit from the Feywild in an unoccupied space you can see within range. The spirit lasts for the duration, and it looks like a Fey creature of your choice. When the spirit appears, you can make one melee spell attack against a creature within 5 feet of it. On a hit, the target takes Psychic damage equal to 3d12 plus your spellcasting ability modifier, and the target has the Frightened condition until the start of your next turn, with both you and the spirit as the source of the fear.\n\nAs a Bonus Action on your later turns, you can teleport the spirit to an unoccupied space you can see within 30 feet of the space it left and make the attack against a creature within 5 feet of it.\n\n_Using a Higher-Level Spell Slot._ The damage increases by 1d12 for each spell slot level above 6.\n\n",
     "is_concentration": true,
+    "damage_formula": "3d12",
+    "damage_type": "psychic",
+    "upcast_damage_increment": "1d12",
+    "upcast_base_slot_level": 6,
     "duration_rounds": 100,
     "extraction_warnings": [
-      "variable_formula_derived_from_modifier: '<type> damage equal to <dice> plus spellcasting modifier' not reduced to dice"
+      "modifier_derived_damage_dice_only: emitting '3d12 psychic' excludes the spellcasting-ability modifier named in the description"
     ]
   },
   {
@@ -1605,6 +1637,8 @@
     "damage_formula": "5d8",
     "damage_type": "force",
     "save_ability": "WIS",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 4,
     "duration_rounds": 100,
     "extraction_warnings": []
   },
@@ -2250,6 +2284,8 @@
     "damage_formula": "10d6 + 40",
     "damage_type": "force",
     "save_ability": "DEX",
+    "upcast_damage_increment": "3d6",
+    "upcast_base_slot_level": 6,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -2327,6 +2363,8 @@
     "damage_formula": "3d6",
     "damage_type": "psychic",
     "save_ability": "WIS",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -2399,6 +2437,8 @@
     "is_concentration": false,
     "damage_formula": "2d8",
     "damage_type": "radiant",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -2732,6 +2772,8 @@
     "damage_formula": "1d6",
     "damage_type": "piercing",
     "save_ability": "STR",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -3206,6 +3248,8 @@
     "damage_formula": "8d6",
     "damage_type": "fire",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 3,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -3231,6 +3275,11 @@
     "is_concentration": false,
     "damage_formula": "1d10",
     "damage_type": "fire",
+    "upcast_level_tiers": [
+      "2d10",
+      "3d10",
+      "4d10"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -3307,9 +3356,13 @@
     "upcast": "The damage increases by 1d6 for each spell slot level above 2.",
     "full_text": "#### Flame Blade\n\n_Level 2 Evocation (Druid, Sorcerer)_\n\n**Casting Time:** Bonus Action\n**Range:** Self\n**Components:** V, S, M (a sumac leaf)\n**Duration:** Concentration, up to 10 minutes\n\nYou evoke a fiery blade in your free hand. The blade is similar in size and shape to a scimitar, and it lasts for the duration. If you let go of the blade, it disappears, but you can evoke it again as a Bonus Action.\n\nAs a Magic action, you can make a melee spell attack with the fiery blade. On a hit, the target takes Fire damage equal to 3d6 plus your spellcasting ability modifier.\n\nThe flaming blade sheds Bright Light in a 10-foot radius and Dim Light for an additional 10 feet.\n\n_Using a Higher-Level Spell Slot._ The damage increases by 1d6 for each spell slot level above 2.\n\n",
     "is_concentration": true,
+    "damage_formula": "3d6",
+    "damage_type": "fire",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 100,
     "extraction_warnings": [
-      "variable_formula_derived_from_modifier: '<type> damage equal to <dice> plus spellcasting modifier' not reduced to dice"
+      "modifier_derived_damage_dice_only: emitting '3d6 fire' excludes the spellcasting-ability modifier named in the description"
     ]
   },
   {
@@ -3331,10 +3384,12 @@
     "upcast": "The Fire damage and the Radiant damage increase by 1d6 for each spell slot level above 5.",
     "full_text": "#### Flame Strike\n\n_Level 5 Evocation (Cleric)_\n\n**Casting Time:** Action\n**Range:** 60 feet\n**Components:** V, S, M (a pinch of sulfur)\n**Duration:** Instantaneous\n\nA vertical column of brilliant fire roars down from above. Each creature in a 10-foot-radius, 40-foot-high Cylinder centered on a point within range makes a Dexterity saving throw, taking 5d6 Fire damage and 5d6 Radiant damage on a failed save or half as much damage on a successful one.\n\n_Using a Higher-Level Spell Slot._ The Fire damage and the Radiant damage increase by 1d6 for each spell slot level above 5.\n\n",
     "is_concentration": false,
+    "damage_formula": "5d6",
+    "damage_type": "fire",
     "save_ability": "DEX",
     "duration_rounds": 0,
     "extraction_warnings": [
-      "multiple_damage_formulas_ambiguous: 5d6 fire, 5d6 radiant"
+      "conjunctive_components_collapsed_to_primary: '5d6 fire, 5d6 radiant' are typed components of one hit; only the first is reported"
     ]
   },
   {
@@ -3361,6 +3416,8 @@
     "damage_formula": "2d6",
     "damage_type": "fire",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -3580,6 +3637,8 @@
     "damage_formula": "10d6",
     "damage_type": "cold",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 6,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -3955,11 +4014,11 @@
     "upcast": "",
     "full_text": "#### Guardian of Faith\n\n_Level 4 Conjuration (Cleric)_\n\n**Casting Time:** Action\n**Range:** 30 feet\n**Components:** V\n**Duration:** 8 hours\n\nA Large spectral guardian appears and hovers for the duration in an unoccupied space that you can see within range. The guardian occupies that space and is invulnerable, and it appears in a form appropriate for your deity or pantheon.\n\nAny enemy that moves to a space within 10 feet of the guardian for the first time on a turn or starts its turn there makes a Dexterity saving throw, taking 20 Radiant damage on a failed save or half as much damage on a successful one. The guardian vanishes when it has dealt a total of 60 damage.\n\n",
     "is_concentration": false,
+    "damage_formula": "20",
+    "damage_type": "radiant",
     "save_ability": "DEX",
     "duration_rounds": 4800,
-    "extraction_warnings": [
-      "no_canonical_damage_expression: description mentions damage but no '<dice> <type> damage' pattern was found"
-    ]
+    "extraction_warnings": []
   },
   {
     "id": "spell_guards_and_wards",
@@ -4028,6 +4087,8 @@
     "is_concentration": false,
     "damage_formula": "4d6",
     "damage_type": "radiant",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 1,
     "extraction_warnings": []
   },
@@ -4224,6 +4285,8 @@
     "damage_formula": "2d8",
     "damage_type": "fire",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -4249,6 +4312,8 @@
     "damage_formula": "2d10",
     "damage_type": "fire",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -4529,10 +4594,15 @@
     "upcast": "The Bludgeoning damage increases by 1d10 for each spell slot level above 4.",
     "full_text": "#### Ice Storm\n\n_Level 4 Evocation (Druid, Sorcerer, Wizard)_\n\n**Casting Time:** Action\n**Range:** 300 feet\n**Components:** V, S, M (a mitten)\n**Duration:** Instantaneous\n\nHail falls in a 20-foot-radius, 40-foot-high Cylinder centered on a point within range. Each creature in the Cylinder makes a Dexterity saving throw. A creature takes 2d10 Bludgeoning damage and 4d6 Cold damage on a failed save or half as much damage on a successful one.\n\nHailstones turn ground in the Cylinder into Difficult Terrain until the end of your next turn.\n_Using a Higher-Level Spell Slot._ The Bludgeoning damage increases by 1d10 for each spell slot level above 4.\n\n",
     "is_concentration": false,
+    "damage_formula": "2d10",
+    "damage_type": "bludgeoning",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 4,
+    "upcast_damage_type": "bludgeoning",
     "duration_rounds": 0,
     "extraction_warnings": [
-      "multiple_damage_formulas_ambiguous: 2d10 bludgeoning, 4d6 cold"
+      "conjunctive_components_collapsed_to_primary: '2d10 bludgeoning, 4d6 cold' are typed components of one hit; only the first is reported"
     ]
   },
   {
@@ -4656,6 +4726,8 @@
     "damage_formula": "2d10",
     "damage_type": "necrotic",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -4683,6 +4755,8 @@
     "damage_formula": "4d10",
     "damage_type": "piercing",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 5,
     "duration_rounds": 100,
     "extraction_warnings": []
   },
@@ -4932,6 +5006,8 @@
     "damage_formula": "8d6",
     "damage_type": "lightning",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 3,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -5401,10 +5477,10 @@
     "upcast": "",
     "full_text": "#### Meld into Stone\n\n_Level 3 Transmutation (Cleric, Druid, Ranger)_\n\n**Casting Time:** Action or Ritual\n**Range:** Touch\n**Components:** V, S\n**Duration:** 8 hours\n\nYou step into a stone object or surface large enough to fully contain your body, merging yourself and your equipment with the stone for the duration. You must touch the stone to do so. Nothing of your presence remains visible or otherwise detectable by nonmagical senses.\n\nWhile merged with the stone, you can't see what occurs outside it, and any Wisdom (Perception) checks you make to hear sounds outside it are made with Disadvantage. You remain aware of the passage of time and can cast spells on yourself while merged in the stone. You can use 5 feet of movement to leave the stone where you entered it, which ends the spell. You otherwise can't move.\n\nMinor physical damage to the stone doesn't harm you, but its partial destruction or a change in its shape (to the extent that you no longer fit within it) expels you and deals 6d6 Force damage to you. The stone's complete destruction (or transmutation into a different substance) expels you and deals 50 Force damage to you. If expelled, you move into an unoccupied space closest to where you first entered and have the Prone condition.\n\n",
     "is_concentration": false,
-    "damage_formula": "6d6",
-    "damage_type": "force",
     "duration_rounds": 4800,
-    "extraction_warnings": []
+    "extraction_warnings": [
+      "mixed_flat_and_dice_amounts_ambiguous: description names both a flat damage value and '6d6 force'"
+    ]
   },
   {
     "id": "spell_mending",
@@ -5479,10 +5555,12 @@
     "upcast": "",
     "full_text": "#### Meteor Swarm\n\n_Level 9 Evocation (Sorcerer, Wizard)_\n\n**Casting Time:** Action\n**Range:** 1 mile\n**Components:** V, S\n**Duration:** Instantaneous\n\nBlazing orbs of fire plummet to the ground at four different points you can see within range. Each creature in a 40-foot-radius Sphere centered on each of those points makes a Dexterity saving throw. A creature takes 20d6 Fire damage and 20d6 Bludgeoning damage on a failed save or half as much damage on a successful one. A creature in the area of more than one fiery Sphere is affected only once.\n\nA nonmagical object that isn't being worn or carried also takes the damage if it's in the spell's area, and the object starts burning if it's flammable.\n\n",
     "is_concentration": false,
+    "damage_formula": "20d6",
+    "damage_type": "fire",
     "save_ability": "DEX",
     "duration_rounds": 0,
     "extraction_warnings": [
-      "multiple_damage_formulas_ambiguous: 20d6 fire, 20d6 bludgeoning"
+      "conjunctive_components_collapsed_to_primary: '20d6 fire, 20d6 bludgeoning' are typed components of one hit; only the first is reported"
     ]
   },
   {
@@ -5534,6 +5612,8 @@
     "damage_formula": "3d8",
     "damage_type": "psychic",
     "save_ability": "WIS",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 600,
     "extraction_warnings": []
   },
@@ -5711,6 +5791,8 @@
     "damage_formula": "2d10",
     "damage_type": "radiant",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -5857,6 +5939,8 @@
     "damage_formula": "4d10",
     "damage_type": "psychic",
     "save_ability": "WIS",
+    "upcast_damage_increment": "1d10",
+    "upcast_base_slot_level": 4,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -6007,6 +6091,11 @@
     "is_concentration": false,
     "damage_formula": "1d12",
     "damage_type": "poison",
+    "upcast_level_tiers": [
+      "2d12",
+      "3d12",
+      "4d12"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -6256,6 +6345,11 @@
     "is_concentration": false,
     "damage_formula": "1d8",
     "damage_type": "fire",
+    "upcast_level_tiers": [
+      "2d8",
+      "3d8",
+      "4d8"
+    ],
     "duration_rounds": 100,
     "extraction_warnings": []
   },
@@ -6485,6 +6579,11 @@
     "is_concentration": false,
     "damage_formula": "1d8",
     "damage_type": "cold",
+    "upcast_level_tiers": [
+      "2d8",
+      "3d8",
+      "4d8"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -6534,6 +6633,8 @@
     "is_concentration": false,
     "damage_formula": "2d8",
     "damage_type": "poison",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -6751,6 +6852,11 @@
     "damage_formula": "1d8",
     "damage_type": "radiant",
     "save_ability": "DEX",
+    "upcast_level_tiers": [
+      "2d8",
+      "3d8",
+      "4d8"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -6853,6 +6959,8 @@
     "damage_formula": "1d6",
     "damage_type": "fire",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -7023,6 +7131,8 @@
     "damage_formula": "3d8",
     "damage_type": "thunder",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -7117,6 +7227,8 @@
     "is_concentration": true,
     "damage_formula": "2d6",
     "damage_type": "radiant",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -7142,6 +7254,11 @@
     "is_concentration": false,
     "damage_formula": "1d8",
     "damage_type": "lightning",
+    "upcast_level_tiers": [
+      "2d8",
+      "3d8",
+      "4d8"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -7510,9 +7627,13 @@
     "upcast": "The damage increases by 1d8 for every slot level above 2.",
     "full_text": "#### Spiritual Weapon\n\n_Level 2 Evocation (Cleric)_\n\n**Casting Time:** Bonus Action\n**Range:** 60 feet\n**Components:** V, S\n**Duration:** Concentration, up to 1 minute\n\nYou create a floating, spectral force that resembles a weapon of your choice and lasts for the duration. The force appears within range in a space of your choice, and you can immediately make one melee spell attack against one creature within 5 feet of the force. On a hit, the target takes Force damage equal to 1d8 plus your spellcasting ability modifier.\n\nAs a Bonus Action on your later turns, you can move the force up to 20 feet and repeat the attack against a creature within 5 feet of it.\n\n_Using a Higher-Level Spell Slot._ The damage increases by 1d8 for every slot level above 2.\n\n",
     "is_concentration": true,
+    "damage_formula": "1d8",
+    "damage_type": "force",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 2,
     "duration_rounds": 10,
     "extraction_warnings": [
-      "variable_formula_derived_from_modifier: '<type> damage equal to <dice> plus spellcasting modifier' not reduced to dice"
+      "modifier_derived_damage_dice_only: emitting '1d8 force' excludes the spellcasting-ability modifier named in the description"
     ]
   },
   {
@@ -7537,6 +7658,11 @@
     "is_concentration": false,
     "damage_formula": "1d8",
     "damage_type": "radiant",
+    "upcast_level_tiers": [
+      "2d8",
+      "3d8",
+      "4d8"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -7953,6 +8079,8 @@
     "damage_formula": "2d8",
     "damage_type": "thunder",
     "save_ability": "CON",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 1,
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -8246,6 +8374,8 @@
     "is_concentration": true,
     "damage_formula": "3d6",
     "damage_type": "necrotic",
+    "upcast_damage_increment": "1d6",
+    "upcast_base_slot_level": 3,
     "duration_rounds": 10,
     "extraction_warnings": []
   },
@@ -8271,6 +8401,11 @@
     "damage_formula": "1d6",
     "damage_type": "psychic",
     "save_ability": "WIS",
+    "upcast_level_tiers": [
+      "2d6",
+      "3d6",
+      "4d6"
+    ],
     "duration_rounds": 0,
     "extraction_warnings": []
   },
@@ -8294,10 +8429,12 @@
     "upcast": "The initial damage increases by 2d4 for each spell slot level above 4.",
     "full_text": "#### Vitriolic Sphere\n\n_Level 4 Evocation (Sorcerer, Wizard)_\n\n**Casting Time:** Action\n**Range:** 150 feet\n**Components:** V, S, M (a drop of bile)\n**Duration:** Instantaneous\n\nYou point at a location within range, and a glowing, 1-foot-diameter ball of acid streaks there and explodes in a 20-foot-radius Sphere. Each creature in that area makes a Dexterity saving throw. On a failed save, a creature takes 10d4 Acid damage and another 5d4 Acid damage at the end of its next turn. On a successful save, a creature takes half the initial damage only.\n\n_Using a Higher-Level Spell Slot._ The initial damage increases by 2d4 for each spell slot level above 4.\n\n",
     "is_concentration": false,
+    "damage_formula": "10d4",
+    "damage_type": "acid",
     "save_ability": "DEX",
     "duration_rounds": 0,
     "extraction_warnings": [
-      "multiple_damage_formulas_ambiguous: 10d4 acid, 5d4 acid"
+      "conjunctive_components_collapsed_to_primary: '10d4 acid, 5d4 acid' are typed components of one hit; only the first is reported"
     ]
   },
   {
@@ -8324,6 +8461,8 @@
     "damage_formula": "5d8",
     "damage_type": "fire",
     "save_ability": "DEX",
+    "upcast_damage_increment": "1d8",
+    "upcast_base_slot_level": 4,
     "duration_rounds": 10,
     "extraction_warnings": []
   },

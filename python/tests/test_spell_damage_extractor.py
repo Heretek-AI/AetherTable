@@ -107,8 +107,18 @@ class TestKnownSpells:
 
 class TestAmbiguousText:
     def test_multiple_formulas_warn_not_guess(self, raw_spells):
-        """Acid Arrow deals 4d4 acid plus 2d4 acid splash - two expressions."""
-        enriched = enrich_spell(_by_name(raw_spells, "Acid Arrow"))
+        """Meld into Stone deals 6d6 force on partial destruction but a flat 50
+        on complete destruction - distinct triggers, so both stay warned."""
+        enriched = enrich_spell(_by_name(raw_spells, "Meld into Stone"))
+        assert "damage_formula" not in enriched
+        assert "damage_type" not in enriched
+        codes = " ".join(enriched["extraction_warnings"]).lower()
+        assert "multiple" in codes or len(enriched["extraction_warnings"]) >= 1
+
+    def test_distinct_trigger_formulas_still_warn(self, raw_spells):
+        """Ice Knife's two expressions hit on different triggers (hit vs failed
+        save), so they cannot be collapsed - both stay warned, not guessed."""
+        enriched = enrich_spell(_by_name(raw_spells, "Ice Knife"))
         assert "damage_formula" not in enriched
         assert "damage_type" not in enriched
         codes = " ".join(enriched["extraction_warnings"]).lower()
@@ -126,13 +136,15 @@ class TestAmbiguousText:
         assert "damage_type" not in out
         assert out["extraction_warnings"], "player-chosen type must produce a warning"
 
-    def test_variable_formula_warns_not_guesses(self, raw_spells):
+    def test_variable_formula_emits_dice_with_disclosure(self, raw_spells):
         """'Fire damage equal to 3d6 plus your spellcasting ability modifier'
-        is derived damage - emitting bare 3d6 would under-report."""
+        names its dice explicitly - iteration 27 emits the bare dice with an
+        explicit modifier-excluded disclosure instead of dropping the spell."""
         enriched = enrich_spell(_by_name(raw_spells, "Flame Blade"))
-        assert "damage_formula" not in enriched
-        assert "damage_type" not in enriched
-        assert enriched["extraction_warnings"]
+        assert enriched["damage_formula"] == "3d6"
+        assert enriched["damage_type"] == "fire"
+        codes = " ".join(enriched["extraction_warnings"]).lower()
+        assert "modifier" in codes
 
     def test_unknown_damage_type_word_rejected(self):
         synthetic = {
@@ -193,6 +205,164 @@ class TestAmbiguousText:
             }
             out = extract_spell_data(synthetic)
             assert out.get("duration_rounds") == expected, duration
+
+
+# --------------------------------------------------------------------------
+# Iteration 27: deterministic patterns that were previously over-warned
+# --------------------------------------------------------------------------
+
+
+class TestConjunctiveDamageSentences:
+    """'takes XdY A damage and ZdW B damage on a failed save' is one
+    simultaneous hit with typed components - the first component is the
+    canonical primary expression.  Distinct-trigger formulas (Ice Knife's
+    'on a hit ... or take ... on a failed save') must still warn."""
+
+    def test_acid_arrow_primary_component(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Acid Arrow"))
+        assert enriched["damage_formula"] == "4d4"
+        assert enriched["damage_type"] == "acid"
+        # Attack roll spell: no save named anywhere.
+        assert "save_ability" not in enriched
+
+    def test_flame_strike_dual_type(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Flame Strike"))
+        assert enriched["damage_formula"] == "5d6"
+        assert enriched["damage_type"] == "fire"
+        assert enriched["save_ability"] == "DEX"
+
+    def test_ice_storm_bludgeoning_plus_cold(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Ice Storm"))
+        assert enriched["damage_formula"] == "2d10"
+        assert enriched["damage_type"] == "bludgeoning"
+
+    def test_meteor_swarm(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Meteor Swarm"))
+        assert enriched["damage_formula"] == "20d6"
+        assert enriched["damage_type"] == "fire"
+
+    def test_vitriolic_sphere_initial_component(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Vitriolic Sphere"))
+        assert enriched["damage_formula"] == "10d4"
+        assert enriched["damage_type"] == "acid"
+
+
+class TestModifierDerivedFormulas:
+    """'<Type> damage equal to <dice> plus your spellcasting ability modifier'
+    names its dice explicitly; the modifier rides the caster, so the bare dice
+    are emitted (with an explicit warning) instead of dropping the whole spell.
+    Only when this is the spell's ONLY damage expression."""
+
+    def test_spiritual_weapon(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Spiritual Weapon"))
+        assert enriched["damage_formula"] == "1d8"
+        assert enriched["damage_type"] == "force"
+        codes = " ".join(enriched["extraction_warnings"]).lower()
+        assert "modifier" in codes
+
+    def test_arcane_sword(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Arcane Sword"))
+        assert enriched["damage_formula"] == "4d12"
+        assert enriched["damage_type"] == "force"
+
+    def test_flame_blade(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Flame Blade"))
+        assert enriched["damage_formula"] == "3d6"
+        assert enriched["damage_type"] == "fire"
+
+    def test_conjure_fey(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Conjure Fey"))
+        assert enriched["damage_formula"] == "3d12"
+        assert enriched["damage_type"] == "psychic"
+
+    def test_varmod_beside_other_dice_stays_warned(self):
+        synthetic = {
+            "name": "Synthetic VarMod Plus Dice",
+            "description": (
+                "On a hit, the target takes Fire damage equal to 3d6 plus your "
+                "spellcasting ability modifier. Each creature nearby takes 1d6 Fire damage."
+            ),
+            "concentration": False,
+            "duration": "Instantaneous",
+        }
+        out = extract_spell_data(synthetic)
+        assert "damage_formula" not in out
+        assert out["extraction_warnings"]
+
+
+class TestFlatDamageValues:
+    """A bare number of damage ('deals 50 Force damage to you') is exact,
+    not derived - emit it as a flat formula."""
+
+    def test_synthetic_flat_value(self):
+        synthetic = {
+            "name": "Synthetic Flat",
+            "description": "The collapsing tunnel deals 20 Bludgeoning damage to you.",
+            "concentration": False,
+            "duration": "Instantaneous",
+        }
+        out = extract_spell_data(synthetic)
+        assert out["damage_formula"] == "20"
+        assert out["damage_type"] == "bludgeoning"
+
+    def test_flat_value_beside_dice_stays_warned(self):
+        """A flat value is only emitted when it is the description's only
+        damage amount; beside dice it would be an arbitrary pick, so the
+        spell stays field-free with a warning."""
+        synthetic = {
+            "name": "Synthetic Flat Plus Dice",
+            "description": (
+                "Partial collapse deals 6d6 Force damage to you. Complete "
+                "destruction expels you and deals 50 Force damage to you."
+            ),
+            "concentration": False,
+            "duration": "Instantaneous",
+        }
+        out = extract_spell_data(synthetic)
+        assert "damage_formula" not in out
+        assert out["extraction_warnings"], "mixed amounts must warn, not pick"
+
+    def test_synthetic_flat_value(self):
+        synthetic = {
+            "name": "Synthetic Flat",
+            "description": "The collapsing tunnel deals 20 Bludgeoning damage to you.",
+            "concentration": False,
+            "duration": "Instantaneous",
+        }
+        out = extract_spell_data(synthetic)
+        assert out["damage_formula"] == "20"
+        assert out["damage_type"] == "bludgeoning"
+
+
+class TestUpcastScalingRows:
+    """The structured ``upcast`` row carries slot scaling.  When it states an
+    unambiguous per-slot increment (or cantrip level tiers), record it as
+    structured metadata alongside the base expression."""
+
+    def test_fireball_upcast_scaling(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Fireball"))
+        assert enriched["upcast_damage_increment"] == "1d6"
+        assert enriched["upcast_base_slot_level"] == 3
+
+    def test_ice_storm_upcast_targets_typed_component(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Ice Storm"))
+        assert enriched["upcast_damage_increment"] == "1d10"
+        assert enriched["upcast_damage_type"] == "bludgeoning"
+
+    def test_cantrip_level_tiers(self, raw_spells):
+        for name, expected in [
+            ("Sacred Flame", ["2d8", "3d8", "4d8"]),
+            ("Fire Bolt", ["2d10", "3d10", "4d10"]),
+            ("Poison Spray", ["2d12", "3d12", "4d12"]),
+        ]:
+            enriched = enrich_spell(_by_name(raw_spells, name))
+            got = enriched.get("upcast_level_tiers")
+            assert got == expected, f"{name}: {got}"
+
+    def test_non_damage_upcast_rows_add_no_fields(self, raw_spells):
+        enriched = enrich_spell(_by_name(raw_spells, "Scorching Ray"))
+        assert "upcast_damage_increment" not in enriched
+        assert "upcast_level_tiers" not in enriched
 
 
 # --------------------------------------------------------------------------
@@ -263,16 +433,17 @@ class TestCoverageStats:
         gained = stats["enriched"]
         assert total == len(raw_spells)
         # Honest partial coverage: some but not all spells gained damage fields.
-        assert 0 < gained < total, f"suspicious coverage: {gained}/{total}"
+        # Iteration 27 raised this from the 73-spell iteration-77 baseline by
+        # parsing conjunctive sentences, modifier-derived dice, flat damage
+        # values, and slot-scaling upcast rows - without guessing.
+        assert 73 <= gained < total, f"coverage regressed below baseline: {gained}/{total}"
+        assert gained > 73, "iteration 27 must strictly improve on the 73-spell baseline"
         assert stats["enriched"] == sum(1 for s in enriched if "damage_formula" in s)
-        assert stats["warned_multi_formula"] >= 1
         assert sum(stats.values()) >= total  # every spell is accounted for somewhere
         print(
             f"\nExtraction coverage: {gained}/{total} spells enriched "
-            f"({stats['warned_multi_formula']} multi-formula warned, "
-            f"{stats['warned_chosen_type']} chosen-type warned, "
-            f"{stats['warned_variable_formula']} variable-formula warned, "
-            f"{stats['no_damage_mention']} with no damage mention)"
+            f"(baseline 73; {stats.get('correctly_unparsed_no_damage', '?')} no-damage, "
+            f"{sum(v for k, v in stats.items() if k.startswith('warned_'))} warned)"
         )
 
     def test_every_warning_carrying_spell_stays_field_free_for_that_reason(self, raw_spells):
@@ -280,12 +451,22 @@ class TestCoverageStats:
         damaged = sum(1 for s in enriched if "damage_formula" in s)
         assert stats["enriched"] == damaged
         for spell in enriched:
-            damage_warned = any(
-                "damage" in warning.lower() for warning in spell.get("extraction_warnings", [])
-            )
+            warnings = spell.get("extraction_warnings", [])
+            damage_warned = any("damage" in w.lower() for w in warnings)
             has_fields = "damage_formula" in spell
-            # A spell warned about its damage text must never guess anyway.
-            assert not (damage_warned and has_fields), (
-                f"{spell['name']}: emitted {spell.get('damage_formula')} "
-                f"despite warnings {spell.get('extraction_warnings')}"
+            # A spell warned about its damage text may still carry fields ONLY
+            # when the warning is the explicit dice-only disclosure that
+            # accompanies a modifier-derived formula (iteration 27).
+            disclosure = any(
+                w.startswith("modifier_derived_damage_dice_only") for w in warnings
             )
+            collapse = any(
+                w.startswith(("conjunctive_components_collapsed_to_primary",
+                              "alternative_forms_collapsed_to_primary"))
+                for w in warnings
+            )
+            if damage_warned and has_fields:
+                assert disclosure or collapse, (
+                    f"{spell['name']}: emitted {spell.get('damage_formula')} "
+                    f"despite unexplained warnings {warnings}"
+                )
