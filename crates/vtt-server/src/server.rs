@@ -1959,6 +1959,10 @@ async fn resolve_grapple_action(
             if let Some(a) = session.entities.get_mut(&req.attacker_id) {
                 a.occupy_hand();
             }
+            // Stamp the hold attribution (audit F-A4#3): the defender now
+            // carries a Grappled condition GRANTED BY this attacker, so only
+            // an escape naming THIS attacker may end it and free the hand.
+            session.record_hold(req.defender_id, req.attacker_id);
         }
 
         let escape_dc = ActionResolver::grapple_escape_dc(attacker_mod);
@@ -2121,6 +2125,23 @@ async fn resolve_escape_grapple_action(
             );
         }
 
+        // Attribution gate (audit F-A4#3): the escape must name the creature
+        // ACTUALLY holding this escaper. Without it, naming any unrelated
+        // hands-occupied bystander released the BYSTANDER's hand while the
+        // true holder kept theirs — a free hand-laundering exploit. The hold's
+        // attribution is stamped onto the victim at grapple-resolve time (see
+        // `resolve_grapple_action`); a legacy hold with no stamp falls back to
+        // the ledger: the latest surviving won GRAPPLE_ATTEMPTED naming both
+        // parties. `force` overrides the CHECK, never the ATTRIBUTION.
+        if !session.holds(&req.entity_id, &req.grappler_id) {
+            return reject(
+                &data,
+                409,
+                "NOT_YOUR_GRAPPLER",
+                "grappler_id does not hold entity_id — escapes must name the recorded holder",
+            );
+        }
+
         // All gates passed — spend the escaper's Action now. A forced GM
         // release is an intervention, not the victim's action: no spend.
         if !force {
@@ -2177,8 +2198,15 @@ async fn resolve_escape_grapple_action(
             "success": success,
             "grappler_hands_released": released_hands,
         });
+
         let grappler_hands_after =
             session.entities.get(&req.grappler_id).map(|g| g.hands_occupied);
+
+        // A won escape ends the attribution too, so the freed victim can be
+        // re-held by someone else later without stale-stamp interference.
+        if success {
+            session.release_hold(req.entity_id);
+        }
 
         let campaign_id = session.campaign_id;
         let event = session.ledger.append_event(
@@ -3445,8 +3473,16 @@ async fn resolve_help_check_action(
 //
 // SRD inspiration lives at most ONE point per character. Every accepted
 // transition journals an `INSPIRATION_CHANGED` event so safety rewind replays
-// the correct holding; this route is the HTTP surface for the GRANT side that
-// makes "rewind past a spend restores the point" reachable end-to-end.
+// the correct holding; these routes are the HTTP surfaces for the GRANT and
+// REVOKE sides that make "rewind past a spend restores the point" reachable
+// end-to-end.
+//
+// RBAC (audit F-A4#2): inspiration is GM FIAT (SRD "Inspiration"). Granting
+// used to ride standard ownership RBAC, which let any PLAYER mint a point on
+// their own character every round — a per-turn Advantage faucet. Both
+// directions are therefore privileged-principal-only: GM/admin seats and the
+// orchestrator service principal. Players RECEIVE points; they never confer
+// them, not even on entities they own outright.
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3454,6 +3490,53 @@ pub struct InspirationGrantReq {
     pub entity_id: Uuid,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// True when this caller may grant or revoke inspiration (GM fiat privilege):
+/// GM/admin roles and the orchestrator service principal only.
+fn may_fiat_inspiration(role: Role, user_id: &str) -> bool {
+    role.is_gm() || user_id == SERVICE_PRINCIPAL_ID
+}
+
+/// Shared body of the grant/revoke routes once the caller passed the fiat
+/// gate. `apply` performs the core transition (`grant_inspiration` /
+/// `revoke_inspiration`) under the session write lock.
+fn inspiration_transition(
+    data: web::Data<AppState>,
+    session_id: Uuid,
+    req: InspirationGrantReq,
+    apply: fn(&mut GameSession, Uuid, Option<&str>) -> Result<(), String>,
+    ok_status: &'static str,
+) -> HttpResponse {
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity_id does not exist in this session");
+        }
+
+        if let Err(e) = apply(&mut session, req.entity_id, req.reason.as_deref()) {
+            let status = match e.as_str() {
+                "ENTITY_NOT_FOUND" => 404u16,
+                _ => 409,
+            };
+            return reject(
+                &data,
+                status,
+                &e,
+                "inspiration transition rejected by the rules engine",
+            );
+        }
+
+        data.count_valid();
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": ok_status,
+            "entity_id": req.entity_id.to_string(),
+            "event_sequence": session.ledger.current_sequence,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
 }
 
 async fn grant_inspiration_route(
@@ -3468,40 +3551,50 @@ async fn grant_inspiration_route(
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot mutate sessions");
     }
-
-    let req = req.into_inner();
-    if let Some(session_lock) = data.sessions.get(&session_id) {
-        let mut session = session_lock.write();
-
-        // Same ownership gate as every other per-entity mutation.
-        if !session.entities.contains_key(&req.entity_id) {
-            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity_id does not exist in this session");
-        }
-        let owner = session
-            .entities
-            .get(&req.entity_id)
-            .and_then(|e| e.owner_player_id.clone());
-        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
-            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
-        }
-
-        if let Err(e) = session.grant_inspiration(req.entity_id, req.reason.as_deref()) {
-            let status = match e.as_str() {
-                "ENTITY_NOT_FOUND" => 404u16,
-                _ => 409,
-            };
-            return reject(&data, status, &e, "inspiration grant rejected by the rules engine");
-        }
-
-        data.count_valid();
-        HttpResponse::Ok().json(serde_json::json!({
-            "status": "INSPIRATION_GRANTED",
-            "entity_id": req.entity_id.to_string(),
-            "event_sequence": session.ledger.current_sequence,
-        }))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    if !may_fiat_inspiration(role, &identity.user_id) {
+        return reject(
+            &data,
+            403,
+            "INSPIRATION_GM_ONLY",
+            "inspiration is granted by GM fiat only (SRD); players receive points through grants",
+        );
     }
+    inspiration_transition(
+        data,
+        session_id,
+        req.into_inner(),
+        GameSession::grant_inspiration,
+        "INSPIRATION_GRANTED",
+    )
+}
+
+async fn revoke_inspiration_route(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<InspirationGrantReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot mutate sessions");
+    }
+    if !may_fiat_inspiration(role, &identity.user_id) {
+        return reject(
+            &data,
+            403,
+            "INSPIRATION_GM_ONLY",
+            "inspiration is revoked by GM fiat only (SRD)",
+        );
+    }
+    inspiration_transition(
+        data,
+        session_id,
+        req.into_inner(),
+        GameSession::revoke_inspiration,
+        "INSPIRATION_REVOKED",
+    )
 }
 
 // --- Damage-triggered concentration automation (backlog 4.11) -----------------
@@ -6286,6 +6379,7 @@ pub fn configure_app_with(
                         .route("/inventory/transfer", web::post().to(transfer_item))
                         .route("/rest", web::post().to(take_rest))
                         .route("/inspiration/grant", web::post().to(grant_inspiration_route))
+                        .route("/inspiration/revoke", web::post().to(revoke_inspiration_route))
                         .route("/safety/x-card", web::post().to(trigger_safety_rewind))
                         .route("/sync", web::get().to(ws_sync)),
                 ),

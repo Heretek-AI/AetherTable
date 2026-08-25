@@ -9423,3 +9423,395 @@ async fn inspiration_grant_is_rbac_gated() {
         status
     );
 }
+
+// ============================================================================
+// Iteration 60: audit A4 game-integrity remediations
+//
+// F-A4#2 — the inspiration grant route used standard ownership RBAC, so ANY
+// PLAYER could self-grant a point every round and buy per-turn Advantage
+// (SRD: inspiration is GM fiat). The route is now GM/service-only, and the
+// missing REVOKE surface (core has `revoke_inspiration`, no HTTP route)
+// lands under the same gate.
+//
+// F-A4#3 — escape-grapple never verified that the NAMED grappler actually
+// holds the escaper. Naming an unrelated creature released ITS hand while
+// the true holder kept theirs (and stripped Grappled regardless). Holds are
+// now attributed: a won grapple stamps the holder id on the victim's hold,
+// and an escape must name THAT holder.
+// ============================================================================
+
+/// A PLAYER cannot self-grant inspiration — even on their OWN entity. SRD
+/// grants are GM fiat; players receive points only via grants.
+#[actix_web::test]
+async fn inspiration_grant_by_player_is_rejected_gm_only() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-insp60", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 0, "1d4");
+    hero["owner_player_id"] = serde_json::json!("player-insp60");
+    spawn(&app, &gm, session_id, hero).await;
+
+    // The player owns this entity outright — still refused: minting advantage
+    // is not something ownership confers.
+    let player = sign_token_with_role("player-insp60", "player", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "self-granted"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "INSPIRATION_GM_ONLY", "{body}");
+
+    // Nothing changed: no point held, no ledger event.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(!inspiration_of(&snap, hero_id), "no self-granted point");
+    assert!(
+        !snap["ledger"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("INSPIRATION_CHANGED")),
+        "a refused grant journals nothing"
+    );
+}
+
+/// GM grant keeps working through the same route (regression guard for the
+/// tightened gate), and GM revoke is now reachable over HTTP at all.
+#[actix_web::test]
+async fn inspiration_grant_and_revoke_work_for_gm() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-insp60b", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+
+    // Grant.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "heroic roleplay"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], serde_json::json!("INSPIRATION_GRANTED"));
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(inspiration_of(&snap, hero_id), "GM grant banks a point");
+
+    // Revoke — the previously-missing HTTP surface for core's revoke_inspiration.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/revoke", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "GM fiat"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], serde_json::json!("INSPIRATION_REVOKED"));
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert!(
+        !inspiration_of(&snap, hero_id),
+        "revoke strips the held point"
+    );
+    let changes: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("INSPIRATION_CHANGED"))
+        .collect();
+    assert_eq!(changes.len(), 2, "grant + revoke both journalled");
+    assert_eq!(changes[1]["payload"]["granted"], serde_json::json!(false));
+    assert_eq!(changes[0]["payload"]["granted"], serde_json::json!(true));
+
+    // Revoking from an empty hand is rejected without journaling anything.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/revoke", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "again"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+
+    // And a player cannot use the new surface either.
+    let player = sign_token_with_role("player-insp60b", "player", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/revoke", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"entity_id": hero_id}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "INSPIRATION_GM_ONLY", "{body}");
+}
+
+/// Escaping must name the creature ACTUALLY holding you. Here a second,
+/// unrelated grappler stands nearby with one hand occupied by its own
+/// separate hold; escaping against IT is refused with 409 NOT_YOUR_GRAPPLER
+/// and leaves BOTH sides untouched — the true holder keeps their hand and the
+/// escaper keeps Grappled (and their Action).
+#[actix_web::test]
+async fn escape_against_wrong_grappler_is_reflected_and_changes_nothing() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc60", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+    let sid = create_session_as(&app, &gm).await;
+
+    // True holder (brute) grapples the victim. A decoy grappler holds some
+    // third party elsewhere — it has hands_occupied but holds nobody here.
+    let victim_id = Uuid::new_v4();
+    let holder_id = Uuid::new_v4();
+    let decoy_id = Uuid::new_v4();
+    let third_id = Uuid::new_v4();
+    for (id, name, x, is_pc) in [
+        (victim_id, "Victim", 10.0, true),
+        (holder_id, "Holder", 15.0, false),
+        (decoy_id, "Decoy", 20.0, false),
+        (third_id, "ThirdParty", 25.0, false),
+    ] {
+        let mut e = entity_json(id, name, 40, 12, 6, "1d8");
+        e["position"] = serde_json::json!([x, 2.5, 0.0]);
+        e["is_player"] = serde_json::json!(is_pc);
+        spawn_entity(&app, &gm, sid, e).await;
+    }
+
+    // Holder grabs victim (deterministic seed scan).
+    win_grapple(&app, &gm, sid, holder_id, victim_id).await;
+
+    // Decoy grabs the third party so its hand reads occupied too.
+    win_grapple(&app, &gm, sid, decoy_id, third_id).await;
+
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&victim_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "fixture: victim is held"
+    );
+
+    // Victim names the WRONG grappler.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": victim_id,
+            "grappler_id": decoy_id,
+            "skill": "athletics",
+            "seed": 7
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "NOT_YOUR_GRAPPLER", "{body}");
+
+    // Both states untouched: the decoy's hand was never released...
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&decoy_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "the wrongly-named creature keeps its own hand"
+    );
+    // ...and the TRUE hold survives intact.
+    assert_eq!(
+        snap["entities"][&holder_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "the real holder's hand stays bound"
+    );
+    assert_eq!(
+        snap["entities"][&victim_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "Grappled stays on the escaper"
+    );
+    assert_eq!(
+        snap["entities"][&third_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "the decoy's unrelated victim is untouched"
+    );
+    assert_eq!(
+        snap["entities"][&victim_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "a mis-attributed escape attempt spends no Action"
+    );
+    assert!(
+        !snap["ledger"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("GRAPPLE_ESCAPED")),
+        "a refused escape journals nothing"
+    );
+}
+
+/// Escaping against your TRUE holder works exactly as before — the attribution
+/// gate adds nothing when the named grappler is the recorded holder.
+#[actix_web::test]
+async fn escape_against_true_holder_still_works() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc60b", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+    let sid = create_session_as(&app, &gm).await;
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+
+    win_grapple(&app, &gm, sid, brute_id, hero_id).await;
+
+    let mut escaped = false;
+    for seed in 1..=60u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": hero_id,
+                "grappler_id": brute_id,
+                "skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        if res.status() == StatusCode::CONFLICT {
+            advance_turn(&app, &gm, sid).await;
+            continue;
+        }
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            escaped = true;
+            break;
+        }
+        advance_turn(&app, &gm, sid).await;
+    }
+    assert!(escaped, "some seed in 1..=60 must clear the escape DC");
+
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "escaping the TRUE holder frees the held hand as before"
+    );
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!([]),
+        "the hold ends on the escaper's side too"
+    );
+}
+
+/// A forced GM release bypasses the check but still cannot free the wrong
+/// pair: force is an override of the CHECK, not of the ATTRIBUTION.
+#[actix_web::test]
+async fn forced_escape_of_wrong_grappler_is_also_refused() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc60c", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+    let sid = create_session_as(&app, &gm).await;
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+    win_grapple(&app, &gm, sid, brute_id, hero_id).await;
+
+    // GM forces an escape naming a bystander instead of the true holder.
+    let bystander_id = Uuid::new_v4();
+    let mut b = entity_json(bystander_id, "Bystander", 30, 12, 0, "1d4");
+    b["position"] = serde_json::json!([40.0, 2.5, 0.0]);
+    b["is_player"] = serde_json::json!(false);
+    spawn_entity(&app, &gm, sid, b).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": bystander_id,
+            "skill": "athletics",
+            "force": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "NOT_YOUR_GRAPPLER", "{body}");
+
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "the forced-but-wrong release frees nothing"
+    );
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "the hold survives"
+    );
+}
+
+/// Rewind consistency: after a corrected escape, rewinding to NOW rebuilds the
+/// freed hand from the surviving GRAPPLE_ESCAPED (whose payload carries the
+/// holder attribution) — never a resurrected hold on either side.
+#[actix_web::test]
+async fn rewind_after_attributed_escape_keeps_the_release_not_a_hold() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc60d", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+    let sid = create_session_as(&app, &gm).await;
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+
+    win_grapple(&app, &gm, sid, brute_id, hero_id).await;
+    let mut escaped = false;
+    for seed in 1..=60u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": hero_id,
+                "grappler_id": brute_id,
+                "skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        if res.status() == StatusCode::CONFLICT {
+            advance_turn(&app, &gm, sid).await;
+            continue;
+        }
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            escaped = true;
+            break;
+        }
+        advance_turn(&app, &gm, sid).await;
+    }
+    assert!(escaped, "fixture escape must succeed");
+
+    // No-op rewind: replay from the ledger must reproduce exactly what the
+    // table saw — freed hand, no condition, no resurrected hold.
+    let target_seq = snapshot_as(&app, &gm, sid).await["ledger"]["current_sequence"]
+        .as_u64()
+        .unwrap();
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", sid))
+        .insert_header(auth)
+        .set_json(serde_json::json!({
+            "player_id": "player-esc60d",
+            "topic": "iteration-60 attribution rewind",
+            "target_sequence_id": target_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
+    assert_eq!(
+        body["snapshot"]["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "rewind honors the attributed escape's hand release"
+    );
+    assert_eq!(
+        body["snapshot"]["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!([]),
+        "rewind keeps the escaper free"
+    );
+}

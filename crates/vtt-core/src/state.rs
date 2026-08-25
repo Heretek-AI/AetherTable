@@ -815,6 +815,14 @@ pub struct GameSession {
     pub ledger: EventSourcingLedger,
     pub ingress_stack: Vec<IngressEvent>,
     pub egress_stack: Vec<EgressEvent>,
+    /// Grapple-hold attribution (audit F-A4#3): escaper id -> the creature
+    /// actually holding it, stamped when a won grapple resolves. Without it an
+    /// escape could free ANY hands-occupied bystander's hand while the true
+    /// holder kept theirs. Serde default keeps legacy sessions deserializing;
+    /// [`GameSession::holds`] falls back to the surviving ledger for unstamped
+    /// holds.
+    #[serde(default)]
+    pub grapple_holders: HashMap<Uuid, Uuid>,
 }
 
 impl GameSession {
@@ -830,6 +838,7 @@ impl GameSession {
             ledger: EventSourcingLedger::new(),
             ingress_stack: Vec::new(),
             egress_stack: Vec::new(),
+            grapple_holders: HashMap::new(),
         }
     }
 
@@ -1287,6 +1296,52 @@ impl GameSession {
     }
 
     // ---------------------------------------------------- condition lifecycle
+
+    // --- grapple-hold attribution (audit F-A4#3) ---
+
+    /// Records that `holder_id` is the creature holding `escaper_id` in a
+    /// won grapple. Called when a grapple resolves as a win; the escape route
+    /// consults it so only the TRUE holder's hand can be freed. A second won
+    /// grapple against the same victim overwrites the stamp — last hold wins,
+    /// mirroring how the single `Grappled` condition entry behaves.
+    pub fn record_hold(&mut self, escaper_id: Uuid, holder_id: Uuid) {
+        self.grapple_holders.insert(escaper_id, holder_id);
+    }
+
+    /// Drops the escaper's hold attribution when the hold ends (escape or GM
+    /// release). Returns true when an attribution actually existed.
+    pub fn release_hold(&mut self, escaper_id: Uuid) -> bool {
+        self.grapple_holders.remove(&escaper_id).is_some()
+    }
+
+    /// True when `holder_id` currently holds `escaper_id` per this session's
+    /// attribution map. Unstamped holds (legacy sessions persisted before the
+    /// map existed, or snapshots restored without it) fall back to the
+    /// surviving ledger: the latest surviving WON GRAPPLE_ATTEMPTED whose
+    /// attacker/defender pair matches. The ledger fallback keeps pre-iteration-60
+    /// holds escapable while never widening who may be named.
+    pub fn holds(&self, escaper_id: &Uuid, holder_id: &Uuid) -> bool {
+        if let Some(recorded) = self.grapple_holders.get(escaper_id) {
+            return recorded == holder_id;
+        }
+        let is_won_hold_by = |e: &crate::event_log::GameEvent| {
+            e.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+                && e.payload.get("applied_condition").is_some()
+                && e.actor_id == *holder_id
+                && e.payload
+                    .get("defender_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    == Some(*escaper_id)
+        };
+        self.ledger
+            .events
+            .iter()
+            .rev()
+            .filter(|e| !e.is_reverted)
+            .find(|e| e.event_type == "GRAPPLE_ATTEMPTED" && is_won_hold_by(e))
+            .is_some()
+    }
 
     /// Applies a timed condition and registers its duration clock.
     pub fn apply_timed_condition(
@@ -1877,6 +1932,46 @@ impl GameSession {
         for id in surviving_grapplers {
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.occupy_hand();
+            }
+        }
+        // Hold-attribution replay (audit F-A4#3): rebuild the escaper->holder
+        // map from the surviving ledger exactly like the hands above — a won
+        // GRAPPLE_ATTEMPTED stamps its holder, and a surviving successful
+        // escape drops the stamp (chronological order, so a later hold over
+        // the same victim wins). Rewind past an escape must not resurrect an
+        // attribution whose hold no longer exists.
+        self.grapple_holders.clear();
+        let mut escaped_actors: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type == "GRAPPLE_ESCAPED"
+                && ev.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+            {
+                if let Some(id) = ev
+                    .payload
+                    .get("entity_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    escaped_actors.insert(id);
+                }
+            }
+        }
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type != "GRAPPLE_ATTEMPTED"
+                || ev.payload.get("success").and_then(|v| v.as_bool()) != Some(true)
+                || ev.payload.get("applied_condition").is_none()
+            {
+                continue;
+            }
+            if let Some(defender) = ev
+                .payload
+                .get("defender_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                if !escaped_actors.contains(&defender) {
+                    self.grapple_holders.insert(defender, ev.actor_id);
+                }
             }
         }
         // Surviving escapes release what their hold took: a successful
