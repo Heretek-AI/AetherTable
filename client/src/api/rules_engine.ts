@@ -99,6 +99,13 @@ export async function engineAttack(params: {
   targetId: string;
   /** Index into the attacker's server-side stat-block attack list. */
   actionIndex?: number;
+  /**
+   * SRD inspiration spend (iteration 56 engine contract): burn this attacker's
+   * held point to buy Advantage on THIS roll. The ENGINE decides whether the
+   * point is actually consumed (a roll already advantaged/disadvantaged cancels
+   * into a straight d20 and keeps it); the client only forwards the intent.
+   */
+  spendInspiration?: boolean;
 }): Promise<EngineAttackResult | null> {
   const sessionId = await ensureEngineSession();
   if (!sessionId) return null;
@@ -109,6 +116,7 @@ export async function engineAttack(params: {
     attacker_id: params.attackerId,
     target_id: params.targetId,
     action_index: params.actionIndex ?? 0,
+    ...(params.spendInspiration ? { spend_inspiration: true } : {}),
   });
 }
 
@@ -117,6 +125,12 @@ export async function engineCheck(params: {
   dc: number;
   advantage?: boolean;
   disadvantage?: boolean;
+  /** Session-scoped grounding pair — required for an inspiration spend to
+   * resolve against real engine state (see CheckActionReq in vtt-server). */
+  sessionId?: string;
+  entityId?: string;
+  /** SRD inspiration spend; see engineAttack for the atomicity contract. */
+  spendInspiration?: boolean;
 }): Promise<EngineCheckResult | null> {
   return enginePost<EngineCheckResult>('/api/v1/engine/check', {
     modifier: params.modifier,
@@ -124,6 +138,17 @@ export async function engineCheck(params: {
     cost_margin: 3,
     advantage: params.advantage ?? false,
     disadvantage: params.disadvantage ?? false,
+    // Grounding and the inspiration spend travel together: without BOTH ids
+    // the engine has no live entity to consume the point from, so sending a
+    // bare spend_inspiration would be silently ignored state-side. A caller
+    // asking to spend while ungrounded therefore keeps the legacy body.
+    ...(params.sessionId && params.entityId
+      ? {
+          session_id: params.sessionId,
+          entity_id: params.entityId,
+          ...(params.spendInspiration ? { spend_inspiration: true } : {}),
+        }
+      : {}),
   });
 }
 
@@ -289,6 +314,51 @@ export interface EngineGrappleResult {
   event_sequence?: number;
 }
 
+/** Verbatim body of POST /api/v1/sessions/{id}/action/escape-grapple
+ * (iteration 49 route). Success/failure of the contest rides on `escaped`
+ * plus the two rolls; every field is individually optional because the
+ * gateway may wrap rejections before the engine answers. */
+export interface EngineEscapeGrappleResult {
+  entity_id?: string;
+  grappler_id?: string;
+  escaped: boolean;
+  skill?: 'athletics' | 'acrobatics';
+  escaper_natural_roll?: number;
+  escaper_total?: number;
+  escape_dc?: number;
+  forced?: boolean;
+  hands_freed_after?: number;
+  event_sequence?: number;
+}
+
+/**
+ * Escape a standing grapple (SRD): contested Athletics/Acrobatics against the
+ * HOLDER's Strength DC, spending the escaper's Action. `grapplerId` comes from
+ * the session's grapple_holders attribution — never guessed by the client.
+ * Rejections surface verbatim: GRAPPLE_NOT_HELD, ENTITY_NOT_OWNED,
+ * ACTION_ECONOMY_EXHAUSTED, … The browser dials /api/v1/engine/escape-grapple;
+ * when that proxy does not exist upstream yet the gateway's answer is quoted
+ * honestly instead of being retried blind.
+ */
+export async function engineEscapeGrapple(params: {
+  sessionId: string;
+  entityId: string;
+  grapplerId: string;
+  skill: 'athletics' | 'acrobatics';
+}): Promise<EngineActionOutcome<EngineEscapeGrappleResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineEscapeGrappleResult>(
+    `/api/v1/engine/escape-grapple`,
+    {
+      session_id: params.sessionId,
+      entity_id: params.entityId,
+      grappler_id: params.grapplerId,
+      skill: params.skill,
+    },
+  );
+}
+
 /** Verbatim body of POST /api/v1/sessions/{id}/action/shove. */
 export interface EngineShoveResult {
   attacker_id: string;
@@ -350,6 +420,20 @@ export interface EngineEntitySummary {
   position?: number[];
   /** Only present for YOUR OWN entity or when viewing as GM/admin. */
   current_hp?: number;
+  /** Iteration 63: verbatim engine combat facts when the projection exposed
+   * them (your own entity / GM view). Undefined = not exposed. */
+  combatStatus?: EngineEntityCombatStatus;
+}
+
+/**
+ * Engine-exposed combat facts carried ONLY on your own entity's projection
+ * (or under GM/admin view). Every field optional: absence means the
+ * projection did not expose it, never zero/free/not-held.
+ */
+export interface EngineEntityCombatStatus {
+  inspiration?: boolean;
+  hands_occupied?: number;
+  conditions?: unknown[];
 }
 
 /** Ask the engine to resolve a grapple contest (attacker spends their Action). */
@@ -906,22 +990,36 @@ export async function engineSessionEntities(
   const outcome = await engineActionPost<{
     session_id: string;
     entities?: Record<string, Record<string, unknown>>;
+    grapple_holders?: Record<string, unknown>;
   }>(`/api/v1/engine/session-state`, {
     session_id: sessionId,
   });
   if (outcome.kind === 'applied') {
     const map = outcome.data.entities ?? {};
+    // Iteration 63: pass the engine-exposed combat facts (inspiration /
+    // hands_occupied / conditions) through verbatim where the projection
+    // carried them — i.e. only on the caller's OWN entity. Board tokens for
+    // other creatures simply lack these keys and stay clean.
     const list: EngineEntitySummary[] = Object.entries(map)
       .filter(([, e]) => e && typeof e === 'object')
-      .map(([key, e]) => ({
-        id: typeof e.id === 'string' ? e.id : key,
-        name: typeof e.name === 'string' ? e.name : undefined,
-        is_visible: e.is_visible !== false,
-        is_player: e.is_player === true,
-        is_dead: e.is_dead === true,
-        position: Array.isArray(e.position) ? (e.position as number[]) : undefined,
-        current_hp: typeof e.current_hp === 'number' ? e.current_hp : undefined,
-      }))
+      .map(([key, e]) => {
+        const combatStatus: EngineEntityCombatStatus = {};
+        if (typeof e.inspiration === 'boolean') combatStatus.inspiration = e.inspiration;
+        if (typeof e.hands_occupied === 'number' && Number.isFinite(e.hands_occupied)) {
+          combatStatus.hands_occupied = e.hands_occupied;
+        }
+        if (Array.isArray(e.conditions)) combatStatus.conditions = e.conditions;
+        return {
+          id: typeof e.id === 'string' ? e.id : key,
+          name: typeof e.name === 'string' ? e.name : undefined,
+          is_visible: e.is_visible !== false,
+          is_player: e.is_player === true,
+          is_dead: e.is_dead === true,
+          position: Array.isArray(e.position) ? (e.position as number[]) : undefined,
+          current_hp: typeof e.current_hp === 'number' ? e.current_hp : undefined,
+          ...(Object.keys(combatStatus).length > 0 ? { combatStatus } : {}),
+        };
+      })
       .filter((e) => e.is_visible);
     return { kind: 'applied', data: list };
   }

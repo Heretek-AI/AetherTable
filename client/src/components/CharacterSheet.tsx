@@ -34,6 +34,7 @@ import { findCharacterForToken, FullStoredCharacter, AbilityScoreMap } from '../
 import {
   EngineActionOutcome,
   EngineEntitySummary,
+  EngineEscapeGrappleResult,
   EngineGrappleResult,
   EngineHealResult,
   EngineShoveResult,
@@ -43,6 +44,7 @@ import {
   engineDash,
   engineDisengage,
   engineDodge,
+  engineEscapeGrapple,
   engineGrapple,
   engineHeal,
   engineRest,
@@ -50,6 +52,11 @@ import {
   engineShove,
   engineStabilize,
 } from '../api/rules_engine';
+import {
+  type EntityCombatStatus,
+  formatHandsLabel,
+  handsPips,
+} from '../api/entity_status_state';
 import {
   ABILITY_KEYS,
   ABILITY_LABELS,
@@ -72,7 +79,9 @@ interface CharacterSheetProps {
     actionName: string,
     damageFormula: string,
     damageType: string,
-    toHitBonus?: number
+    toHitBonus?: number,
+    /** Iteration 63: attach an SRD inspiration spend to THIS roll. */
+    spendInspiration?: boolean
   ) => void;
   onCastSpell: (
     spellId: string,
@@ -80,7 +89,13 @@ interface CharacterSheetProps {
     level: number,
     toHitBonus?: number
   ) => void;
-  onRollCheck: (skillName: string, modifier: number, dc: number) => void;
+  onRollCheck: (
+    skillName: string,
+    modifier: number,
+    dc: number,
+    /** Iteration 63: attach an SRD inspiration spend to THIS check. */
+    spendInspiration?: boolean
+  ) => void;
   onOpenGrimoire?: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
@@ -99,6 +114,16 @@ interface CharacterSheetProps {
    * expose it — the sheet renders no line rather than guessing.
    */
   concentration?: ConcentrationInfo | null;
+  /**
+   * Iteration 63: this token's engine-exposed combat facts, parsed verbatim
+   * from the session-state projection (`entities[id].inspiration`,
+   * `hands_occupied`, `conditions`, plus the session-level `grapple_holders`
+   * attribution). Null = the projection did not expose them — the sheet
+   * renders no line rather than guessing (see api/entity_status_state.ts).
+   */
+  combatStatus?: EntityCombatStatus | null;
+  /** Holder entity id when the projection's grapple_holders names one. */
+  grappleHolderId?: string | null;
 }
 
 /* Design-token shorthands (official-5e-book system). */
@@ -117,6 +142,8 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   onToggleCollapse,
   engineSessionId,
   concentration,
+  combatStatus,
+  grappleHolderId,
 }) => {
   const [activeTab, setActiveTab] = useState<'actions' | 'spells' | 'inventory' | 'features'>('actions');
 
@@ -209,7 +236,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   const [defenderSkill, setDefenderSkill] = useState<'athletics' | 'acrobatics'>('athletics');
   const [shoveEffect, setShoveEffect] = useState<'prone' | 'push_5ft'>('prone');
   const [maneuverBusy, setManeuverBusy] = useState<
-    'grapple' | 'shove' | 'dodge' | 'dash' | 'disengage' | 'stabilize' | null
+    'grapple' | 'shove' | 'dodge' | 'dash' | 'disengage' | 'stabilize' | 'escape-grapple' | null
   >(null);
   const [maneuverFeedback, setManeuverFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
 
@@ -313,7 +340,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   /** One flight per panel; every button disables while any maneuver is busy. */
   const runManeuver = async (
     kind: Exclude<typeof maneuverBusy, null>,
-    fire: () => Promise<EngineActionOutcome<EngineGrappleResult | EngineShoveResult | EngineStandardActionResult | EngineStabilizeResult>>,
+    fire: () => Promise<EngineActionOutcome<EngineGrappleResult | EngineShoveResult | EngineStandardActionResult | EngineStabilizeResult | EngineEscapeGrappleResult>>,
     describe: (data: never) => string,
   ): Promise<void> => {
     if (!activeToken || maneuverBusy) return;
@@ -375,12 +402,81 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     );
   };
 
+  /**
+   * Attack through App's engine-resolved pipeline with this roll's inspiration
+   * intent attached. The spend flag is SINGLE-SHOT: one click of Greataxe or
+   * Shortbow consumes it, so a later action can never silently re-spend. App
+   * resolves the roll and owns any further disclosure.
+   */
+  const handleExecuteAttack = (actionName: string, formula: string, type: string, toHit?: number): void => {
+    const spend = spendInspirationNext;
+    if (spend) setSpendInspirationNext(false);
+    if (spend) {
+      setInspirationFeedback(
+        'Inspiration spend attached to that roll — the engine confirms consumption in chat.',
+      );
+    }
+    onExecuteAttack(actionName, formula, type, toHit, spend);
+  };
+
   const handleStabilize = (healerId: string, dyingId: string) =>
     void runManeuver(
       'stabilize',
       () => engineStabilize({ sessionId: maneuverSessionId!, healerId, targetId: dyingId }),
       (d: EngineStabilizeResult) => stabilizeFeedback(d),
     );
+
+  /** Verbatim body summary of an escape-grapple response. Renders only fields
+   * the engine actually sent; a forced escape has no rolls to quote. */
+  const escapeGrappleFeedback = (r: EngineEscapeGrappleResult): string =>
+    `Engine escape attempt — ${
+      r.escaper_natural_roll !== undefined
+        ? `d20 ${r.escaper_natural_roll}${typeof r.escape_dc === 'number' ? ` vs DC ${r.escape_dc}` : ''}`
+        : r.forced
+        ? 'forced (GM override)'
+        : 'contest resolved'
+    } → ${r.escaped ? 'ESCAPED' : 'still held'}` +
+    (typeof r.hands_freed_after === 'number' ? `, holder hands_occupied now ${r.hands_freed_after}` : '') +
+    ` · event_sequence ${r.event_sequence ?? '?'}.`;
+
+  /**
+   * Escape-grapple (SRD, iteration 49 route): contested check against the
+   * HOLDER's Strength DC, spending your Action. Offered only when BOTH the
+   * Grappled condition and the grapple_holders stamp are present in the
+   * projection — without the holder id there is nothing to aim at and the
+   * button must not exist.
+   */
+  const handleEscapeGrapple = () => {
+    if (!grappleHolderId) return;
+    return void runManeuver(
+      'escape-grapple',
+      () =>
+        engineEscapeGrapple({
+          sessionId: maneuverSessionId!,
+          entityId: activeToken!.id,
+          grapplerId: grappleHolderId,
+          skill: defenderSkill,
+        }),
+      (d: EngineEscapeGrappleResult) => escapeGrappleFeedback(d),
+    );
+  };
+
+  /* --- SRD inspiration spend ----------------------------------------------
+   * A held point buys Advantage on ONE d20 roll; the ENGINE decides atomically
+   * whether it is actually consumed (a roll already advantaged/disadvantaged
+   * cancels into a straight d20 and keeps the point). The toggle only marks the
+   * intent on the next attack/check payload (`spend_inspiration`, iteration 56
+   * engine contract); it is cleared after each use so a later action never
+   * silently re-spends.
+   */
+  const [spendInspirationNext, setSpendInspirationNext] = useState(false);
+  const [inspirationFeedback, setInspirationFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSpendInspirationNext(false);
+    setInspirationFeedback(null);
+  }, [activeToken?.id]);
+
 
   /* --- SRD Ready action ----------------------------------------------------
    * Spend your Action to hold a triggered response ("I attack the goblin when
@@ -671,6 +767,13 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
 
   const abilities = derived?.abilities ?? [];
 
+  /** Resolved holder name for the Grappled-by line: the projected roster when
+   * the id is there, otherwise the raw engine UUID — never a made-up name. */
+  const grappleHolderName = grappleHolderId
+    ? maneuverTargets?.find((t) => t.id === grappleHolderId)?.name || grappleHolderId
+    : null;
+
+
   /** Explicit empty state — replaces every hardcoded stat when no record binds. */
   const noBoundCharacter = !derived;
   const classLabel = derived
@@ -772,6 +875,76 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
             }}
           >
             <ConcentrationBadge info={concentration} />
+          </div>
+        )}
+
+        {/* Engine-exposed combat state (iteration 63) — inspiration hold,
+            occupied hands, Grappled-by. Every line comes straight from the
+            session-state projection; a field the projection omitted renders
+            NOTHING (absence means "not exposed", never "free"/"not held"). */}
+        {combatStatus && (
+          <div
+            data-testid="sheet-combat-status"
+            className="rounded-md px-2 py-1.5 space-y-1"
+            style={{
+              border: `1px solid ${LEATHER_HAIRLINE}`,
+              background: 'color-mix(in srgb, var(--parchment-paper-aged) 30%, transparent)',
+            }}
+          >
+            {combatStatus.inspiration && (
+              <div className="flex items-center gap-2" title="SRD inspiration: spend it for Advantage on one d20 roll">
+                <span
+                  data-testid="sheet-inspiration-dot"
+                  className="w-2.5 h-2.5 rounded-full shrink-0"
+                  style={{ background: 'var(--tavern-accent)', boxShadow: '0 0 6px rgba(214,178,106,0.7)' }}
+                />
+                <span className="text-[11px] font-prose" style={{ color: INK }}>
+                  Inspiration held
+                </span>
+              </div>
+            )}
+            {(() => {
+              const label = formatHandsLabel(combatStatus);
+              if (!label) return null;
+              const pips = handsPips(combatStatus);
+              return (
+                <div className="flex items-center gap-2" title={label}>
+                  <span className="flex items-center gap-1 shrink-0">
+                    {pips.map((occupied, i) => (
+                      <span
+                        key={i}
+                        className="w-2.5 h-2.5 rounded-sm shrink-0 transition"
+                        style={{
+                          background: occupied ? CRIMSON_TEXT : 'transparent',
+                          border: `1.5px solid ${occupied ? CRIMSON_TEXT : 'var(--rp-leather-700)'}`,
+                        }}
+                        aria-label={`Hand ${i + 1} ${occupied ? 'occupied' : 'free'}`}
+                      />
+                    ))}
+                  </span>
+                  <span className="text-[11px] font-prose" style={{ color: INK }}>
+                    {label}
+                  </span>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {grappleHolderId && (
+          <div
+            data-testid="sheet-grappled-by-line"
+            className="rounded-md px-2 py-1.5 flex items-center gap-2"
+            style={{
+              border: `1px solid ${LEATHER_HAIRLINE}`,
+              background:
+                'color-mix(in srgb, var(--state-danger) 12%, transparent)',
+            }}
+          >
+            <Hand className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--state-danger)' }} />
+            <span className="text-[11px] font-prose" style={{ color: INK }}>
+              Grappled{grappleHolderName ? ` by ${grappleHolderName}` : ''}
+            </span>
           </div>
         )}
 
@@ -966,6 +1139,28 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                 Push 5 ft
               </button>
             </div>
+
+            {/* Escape grapple (iteration 49 route): offered ONLY when the
+                projection shows this token Grappled AND names its holder via
+                the session's grapple_holders attribution. The holder id comes
+                from engine state — never guessed from the target picker. */}
+            {grappleHolderId && (
+              <button
+                type="button"
+                onClick={handleEscapeGrapple}
+                disabled={maneuverBusy !== null}
+                data-testid="sheet-escape-grapple"
+                title={`Contested ${defenderSkill} check vs your holder's STR DC; spends your Action engine-side`}
+                className="vtt-btn vtt-btn-danger w-full text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5">
+                  <Hand className="w-3.5 h-3.5" />
+                  {maneuverBusy === 'escape-grapple'
+                    ? 'Escaping…'
+                    : `Escape grapple (${defenderSkill})`}
+                </span>
+              </button>
+            )}
 
             {/* Contested maneuvers against the picked target */}
             <div className="grid grid-cols-2 gap-2">
@@ -1239,10 +1434,48 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
         {/* Tab Content */}
         {activeTab === 'actions' && (
           <div className="space-y-3">
+            {/* SRD inspiration spend (iteration 63): a held point buys
+                Advantage on ONE d20 roll. The toggle only marks the intent on
+                the next attack/check payload (`spend_inspiration`, iteration 56
+                engine contract); the engine decides atomically whether the
+                point is actually consumed and cancels a wasted spend back into
+                a straight d20. Rendered only when the projection shows the
+                point actually HELD. */}
+            {combatStatus?.inspiration && (
+              <div className="space-y-1">
+                <button
+                  type="button"
+                  onClick={() => setSpendInspirationNext((v) => !v)}
+                  aria-pressed={spendInspirationNext}
+                  data-testid="sheet-spend-inspiration-toggle"
+                  title="Burn your held inspiration for Advantage on your NEXT attack or check — the engine keeps the point if the roll was already advantaged/disadvantaged"
+                  className={`transition cursor-pointer w-full ${
+                    spendInspirationNext ? 'vtt-badge-danger' : 'vtt-badge'
+                  }`}
+                >
+                  <span className="flex items-center justify-center gap-1.5">
+                    <Sparkles className="w-3 h-3" />
+                    {spendInspirationNext
+                      ? 'Inspiration armed — next roll has Advantage'
+                      : 'Spend Inspiration on next roll'}
+                  </span>
+                </button>
+                {inspirationFeedback && (
+                  <p
+                    aria-live="polite"
+                    className="text-[10px] font-prose leading-snug break-words"
+                    style={{ color: 'color-mix(in srgb, var(--parchment-ink) 65%, transparent)' }}
+                  >
+                    {inspirationFeedback}
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="space-y-2">
               <button
                 onClick={() =>
-                  onExecuteAttack(
+                  handleExecuteAttack(
                     'Greataxe Slash',
                     `1d12 + ${derived!.mods.str}`,
                     'slashing',
@@ -1270,7 +1503,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
 
               <button
                 onClick={() =>
-                  onExecuteAttack(
+                  handleExecuteAttack(
                     'Shortbow Shot',
                     `1d8 + ${derived!.mods.dex}`,
                     'piercing',
@@ -1309,7 +1542,11 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                 ].map(({ skill, ability, abilityMod, dc }) => (
                   <button
                     key={skill}
-                    onClick={() => onRollCheck(skill, abilityMod, dc)}
+                    onClick={() => {
+                      const spend = spendInspirationNext;
+                      if (spend) setSpendInspirationNext(false);
+                      onRollCheck(skill, abilityMod, dc, spend);
+                    }}
                     title={`${skill}: raw ${ability} modifier (no proficiency recorded)`}
                     className="vtt-btn vtt-btn-secondary w-full font-prose text-sm"
                     style={{ justifyContent: 'flex-start', padding: '0.4rem 0.6rem' }}

@@ -109,6 +109,10 @@ import {
   parseConcentrationFromSessionState,
   type ConcentrationInfo,
 } from './api/concentration_state';
+import {
+  parseEntityStatusFromSessionState,
+  type EntityCombatStatus,
+} from './api/entity_status_state';
 
 /**
  * Authoritative engine combat state, mirrored from GET /api/v1/engine/session-state
@@ -640,6 +644,17 @@ export function App() {
   const [concentrationByEntity, setConcentrationByEntity] = useState<
     Record<string, ConcentrationInfo>
   >({});
+  // Iteration 63: engine-exposed combat facts (inspiration / hands_occupied /
+  // conditions) plus the session's grapple_holders attribution, parsed from
+  // the same session-state snapshot the 15s poll already fetches. Only the
+  // caller's OWN entity carries these fields in the projection — everyone
+  // else arrives as a board token. Absent = "engine did not expose it".
+  const [entityStatusByEntity, setEntityStatusByEntity] =
+    useState<Record<string, EntityCombatStatus>>({});
+  const [grappleHolders, setGrappleHolders] = useState<Record<string, string>>({});
+  /** Status for one token id, or null when the projection exposed nothing. */
+  const combatStatusFor = (tokenId: string | undefined): EntityCombatStatus | null =>
+    (tokenId ? entityStatusByEntity[tokenId] : undefined) ?? null;
   // Transient line for the most recent damage-triggered concentration save
   // (auto-dismissing toast). Cleared when a fresh disclosure arrives so the
   // next one takes over instead of stacking.
@@ -1026,6 +1041,11 @@ export function App() {
       // (`entities[id].concentration = {spell_id, started_round}`). Parsed
       // defensively; a projection that omits the field leaves the badge off.
       setConcentrationByEntity(parseConcentrationFromSessionState(snap));
+      // Iteration 63: same snapshot, same discipline — parse the engine's
+      // inspiration/hands/conditions facts and the grapple-hold attribution.
+      const status = parseEntityStatusFromSessionState(snap);
+      setEntityStatusByEntity(status.byEntity);
+      setGrappleHolders(status.grappleHolders);
     } catch {
       /* engine unreachable — keep showing last known state */
     }
@@ -1278,7 +1298,8 @@ export function App() {
     actionName: string,
     damageFormula: string,
     damageType: string,
-    toHitBonus?: number
+    toHitBonus?: number,
+    spendInspiration?: boolean
   ) => {
     const target = tokens.find((t) => !t.isPlayer && t.hp > 0) || tokens[2];
 
@@ -1291,10 +1312,11 @@ export function App() {
     const result = await engineAttack({
       attackerId: selectedToken?.id || 'thorin',
       targetId: target.id,
+      spendInspiration,
     });
     if (!result) {
       setEngineUnreachable('attack', `${actionName} by ${selectedToken?.name || 'Hero'}`, () => {
-        void handleExecuteAttack(actionName, damageFormula, damageType, toHitBonus);
+        void handleExecuteAttack(actionName, damageFormula, damageType, toHitBonus, spendInspiration);
       });
       return;
     }
@@ -1473,14 +1495,30 @@ export function App() {
     );
   };
 
-  const handleRollCheck = async (skillName: string, modifier: number, dc: number) => {
+  const handleRollCheck = async (
+    skillName: string,
+    modifier: number,
+    dc: number,
+    spendInspiration?: boolean
+  ) => {
     // Authoritative d20 resolution via the rules engine. Iteration-19: like the
     // attack path above, an unreachable engine no longer rolls locally and
     // grades itself — that fabricated a success/failure the ledger never saw.
-    const result = await engineCheck({ modifier, dc });
+    // Iteration 63: when the sheet armed an inspiration spend, the roll is
+    // grounded in the live session (session_id + entity_id) so the engine can
+    // consume the held point atomically with its condition-edge decision; the
+    // legacy stateless path is byte-for-byte unchanged when no spend is asked.
+    const groundedSpend = Boolean(spendInspiration) && Boolean(combatSessionId) && Boolean(selectedToken?.id);
+    const result = await engineCheck({
+      modifier,
+      dc,
+      ...(groundedSpend
+        ? { sessionId: combatSessionId!, entityId: selectedToken!.id, spendInspiration: true }
+        : {}),
+    });
     if (!result) {
       setEngineUnreachable('check', `${skillName} check (DC ${dc})`, () => {
-        void handleRollCheck(skillName, modifier, dc);
+        void handleRollCheck(skillName, modifier, dc, spendInspiration);
       });
       return;
     }
@@ -2153,6 +2191,10 @@ export function App() {
                 onToggleCollapse={() => setIsRightDockCollapsed(!isRightDockCollapsed)}
                 concentration={
                   selectedToken ? concentrationByEntity[selectedToken.id] ?? null : null
+                }
+                combatStatus={combatStatusFor(selectedToken?.id)}
+                grappleHolderId={
+                  selectedToken ? grappleHolders[selectedToken.id] ?? null : null
                 }
               />
             </div>
