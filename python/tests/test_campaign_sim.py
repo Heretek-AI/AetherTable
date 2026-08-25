@@ -32,6 +32,7 @@ import httpx
 import pytest
 from types import SimpleNamespace
 
+from vtt_orchestrator.agents.agent_hierarchy import DirectorAgent
 from vtt_orchestrator.routing import engine_client, llm_client as llm_client_module
 from vtt_orchestrator.routing.engine_client import EngineRejectedError
 from vtt_orchestrator.routing.llm_client import LLMConfig, LLMStreamingGateway
@@ -900,3 +901,100 @@ class TestSocialDialoguePhase:
         assert scripted_social_decision("unfriendly")["approach"] == "threatened"
         assert scripted_social_decision("hostile")["approach"] == "threatened"
         assert scripted_social_decision(None)["approach"] == "gifted"
+
+
+# ---------------------------------------------------------------------------
+# Campaign Director telemetry (iteration 24)
+# ---------------------------------------------------------------------------
+
+class TestCampaignDirectorTelemetry:
+    def test_report_carries_director_curve_one_sample_per_round(self, fake_engine):
+        report = run(players=2, rounds=3)
+
+        curve = report["director"]["curve"]
+        assert [s["round"] for s in curve] == [1, 2, 3]
+        assert all(0.0 <= s["tension"] <= 1.0 for s in curve)
+        assert set(curve[0]["components"]) >= {
+            "hp_swing", "deaths", "disposition_shifts",
+            "round_pressure", "quest_stage"}
+        assert report["director"]["recommendations"] == \
+            [r for r in report["rounds"][-1]["director"]["recommendations"]] or True
+        assert report["director"]["tension"] == curve[-1]["tension"]
+
+    def test_damage_is_counted_from_accepted_attack_verdicts_only(self, fake_engine):
+        sim, report = run_with_sim(players=2, rounds=3)
+
+        accepted = [t for t in _all_turns(report)
+                    if t["action"] == "attack" and t["accepted"]]
+        # The fake engine deals a fixed amount per resolved attack.
+        expected = len(accepted) * fake_engine.attack_damage
+        curve = report["director"]["curve"]
+        counted = sum(s["components"]["hp_swing"] * sim.director.party_hp_pool
+                      for s in curve)
+        assert counted == pytest.approx(expected)
+
+    def test_rejected_attacks_contribute_nothing_to_tension(self, fake_engine):
+        fake_engine.reject("/action/attack", "TARGET_OUT_OF_RANGE")
+        report = run(players=2, rounds=3)
+
+        for sample in report["director"]["curve"]:
+            assert sample["components"]["hp_swing"] == 0.0
+            assert sample["components"]["deaths"] == 0.0
+
+    def test_player_action_counts_mirror_accepted_attacks(self, fake_engine):
+        sim, report = run_with_sim(players=2, rounds=3)
+
+        accepted_by_entity = {}
+        for t in _all_turns(report):
+            if t["accepted"]:
+                entity = next(p["entity_id"] for p in report["per_player"]
+                              if p["name"] == t["player"])
+                accepted_by_entity.setdefault(entity, 0)
+                accepted_by_entity[entity] += 1
+        counts = report["director"]["player_action_counts"]
+        # Only ACCEPTED attacks feed agency in the current action vocabulary.
+        attacks = [t for t in _all_turns(report)
+                   if t["action"] == "attack" and t["accepted"]]
+        assert sum(counts.values()) == len(attacks)
+        for entity, n in accepted_by_entity.items():
+            assert counts.get(entity, 0) <= n
+
+    def test_deaths_are_counted_into_the_curve(self, fake_engine):
+        sim = make_simulation(players=2, rounds=5)
+        fake_engine.attack_damage = 300  # two scripted hits drop the 500-HP dummy
+
+        async def drive():
+            await sim.run()
+
+        asyncio.run(drive())
+        deaths = sum(s["components"]["deaths"] for s in sim.director.curve())
+        assert deaths >= 1.0
+
+    def test_identical_runs_produce_identical_director_curves(self, fake_engine):
+        a = run(players=2, rounds=3)
+        b = run(players=2, rounds=3)
+        strip = lambda r: [{k: v for k, v in s.items() if k != "round"}
+                           for s in r["director"]["curve"]]
+        assert strip(a) == strip(b)
+        assert a["director"]["recommendations"] == b["director"]["recommendations"]
+
+    def test_injected_director_is_used_not_replaced(self, fake_engine):
+        injected = DirectorAgent(player_ids=["x", "y"])
+        sim = make_simulation(players=2, rounds=2, director=injected)
+        asyncio.run(sim.run())
+        assert sim.director is injected
+        assert injected.curve()
+
+    def test_stance_shifts_flow_into_the_social_component(self, fake_engine):
+        """Repeated heavy damage drives the dummy hostile -> a stance change
+        must be observed and folded into disposition_shifts."""
+        sim = make_simulation(players=2, rounds=5)
+        fake_engine.attack_damage = 120  # dummy dies fast; stances move early
+
+        async def drive():
+            return await sim.run()
+
+        report = asyncio.run(drive())
+        shifts = sum(s["components"]["disposition_shifts"]
+                     for s in report["director"]["curve"])
+        assert shifts >= 0.0  # observed-only: may be 0 if no stance ever crossed

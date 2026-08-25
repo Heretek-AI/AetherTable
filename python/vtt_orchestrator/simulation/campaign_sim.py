@@ -48,6 +48,15 @@ an LLM utterance or reply that trips the NPC's social norms degrades the whole
 exchange to the template voice with the ``norm_rejected`` reason surfaced in
 the round report.
 
+Campaign Director telemetry (integration with ``agents.agent_hierarchy``):
+after each round, the sim folds that round's OBSERVED outcomes — HP damage
+dealt (from accepted attack verdicts), entity deaths, disposition stance
+transitions, rounds elapsed — into an injectable ``DirectorAgent``'s
+deterministic tension curve, and records each player's ACCEPTED action count.
+The resulting ``director`` block of the report carries the curve and the
+director's recommendations verbatim; it is pure accounting over counted
+events, never invented.
+
 Importable API only — no HTTP routes are added this iteration. To run live:
 
     # 1. authoritative engine:      cargo run -p vtt-server
@@ -67,6 +76,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from ..agents.agent_hierarchy import DirectorAgent
 from ..routing.llm_client import LLMConfig, LLMStreamingGateway
 from .npc_disposition import NpcDispositionEngine
 
@@ -632,6 +642,7 @@ class CampaignSimulation:
         disposition_engine: Optional[NpcDispositionEngine] = None,
         npc_registry: Optional[Dict[str, Any]] = None,
         social_npc_id: Optional[str] = None,
+        director: Optional[DirectorAgent] = None,
     ):
         if players < 1:
             raise ValueError("players must be >= 1")
@@ -664,6 +675,15 @@ class CampaignSimulation:
         self.disposition = disposition_engine or NpcDispositionEngine(clock=lambda: 0.0)
         # npc_id -> best-known display name (from snapshots), for report keys.
         self._npc_names: Dict[str, str] = {}
+        # Campaign Director (GOALS.md Pillar 5): deterministic tension tracking
+        # over the sim's own counted outcomes. Injectable for determinism.
+        self.director = director or DirectorAgent()
+        # Per-round HP damage + deaths, observed from accepted attack verdicts.
+        self._round_damage: Dict[int, float] = {}
+        self._round_deaths: Dict[int, int] = {}
+        # Stance at the end of round N, per (npc_id, player_id), to diff
+        # against round N+1 -> stance TRANSITIONS observed.
+        self._stance_cache: Dict[tuple, str] = {}
 
     @property
     def _end_ts(self) -> float:
@@ -707,6 +727,21 @@ class CampaignSimulation:
         actor_id = player.entity_id or player.name
         if not npc_id or npc_id == actor_id:
             return
+        # Director signals: HP swing + deaths are counted ONLY from the proxy's
+        # own attack verdict — never extrapolated.
+        outcome = result.get("outcome")
+        if isinstance(outcome, dict):
+            try:
+                self._round_damage[round_no] = (
+                    self._round_damage.get(round_no, 0.0)
+                    + float(outcome.get("total_damage") or 0.0)
+                )
+            except (TypeError, ValueError):
+                pass
+            if bool(outcome.get("target_is_dead")):
+                self._round_deaths[round_no] = self._round_deaths.get(round_no, 0) + 1
+            # Accepted attacks by players also feed conversational agency.
+            self.director.record_player_action(actor_id)
         ts = round_no * 10.0 + player.index  # deterministic sim clock
         try:
             self.disposition.record_interaction(
@@ -792,11 +827,26 @@ class CampaignSimulation:
                         if entry is not None:
                             round_entry["social"].append(entry)
                             report["totals"]["social_interactions"] += 1
+                # Campaign Director: fold THIS round's counted outcomes into
+                # the tension curve, then attach the curve + recommendations.
+                round_entry["director"] = self._director_tick(
+                    round_no,
+                    stance_shifts=self._count_stance_shifts(round_no),
+                )
                 report["rounds"].append(round_entry)
         except CampaignSimError as exc:
             report["errors"].append(f"aborted mid-run: {exc}")
 
         report["per_player"] = [self._player_summary(p, report) for p in players]
+        # Campaign Director summary: the full curve + final recommendations,
+        # verbatim from the deterministic tracker (pure accounting, no
+        # invention).
+        report["director"] = {
+            "curve": self.director.curve(),
+            "recommendations": self.director.recommendations(),
+            "tension": self.director.tension(),
+            "player_action_counts": dict(self.director._action_counts),
+        }
         # Social-state telemetry: counted from the disposition engine's own
         # history — nothing here is extrapolated.
         by_kind: Dict[str, int] = {}
@@ -808,6 +858,42 @@ class CampaignSimulation:
         return report
 
     # -- phases -------------------------------------------------------------
+
+    def _count_stance_shifts(self, round_no: int) -> int:
+        """Count disposition stance TRANSITIONS observed through the end of
+        ``round_no`` vs the previous round's cached readings. A stance that
+        appears for the first time is NOT a shift (nothing moved — it was
+        simply never read before)."""
+        ts = round_no * 10.0
+        current: Dict[tuple, str] = {}
+        for record in self.disposition.history():
+            if record.timestamp > ts:
+                continue
+            try:
+                stance = self.disposition.stance(
+                    record.npc_id, record.player_id, timestamp=ts)
+            except Exception:  # never let telemetry break the run
+                continue
+            current[(record.npc_id, record.player_id)] = stance
+
+        shifts = 0
+        for key, stance in current.items():
+            previous = self._stance_cache.get(key)
+            if previous is not None and previous != stance:
+                shifts += 1
+            self._stance_cache[key] = stance
+        return shifts
+
+    def _director_tick(self, round_no: int, *, stance_shifts: int) -> Dict[str, Any]:
+        """One deterministic director step over this round's counted outcomes."""
+        sample = self.director.observe_round(
+            round_no,
+            hp_damage=self._round_damage.pop(round_no, 0.0),
+            deaths=self._round_deaths.pop(round_no, 0),
+            disposition_shifts=stance_shifts,
+        )
+        sample["recommendations"] = self.director.recommendations()
+        return sample
 
     async def _setup(self, players: List[CampaignSimPlayer], report: Dict[str, Any]) -> None:
         for player in players:
