@@ -20,6 +20,12 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # Static-analysis gate: zero warnings tolerated. Verified locally that
+      # `cargo clippy --workspace --all-targets` is already warning-free, so
+      # this is a regression gate rather than a fix-up burden.
+      - name: Clippy Lint (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Run Workspace Tests
         run: cargo test --workspace --verbose
 
@@ -30,6 +36,13 @@ jobs:
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       LLM_KEY: ${{ secrets.LLM_KEY }}
       LLM_API: ${{ secrets.LLM_API }}
+      # Env-dependent suites stay skipped in CI by design (honest skip):
+      #   * engine-live tests need the Rust gateway (ENGINE_API_URL, default
+      #     localhost:8088) — unreachable in CI, so the harness reports
+      #     engine_live=False and those assertions skip rather than fail
+      #   * live-LLM tests additionally require RUN_LIVE_LLM=1 + a real key
+      #     (see python/tests/conftest.py "live" gating)
+      ENGINE_API_URL: ""
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -94,6 +107,12 @@ jobs:
         working-directory: client
         run: npm ci
 
-      - name: Build Production Client
+      # Unit suite (Vitest, src/**/__tests__/*). Pure in-browser logic — no
+      # external services — so it is a hard gate.
+      - name: Run Vitest Unit Suite
+        working-directory: client
+        run: npm run test
+
+      - name: Typecheck & Build Production Client
         working-directory: client
         run: npm run build

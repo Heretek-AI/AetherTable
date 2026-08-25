@@ -1,0 +1,53 @@
+# SonarQube Cloud analysis — AetherTable
+#
+# Project is already registered on SonarCloud (org: heretek-ai, key:
+# Heretek-AI_TTRPG) and currently analyzed by the org's automatic "Autoscan".
+# This job makes analysis explicit and deterministic on push to main.
+#
+# Operator prerequisite (one-time): create an analysis token at
+# https://sonarcloud.io/account/security and add it as repository secret
+# SONAR_TOKEN. Until that secret exists this job fails fast with a clear
+# message instead of uploading nothing silently.
+#
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sonar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonarcloud:
+    name: SonarCloud Scan (main)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for SONAR_TOKEN secret
+        id: token-check
+        env:
+          HAS_TOKEN: ${{ secrets.SONAR_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" = "true" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::SONAR_TOKEN secret is not set. Create an analysis token at https://sonarcloud.io/account/security and add it as the SONAR_TOKEN repository secret."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # Shallow history breaks Sonar's blame-based new-code detection; a
+          # full fetch keeps the "new code" period accurate.
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        if: steps.token-check.outputs.available == 'true'
+        uses: SonarSource/sonarqube-scan-action@v8.2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
