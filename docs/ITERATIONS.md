@@ -330,3 +330,14 @@ Lesson recorded: perimeter claims in commit messages must match diff scope.
 ### Iteration 25 — c055901 — feat(spatial): visibility polygon engine + route (P4) — cargo 295/18
 ### Iteration 26 — c8cf376 — feat(infra): coturn TURN service + PeerJS ICE plumbing — vitest 168
 ### Iteration 27 — this wave — feat(compendium): spell damage coverage 73→82 + upcast metadata — pytest 764
+### Iteration 28 — d12c398 — feat(client): X-card reconciles tokens from rewind state (P11) — vitest 191
+### Iteration 29 — 2550c1d — fix(server): spatial bounds + multi-layer cover depth (A2 #1/#2) — cargo 297/18
+### Iteration 30 — this commit — fix(client,relay): speech-ledger poisoning defense (A2 #4/#5) — vitest 206 + relay 21
+
+## Audit sweep A2 (~it.27) — verdict: NO BLOCKERS; A1 fixes verified intact
+
+New findings all remediated red-first: #4 speech-ledger CRDT poisoning
+(iteration 30, defense in depth incl. relay-side attribution), #1 elevation-
+cover no-op through /los single-layer grid + #2 unbounded spatial route params
+(iteration 29). Claim-audit lesson repeated: iteration 20's "server callers
+pass real z" was wrong — proven wrong by test, fixed, tracker noted.
