@@ -3359,6 +3359,58 @@ async fn resolve_death_save(
 
 // --- Spatial utilities ------------------------------------------------------
 
+/// Validation ceilings for the stateless `/api/v1/spatial/*` compute routes.
+///
+/// These routes deserialize raw client integers straight into allocations, so
+/// every dimension is bounded BEFORE a collision grid is constructed
+/// (audit F-A2#2): an unbounded `grid_width * grid_height * depth` usize pair
+/// was a one-POST OOM, an uncapped occluder Vec flooded the allocator, and
+/// unbounded `f32` ranges / elevation layers fed pathological loops.
+pub const MAX_SPATIAL_GRID_DIM: usize = 256;
+/// Maximum occluder cells accepted per stateless spatial request.
+pub const MAX_SPATIAL_SOLID_CELLS: usize = 4_096;
+/// Inclusive upper bound (feet) for any client-supplied sight/range value.
+pub const MAX_SPATIAL_RANGE_FEET: f32 = 500.0;
+/// Highest elevation layer index addressable by a spatial request.
+pub const MAX_SPATIAL_Z: usize = 32;
+
+/// Validates one bounded grid dimension, returning the field-naming error
+/// string on violation (`None` = acceptable).
+fn check_spatial_dim(value: usize, field: &str) -> Option<String> {
+    if value == 0 || value > MAX_SPATIAL_GRID_DIM {
+        Some(format!(
+            "{field} must be between 1 and {MAX_SPATIAL_GRID_DIM} (got {value})"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Validates the shared grid/occluder parameters of ALL three stateless
+/// spatial routes BEFORE any allocation happens. Returns `(code, detail)` for
+/// the FIRST violation so responses stay single-error and predictable.
+fn validate_spatial_grid_params(
+    grid_width: usize,
+    grid_height: usize,
+    solid_cells_len: usize,
+) -> Result<(), (String, String)> {
+    if let Some(detail) = check_spatial_dim(grid_width, "grid_width") {
+        return Err(("INVALID_GRID_WIDTH".into(), detail));
+    }
+    if let Some(detail) = check_spatial_dim(grid_height, "grid_height") {
+        return Err(("INVALID_GRID_HEIGHT".into(), detail));
+    }
+    if solid_cells_len > MAX_SPATIAL_SOLID_CELLS {
+        return Err((
+            "INVALID_SOLID_CELLS".into(),
+            format!(
+                "solid_cells must hold at most {MAX_SPATIAL_SOLID_CELLS} entries (got {solid_cells_len})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn build_collision_grid(map: &SessionMap) -> GridCollisionMap {
     let mut grid = GridCollisionMap::new(map.width, map.height, 1, map.cell_size_feet);
     for &(x, y) in &map.solid_cells {
@@ -3459,6 +3511,16 @@ pub struct LosReq {
     pub grid_width: usize,
     pub grid_height: usize,
     pub solid_cells: Vec<(usize, usize)>,
+    /// Number of elevation layers the caller is modeling. Absent or 1 keeps
+    /// the legacy single-layer behavior; values > 1 make head-height corner
+    /// rays sample real voxels instead of clamping back onto layer 0
+    /// (audit F-A2#1: iteration 20's elevation-aware cover was a no-op here).
+    #[serde(default)]
+    pub z_layers: Option<usize>,
+    /// Occluders as full `(x, y, z)` grid voxels. Only meaningful together
+    /// with `z_layers > 1`; ground-layer payloads keep using `solid_cells`.
+    #[serde(default)]
+    pub solid_cells_3d: Vec<(usize, usize, usize)>,
     /// Per-cell lighting zones to evaluate against (PHB bright/dim/darkness/
     /// magical darkness). Serde default keeps legacy payloads (no lighting)
     /// working — absent zones are Bright.
@@ -3472,6 +3534,54 @@ pub struct LosReq {
     pub viewer_vision_range_feet: Option<f32>,
 }
 
+/// Resolves the collision-grid depth for a stateless spatial request:
+/// an explicit multi-layer declaration wins; otherwise the request stays on
+/// the legacy single ground layer. Depth is bounded by [`MAX_SPATIAL_Z`].
+fn resolve_spatial_depth(z_layers: Option<usize>, fallback: usize) -> Result<usize, String> {
+    let depth = z_layers.unwrap_or(fallback);
+    if depth == 0 || depth > MAX_SPATIAL_Z {
+        return Err(format!(
+            "z_layers must be between 1 and {MAX_SPATIAL_Z} (got {depth})"
+        ));
+    }
+    Ok(depth)
+}
+
+/// Builds a validated depth-aware occluder grid from a stateless spatial
+/// request: ground-layer cells from `solid_cells`, elevated voxels via
+/// `fill`. Returns `(code, detail)` for the first validation violation so the
+/// caller renders the field-naming 422 (keeps the Err variant small).
+fn build_validated_grid(
+    width: usize,
+    height: usize,
+    depth: usize,
+    solid_cells_len: usize,
+    fill: impl FnOnce(&mut GridCollisionMap),
+) -> Result<GridCollisionMap, (String, String)> {
+    validate_spatial_grid_params(width, height, solid_cells_len)?;
+    let mut grid = GridCollisionMap::new(width, height, depth, SPATIAL_CELL_SIZE_FEET);
+    fill(&mut grid);
+    Ok(grid)
+}
+
+/// Convenience wrapper: validates then rejects through `reject()` on failure.
+macro_rules! validated_grid_or_reject {
+    ($data:expr, $($args:tt)*) => {
+        match build_validated_grid($($args)*) {
+            Ok(g) => g,
+            Err((code, detail)) => return reject($data, 422, &code, &detail),
+        }
+    };
+}
+
+/// Feet per cell assumed by every stateless spatial route payload (world
+/// coordinates in these requests are plain feet on a 5 ft grid).
+const SPATIAL_CELL_SIZE_FEET: f32 = 5.0;
+
+/// Upper bound on elevated-voxel entries so a `z_layers > 1` payload cannot
+/// smuggle past the flat-list ceiling via `solid_cells_3d`.
+const MAX_SPATIAL_VOXELS_3D: usize = MAX_SPATIAL_SOLID_CELLS * MAX_SPATIAL_Z;
+
 async fn compute_los(
     data: web::Data<AppState>,
     identity: AuthIdentity,
@@ -3483,10 +3593,36 @@ async fn compute_los(
     {
         return resp;
     }
-    let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
-    for &(x, y) in &req.solid_cells {
-        grid.set_solid(x, y, 0, true);
+    let depth = match resolve_spatial_depth(req.z_layers, 1) {
+        Ok(d) => d,
+        Err(detail) => return reject(&data, 422, "INVALID_Z_LAYERS", &detail),
+    };
+    if req.solid_cells_3d.len() > MAX_SPATIAL_VOXELS_3D {
+        return reject(
+            &data,
+            422,
+            "INVALID_SOLID_CELLS",
+            &format!(
+                "solid_cells_3d must hold at most {MAX_SPATIAL_VOXELS_3D} entries (got {})",
+                req.solid_cells_3d.len()
+            ),
+        );
     }
+    let grid = validated_grid_or_reject!(
+        &data,
+        req.grid_width,
+        req.grid_height,
+        depth,
+        req.solid_cells.len() + req.solid_cells_3d.len(),
+        |grid| {
+            for &(x, y) in &req.solid_cells {
+                grid.set_solid(x, y, 0, true);
+            }
+            for &(x, y, z) in &req.solid_cells_3d {
+                grid.set_solid(x, y, z, true);
+            }
+        }
+    );
 
     let lighting = LightingOverlay::from_cells(&req.lighting_zones);
     // Vision defaults keep the route backward compatible: no mode/range given
@@ -3553,12 +3689,49 @@ async fn compute_visibility(
     {
         return resp;
     }
-    let z = req.z;
-    let mut grid =
-        GridCollisionMap::new(req.grid_width.max(1), req.grid_height.max(1), z + 1, 5.0);
-    for &(x, y) in &req.solid_cells {
-        grid.set_solid(x, y, z, true);
+    if req.z > MAX_SPATIAL_Z {
+        return reject(
+            &data,
+            422,
+            "INVALID_Z",
+            &format!("z must be at most {MAX_SPATIAL_Z} (got {})", req.z),
+        );
     }
+    if !(req.max_range_feet > 0.0 && req.max_range_feet.is_finite()) {
+        return reject(
+            &data,
+            422,
+            "INVALID_MAX_RANGE_FEET",
+            &format!(
+                "max_range_feet must be finite and greater than 0 (got {})",
+                req.max_range_feet
+            ),
+        );
+    }
+    if req.max_range_feet > MAX_SPATIAL_RANGE_FEET {
+        return reject(
+            &data,
+            422,
+            "INVALID_MAX_RANGE_FEET",
+            &format!(
+                "max_range_feet must be at most {MAX_SPATIAL_RANGE_FEET} (got {})",
+                req.max_range_feet
+            ),
+        );
+    }
+    let grid = validated_grid_or_reject!(
+        &data,
+        req.grid_width,
+        req.grid_height,
+        req.z + 1,
+        req.solid_cells.len(),
+        |grid| {
+            for &(x, y) in &req.solid_cells {
+                grid.set_solid(x, y, req.z, true);
+            }
+        }
+    );
+    let z = req.z;
 
     let polygon = if req.origin.x.is_finite() && req.origin.y.is_finite() {
         visibility_polygon_z(&grid, &req.origin, z, req.max_range_feet)
@@ -3583,6 +3756,11 @@ pub struct PathReq {
     pub solid_cells: Vec<(usize, usize)>,
     #[serde(default)]
     pub difficult_terrain: Vec<(usize, usize)>,
+    /// Number of elevation layers to route through. Absent or 1 keeps the
+    /// legacy single-layer behavior (audit F-A2#1 applied here too — /path
+    /// had the SAME forced depth-1 collision grid as /los).
+    #[serde(default)]
+    pub z_layers: Option<usize>,
 }
 
 async fn compute_path(
@@ -3596,10 +3774,22 @@ async fn compute_path(
     {
         return resp;
     }
-    let mut grid = GridCollisionMap::new(req.grid_width, req.grid_height, 1, 5.0);
-    for &(x, y) in &req.solid_cells {
-        grid.set_solid(x, y, 0, true);
-    }
+    let depth = match resolve_spatial_depth(req.z_layers, 1) {
+        Ok(d) => d,
+        Err(detail) => return reject(&data, 422, "INVALID_Z_LAYERS", &detail),
+    };
+    let grid = validated_grid_or_reject!(
+        &data,
+        req.grid_width,
+        req.grid_height,
+        depth,
+        req.solid_cells.len(),
+        |grid| {
+            for &(x, y) in &req.solid_cells {
+                grid.set_solid(x, y, 0, true);
+            }
+        }
+    );
     let terrain = build_terrain_overlay(&SessionMap {
         width: req.grid_width,
         height: req.grid_height,

@@ -5701,6 +5701,240 @@ async fn visibility_route_returns_occlusion_polygon_for_viewer() {
     assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
 }
 
+/// Payload for `/api/v1/spatial/path`: straight 30 ft corridor dash on an
+/// empty 16x16 grid.
+fn path_payload() -> serde_json::Value {
+    serde_json::json!({
+        "start": {"x": 2.5, "y": 2.5, "z": 0.0},
+        "end": {"x": 10.0, "y": 2.5, "z": 0.0},
+        "speed_budget": 30.0,
+        "grid_width": 16,
+        "grid_height": 16,
+        "solid_cells": []
+    })
+}
+
+/// Shallow-merges `patch` into `base` (top-level keys only).
+fn patched(mut base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    if let (Some(map), Some(patch_map)) = (base.as_object_mut(), patch.as_object()) {
+        for (k, v) in patch_map {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    base
+}
+
+// --- Audit A2 remediations ------------------------------------------------------
+//
+// F-A2#2 (DoS via unbounded stateless-solver params): the three /api/v1/spatial
+// routes previously consumed raw client integers straight into allocations —
+// grid_width * grid_height * depth collision booleans per POST, an uncapped
+// occluder Vec, an uncapped f32 sight range and an uncapped elevation layer.
+// Contract pinned here:
+//   - grid_width / grid_height beyond 256      -> 422 INVALID_GRID_WIDTH/HEIGHT
+//   - more than 4096 solid cells               -> 422 INVALID_SOLID_CELLS
+//   - max_range_feet outside (0, 500]          -> 422 INVALID_MAX_RANGE_FEET
+//   - elevation z beyond 32                    -> 422 INVALID_Z
+// Every rejection names the offending field in `detail`, fires BEFORE any
+// collision grid is constructed, and leaks no solver result.
+#[actix_web::test]
+async fn spatial_routes_reject_unbounded_parameters_with_field_naming_422s() {
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+
+    // Ten billion collision booleans demanded by ONE request must die in
+    // validation, never in an allocator.
+    let hostile_dims = serde_json::json!({
+        "grid_width": 100_000u64,
+        "grid_height": 100_000u64,
+    });
+    for (path, payload) in [
+        (
+            "/api/v1/spatial/los",
+            patched(los_payload(), hostile_dims.clone()),
+        ),
+        (
+            "/api/v1/spatial/visibility",
+            patched(visibility_payload(), hostile_dims.clone()),
+        ),
+        ("/api/v1/spatial/path", patched(path_payload(), hostile_dims)),
+    ] {
+        let (status, body) = post_raw(&app, &player, path, payload).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+        assert_eq!(
+            body["error"],
+            serde_json::json!("INVALID_GRID_WIDTH"),
+            "{path}: {body}"
+        );
+        assert!(
+            body["detail"].as_str().unwrap_or_default().contains("grid_width"),
+            "{path}: rejection must name the offending field: {body}"
+        );
+    }
+
+    // Height gets its own named verdict.
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/los",
+        patched(los_payload(), serde_json::json!({"grid_height": 100_000u64})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], serde_json::json!("INVALID_GRID_HEIGHT"), "{body}");
+    assert!(
+        body["detail"].as_str().unwrap_or_default().contains("grid_height"),
+        "{body}"
+    );
+
+    // Occluder-list flooding: 4097 solid cells is past the ceiling.
+    let flood: Vec<(usize, usize)> = (0..4_097usize).map(|i| (i % 65, i / 65)).collect();
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/los",
+        patched(los_payload(), serde_json::json!({"solid_cells": flood})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], serde_json::json!("INVALID_SOLID_CELLS"), "{body}");
+    assert!(
+        body["detail"].as_str().unwrap_or_default().contains("solid_cells"),
+        "{body}"
+    );
+
+    // Sight-range ceilings: absurd AND negative ranges both rejected.
+    for range in [1.0e9f64, -5.0] {
+        let (status, body) = post_raw(
+            &app,
+            &player,
+            "/api/v1/spatial/visibility",
+            patched(
+                visibility_payload(),
+                serde_json::json!({"max_range_feet": range}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{range}: {body}");
+        assert_eq!(
+            body["error"],
+            serde_json::json!("INVALID_MAX_RANGE_FEET"),
+            "{range}: {body}"
+        );
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_range_feet"),
+            "{body}"
+        );
+    }
+
+    // Elevation ceiling on the visibility layer selector.
+    let (status, body) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/visibility",
+        patched(visibility_payload(), serde_json::json!({"z": 33u64})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], serde_json::json!("INVALID_Z"), "{body}");
+    assert!(
+        body["detail"].as_str().unwrap_or_default().contains("z "),
+        "rejection must name the z field: {body}"
+    );
+
+    // Control: the same shapes INSIDE the ceilings still solve.
+    let (status, _) = post_raw(&app, &player, "/api/v1/spatial/los", los_payload()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_raw(
+        &app,
+        &player,
+        "/api/v1/spatial/visibility",
+        visibility_payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_raw(&app, &player, "/api/v1/spatial/path", path_payload()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// F-A2#1 end-to-end: iteration 20's elevation-aware cover bundle must fire
+/// through the LIVE /api/v1/spatial/los route, not only in unit tests. The
+/// audited geometry (vtt-spatial cover.rs `upper_wall_grants_half_cover…`) is
+/// replayed twice over HTTP with the same footprint:
+///   - multi-layer payload: the wall occupies elevation layers 1..=3 (a wall
+///     covering the target ABOVE foot level). Head rays strike it, base rays
+///     slip under the foot gap -> HALF_COVER.
+///   - single-layer control with the elevated geometry ABSENT (exactly what
+///     the old depth-1 handler computed — head rays clamped onto layer 0 and
+///     saw nothing): NO cover.
+/// Different answers prove the z axis is live end-to-end. A third payload
+/// pins the documented legacy behavior: a wall authored ON layer 0 still
+/// blocks every ray (TOTAL_COVER) exactly as before.
+#[actix_web::test]
+async fn los_route_multi_layer_payload_produces_elevation_aware_cover() {
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+
+    // Shooter on a 5 ft ledge at (7.5, 22.5, 5), target at (57.5, 22.5, 0),
+    // wall column gx=8 across corridor rows gy=3..=6 on a 14x10 grid.
+    let base = serde_json::json!({
+        "attacker_pos": {"x": 7.5, "y": 22.5, "z": 5.0},
+        "target_pos": {"x": 57.5, "y": 22.5, "z": 0.0},
+        "target_radius": 5.0,
+        "grid_width": 14,
+        "grid_height": 10
+    });
+
+    // Multi-layer: wall voxels lifted to z-layers 1..=3, four layers declared.
+    let upper_wall: Vec<(usize, usize, usize)> =
+        (3..=6).flat_map(|y| (1..=3).map(move |z| (8usize, y, z))).collect();
+    let multi_layer = patched(
+        base.clone(),
+        serde_json::json!({
+            "z_layers": 4,
+            "solid_cells": [],
+            "solid_cells_3d": upper_wall,
+        }),
+    );
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", multi_layer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["cover_type"],
+        serde_json::json!("HALF_COVER"),
+        "head rays must strike the elevated wall through the live HTTP route: {body}"
+    );
+
+    // Single-layer control: the elevated wall is invisible to a depth-1 grid
+    // (this is precisely what the pre-fix handler reported for ANY payload,
+    // because head rays were clamped back onto layer 0).
+    let single_layer = patched(base.clone(), serde_json::json!({"solid_cells": []}));
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", single_layer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["cover_type"],
+        serde_json::json!("NONE"),
+        "{body}"
+    );
+
+    // Documented legacy behavior: a wall authored ON the ground layer keeps
+    // blocking everything, exactly as before the fix.
+    let ground_wall: Vec<(usize, usize)> = (3..=6).map(|y| (8usize, y)).collect();
+    let legacy = patched(
+        base,
+        serde_json::json!({"solid_cells": ground_wall}),
+    );
+    let (status, body) = post_raw(&app, &player, "/api/v1/spatial/los", legacy).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["cover_type"],
+        serde_json::json!("TOTAL_COVER"),
+        "ground-layer walls must keep legacy total-cover semantics: {body}"
+    );
+}
+
 #[actix_web::test]
 async fn client_supplied_seeds_are_rejected_for_non_privileged_roles() {
     let app = test_app().await;
