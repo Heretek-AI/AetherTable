@@ -233,6 +233,118 @@ fn cyclic_parent_chain_does_not_overflow_the_subtree_walk() {
     let _ = inv.insert_into_container(&coin, &a_id);
 }
 
+/// Iteration 61, audit F-A4#4: filling a pouch INSIDE a chest must re-check
+/// the chest too. Capacity used to be validated on the immediate target only,
+/// so nested fills silently blew every ancestor above them.
+#[test]
+fn inserting_into_a_nested_container_rechecks_every_ancestor() {
+    let mut inv = InventoryManager::new();
+    let chest_id = Uuid::new_v4();
+    let pouch_id = Uuid::new_v4();
+    inv.add_item(container(chest_id, "Chest", 5.0, Some(10.0), Some(100.0)));
+    inv.add_item(container(pouch_id, "Pouch", 0.5, Some(50.0), Some(50.0)));
+    inv.items.get_mut(&pouch_id).unwrap().parent_container_id = Some(chest_id);
+
+    // 9 lbs into the pouch: pouch trivially fits, and the chest's projected
+    // contents (0.5 + 9 = 9.5 <= 10) still fit either.
+    inv.insert_into_container(&item(Uuid::new_v4(), "Anvil", 9.0, 1), &pouch_id)
+        .expect("9 lbs keeps the chest under its 10 lb limit");
+
+    // One more pound through the pouch: the POUCH is fine (50 lb rating), but
+    // the CHEST would sit at 10.5 > 10. The ancestor must refuse, and name
+    // itself as the violating container.
+    let err = inv
+        .insert_into_container(&item(Uuid::new_v4(), "Scrolls", 1.0, 1), &pouch_id)
+        .expect_err("chest limit must be re-checked through the nested pouch");
+    assert_eq!(err.code, "CONTAINER_OVERFILLED");
+    assert_eq!(
+        err.container_id, chest_id,
+        "the refusal must name the violating ANCESTOR, not the pouch"
+    );
+}
+
+/// Same hole through the reparent (transfer/give) boundary.
+#[test]
+fn reparenting_into_a_nested_container_rechecks_every_ancestor() {
+    let mut inv = InventoryManager::new();
+    let chest_id = Uuid::new_v4();
+    let pouch_id = Uuid::new_v4();
+    inv.add_item(container(chest_id, "Chest", 0.5, Some(6.0), Some(100.0)));
+    // The pouch carries NO limits of its own: only the ancestor can catch this.
+    inv.add_item(container(pouch_id, "Pouch", 0.5, None, None));
+    inv.items.get_mut(&pouch_id).unwrap().parent_container_id = Some(chest_id);
+
+    let sword = Uuid::new_v4();
+    inv.add_item(item(sword, "Sword", 3.0, 1));
+    inv.reparent_item_into_container(&sword, &pouch_id)
+        .expect("3 lbs keeps the chest at 4.0 <= 6");
+
+    let mace = Uuid::new_v4();
+    inv.add_item(item(mace, "Mace", 3.5, 1));
+    let err = inv
+        .reparent_item_into_container(&mace, &pouch_id)
+        .expect_err("0.5 + 3 + 3.5 = 7 > 6 blows the CHEST above the pouch");
+    assert_eq!(err.code, "CONTAINER_OVERFILLED");
+    assert_eq!(err.container_id, chest_id, "violating ancestor named");
+    // Refused move leaves the mace where it was.
+    assert_eq!(inv.items[&mace].parent_container_id, None);
+}
+
+/// Iteration 61, audit F-A4#5: moving a container into its OWN descendant
+/// used to succeed whenever the target carried no capacities, forging a
+/// parent cycle that dropped the whole subtree out of
+/// `total_inventory_weight` (roots-only iteration). The move must be refused
+/// on structure alone, independent of any capacity settings.
+#[test]
+fn reparenting_a_container_into_its_own_descendant_is_refused() {
+    let mut inv = InventoryManager::new();
+    let bag_id = Uuid::new_v4();
+    let box_id = Uuid::new_v4();
+    inv.add_item(container(bag_id, "Bag", 1.0, None, None));
+    inv.add_item(container(box_id, "Box", 1.0, None, None));
+    inv.items.get_mut(&box_id).unwrap().parent_container_id = Some(bag_id);
+    // Something valuable inside the bag so the corruption is observable.
+    let gem = Uuid::new_v4();
+    inv.add_item(item(gem, "Gem", 2.0, 1));
+
+    let weight_before = inv.total_inventory_weight();
+
+    let err = inv
+        .reparent_item_into_container(&bag_id, &box_id)
+        .expect_err("a bag cannot live inside its own contents");
+    assert_eq!(err.code, "CONTAINER_CYCLE");
+
+    // State untouched by the refused move, and the books still balance.
+    assert_eq!(inv.items[&bag_id].parent_container_id, None);
+    assert_eq!(inv.items[&box_id].parent_container_id, Some(bag_id));
+    assert_eq!(
+        inv.total_inventory_weight(),
+        weight_before,
+        "a refused cycle move must not drop the subtree out of the totals"
+    );
+}
+
+/// The cycle check reaches the WHOLE descendant chain, not just direct
+/// children: bag -> box -> strongbox, moving the bag into the strongbox.
+#[test]
+fn reparenting_into_a_deeper_descendant_is_refused_too() {
+    let mut inv = InventoryManager::new();
+    let bag_id = Uuid::new_v4();
+    let box_id = Uuid::new_v4();
+    let strongbox_id = Uuid::new_v4();
+    inv.add_item(container(bag_id, "Bag", 1.0, None, None));
+    inv.add_item(container(box_id, "Box", 1.0, None, None));
+    inv.add_item(container(strongbox_id, "Strongbox", 1.0, None, None));
+    inv.items.get_mut(&box_id).unwrap().parent_container_id = Some(bag_id);
+    inv.items.get_mut(&strongbox_id).unwrap().parent_container_id = Some(box_id);
+
+    let err = inv
+        .reparent_item_into_container(&bag_id, &strongbox_id)
+        .expect_err("the strongbox is the bag's own grandchild");
+    assert_eq!(err.code, "CONTAINER_CYCLE");
+    assert_eq!(inv.items[&bag_id].parent_container_id, None);
+}
+
 /// Reparenting an existing item (the transfer/give flow) runs the same checks.
 #[test]
 fn reparent_existing_item_enforces_and_binds_on_success() {

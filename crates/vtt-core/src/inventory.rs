@@ -249,25 +249,74 @@ impl InventoryManager {
         }
     }
 
+    /// Checks placing `item` into `container_id` AND every ancestor above it:
+    /// filling a pouch inside a chest consumes chest capacity too, so each
+    /// link of the containment chain must accept the projected load (audit
+    /// F-A4#4). The first refusing link wins; its error names THAT container,
+    /// so a refusal always points at the ancestor whose limit was breached.
+    pub fn check_container_capacity_chain(
+        &self,
+        item: &Item,
+        container_id: &Uuid,
+    ) -> Result<(), ContainerOverfillError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(*container_id);
+        while let Some(id) = cursor {
+            // Crafted parent cycles terminate the walk instead of looping;
+            // cycle CREATION through reparenting is refused separately (see
+            // `reparent_item_into_container`).
+            if !seen.insert(id) {
+                break;
+            }
+            self.check_container_capacity(item, &id)?;
+            cursor = self.items.get(&id).and_then(|c| c.parent_container_id);
+        }
+        Ok(())
+    }
+
     /// Inserts a NEW item bound to `container_id`, refusing when either the
-    /// weight or the volume capacity would be exceeded. On success the item's
-    /// `parent_container_id` is stamped to the container.
+    /// weight or the volume capacity would be exceeded — on the target OR any
+    /// of its ancestors. On success the item's `parent_container_id` is
+    /// stamped to the container.
     pub fn insert_into_container(
         &mut self,
         item: &Item,
         container_id: &Uuid,
     ) -> Result<(), ContainerOverfillError> {
-        self.check_container_capacity(item, container_id)?;
+        self.check_container_capacity_chain(item, container_id)?;
         let mut stored = item.clone();
         stored.parent_container_id = Some(*container_id);
         self.items.insert(stored.id, stored);
         Ok(())
     }
 
+    /// Walks the ancestor chain of `container_id`; `true` when `ancestor_id`
+    /// appears anywhere above it (or IS it). Cycle-guarded like every other
+    /// parent-chain walk.
+    fn is_descendant_of(&self, container_id: &Uuid, ancestor_id: &Uuid) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(*container_id);
+        while let Some(id) = cursor {
+            if id == *ancestor_id {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            cursor = self.items.get(&id).and_then(|c| c.parent_container_id);
+        }
+        false
+    }
+
     /// Moves an EXISTING item into `container_id` under the same limits — the
     /// transfer/give boundary. The item's CURRENT placement is excluded from
     /// the subtree math (moving it out must not count it as still inside),
     /// then rebound to the new container on success.
+    ///
+    /// Two structural gates run before any capacity math: the move must not
+    /// plant a container inside its own subtree (`CONTAINER_CYCLE`), which
+    /// would otherwise drop the whole subtree out of the root-based weight
+    /// totals even when no capacities are configured (audit F-A4#5).
     pub fn reparent_item_into_container(
         &mut self,
         item_id: &Uuid,
@@ -278,13 +327,23 @@ impl InventoryManager {
             .get(item_id)
             .cloned()
             .ok_or_else(|| ContainerOverfillError::structural("ITEM_NOT_FOUND", *item_id))?;
+        // Cycle gate: the destination must not be the mover itself nor live
+        // anywhere inside the mover's own subtree. (The mover-is-destination
+        // degenerate case keeps its dedicated CONTAINER_SELF_NESTING verdict
+        // from `check_container_capacity`.)
+        if *container_id != item.id && self.is_descendant_of(container_id, item_id) {
+            return Err(ContainerOverfillError::structural(
+                "CONTAINER_CYCLE",
+                *container_id,
+            ));
+        }
         let previous_parent = item.parent_container_id;
         // Detach first so the source chain is evaluated WITHOUT the mover:
         // reparenting within one tree must reflect post-move reality.
         if let Some(stored) = self.items.get_mut(item_id) {
             stored.parent_container_id = None;
         }
-        match self.check_container_capacity(&item, container_id) {
+        match self.check_container_capacity_chain(&item, container_id) {
             Ok(()) => {
                 if let Some(stored) = self.items.get_mut(item_id) {
                     stored.parent_container_id = Some(*container_id);
