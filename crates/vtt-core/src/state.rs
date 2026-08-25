@@ -1587,10 +1587,19 @@ impl GameSession {
     /// Checks:
     /// - coordinates must be finite
     /// - source and target points must differ for movement-style ingress
-    ///   (teleport / portal / burrow); StealthReveal and SpawnEvent may pop
-    ///   in place at the target point
-    /// - SpawnEvent is only legal during setup (before combat starts)
+    ///   (teleport / portal / burrow); StealthReveal may appear in place at
+    ///   the target point
+    /// - SpawnEvent is only legal during setup (before combat starts) — once
+    ///   [`Self::begin_combat`] has run, materializing a token from nothing is
+    ///   exactly the "popping" GOALS.md P6's conservation law forbids. The
+    ///   transit protocols stay legal mid-combat because each carries a
+    ///   verifiable traversal story (see [`IngressType`] docs)
+    /// - the target point must land on open, in-bounds map terrain: no
+    ///   teleporting into a wall cell or off the authored map rectangle
     /// - the entity must not already exist on the board
+    ///
+    /// Returns a stable machine-readable error string per failure mode so the
+    /// server can surface them as 422 INGRESS_REJECTED details.
     pub fn validate_ingress(&self, ing: &IngressEvent) -> Result<(), String> {
         let finite = |p: &(f32, f32, f32)| p.0.is_finite() && p.1.is_finite() && p.2.is_finite();
         if !finite(&ing.source_point) || !finite(&ing.target_point) {
@@ -1602,9 +1611,29 @@ impl GameSession {
             {
                 return Err("INGRESS_DEGENERATE_TRANSIT".to_string());
             }
+            IngressType::SpawnEvent if self.combat.in_combat => {
+                return Err("INGRESS_SPAWN_FORBIDDEN_IN_COMBAT".to_string());
+            }
             _ => {}
         }
+        if self.ingress_target_blocked(ing.target_point) {
+            return Err("INGRESS_TARGET_BLOCKED".to_string());
+        }
         Ok(())
+    }
+
+    /// Whether an arrival point lands inside a solid (wall) cell or outside
+    /// the authored map rectangle. A session with no authored walls still
+    /// bounds arrivals to its width x height rectangle — the world does not
+    /// extend past the battle map just because nobody drew a wall yet.
+    fn ingress_target_blocked(&self, p: (f32, f32, f32)) -> bool {
+        let cell = self.map.cell_size_feet.max(f32::EPSILON);
+        let gx = (p.0 / cell).floor();
+        let gy = (p.1 / cell).floor();
+        if gx < 0.0 || gy < 0.0 || gx >= self.map.width as f32 || gy >= self.map.height as f32 {
+            return true;
+        }
+        self.map.solid_cells.contains(&(gx as usize, gy as usize))
     }
 
     pub fn add_entity(&mut self, entity: EntityState, ingress: Option<IngressEvent>) -> Result<(), String> {
@@ -1613,8 +1642,10 @@ impl GameSession {
             return Err("INGRESS_ENTITY_ALREADY_PRESENT".to_string());
         }
         if let Some(ing) = &ingress {
-            // The caller-supplied `verified` flag is advisory only; the
-            // authoritative check is structural validation below.
+            // The caller-supplied `verified` flag is advisory only: validation
+            // below is authoritative, and only a fully validated event earns
+            // `verified = true` on its stack record. Rejected events never
+            // reach the stack at all.
             self.validate_ingress(ing)?;
             let mut verified_ing = ing.clone();
             verified_ing.verified = true;

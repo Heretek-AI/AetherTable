@@ -1992,3 +1992,171 @@ fn test_safety_rewind_past_help_clears_the_token_and_refunds_the_action() {
     );
     assert!(!session.consume_help_advantage(ally_id, enemy_id));
 }
+
+// --- Audit iteration 14 / F11: validate_ingress must enforce its docstring ---
+
+use vtt_core::SessionMap;
+
+fn ingress(id: uuid::Uuid, kind: IngressType, source: (f32, f32, f32), target: (f32, f32, f32)) -> IngressEvent {
+    IngressEvent {
+        entity_id: id,
+        ingress_type: kind,
+        source_point: source,
+        target_point: target,
+        verified: false,
+    }
+}
+
+/// GOALS.md P6 anti-popping: a SpawnEvent materializes a token from nothing.
+/// That is legal during setup, but once combat has begun it is exactly the
+/// "popping" the conservation law forbids — mid-combat arrivals must come
+/// through a transit protocol (teleport / portal / burrow / stealth reveal).
+#[test]
+fn test_spawn_event_ingress_rejected_once_combat_has_begun() {
+    let mut session = session_with_pair();
+    let mut dice = DiceEngine::with_seed(7);
+    session.begin_combat(&mut dice);
+    assert!(session.combat.in_combat);
+
+    let id = uuid::Uuid::new_v4();
+    let newcomer = hero("late-arriver", 22, 14);
+    let err = session
+        .add_entity(newcomer, Some(ingress(id, IngressType::SpawnEvent, (0.0, 0.0, 0.0), (9.0, 9.0, 0.0))))
+        .unwrap_err();
+    assert_eq!(err, "INGRESS_SPAWN_FORBIDDEN_IN_COMBAT");
+
+    // Rejected ingress must not have added the entity or logged a spawn.
+    assert!(session.entities.keys().all(|k| *k != id), "entity must not be on the board");
+}
+
+/// Before combat starts the same SpawnEvent is legal (setup-phase deployment).
+#[test]
+fn test_spawn_event_ingress_still_legal_during_setup() {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Setup".into());
+    let id = uuid::Uuid::new_v4();
+    let newcomer = hero("deployed", 22, 14);
+    assert!(
+        session
+            .add_entity(
+                newcomer,
+                Some(ingress(id, IngressType::SpawnEvent, (0.0, 0.0, 0.0), (3.0, 3.0, 0.0)))
+            )
+            .is_ok(),
+        "SpawnEvent is legal before combat begins"
+    );
+}
+
+/// Portal/Door-style transit protocols stay legal mid-combat — that is their
+/// entire purpose under P6 (a creature walks through a door mid-fight).
+#[test]
+fn test_portal_ingress_remains_legal_mid_combat() {
+    let mut session = session_with_pair();
+    let mut dice = DiceEngine::with_seed(7);
+    session.begin_combat(&mut dice);
+
+    let id = uuid::Uuid::new_v4();
+    let walker = hero("door-walker", 22, 14);
+    assert!(
+        session
+            .add_entity(
+                walker,
+                Some(ingress(id, IngressType::PortalDoor, (1.0, 1.0, 0.0), (12.0, 12.0, 0.0)))
+            )
+            .is_ok(),
+        "PortalDoor transit is a legal mid-combat arrival protocol"
+    );
+}
+
+/// A Teleportation ingress whose target lands inside a wall cell must be
+/// rejected — teleporting INTO rock is not transit, it is clipping.
+#[test]
+fn test_teleport_into_wall_rejected() {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Walls".into());
+    let mut map = SessionMap::default();
+    map.solid_cells.push((6, 6)); // world rect x in [30,35), y in [30,35) at 5 ft cells
+    session.map = map;
+
+    let id = uuid::Uuid::new_v4();
+    let blinker = hero("blinker", 22, 14);
+    let err = session
+        .add_entity(
+            blinker,
+            Some(ingress(id, IngressType::Teleportation, (2.0, 2.0, 0.0), (32.5, 32.5, 0.0))),
+        )
+        .unwrap_err();
+    assert_eq!(err, "INGRESS_TARGET_BLOCKED");
+    assert!(session.entities.keys().all(|k| *k != id));
+}
+
+/// Landing outside the authored map rectangle is blocked too.
+#[test]
+fn test_ingress_target_off_map_rejected() {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Walls".into());
+    session.map = SessionMap::default(); // 32x32 @ 5ft
+
+    let id = uuid::Uuid::new_v4();
+    let drifter = hero("drifter", 22, 14);
+    let err = session
+        .add_entity(
+            drifter,
+            Some(ingress(id, IngressType::Burrowing, (2.0, 2.0, 0.0), (500.0, 2.0, 0.0))),
+        )
+        .unwrap_err();
+    assert_eq!(err, "INGRESS_TARGET_BLOCKED");
+}
+
+/// Open floor remains a legal teleport destination.
+#[test]
+fn test_teleport_to_open_floor_allowed() {
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Walls".into());
+    let mut map = SessionMap::default();
+    map.solid_cells.push((6, 6));
+    session.map = map;
+
+    let id = uuid::Uuid::new_v4();
+    let blinker = hero("blinker", 22, 14);
+    session
+        .add_entity(
+            blinker,
+            Some(ingress(id, IngressType::Teleportation, (2.0, 2.0, 0.0), (27.5, 27.5, 0.0))),
+        )
+        .expect("open-floor target must pass validation");
+}
+
+/// The `verified` flag must be set by VALIDATION, not stamped unconditionally:
+/// an event that never passed validation must not enter the stack wearing a
+/// verified badge (the anti-popping gate looked stronger than it was).
+#[test]
+fn test_verified_flag_reflects_actual_validation_outcome() {
+    // A caller lies with verified=true; the engine validates structurally and
+    // only then stamps true — so far unchanged behavior for GOOD events...
+    let mut session = GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Honesty".into());
+    let good = uuid::Uuid::new_v4();
+    session
+        .add_entity(
+            hero("good", 10, 12),
+            Some(IngressEvent {
+                entity_id: good,
+                ingress_type: IngressType::StealthReveal,
+                source_point: (2.0, 2.0, 0.0),
+                target_point: (4.0, 4.0, 0.0),
+                verified: false,
+            }),
+        )
+        .unwrap();
+    let stored = session.ingress_stack.last().unwrap();
+    assert!(stored.verified, "validated ingress earns its verified flag");
+
+    // ...but a BAD event must be rejected outright, never recorded as verified.
+    let mut session2 = session_with_pair();
+    let mut dice = DiceEngine::with_seed(3);
+    session2.begin_combat(&mut dice);
+    let bad = uuid::Uuid::new_v4();
+    let mut bad_event = ingress(bad, IngressType::SpawnEvent, (0.0, 0.0, 0.0), (5.0, 5.0, 0.0));
+    bad_event.verified = true; // caller-supplied lie
+    assert!(session2.add_entity(hero("bad", 10, 12), Some(bad_event)).is_err());
+    assert!(
+        !session2.ingress_stack.iter().any(|i| i.entity_id == bad),
+        "rejected ingress must not sit in the stack"
+    );
+}

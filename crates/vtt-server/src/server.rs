@@ -3714,6 +3714,16 @@ fn public_board_token(entity_id: &str, entity: &serde_json::Value) -> serde_json
 ///                   kept for fails-closed symmetry.)
 /// ================  ========================================================
 ///
+/// AUDIT F7: entity projection alone is not enough — the same serialized
+/// GameSession also carries:
+/// - `ingress_stack` / `egress_stack`: entries referencing a hidden entity are
+///   DROPPED entirely for non-GMs (an id without points, or points without an
+///   id, still leak half the transit). Visible entities' records survive so
+///   conservation auditing keeps working.
+/// - `combat.order`: hidden combatants' slots are stripped; visible actors'
+///   slots survive so turn tracking still works, and `turn_index` is re-mapped
+///   onto the projected slice.
+///
 /// Ledger events need no redaction here: only gm/player roles reach this route,
 /// and both are trusted with exact ledger numbers under the gateway policy.
 fn project_snapshot_for_role(
@@ -3724,11 +3734,17 @@ fn project_snapshot_for_role(
     if role.is_gm() {
         return snapshot;
     }
+
+    // Ids of entities hidden from every non-GM viewer. Collected BEFORE the
+    // entity projection drops them so the stack/order redaction below can
+    // match entries against the same set.
+    let mut hidden_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(entities) = snapshot.get_mut("entities").and_then(|e| e.as_object_mut()) {
         let projected: serde_json::Map<String, serde_json::Value> = entities
             .iter()
             .filter_map(|(id, entity)| {
                 if !entity_is_visible(entity) {
+                    hidden_ids.insert(id.clone());
                     return None; // hidden from everyone but GM/admin
                 }
                 if entity.get("owner_player_id").and_then(|o| o.as_str()) == Some(user_id) {
@@ -3740,6 +3756,77 @@ fn project_snapshot_for_role(
             .collect();
         *entities = projected;
     }
+
+    // AUDIT F7: ingress/egress stack records carry entity_id plus exact
+    // source_point/target_point coordinates — for a hidden NPC that reveals
+    // where an invisible creature teleported from and to. Entries referencing
+    // a hidden entity are DROPPED entirely rather than nulled: partial data
+    // (an id without points, points without an id) still leaks half the
+    // transit, and conservation auditing from non-GM views only needs the
+    // VISIBLE entities' records anyway. Residual allowance: an egress record
+    // for an entity ALREADY REMOVED from the board cannot be resolved against
+    // the roster, so it survives even if that entity was hidden at despawn —
+    // matching the ledger, which non-GMs are trusted with wholesale.
+    for key in ["ingress_stack", "egress_stack"] {
+        if let Some(stack) = snapshot.get_mut(key).and_then(|s| s.as_array_mut()) {
+            stack.retain(|entry| {
+                entry
+                    .get("entity_id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| !hidden_ids.contains(id))
+                    .unwrap_or(true)
+            });
+        }
+    }
+
+    // AUDIT F7 (combat half): `combat.order` lists every combatant in
+    // initiative sequence, so its length and a hidden NPC's POSITION reveal
+    // when the invisible creature acts (relative initiative leak). Non-GM
+    // views keep the visible actors' entries — players can still track whose
+    // turn it is — while hidden ones are dropped. `turn_index` is re-mapped
+    // onto the projected slice: it advances to the first VISIBLE combatant at
+    // or after the authoritative index (wrapping), so it never dangles past
+    // the shortened order and keeps naming the acting visible token whenever
+    // one exists.
+    if let Some(combat) = snapshot.get_mut("combat").and_then(|c| c.as_object_mut()) {
+        let old_turn = combat
+            .get("turn_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        if let Some(order) = combat.get_mut("order").and_then(|o| o.as_array_mut()) {
+            let visible_positions: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| {
+                    id.as_str()
+                        .map(|s| !hidden_ids.contains(s))
+                        .unwrap_or(true)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            *order = order
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| visible_positions.contains(i))
+                .map(|(_, v)| v.clone())
+                .collect();
+            let in_combat = combat
+                .get("in_combat")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if in_combat && !visible_positions.is_empty() {
+                let mapped = visible_positions
+                    .iter()
+                    .position(|&pos| pos >= old_turn)
+                    .unwrap_or(0);
+                combat.insert(
+                    "turn_index".to_string(),
+                    serde_json::json!(mapped),
+                );
+            }
+        }
+    }
+
     snapshot
 }
 
@@ -4058,6 +4145,12 @@ fn parse_fog_mask(value: &serde_json::Value, layer_id: &str) -> Option<FogOfWarM
 /// - Fog follows `party_merged_spectator_fog` semantics: spectators get ONE
 ///   party-merged layer (`party-explored`) covering everything the hub has
 ///   retained; GMs/players get every individual layer.
+///
+/// AUDIT F7 cross-check: the SyncStep2 frame carries ONLY tokens + fog — it
+/// never embeds `ingress_stack`, `egress_stack`, or `combat.order`, so the
+/// transit/initiative leaks fixed on the HTTP projection paths have no WS
+/// counterpart here. Hidden-entity filtering above keeps the token list in
+/// agreement with `project_snapshot_for_role`.
 fn build_initial_snapshot(
     data: &AppState,
     room_id: &str,

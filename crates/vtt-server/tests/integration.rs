@@ -6243,3 +6243,326 @@ async fn script_execution_is_gm_and_service_only() {
     let (status, _) = post_raw(&app, &service, "/api/v1/scripts/rhai", rhai).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// --- Audit iteration 14 / F7: stacks + initiative order leak hidden entities --
+
+/// F7: `ingress_stack` / `egress_stack` entries carry entity_id plus
+/// source_point/target_point. For a HIDDEN NPC those points reveal where an
+/// invisible creature teleported from and to — and the id lets a spectator
+/// correlate it with ledger events. Non-GM snapshots must DROP every stack
+/// entry whose entity is hidden (dropping, not nulling: partial coordinates
+/// still leak half the transit). GMs keep everything.
+#[actix_web::test]
+async fn ingress_egress_stacks_redacted_for_non_gm_views() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // A visible hero and a hidden lurker, each arriving through a real
+    // transit protocol so the session's ingress_stack actually holds records
+    // (the leak surface under test).
+    let hero_id = Uuid::new_v4();
+    let lurker_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["position"] = serde_json::json!([5.0, 5.0, 0.0]);
+    hero["ingress"] = serde_json::json!({
+        "entity_id": hero_id,
+        "ingress_type": "SPAWN_EVENT",
+        "source_point": [5.0, 5.0, 0.0],
+        "target_point": [5.0, 5.0, 0.0],
+        "verified": false,
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(hero)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let mut lurker = entity_json(lurker_id, "Hidden Lurker", 40, 17, 6, "2d8+4");
+    lurker["is_player"] = serde_json::json!(false);
+    lurker["is_visible"] = serde_json::json!(false);
+    lurker["position"] = serde_json::json!([20.0, 20.0, 0.0]);
+    lurker["ingress"] = serde_json::json!({
+        "entity_id": lurker_id,
+        "ingress_type": "TELEPORTATION",
+        "source_point": [1.0, 1.0, 0.0],
+        "target_point": [20.0, 20.0, 0.0],
+        "verified": false,
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(lurker)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Despawn the hero so an egress entry exists for a VISIBLE entity too —
+    // proving redaction is selective, not a wholesale stack wipe.
+    let req = test::TestRequest::delete()
+        .uri(&format!("/api/v1/sessions/{}/entities/{}", session_id, hero_id))
+        .insert_header(gm_auth.clone())
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let fetch = |token: &str| {
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header(bearer(token))
+            .to_request()
+    };
+
+    for viewer in [
+        sign_token_with_role("player-2", "player", TEST_SECRET),
+        sign_token_with_role("spec-1", "spectator", TEST_SECRET),
+    ] {
+        let body: serde_json::Value =
+            test::read_body_json(test::call_service(&app, fetch(&viewer)).await).await;
+        // Scope: entities + both stacks must be clean of the hidden NPC.
+        // (The ledger passes verbatim by gateway policy — non-GMs are trusted
+        // with exact ledger numbers, so its event payloads are out of scope
+        // here.)
+        let projected_slice = serde_json::json!({
+            "entities": body["entities"],
+            "ingress_stack": body["ingress_stack"],
+            "egress_stack": body["egress_stack"],
+            "combat": body["combat"],
+        });
+        let serialized = serde_json::to_string(&projected_slice).unwrap();
+        assert!(
+            !serialized.contains(&lurker_id.to_string()),
+            "hidden NPC's id must not appear in a non-GM projection: {}",
+            serialized
+        );
+        // The lurker's transit coordinates (spawned at [20,20]) never leak even
+        // as bare numbers inside the stacks.
+        if let Some(ingress) = body["ingress_stack"].as_array() {
+            for entry in ingress {
+                assert_ne!(
+                    entry["entity_id"].as_str(),
+                    Some(lurker_id.to_string().as_str()),
+                    "hidden NPC's ingress point leaked: {:?}",
+                    entry["source_point"]
+                );
+            }
+        }
+        // The VISIBLE hero's egress survives so conservation auditing still
+        // works from non-GM views.
+        let egress_ids: Vec<&str> = body["egress_stack"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["entity_id"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            egress_ids.contains(&hero_id.to_string().as_str()),
+            "visible entity's egress entry must survive projection: {:?}",
+            body["egress_stack"]
+        );
+    }
+
+    // GM keeps the full stacks, hidden entries included.
+    let body: serde_json::Value =
+        test::read_body_json(test::call_service(&app, fetch(&gm)).await).await;
+    let gm_ingress_ids: Vec<&str> = body["ingress_stack"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e["entity_id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        gm_ingress_ids.contains(&lurker_id.to_string().as_str()),
+        "GM sees the hidden NPC's ingress record"
+    );
+}
+
+/// F7 (combat half): `combat.order` is a Vec<Uuid> of ALL combatants in
+/// initiative sequence. For a hidden NPC its POSITION IN THE ORDER reveals
+/// when the invisible creature acts, and its index leaks relative initiative.
+/// Non-GM projections keep visible actors' entries (turn tracking still works)
+/// but drop hidden ones; GMs keep the full order. `turn_index` is re-mapped to
+/// stay meaningful against the projected order.
+#[actix_web::test]
+async fn combat_order_drops_hidden_entities_for_non_gm_views() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-2", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("spec-1", "spectator", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let lurker_id = Uuid::new_v4();
+    spawn_at(&app, &gm_auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+
+    let mut lurker = entity_json(lurker_id, "Hidden Lurker", 40, 17, 6, "2d8+4");
+    lurker["is_player"] = serde_json::json!(false);
+    lurker["is_visible"] = serde_json::json!(false);
+    lurker["position"] = serde_json::json!([20.0, 20.0, 0.0]);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(lurker)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Begin combat with both on the board.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(gm_auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let began: serde_json::Value = test::read_body_json(res).await;
+    let full_order = began["order"].as_array().expect("GM order array").clone();
+    assert_eq!(full_order.len(), 2);
+
+    // --- Player view: only the visible actor remains in combat.order ---
+    let body: serde_json::Value = {
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header(bearer(&player))
+            .to_request();
+        test::read_body_json(test::call_service(&app, req).await).await
+    };
+    let order = body["combat"]["order"].as_array().expect("player combat.order");
+    assert_eq!(
+        order.len(),
+        1,
+        "hidden NPC must be dropped from a player's initiative order: {:?}",
+        order
+    );
+    // Serialized sessions carry order as bare id strings (the entry objects
+    // with name/dex/initiative_total live only on the /combat/begin response).
+    assert_eq!(order[0].as_str(), Some(hero_id.to_string().as_str()));
+    assert!(
+        !serde_json::to_string(order).unwrap().contains(&lurker_id.to_string()),
+        "hidden id must not survive in the projected order"
+    );
+    // turn_index stays coherent with the PROJECTED order (points at an entry).
+    let idx = body["combat"]["turn_index"].as_u64().unwrap();
+    if !order.is_empty() && body["combat"]["in_combat"].as_bool() == Some(true) {
+        assert!(
+            (idx as usize) < order.len(),
+            "projected turn_index {} out of bounds of projected order len {}",
+            idx,
+            order.len()
+        );
+    }
+
+    // --- Spectator view: same redaction ---
+    let body: serde_json::Value = {
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header(bearer(&spectator))
+            .to_request();
+        test::read_body_json(test::call_service(&app, req).await).await
+    };
+    let order = body["combat"]["order"].as_array().expect("spectator combat.order");
+    assert_eq!(order.len(), 1, "hidden NPC dropped for spectators too");
+    assert_eq!(order[0].as_str(), Some(hero_id.to_string().as_str()));
+
+    // --- GM view: full authoritative order, hidden actor included ---
+    let body: serde_json::Value = {
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header(bearer(&gm))
+            .to_request();
+        test::read_body_json(test::call_service(&app, req).await).await
+    };
+    let order = body["combat"]["order"].as_array().expect("GM combat.order");
+    assert_eq!(order.len(), 2, "GM keeps every combatant");
+}
+
+// --- Audit iteration 14 / F11 (HTTP surface): SpawnEvent mid-combat + walls ---
+
+/// A SpawnEvent arriving once combat has begun must be rejected with 422 —
+/// the engine enforces GOALS.md P6 anti-popping; the HTTP route surfaces it.
+#[actix_web::test]
+async fn spawn_event_ingress_rejected_mid_combat_over_http() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let session_id = create_session_as(&app, &gm).await;
+
+    spawn_at(&app, &gm_auth, session_id, Uuid::new_v4(), "Hero", true, [5.0, 5.0, 0.0]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(gm_auth.clone())
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Mid-combat pop-in attempt via SpawnEvent.
+    let late_id = Uuid::new_v4();
+    let mut late = entity_json(late_id, "Late Goblin", 12, 12, 3, "1d6");
+    late["is_player"] = serde_json::json!(false);
+    late["ingress"] = serde_json::json!({
+        "entity_id": late_id,
+        "ingress_type": "SPAWN_EVENT",
+        "source_point": [0.0, 0.0, 0.0],
+        "target_point": [9.0, 9.0, 0.0],
+        "verified": false,
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(late)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "INGRESS_REJECTED");
+
+    // The same arrival through a portal stays legal mid-combat.
+    let walker_id = Uuid::new_v4();
+    let mut walker = entity_json(walker_id, "Door Walker", 12, 12, 3, "1d6");
+    walker["is_player"] = serde_json::json!(false);
+    walker["position"] = serde_json::json!([12.0, 12.0, 0.0]);
+    walker["ingress"] = serde_json::json!({
+        "entity_id": walker_id,
+        "ingress_type": "PORTAL_DOOR",
+        "source_point": [1.0, 1.0, 0.0],
+        "target_point": [12.0, 12.0, 0.0],
+        "verified": false,
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(walker)
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::OK,
+        "PORTAL_DOOR transit is legal mid-combat"
+    );
+
+    // Teleporting into a wall is rejected over HTTP too.
+    let wall_session = create_session_as(&app, &gm).await;
+    let map = serde_json::json!({
+        "width": 32, "height": 32, "cell_size_feet": 5.0,
+        "solid_cells": [[6, 6]],
+        "difficult_terrain": [], "lighting_zones": []
+    });
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/map", wall_session))
+        .insert_header(gm_auth.clone())
+        .set_json(map)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let blinker_id = Uuid::new_v4();
+    let mut blinker = entity_json(blinker_id, "Wall Blinker", 12, 12, 3, "1d6");
+    blinker["is_player"] = serde_json::json!(false);
+    blinker["ingress"] = serde_json::json!({
+        "entity_id": blinker_id,
+        "ingress_type": "TELEPORTATION",
+        "source_point": [2.0, 2.0, 0.0],
+        "target_point": [32.5, 32.5, 0.0],
+        "verified": false,
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", wall_session))
+        .insert_header(gm_auth.clone())
+        .set_json(blinker)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
