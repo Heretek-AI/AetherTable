@@ -7978,3 +7978,257 @@ async fn escape_grapple_route_enforces_seed_policy_rbac_and_hold_state() {
         "DC is 8 + the grappler's STR modifier (STR 8 -> -1): {body}"
     );
 }
+
+// --- Iteration 48 (Pillar-7): container capacity enforcement ------------------
+//
+// GOALS.md P7 requires volume AND weight limits on container hierarchies. The
+// engine's `InventoryManager` had recursive nesting but NO enforcement. These
+// tests pin the transfer route's typed 422 rejections and its success path.
+
+
+fn item_json(id: Uuid, name: &str, weight_lbs: f32, quantity: u32) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "compendium_id": format!("item_{}", name.to_lowercase().replace(' ', "_")),
+        "name": name,
+        "base_weight_lbs": weight_lbs,
+        "quantity": quantity,
+        "is_container": false,
+        "container_capacity_lbs": null,
+        "parent_container_id": null,
+        "is_equipped": false,
+        "is_attuned": false,
+        "is_cursed": false,
+        "is_curse_revealed": false,
+        "true_state": {},
+        "perceived_state": {}
+    })
+}
+
+fn container_json(
+    id: Uuid,
+    name: &str,
+    weight_lbs: f32,
+    capacity_lbs: Option<f32>,
+    volume_cu_ft: Option<f32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "compendium_id": format!("item_{}", name.to_lowercase().replace(' ', "_")),
+        "name": name,
+        "base_weight_lbs": weight_lbs,
+        "quantity": 1,
+        "is_container": true,
+        "container_capacity_lbs": capacity_lbs,
+        "container_volume_cu_ft": volume_cu_ft,
+        "volume_cu_ft": 0.5,
+        "parent_container_id": null,
+        "is_equipped": false,
+        "is_attuned": false,
+        "is_cursed": false,
+        "is_curse_revealed": false,
+        "true_state": {},
+        "perceived_state": {}
+    })
+}
+
+/// Spawns a session + one owning hero, returns ids.
+async fn spawn_hero_with_inventory(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    auth: &(actix_web::http::header::HeaderName, String),
+    items: Vec<serde_json::Value>,
+) -> (Uuid, Uuid) {
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Inv"}))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let session_id: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let hero_id = Uuid::new_v4();
+    let mut entity = entity_json(hero_id, "Porter", 30, 14, 5, "1d8+3");
+    let mut inv = serde_json::Map::new();
+    for it in &items {
+        inv.insert(it["id"].as_str().unwrap().to_string(), it.clone());
+    }
+    entity["inventory"] = serde_json::json!({"items": inv});
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(auth.clone())
+        .set_json(entity)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "hero spawn");
+    (session_id, hero_id)
+}
+
+#[actix_web::test]
+async fn item_transfer_over_weight_capacity_is_422_with_honest_detail() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(10.0), Some(100.0));
+    let anvil = item_json(Uuid::new_v4(), "Anvil", 11.0, 1);
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![chest.clone(), anvil.clone()]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": anvil["id"],
+            "container_id": chest["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "CONTAINER_OVERFILLED");
+    // Honest per-field detail: which limit, by how much — not a bare string.
+    let violations = body["violations"].as_array().expect("violations array");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["limit"], "weight_lbs");
+    let over_by = violations[0]["over_by"].as_f64().unwrap();
+    assert!(over_by > 0.0 && over_by < 2.0, "over_by={}", over_by);
+
+    // The refused transfer must not have mutated the inventory.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let snap: serde_json::Value = test::read_body_json(res).await;
+    let parent = snap["entities"][&hero_id.to_string()]["inventory"]["items"]
+        [&anvil["id"].as_str().unwrap()]["parent_container_id"]
+        .clone();
+    assert_eq!(
+        parent,
+        serde_json::Value::Null,
+        "anvil must stay unattached after refusal"
+    );
+}
+
+#[actix_web::test]
+async fn item_transfer_over_volume_capacity_is_422_naming_volume_limit() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let case_box = container_json(Uuid::new_v4(), "Scroll Case", 0.5, Some(50.0), Some(1.0));
+    let mut boulder = item_json(Uuid::new_v4(), "Boulder", 2.0, 1);
+    boulder["volume_cu_ft"] = serde_json::json!(1.5);
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![case_box.clone(), boulder.clone()]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": boulder["id"],
+            "container_id": case_box["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let violations = body["violations"].as_array().expect("violations array");
+    assert_eq!(violations[0]["limit"], "volume_cu_ft");
+}
+
+#[actix_web::test]
+async fn item_transfer_at_exact_capacity_is_allowed_and_binds() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(10.0), Some(100.0));
+    let anvil = item_json(Uuid::new_v4(), "Anvil", 10.0, 1);
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![chest.clone(), anvil.clone()]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "item_id": anvil["id"],
+            "container_id": chest["id"]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "TRANSFERRED");
+
+    // Bound on the server: the anvil now names the chest as parent.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/v1/sessions/{}", session_id))
+        .insert_header(auth.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let snap: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["inventory"]["items"]
+            [&anvil["id"].as_str().unwrap()]["parent_container_id"],
+        serde_json::json!(chest["id"]),
+        "transfer must bind the item to the container server-side"
+    );
+}
+
+#[actix_web::test]
+async fn nested_pouch_contents_are_enforced_transitively_via_http() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let chest = container_json(Uuid::new_v4(), "Chest", 5.0, Some(10.0), Some(100.0));
+    let pouch = container_json(Uuid::new_v4(), "Pouch", 0.5, Some(8.0), Some(2.0));
+    let coins = item_json(Uuid::new_v4(), "Gold Coins", 4.0, 2); // 8 lbs
+    let bar = item_json(Uuid::new_v4(), "Iron Bar", 3.0, 1);
+    let (session_id, hero_id) =
+        spawn_hero_with_inventory(&app, &auth, vec![chest.clone(), pouch.clone(), coins.clone(), bar.clone()])
+            .await;
+
+    async fn transfer(
+        app: &impl Service<
+            actix_http::Request,
+            Response = ServiceResponse<EitherBody<BoxBody>>,
+            Error = actix_web::Error,
+        >,
+        auth: &(actix_web::http::header::HeaderName, String),
+        session_id: Uuid,
+        hero_id: Uuid,
+        item: &serde_json::Value,
+        container: &serde_json::Value,
+    ) -> actix_web::dev::ServiceResponse<EitherBody<BoxBody>> {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/inventory/transfer", session_id))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": hero_id,
+                "item_id": item["id"],
+                "container_id": container["id"]
+            }))
+            .to_request();
+        test::call_service(app, req).await
+    }
+
+    // Pouch into the chest: fine.
+    let res = transfer(&app, &auth, session_id, hero_id, &pouch, &chest).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // Coins into the pouch (exactly at the pouch's own limit): fine.
+    let res = transfer(&app, &auth, session_id, hero_id, &coins, &pouch).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    // Now the bar into the CHEST: chest contents = pouch 0.5 + coins 8 + bar 3
+    // = 11.5 > 10 → rejected BECAUSE OF what the pouch carries.
+    let res = transfer(&app, &auth, session_id, hero_id, &bar, &chest).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "CONTAINER_OVERFILLED");
+}

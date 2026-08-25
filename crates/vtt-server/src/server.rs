@@ -3356,13 +3356,106 @@ async fn heal_entity(
     }
 }
 
+// --- Inventory container transfer (Pillar-7: capacity enforcement) -----------
+
+/// Places an item the entity ALREADY carries into one of its containers. The
+/// item is referenced by id (spawn-time inventories create items); the engine
+/// decides whether it fits — the server never does inventory arithmetic.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemTransferReq {
+    pub entity_id: Uuid,
+    /// The item being moved; must already exist in this entity's inventory.
+    pub item_id: Uuid,
+    /// Destination container in the same inventory.
+    pub container_id: Uuid,
+}
+
+async fn transfer_item(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<ItemTransferReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(
+                &data,
+                404,
+                "ENTITY_NOT_FOUND",
+                "entity does not exist in session",
+            );
+        }
+        let owner = session.entities[&req.entity_id].owner_player_id.clone();
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+
+        // Engine-owned verdict: weight AND volume limits, nested contents
+        // included. A refusal here leaves the inventory untouched.
+        let outcome = {
+            let entity = session.entities.get_mut(&req.entity_id).expect("checked above");
+            entity.inventory.reparent_item_into_container(&req.item_id, &req.container_id)
+        };
+        match outcome {
+            Ok(()) => {
+                data.count_valid();
+                let campaign_id = session.campaign_id;
+                session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    req.entity_id,
+                    "ITEM_TRANSFERRED",
+                    serde_json::json!({
+                        "item_id": req.item_id.to_string(),
+                        "container_id": req.container_id.to_string(),
+                    }),
+                );
+                HttpResponse::Ok().json(serde_json::json!({
+                    "status": "TRANSFERRED",
+                    "entity_id": req.entity_id,
+                    "item_id": req.item_id,
+                    "container_id": req.container_id,
+                }))
+            }
+            Err(e) => {
+                if e.violations.is_empty() {
+                    // Structural refusals (unknown container / not a container /
+                    // self-nesting): distinct codes, still a client error.
+                    let status = if e.code == "ITEM_NOT_FOUND" { 404 } else { 422 };
+                    reject(&data, status, &e.code, &e.summary())
+                } else {
+                    data.count_rejected();
+                    HttpResponse::build(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY)
+                        .json(serde_json::json!({
+                            "error": e.code,
+                            "detail": e.summary(),
+                            "container_id": e.container_id,
+                            "violations": e.violations,
+                        }))
+                }
+            }
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestKind {
     Short,
     Long,
 }
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestReq {
@@ -5511,6 +5604,7 @@ pub fn configure_app_with(
                         .route("/action/death-save", web::post().to(resolve_death_save))
                         .route("/damage", web::post().to(apply_damage))
                         .route("/heal", web::post().to(heal_entity))
+                        .route("/inventory/transfer", web::post().to(transfer_item))
                         .route("/rest", web::post().to(take_rest))
                         .route("/safety/x-card", web::post().to(trigger_safety_rewind))
                         .route("/sync", web::get().to(ws_sync)),

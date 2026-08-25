@@ -22,7 +22,9 @@ pub mod types;
 pub use actions::ActionResolver;
 pub use dice::{DiceEngine, DiceRollResult};
 pub use event_log::{EventSourcingLedger, GameEvent};
-pub use inventory::{EncumbranceStatus, InventoryManager, Item};
+pub use inventory::{
+    CapacityViolation, ContainerOverfillError, EncumbranceStatus, InventoryManager, Item,
+};
 pub use modifier_graph::{
     calculate_ability_modifier, calculate_armor_class, calculate_passive_perception,
     calculate_proficiency_bonus, AbilityModifier, AbilityScoreNode, AbilityType, ArmorCategory,
