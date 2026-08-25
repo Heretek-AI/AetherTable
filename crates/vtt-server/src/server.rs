@@ -1909,7 +1909,8 @@ async fn resolve_grapple_action(
             // Bound-hands model: a WON grapple keeps one of the grappler's
             // hands busy (SRD: the creature has a hand occupied by the hold).
             // Saturating, so a second won grapple cannot phantom-bind a third
-            // hand; the release path is the escape/rewind sweep below.
+            // hand; the live release path is /action/escape-grapple below (and
+            // the x-card rewind replay for reverted events).
             if let Some(a) = session.entities.get_mut(&req.attacker_id) {
                 a.occupy_hand();
             }
@@ -1942,6 +1943,210 @@ async fn resolve_grapple_action(
         body["winner_side"] = serde_json::json!(resolution.contest.winner_side);
         body["margin"] = serde_json::json!(resolution.contest.margin);
         body["distance_feet"] = serde_json::json!(attacker.distance_to_feet(&defender));
+        body["event_sequence"] = serde_json::json!(event.sequence_id);
+        HttpResponse::Ok().json(body)
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+/// SRD escape from a grapple: the grappled creature spends its Action on an
+/// Athletics or Acrobatics check against DC 8 + the grappler's Strength
+/// modifier ([`ActionResolver::grapple_escape_dc`]). Winning ends the hold on
+/// BOTH sides of it — the victim's `Condition::Grappled` is stripped and the
+/// grappler's occupied hand is released through the existing
+/// `EntityState::release_hand` path (iteration 41 bound hands but had no live
+/// release; this route is that release).
+///
+/// DISCLOSED LIMITATION (bound-hands, weapon wielding): this engine has no
+/// equip/wield pipeline — attacks reference indexes into `EntityState.attacks`
+/// and `InventoryManager.is_equipped` is never read mechanically — so weapons,
+/// shields, and two-weapon off-hands do NOT occupy hands anywhere. The only
+/// writers of `hands_occupied` today are won grapples (the `/action/grapple`
+/// route) and their undoings (this route + x-card rewind replay). Wiring a
+/// future equip route must call `occupy_hand`/`release_hand` alongside it, and
+/// the somatic gate in `RulesEvaluator::validate_and_cast_spell` already
+/// enforces the free-hand check those writers must respect.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EscapeGrappleReq {
+    /// The currently-grappled creature attempting to break out.
+    pub entity_id: Uuid,
+    /// The creature whose hold is being escaped (its STR sets the DC).
+    pub grappler_id: Uuid,
+    /// Escaper's choice of skill ("athletics" | "acrobatics").
+    pub skill: DefenderSkill,
+    /// GM/service override (Pillar 11): skip the check entirely and end the
+    /// hold. Privileged principals only — see the handler's RBAC gate.
+    #[serde(default)]
+    pub force: Option<bool>,
+    /// Optional deterministic seed pinning the roll (engine decides meaning).
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+async fn resolve_escape_grapple_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<EscapeGrappleReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy (see `refuse_client_seed`): refused BEFORE any validation
+    // side effect (Action spend, ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
+    let force = req.force.unwrap_or(false);
+    if force && !role.is_gm() && identity.user_id != SERVICE_PRINCIPAL_ID {
+        return reject(
+            &data,
+            403,
+            "ESCAPE_OVERRIDE_FORBIDDEN",
+            "forcing an escape without a check is a GM/service override only",
+        );
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let (escapee, grappler) = match (
+            session.entities.get(&req.entity_id),
+            session.entities.get(&req.grappler_id),
+        ) {
+            (Some(e), Some(g)) => (e.clone(), g.clone()),
+            (None, _) => {
+                return reject(
+                    &data,
+                    404,
+                    "ENTITY_NOT_FOUND",
+                    "entity_id does not exist in this session",
+                )
+            }
+            (_, None) => {
+                return reject(
+                    &data,
+                    404,
+                    "GRAPPLER_NOT_FOUND",
+                    "grappler_id does not exist in this session",
+                )
+            }
+        };
+        if !may_control_entity(escapee.owner_player_id.as_ref(), role, &identity.user_id) {
+            return reject(
+                &data,
+                403,
+                "ENTITY_NOT_OWNED",
+                "you do not control the escaping entity",
+            );
+        }
+        if escapee.id == grappler.id {
+            return reject(
+                &data,
+                422,
+                "SELF_TARGET_INVALID",
+                "an entity cannot escape its own hold",
+            );
+        }
+        if !escapee.can_act() {
+            return reject(
+                &data,
+                409,
+                "ENTITY_CANNOT_ACT",
+                "escaper is unconscious, dead, or incapacitated",
+            );
+        }
+        // No reach gate here ON PURPOSE: unlike a grapple ATTEMPT (which needs
+        // touch), ending a hold must stay possible even when engine
+        // simplifications have let the pair drift past 5 ft — refusing would
+        // strand a permanent Grappled + phantom-bound hand with no way out.
+        // A non-forced escape also requires a standing hold to break.
+        if !force && !escapee.has_condition(&Condition::Grappled) {
+            return reject(
+                &data,
+                409,
+                "NOT_GRAPPLED",
+                "entity_id carries no Grappled condition to escape",
+            );
+        }
+
+        // All gates passed — spend the escaper's Action now. A forced GM
+        // release is an intervention, not the victim's action: no spend.
+        if !force {
+            if let Err(e) = session
+                .entities
+                .get_mut(&req.entity_id)
+                .expect("checked above")
+                .spend_action()
+            {
+                return reject(&data, 409, &e, "action budget exhausted or entity incapable");
+            }
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+
+        let escape_dc = ActionResolver::grapple_escape_dc(grappler.abilities.modifier(Ability::Strength));
+        let escape_mod = escapee.abilities.modifier(req.skill.ability());
+        let (natural_roll, total, success) = if force {
+            // No dice for an override — the outcome is authored, not rolled.
+            (None, None, true)
+        } else {
+            let natural = dice.roll_d20();
+            let total = natural + escape_mod;
+            (Some(natural), Some(total), total >= escape_dc)
+        };
+
+        // On a win the hold ends on both sides: the condition leaves the
+        // escaper and the grappler's hand goes back through the saturating
+        // release path (a stray release can never mint a phantom hand).
+        let mut released_hands = 0u8;
+        if success {
+            if let Some(e) = session.entities.get_mut(&req.entity_id) {
+                e.remove_condition(&Condition::Grappled);
+            }
+            if let Some(g) = session.entities.get_mut(&req.grappler_id) {
+                if g.hands_occupied > 0 {
+                    released_hands = 1;
+                }
+                g.release_hand();
+            }
+        }
+
+        let payload = serde_json::json!({
+            "entity_id": req.entity_id.to_string(),
+            "grappler_id": req.grappler_id.to_string(),
+            "skill": req.skill,
+            "escape_dc": escape_dc,
+            "natural_roll": natural_roll,
+            "total": total,
+            "forced": force,
+            "success": success,
+            "grappler_hands_released": released_hands,
+        });
+        let grappler_hands_after =
+            session.entities.get(&req.grappler_id).map(|g| g.hands_occupied);
+
+        let campaign_id = session.campaign_id;
+        let event = session.ledger.append_event(
+            session_id,
+            campaign_id,
+            req.entity_id,
+            "GRAPPLE_ESCAPED",
+            payload.clone(),
+        );
+
+        data.count_valid();
+        let mut body = payload;
+        body["grappler_hands_occupied"] = serde_json::json!(grappler_hands_after);
         body["event_sequence"] = serde_json::json!(event.sequence_id);
         HttpResponse::Ok().json(body)
     } else {
@@ -5288,6 +5493,7 @@ pub fn configure_app_with(
                         .route("/map", web::put().to(set_session_map))
                         .route("/action/attack", web::post().to(resolve_attack))
                         .route("/action/grapple", web::post().to(resolve_grapple_action))
+                        .route("/action/escape-grapple", web::post().to(resolve_escape_grapple_action))
                         .route("/action/shove", web::post().to(resolve_shove_action))
                         .route("/action/dodge", web::post().to(resolve_dodge))
                         .route("/action/dash", web::post().to(resolve_dash))

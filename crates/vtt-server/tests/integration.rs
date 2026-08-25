@@ -7273,3 +7273,708 @@ async fn won_grapple_occupies_the_grapplers_hand_and_blocks_somatic_casts() {
         "the grappler's hand is occupied while the hold lasts"
     );
 }
+
+// --- Iteration 49: escape releases the grappler's hand -----------------------
+//
+// Iteration 41 gave the engine a bound-hands model (hands_occupied, occupied
+// by a WON grapple, gating somatic casts) but left the hold permanently
+// binding: no live path released the hand. The smallest honest completion is
+// the SRD escape contest — the grappled creature spends its Action on
+// Athletics/Acrobatics vs DC 8 + grappler's STR; winning strips Grappled from
+// BOTH sides of the hold and frees the grappler's hand (the hold was what
+// occupied it). Weapon wielding stays documented-unmodeled: there is no
+// equip/wield route in this engine to hang occupancy on.
+
+/// Spawns two adjacent entities with full sheets and returns their ids.
+async fn escape_fixture(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+) -> (Uuid, Uuid) {
+    let hero_id = Uuid::new_v4();
+    let brute_id = Uuid::new_v4();
+    for (id, name, x) in [(hero_id, "Escaper", 2), (brute_id, "Holder", 3)] {
+        let mut e = entity_json(id, name, 40, 12, 6, "1d8");
+        e["position"] = serde_json::json!([(x as f32) * 5.0, 2.5, 0.0]);
+        if id == brute_id {
+            e["is_player"] = serde_json::json!(false);
+        }
+        spawn_entity(app, token, session_id, e).await;
+    }
+    (hero_id, brute_id)
+}
+
+/// Wins one grapple (hero as attacker) deterministically, advancing turns as
+/// needed. Panics if no seed in 1..=60 wins an even contest.
+async fn win_grapple(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+    attacker_id: Uuid,
+    defender_id: Uuid,
+) {
+    for seed in 1..=60u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/grapple", session_id))
+            .insert_header(bearer(token))
+            .set_json(serde_json::json!({
+                "attacker_id": attacker_id,
+                "defender_id": defender_id,
+                "defender_skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(app, req).await;
+        let status = res.status();
+        if status == StatusCode::CONFLICT {
+            advance_turn(app, token, session_id).await;
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "grapple contest resolved");
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            return;
+        }
+        advance_turn(app, token, session_id).await;
+    }
+    panic!("no seed in 1..=60 won an even STR contest");
+}
+
+#[actix_web::test]
+async fn escape_breaks_grapple_frees_the_grapplers_hand_and_unblocks_casting() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc1", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Escape Hands"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    // Hero is BOTH grappler and caster; brute is the held victim who will
+    // fight his way out.
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+
+    // Give the hero spell slots before the fixture grapples.
+    {
+        let mut snap = snapshot_as(&app, &gm, sid).await;
+        snap["entities"][&hero_id.to_string()]["spell_slots_remaining"] =
+            serde_json::json!({"1": 1});
+        let service = sign_token("orchestrator-service", TEST_SECRET);
+        let req = test::TestRequest::put()
+            .uri(&format!("/api/v1/sessions/{}/restore", sid))
+            .insert_header(bearer(&service))
+            .set_json(snap)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    // Hero wins a grapple on the brute: one hand bound.
+    win_grapple(&app, &gm, sid, hero_id, brute_id).await;
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "a won grapple occupies the grappler's hand"
+    );
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "the victim carries Grappled while the hold lasts"
+    );
+
+    // Pin the hero's SECOND hand (shield grip — weapon/shield wielding is
+    // documented-unmodeled, so the fixture writes it directly): both hands
+    // occupied, somatic casting must refuse.
+    {
+        let mut snap = snapshot_as(&app, &gm, sid).await;
+        snap["entities"][&hero_id.to_string()]["hands_occupied"] = serde_json::json!(2);
+        let service = sign_token("orchestrator-service", TEST_SECRET);
+        let req = test::TestRequest::put()
+            .uri(&format!("/api/v1/sessions/{}/restore", sid))
+            .insert_header(bearer(&service))
+            .set_json(snap)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    let caster_spell = serde_json::json!({
+        "spell": {
+            "spell_id": "escape_probe", "name": "Probe", "level": 1,
+            "school": "Illusion", "casting_time": "1 action", "range_feet": 30,
+            "verbal_component": true, "somatic_component": true,
+            "material_component_desc": null, "save_attribute": null,
+            "damage_formula": "2d4", "damage_type": "psychic",
+            "duration_rounds": 0, "is_concentration": false, "is_ritual": false
+        },
+        "caster_id": hero_id,
+        "target_id": brute_id,
+        "cast_level": 1
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", sid))
+        .insert_header(auth.clone())
+        .set_json(caster_spell.clone())
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "CANNOT_SOMATIZE", "{body}");
+
+    // The VICTIM escapes: Athletics vs DC 8 + grappler STR (+3 → 11). Scan
+    // seeds until one clears; each attempt spends the escaper's Action, so a
+    // 409 refreshes the round.
+    let mut escaped = false;
+    for seed in 1..=60u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": brute_id,
+                "grappler_id": hero_id,
+                "skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let status = res.status();
+        if status == StatusCode::CONFLICT {
+            advance_turn(&app, &gm, sid).await;
+            continue;
+        }
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "escape contest resolved: {}",
+            res.status()
+        );
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            assert_eq!(
+                body["grappler_hands_released"], serde_json::json!(1),
+                "a won escape reports how many hands the hold freed"
+            );
+            escaped = true;
+            break;
+        }
+        advance_turn(&app, &gm, sid).await;
+    }
+    assert!(escaped, "some seed in 1..=60 must clear the escape DC");
+
+    // Freed-hand transition visible in the session snapshot.
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "escaping the hold frees exactly ONE of the grappler's hands live"
+    );
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["conditions"],
+        serde_json::json!([]),
+        "escaping strips Grappled from the escaper"
+    );
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "the escapee's own hands were never the model's concern"
+    );
+
+    // One free hand is enough to somatize again: the same spell now resolves
+    // and spends the slot it refused to touch while both hands were bound.
+    advance_turn(&app, &gm, sid).await;
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", sid))
+        .insert_header(auth.clone())
+        .set_json(caster_spell)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "after escaping, the freed hand must allow the somatic cast: {body}"
+    );
+}
+
+#[actix_web::test]
+async fn failed_escape_keeps_the_hand_bound_and_spends_the_action() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc2", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Escape Fails"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    // A WEAK escaper (STR 8, -1) vs a strong grappler (STR 18, +4 → DC 12):
+    // a natural roll of 1 always fails the check regardless of the d20's
+    // companions... but a nat 1 with -1 still cannot clear DC 12.
+    let weak_id = Uuid::new_v4();
+    let brute_id = Uuid::new_v4();
+    for (id, name, x, str_score) in [(weak_id, "Weakling", 2, 8i32), (brute_id, "Stronghold", 3, 18)] {
+        let mut e = entity_json(id, name, 40, 12, 0, "1d4");
+        e["position"] = serde_json::json!([(x as f32) * 5.0, 2.5, 0.0]);
+        e["abilities"]["strength"] = serde_json::json!(str_score);
+        if id == brute_id {
+            e["is_player"] = serde_json::json!(false);
+        }
+        spawn_entity(&app, &gm, sid, e).await;
+    }
+
+    // Seed the hold directly through the ledger-free route: grapple attempts
+    // from the STRONG grappler against the weak target win readily.
+    win_grapple(&app, &gm, sid, brute_id, weak_id).await;
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "fixture: the strong grappler holds one hand"
+    );
+
+    // Deterministic failure: simulate the check locally (the route rolls a
+    // fresh d20 from the pinned seed) to find a seed whose natural roll cannot
+    // reach DC 12 even with the -1 STR modifier.
+    let losing_seed = (1u64..)
+        .find(|&seed| vtt_core::DiceEngine::with_seed(seed).roll_d20() + (-1) < 12)
+        .expect("some seed must lose a DC 12 check at -1");
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": weak_id,
+            "grappler_id": brute_id,
+            "skill": "athletics",
+            "seed": losing_seed
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], serde_json::json!(false), "{body}");
+    assert_eq!(
+        body["grappler_hands_released"], serde_json::json!(0),
+        "a lost escape releases nothing"
+    );
+    assert_eq!(
+        body["escape_dc"], serde_json::json!(12),
+        "DC is 8 + grappler STR (+4)"
+    );
+
+    // The failed attempt still cost the escaper their Action.
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&weak_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(false),
+        "an escape attempt spends the escaper's Action whether or not it lands"
+    );
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(1),
+        "a FAILED escape leaves the grappler's hand bound"
+    );
+    assert_eq!(
+        snap["entities"][&weak_id.to_string()]["conditions"],
+        serde_json::json!(["grappled"]),
+        "a FAILED escape leaves the victim Grappled"
+    );
+}
+
+// --- Legacy durability: hands fields are additive ----------------------------
+
+#[actix_web::test]
+async fn legacy_snapshot_without_hands_fields_hydrates_and_parses_identically() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-legacy", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Legacy Hands"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let eid = Uuid::new_v4();
+    // Pre-iteration-41 entity sheets carry NO hands_occupied key at all —
+    // entity_json mirrors that (the field only exists once a model writes it).
+    let mut e = entity_json(eid, "Old Timer", 30, 12, 2, "1d6");
+    e["spell_slots_remaining"] = serde_json::json!({"0": 2}); // cantrip slots
+    spawn_entity(&app, &gm, sid, e).await;
+
+    // Snapshot as emitted, then strip EVERY hands-era key to simulate a
+    // pre-iteration-41 persisted payload coming back from PostgreSQL.
+    let mut snapshot = snapshot_as(&app, &gm, sid).await;
+    if let Some(entities) = snapshot["entities"].as_object_mut() {
+        for (_, entity) in entities.iter_mut() {
+            entity.as_object_mut().unwrap().remove("hands_occupied");
+        }
+    }
+
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&service))
+        .set_json(snapshot.clone())
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::OK,
+        "a hands-less legacy snapshot must hydrate cleanly"
+    );
+
+    let restored = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        restored["entities"][&eid.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "legacy entities deserialize with zero occupied hands"
+    );
+
+    // And the restored session stays fully playable: a somatic cast passes.
+    let dummy_id = Uuid::new_v4();
+    let mut dummy = entity_json(dummy_id, "Target", 20, 10, 0, "1d4");
+    dummy["is_player"] = serde_json::json!(false);
+    dummy["position"] = serde_json::json!([40.0, 2.5, 0.0]);
+    spawn_entity(&app, &gm, sid, dummy).await;
+
+    let spell = serde_json::json!({
+        "spell": {
+            "spell_id": "legacy_probe", "name": "Probe", "level": 0,
+            "school": "Illusion", "casting_time": "1 action", "range_feet": 60,
+            "verbal_component": true, "somatic_component": true,
+            "material_component_desc": null, "save_attribute": null,
+            "damage_formula": "1d4", "damage_type": "psychic",
+            "duration_rounds": 0, "is_concentration": false, "is_ritual": false
+        },
+        "caster_id": eid,
+        "target_id": dummy_id,
+        "cast_level": 0
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/cast-spell", sid))
+        .insert_header(bearer(&gm))
+        .set_json(spell)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a legacy-hydrated caster has both hands free"
+    );
+}
+
+// --- Pillar 11: the GM override ----------------------------------------------
+
+#[actix_web::test]
+async fn gm_forced_escape_releases_the_hand_without_a_roll_but_players_cannot() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc3", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-esc3", "player", TEST_SECRET);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Forced Escape"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+    win_grapple(&app, &gm, sid, brute_id, hero_id).await;
+
+    // A player may NOT invoke the override — it is a GM agency tool.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": brute_id,
+            "skill": "athletics",
+            "force": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The GM forces it: no dice at all, the hold simply ends.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": brute_id,
+            "skill": "athletics",
+            "force": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], serde_json::json!(true), "{body}");
+    assert_eq!(body["forced"], serde_json::json!(true), "{body}");
+    assert!(
+        body["natural_roll"].is_null(),
+        "a forced escape rolls no dice: {body}"
+    );
+
+    let snap = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snap["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "the forced escape frees the grappler's hand"
+    );
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!([]),
+        "the forced escape strips Grappled"
+    );
+}
+
+// --- Ledger replay: rewinds honor escapes ------------------------------------
+
+#[actix_web::test]
+async fn rewind_between_escape_and_grapple_keeps_the_release_not_a_resurrected_hold() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-esc4", "gm", TEST_SECRET);
+    let auth = bearer(&gm);
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"campaign_id": Uuid::new_v4(), "session_name": "Escape Rewind"}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let sid: Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+
+    let (hero_id, brute_id) = escape_fixture(&app, &gm, sid).await;
+
+    // Brute holds hero; hero wins free.
+    win_grapple(&app, &gm, sid, brute_id, hero_id).await;
+    let mut escaped = false;
+    for seed in 1..=60u64 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", sid))
+            .insert_header(auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": hero_id,
+                "grappler_id": brute_id,
+                "skill": "athletics",
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        if res.status() == StatusCode::CONFLICT {
+            advance_turn(&app, &gm, sid).await;
+            continue;
+        }
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(res).await;
+        if body["success"] == serde_json::json!(true) {
+            escaped = true;
+            break;
+        }
+        advance_turn(&app, &gm, sid).await;
+    }
+    assert!(escaped, "fixture escape must succeed");
+
+    // Rewind to NOW (nothing reverted): the sweep rebuilds bound hands purely
+    // from the surviving ledger, and the ledger must still say ESCAPED — not
+    // resurrect a hold the table already broke.
+    let target_seq = snapshot_as(&app, &gm, sid).await["ledger"]["current_sequence"]
+        .as_u64()
+        .unwrap();
+    let card = serde_json::json!({
+        "player_id": "player-esc4",
+        "topic": "no-op rewind",
+        "target_sequence_id": target_seq
+    });
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", sid))
+        .insert_header(bearer(&gm))
+        .set_json(card)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SAFETY_REWIND_SUCCESS");
+
+    assert_eq!(
+        body["snapshot"]["entities"][&brute_id.to_string()]["hands_occupied"],
+        serde_json::json!(0),
+        "a rewind must not resurrect a hold that a surviving GRAPPLE_ESCAPED already ended"
+    );
+    assert_eq!(
+        body["snapshot"]["entities"][&hero_id.to_string()]["conditions"],
+        serde_json::json!([]),
+        "the escaper stays free across the replay"
+    );
+}
+
+// --- Route contract: seed policy, RBAC, hold-state gates ----------------------
+
+#[actix_web::test]
+async fn escape_grapple_route_enforces_seed_policy_rbac_and_hold_state() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-seed-escape", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id,
+        entity_with_abilities(entity_json(hero_id, "Hero", 30, 14, 0, "1d4"), 20, 10)).await;
+    spawn(&app, &gm, session_id,
+        entity_at(entity_with_abilities(entity_json(orc_id, "Orc", 20, 11, 0, "1d4"), 8, 8), 7.5, 2.5)).await;
+
+    // A player's pinned seed is refused exactly like every other contest
+    // route — before any Action is spent or event appended.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+        .insert_header(bearer(&player_token()))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics",
+            "seed": contest_seed(5, -1, true)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_seed_rejected(status, &body);
+
+    // Spectators cannot act at all.
+    let spectator = sign_token_with_role("spec-seed-escape", "spectator", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+        .insert_header(bearer(&spectator))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics"
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Unknown grappler -> 404 with a distinct code from the escaper miss.
+    for (field, value, code) in [
+        ("entity_id", Uuid::new_v4(), "ENTITY_NOT_FOUND"),
+        ("grappler_id", Uuid::new_v4(), "GRAPPLER_NOT_FOUND"),
+    ] {
+        let mut payload = serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics"
+        });
+        payload[field] = serde_json::json!(value);
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(payload)
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        let status = res.status();
+        let body: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], code, "{body}");
+    }
+
+    // No standing hold -> 409 NOT_GRAPPLED (the honest gate: no phantom holds).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics"
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "NOT_GRAPPLED", "{body}");
+
+    // Smuggled fields are structurally impossible (deny_unknown_fields).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics",
+            "escape_dc_override": 1
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    // actix surfaces serde `deny_unknown_fields` errors as 400; the contract
+    // is structural rejection, not a specific code.
+    assert!(
+        res.status() == StatusCode::BAD_REQUEST
+            || res.status() == StatusCode::UNPROCESSABLE_ENTITY,
+        "client-authored DC math must be rejected by shape, got {}",
+        res.status()
+    );
+
+    // Once the orc actually holds the hero, the route resolves a real check.
+    // The weak orc (-1 STR) needs a pinned seed to beat the hero's +5.
+    let hold_seed = contest_seed(-1, 5, true);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/grapple", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "attacker_id": orc_id,
+            "defender_id": hero_id,
+            "defender_skill": "athletics",
+            "seed": hold_seed
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], serde_json::json!(true), "{body}");
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/escape-grapple", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "grappler_id": orc_id,
+            "skill": "athletics",
+            "seed": contest_seed(9, 5, true)
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut local = vtt_core::DiceEngine::with_seed(contest_seed(9, 5, true));
+    assert_eq!(
+        body["natural_roll"],
+        serde_json::json!(local.roll_d20()),
+        "the GM's pinned seed decides the d20 exactly as the local engine does: {body}"
+    );
+    assert_eq!(
+        body["escape_dc"],
+        serde_json::json!(8 + (-1)),
+        "DC is 8 + the grappler's STR modifier (STR 8 -> -1): {body}"
+    );
+}

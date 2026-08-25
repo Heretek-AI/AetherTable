@@ -1589,6 +1589,51 @@ impl GameSession {
                 entity.occupy_hand();
             }
         }
+        // Surviving escapes release what their hold took: a successful
+        // GRAPPLE_ESCAPED always follows the GRAPPLE_ATTEMPTED it undoes
+        // (chronological append), and a reverted escape is excluded by the
+        // filter above — so applying releases after occupations nets out to
+        // exactly the holds the ledger still vouches for. Without this, a
+        // rewind past an escaped grapple would resurrect both the condition
+        // sweep below refuses to keep and a hand the escaper already freed.
+        let mut freed_grapplers: Vec<Uuid> = Vec::new();
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type == "GRAPPLE_ESCAPED"
+                && ev.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+            {
+                if let Some(id) = ev
+                    .payload
+                    .get("grappler_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    freed_grapplers.push(id);
+                }
+            }
+        }
+        for id in freed_grapplers {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.release_hand();
+            }
+        }
+        // An escaped hold must not re-grant its Grappled either: drop the
+        // defender from the contest-condition replay set when a surviving
+        // successful escape names them.
+        for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+            if ev.event_type != "GRAPPLE_ESCAPED"
+                || ev.payload.get("success").and_then(|v| v.as_bool()) != Some(true)
+            {
+                continue;
+            }
+            if let Some(id) = ev
+                .payload
+                .get("entity_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                condition_state.remove(&id);
+            }
+        }
         for (id, condition) in condition_state {
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.add_condition(condition);
