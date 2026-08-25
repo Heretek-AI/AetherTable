@@ -31,6 +31,21 @@ ATTACKER = "aaaaaaaa-0000-0000-0000-000000000001"
 TARGET = "bbbbbbbb-0000-0000-0000-000000000002"
 
 
+# WIRE-SHAPE CONTRACT (audit A4/F1 regression guard): fixtures here MUST
+# mirror what the Rust engine actually emits, not what is convenient for
+# python. Two rules, both verified against the engine source:
+#
+#   1. ``actor_id`` is a TOP-LEVEL GameEvent field
+#      (crates/vtt-core/src/event_log.rs::GameEvent) set by
+#      EventSourcingLedger::append_event — it is NEVER a payload key.
+#   2. DEATH_SAVE_RESOLVED payloads carry EXACTLY these keys (copied
+#      verbatim from crates/vtt-server/src/server.rs, the death-save route):
+#      outcome, natural_roll, successes, failures, is_stabilized, is_dead.
+#
+# Any fixture that stuffs identity or unknown keys into a payload encodes a
+# fictional wire shape and will green-light an aggregator the engine breaks.
+
+
 def _event(seq: int, event_type: str, payload: dict, *, actor: str = ATTACKER,
            is_reverted: bool = False) -> dict:
     return {
@@ -75,24 +90,12 @@ def _stabilized_events() -> list:
             "target_hp_remaining": 0,
             "target_is_conscious": False, "target_is_dead": False,
         }),
-        _event(4, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 15, "outcome": "PENDING",
-            "successes": 1, "failures": 0,
-            "is_stabilized": False, "is_dead": False,
-        }),
-        _event(5, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 12, "outcome": "PENDING",
-            "successes": 2, "failures": 0,
-            "is_stabilized": False, "is_dead": False,
-        }),
-        _event(6, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 18, "outcome": "STABILIZED",
-            "successes": 3, "failures": 0,
-            "is_stabilized": True, "is_dead": False,
-        }),
+        _event(4, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(15, "PENDING", successes=1), actor=TARGET),
+        _event(5, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(12, "PENDING", successes=2), actor=TARGET),
+        _event(6, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(18, "STABILIZED", successes=3), actor=TARGET),
     ]
 
 
@@ -108,18 +111,52 @@ def _died_events() -> list:
             "target_hp_remaining": 0,
             "target_is_conscious": False, "target_is_dead": False,
         }),
-        _event(4, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 7, "outcome": "PENDING",
-            "successes": 0, "failures": 1,
-            "is_stabilized": False, "is_dead": False,
+        _event(4, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(7, "PENDING", failures=1), actor=TARGET),
+        _event(5, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(1, "DEAD", failures=3), actor=TARGET),
+    ]
+
+
+def _death_save_payload(natural_roll: int, outcome: str, *, successes: int = 0,
+                        failures: int = 0) -> dict:
+    """Verbatim DEATH_SAVE_RESOLVED payload keys from the engine's death-save
+    route (crates/vtt-server/src/server.rs). Nothing else is ever in there —
+    notably NOT actor_id, which is a top-level GameEvent field."""
+    return {
+        "outcome": outcome,
+        "natural_roll": natural_roll,
+        "successes": successes,
+        "failures": failures,
+        "is_stabilized": outcome == "STABILIZED",
+        "is_dead": outcome == "DEAD",
+    }
+
+
+def _real_engine_shape_events() -> list:
+    """Fixture derived directly from engine emission.
+
+    The target is dropped to 0 HP by an ATTACK_RESOLVED event (top-level
+    actor_id = attacker, payload.target_id = target), then two DEATH_SAVE_
+    RESOLVED events fire with top-level actor_id = TARGET and the exact
+    six-key payload the Rust server serializes. This is the shape
+    EventSourcingLedger::append_event actually produces; if this fixture
+    ever stops resolving, the audit has drifted from real emission again.
+    """
+    return [
+        _event(1, "SESSION_CREATED", {"name": "Real Wire"}),
+        _event(3, "ATTACK_RESOLVED", {
+            "attacker_id": ATTACKER, "target_id": TARGET,
+            "is_hit": True, "is_critical_hit": False,
+            "natural_roll": 17, "total_damage": 12,
+            "target_hp_remaining": 0,
+            "target_is_conscious": False, "target_is_dead": False,
         }),
-        _event(5, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 1, "outcome": "DEAD",
-            "successes": 0, "failures": 3,
-            "is_stabilized": False, "is_dead": True,
-        }),
+        # Top-level actor_id is the dying token; payload carries no identity.
+        _event(4, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(15, "PENDING", successes=1), actor=TARGET),
+        _event(6, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(18, "STABILIZED", successes=3), actor=TARGET),
     ]
 
 
@@ -132,18 +169,10 @@ def _in_progress_events() -> list:
             "target_id": TARGET, "amount": 10,
             "hp_remaining": 0, "instant_death": False,
         }, actor=ATTACKER),
-        _event(4, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 14, "outcome": "PENDING",
-            "successes": 1, "failures": 0,
-            "is_stabilized": False, "is_dead": False,
-        }),
-        _event(5, "DEATH_SAVE_RESOLVED", {
-            "actor_id": TARGET,
-            "natural_roll": 16, "outcome": "PENDING",
-            "successes": 2, "failures": 0,
-            "is_stabilized": False, "is_dead": False,
-        }),
+        _event(4, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(14, "PENDING", successes=1), actor=TARGET),
+        _event(5, "DEATH_SAVE_RESOLVED",
+               _death_save_payload(16, "PENDING", successes=2), actor=TARGET),
     ]
 
 
@@ -217,6 +246,32 @@ class TestDied:
         assert entry["outcome"] == "died"
         kinds = [a["kind"] for a in entry["save_attempts"]]
         assert "failure" in kinds
+
+
+class TestRealEngineEventShape:
+    """Regression for audit A4/F1: the audit read token identity from
+    event.payload.actor_id, a key the engine never puts in payloads.
+    Every real ledger therefore produced in_progress forever."""
+
+    def test_real_shape_fixture_resolves_stabilized(self):
+        report = build_death_audit(_real_engine_shape_events())
+        assert report["available"] is True
+        entry = report["entries"][0]
+        assert entry["token_id"] == TARGET
+        assert entry["outcome"] == "stabilized"
+        # Both saves attributed to the dying token, not dropped on the floor.
+        rolls = [a["roll"] for a in entry["save_attempts"]]
+        assert rolls == [15, 18]
+
+    def test_payload_actor_id_is_never_the_lookup_source(self):
+        # Even when a payload carries a (fictional) actor_id key, the
+        # top-level field wins — that is the field the engine sets.
+        events = _real_engine_shape_events()
+        for event in events:
+            if event["event_type"] == "DEATH_SAVE_RESOLVED":
+                event["payload"]["actor_id"] = "payload-lies"
+        report = build_death_audit(events)
+        assert report["entries"][0]["token_id"] == TARGET
 
 
 class TestInProgress:

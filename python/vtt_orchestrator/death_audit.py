@@ -48,6 +48,24 @@ def _opt(payload: Any, key: str) -> Any:
     return payload.get(key) if isinstance(payload, dict) else None
 
 
+def _event_actor(event: Dict[str, Any]) -> Any:
+    """Token identity for a save event.
+
+    WINS: the TOP-LEVEL ``actor_id`` field — that is where the Rust engine
+    puts it (``GameEvent.actor_id`` in crates/vtt-core/src/event_log.rs,
+    set by ``EventSourcingLedger::append_event``). DEATH_SAVE_RESOLVED
+    payloads carry only outcome/roll/counter keys and never identity.
+
+    FALLBACK (backward tolerance only): a legacy export shape that stashed
+    ``actor_id`` inside the payload. Never preferred over the top-level
+    field when both are present.
+    """
+    top = event.get("actor_id")
+    if isinstance(top, str):
+        return top
+    return _opt(event.get("payload") or {}, "actor_id")
+
+
 def _event_is_reverted(event: Dict[str, Any]) -> bool:
     """X-card rewinds set ``is_reverted``; those events must never feed the
     audit because they were undone in-fiction. Same policy as the replay
@@ -200,7 +218,7 @@ def build_death_audit(events: List[Any]) -> Dict[str, Any]:
         payload = event.get("payload") or {}
 
         if et == "DEATH_SAVE_RESOLVED":
-            token = _opt(payload, "actor_id")
+            token = _event_actor(event)
             if not isinstance(token, str) or not isinstance(seq, int):
                 continue
             classified = _classify_save(payload)
