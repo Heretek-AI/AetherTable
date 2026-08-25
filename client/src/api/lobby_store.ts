@@ -8,14 +8,24 @@
 import { authHeaders, getStoredToken } from './auth_headers';
 
 /**
- * Member record as returned by the lobby detail endpoint.
- * Backend gaps (follow-up candidates): no ready flag, no latency/ping metric,
- * and no bound character per member — only these three fields exist.
+ * Member record as returned by the lobby detail endpoint (iteration-33+).
+ *
+ * Remaining backend gap: no latency/ping metric per seat.
  */
 export interface LobbyMember {
   user_id: string;
   display_name: string;
   role: string;
+  /** True once the member has readied up (POST /lobbies/{id}/ready). */
+  ready: boolean;
+  /** The member's bound character sheet id, or null before they pick one. */
+  selected_character_id: string | null;
+}
+
+/** A seat the launch gate refused for: listed by id AND display name. */
+export interface UnreadyMember {
+  user_id: string;
+  display_name: string;
 }
 
 export interface Lobby {
@@ -68,9 +78,126 @@ export async function fetchLobby(lobbyId: string): Promise<Lobby | null> {
   return req<Lobby>(`/api/v1/lobbies/${lobbyId}`);
 }
 
-export async function launchLobby(lobbyId: string): Promise<{ session_id: string } | null> {
+/**
+ * Toggle the CALLING member's ready flag. Returns the refreshed roster so the
+ * UI can render live synchrony from one response, or null when signed out,
+ * offline, or refused (403 non-member / 404 unknown lobby).
+ */
+export async function setMemberReady(lobbyId: string, ready: boolean): Promise<Lobby | null> {
   if (!getToken()) return null;
-  return req<{ session_id: string }>(`/api/v1/lobbies/${lobbyId}/launch`, { method: 'POST' });
+  return req<Lobby>(`/api/v1/lobbies/${lobbyId}/ready`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ready }),
+  });
+}
+
+/**
+ * Bind one of the caller's OWN characters to their lobby seat. The gateway
+ * refuses a foreign (but real) sheet with 403 and an unknown id with 404 —
+ * both surface here as null rather than an exception.
+ */
+export async function setMemberCharacter(
+  lobbyId: string,
+  characterId: string
+): Promise<Lobby | null> {
+  if (!getToken()) return null;
+  return req<Lobby>(`/api/v1/lobbies/${lobbyId}/character`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ character_id: characterId }),
+  });
+}
+
+/**
+ * Filter a character list down to sheets owned by `userId`. The lobby seat's
+ * character selector must offer ONLY the signed-in user's own characters — the
+ * gateway rejects any other bind with 403, and offering foreign sheets in the
+ * dropdown would just manufacture that refusal for every click.
+ */
+export function ownedCharacters(
+  roster: StoredCharacter[],
+  userId: string | null | undefined
+): StoredCharacter[] {
+  if (!userId) return [];
+  return roster.filter((c) => !!c && c.owner_user_id === userId);
+}
+
+/**
+ * Structured launch result. Unlike the other helpers this does NOT collapse
+ * every failure to null: a 409 MEMBERS_NOT_READY is world state (who is not
+ * ready), not an error, and the UI must show those names honestly.
+ */
+export type LaunchResult =
+  | { outcome: 'LAUNCHED'; sessionId: string }
+  | { outcome: 'MEMBERS_NOT_READY'; message: string; unreadyMembers: UnreadyMember[] }
+  | { outcome: 'NOT_ALLOWED'; detail: string }
+  /** Signed out, offline, or an unmapped failure (null means "no signal"). */
+  | { outcome: 'ERROR' }
+  | null;
+
+function normalizeUnready(raw: unknown): UnreadyMember[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object')
+    .map((m) => ({
+      user_id: String(m.user_id ?? ''),
+      display_name: String(m.display_name ?? m.user_id ?? ''),
+    }))
+    .filter((m) => m.user_id !== '');
+}
+
+export async function launchLobby(
+  lobbyId: string,
+  opts?: { force?: boolean }
+): Promise<LaunchResult> {
+  if (!getToken()) return null;
+  try {
+    // An absent body keeps force=false server-side; only an explicit override
+    // sends {"force": true}.
+    const init: RequestInit = { method: 'POST', headers: authHeaders() };
+    if (opts?.force) {
+      init.headers = { ...init.headers, 'Content-Type': 'application/json' };
+      init.body = JSON.stringify({ force: true });
+    }
+    const resp = await fetch(`/api/v1/lobbies/${lobbyId}/launch`, init);
+    if (resp.ok) {
+      const data = (await resp.json()) as { session_id?: string };
+      return data?.session_id
+        ? { outcome: 'LAUNCHED', sessionId: data.session_id }
+        : { outcome: 'ERROR' };
+    }
+    const payload = await resp.json().catch(() => null);
+    // FastAPI wraps HTTPException(detail=dict) verbatim in {"detail": {...}}.
+    const detail = (payload as { detail?: unknown } | null)?.detail;
+    if (
+      resp.status === 409 &&
+      detail &&
+      typeof detail === 'object' &&
+      (detail as { error?: string }).error === 'MEMBERS_NOT_READY'
+    ) {
+      return {
+        outcome: 'MEMBERS_NOT_READY',
+        message:
+          typeof (detail as { message?: unknown }).message === 'string'
+            ? (detail as { message: string }).message
+            : 'Some members are not ready.',
+        unreadyMembers: normalizeUnready((detail as { unready_members?: unknown }).unready_members),
+      };
+    }
+    if (resp.status === 403) {
+      return {
+        outcome: 'NOT_ALLOWED',
+        detail:
+          typeof detail === 'string'
+            ? detail
+            : 'Only the host can launch this table.',
+      };
+    }
+    return { outcome: 'ERROR' };
+  } catch {
+    return null;
+  }
 }
 
 // --- Characters ---------------------------------------------------------------

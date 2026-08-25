@@ -1,5 +1,18 @@
 import React, { useEffect, useState } from 'react';
-import { createLobby, joinLobby, launchLobby, fetchLobby, listMyLobbies, type Lobby } from '../api/lobby_store';
+import {
+  createLobby,
+  joinLobby,
+  launchLobby,
+  fetchLobby,
+  listMyLobbies,
+  listCharacters,
+  ownedCharacters,
+  setMemberReady,
+  setMemberCharacter,
+  type Lobby,
+  type StoredCharacter,
+  type UnreadyMember,
+} from '../api/lobby_store';
 import {
   Users,
   Shield,
@@ -11,7 +24,9 @@ import {
   UserCheck,
   UserPlus,
   Eye,
-  Radio
+  Radio,
+  AlertTriangle,
+  Zap
 } from 'lucide-react';
 import { globalAudio } from '../render/audio_manager';
 import { authHeaders, getStoredToken } from '../api/auth_headers';
@@ -44,6 +59,11 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
   // REAL lobby state: created/joined via /api/v1/lobbies. Null = demo fallback.
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [joinCode, setJoinCode] = useState('');
+  // The signed-in user's OWN sheets — the only ones the seat selector may
+  // offer (a foreign bind is a hard 403 server-side).
+  const [myCharacters, setMyCharacters] = useState<StoredCharacter[]>([]);
+  // Honest launch-refusal state from a 409 MEMBERS_NOT_READY answer.
+  const [unreadyMembers, setUnreadyMembers] = useState<UnreadyMember[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,9 +86,13 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     pollPresence();
     const timer = setInterval(pollPresence, 5000);
 
-    // Restore the user's most recent lobby and refresh its roster.
+    // Restore the user's most recent lobby and refresh its roster, plus the
+    // caller's own character sheets for the seat selector.
     listMyLobbies().then((mine) => {
       if (!cancelled && mine && mine.length > 0) setLobby(mine[0]);
+    });
+    listCharacters().then((roster) => {
+      if (!cancelled) setMyCharacters(ownedCharacters(roster, currentUser?.id));
     });
     const rosterTimer = setInterval(() => {
       setLobby((current) => {
@@ -173,17 +197,56 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
     if (joined) setLobby(joined);
   };
 
-  const handleLaunch = async () => {
+  const myMember = lobby && currentUser
+    ? lobby.members.find((m) => m.user_id === currentUser.id) ?? null
+    : null;
+  const amHost = !!lobby && !!currentUser && lobby.host_user_id === currentUser.id;
+
+  const applyRoster = (fresh: Lobby | null) => {
+    if (fresh) setLobby(fresh);
+  };
+
+  // Self-only readiness toggle: the gateway flips ONLY the calling member's
+  // flag, so the UI must not even offer a toggle for another seat.
+  const handleToggleReady = async () => {
+    if (!lobby || !myMember) return;
+    setUnreadyMembers(null);
+    applyRoster(await setMemberReady(lobby.lobby_id, !myMember.ready));
+  };
+
+  const handleSelectCharacter = async (characterId: string) => {
+    if (!lobby) return;
+    if (characterId) {
+      applyRoster(await setMemberCharacter(lobby.lobby_id, characterId));
+    }
+  };
+
+  const runLaunch = async (force: boolean) => {
     globalAudio.playSpellCast();
     if (lobby && !lobby.engine_session_id) {
-      const launched = await launchLobby(lobby.lobby_id);
-      if (launched?.session_id) {
-        setLobby({ ...lobby, engine_session_id: launched.session_id });
+      const launched = await launchLobby(lobby.lobby_id, force ? { force: true } : undefined);
+      if (launched && launched.outcome === 'LAUNCHED') {
+        setUnreadyMembers(null);
+        setLobby({ ...lobby, engine_session_id: launched.sessionId });
+      } else if (launched && launched.outcome === 'MEMBERS_NOT_READY') {
+        // Honest refusal: show exactly who is holding up the party.
+        setUnreadyMembers(launched.unreadyMembers);
+        return; // do NOT enter a half-party session behind the user's back
+      } else {
+        setUnreadyMembers(null);
       }
-      // Offline/failed launch still proceeds into the demo tabletop.
     }
     onLaunchCampaign(activeSeatId);
   };
+
+  const handleLaunch = async () => {
+    await runLaunch(false);
+  };
+
+  const unreadyNames = (unreadyMembers ?? [])
+    .map((m) => m.display_name || m.user_id)
+    .filter(Boolean)
+    .join(', ');
 
   return (
     <div className="flex-1 flex flex-col h-full bg-tavern-bg text-[var(--rp-parchment-200)] overflow-hidden select-none">
@@ -233,6 +296,15 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
               const isSelected = !seat.isOpen && selectedSeat === seat.id;
               const isGm = seat.role === 'gm';
               const isSpectator = seat.role === 'spectator';
+              // Real readiness comes only from the backend roster; demo seats
+              // (no live lobby) have no flag to render.
+              const member = lobby?.members.find((m) => m.user_id === seat.id) ?? null;
+              const isSelf = !!currentUser && seat.id === currentUser.id;
+              const boundCharacter =
+                member?.selected_character_id != null
+                  ? myCharacters.find((c) => c.character_id === member.selected_character_id)
+                    ?.name ?? 'bound sheet'
+                  : null;
 
               return (
                 <div
@@ -283,6 +355,16 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
                         {seat.isHost && (
                           <span className="vtt-badge">HOST</span>
                         )}
+                        {!seat.isOpen && member && (
+                          <span
+                            data-testid={`ready-badge-${seat.id}`}
+                            className={`vtt-badge uppercase ${
+                              member.ready ? 'vtt-badge-success' : ''
+                            }`}
+                          >
+                            {member.ready ? 'READY' : 'NOT READY'}
+                          </span>
+                        )}
                       </div>
                       <div
                         className={`text-[11px] font-mono mt-0.5 ${
@@ -295,20 +377,90 @@ export const LobbyView: React.FC<LobbyViewProps> = ({ onLaunchCampaign, currentU
                             ? 'Dungeon Master'
                             : isSpectator
                               ? 'Read-only spectator'
-                              : 'Party member'}
+                              : boundCharacter
+                                ? `Playing: ${boundCharacter}`
+                                : 'Party member'}
                       </div>
                     </div>
                   </div>
 
-                  <span
-                    className={`vtt-badge uppercase ${seat.isOpen ? '' : 'vtt-badge-success'}`}
-                  >
-                    {seat.isOpen ? 'open' : seat.role}
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
+                    {/* Character picker: ONLY the signed-in user's own sheets,
+                        since the gateway 403s any foreign bind. */}
+                    {isSelf && member && lobby && (
+                      <select
+                        aria-label="Choose your character for this table"
+                        data-testid="character-select"
+                        value={member.selected_character_id ?? ''}
+                        onChange={(e) => void handleSelectCharacter(e.target.value)}
+                        className="px-2 py-1 text-xs bg-black/40 border border-tavern-border rounded-lg font-mono max-w-[10rem]"
+                      >
+                        <option value="">Unassigned…</option>
+                        {myCharacters.map((c) => (
+                          <option key={c.character_id} value={c.character_id}>
+                            {c.name} (Lv {c.level} {c.character_class})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    {/* Self-only readiness toggle: the gateway flips ONLY the
+                        calling member's flag, so no toggle renders for other seats. */}
+                    {isSelf && member && (
+                      <button
+                        onClick={() => void handleToggleReady()}
+                        data-testid="ready-toggle"
+                        title={member.ready ? 'Mark yourself not ready' : 'Ready up'}
+                        className={`px-2 py-1 text-xs rounded-lg transition border ${
+                          member.ready
+                            ? 'border-emerald-500 bg-emerald-900/40 text-emerald-300'
+                            : 'vtt-surface hover:bg-black/20 border-tavern-border'
+                        }`}
+                      >
+                        {member.ready ? 'Ready ✓' : 'Ready up'}
+                      </button>
+                    )}
+                    <span
+                      className={`vtt-badge uppercase ${seat.isOpen ? '' : 'vtt-badge-success'}`}
+                    >
+                      {seat.isOpen ? 'open' : seat.role}
+                    </span>
+                  </div>
                 </div>
               );
             })}
           </div>
+
+          {/* Honest launch refusal: a 409 MEMBERS_NOT_READY names exactly who
+              is holding up the party, and the host alone gets a force override. */}
+          {unreadyMembers !== null && unreadyMembers.length > 0 && (
+            <div
+              data-testid="unready-banner"
+              role="alert"
+              className="mt-4 p-4 rounded-xl border border-[var(--rp-crimson-400)]/60 bg-[color-mix(in_srgb,var(--rp-crimson-400)_12%,transparent)] space-y-2"
+            >
+              <div className="flex items-start gap-2 text-xs text-[var(--rp-parchment-100)]">
+                <AlertTriangle className="w-4 h-4 text-[var(--rp-crimson-400)] shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-bold font-display">Cannot launch yet</p>
+                  <p className="mt-0.5 font-prose">
+                    Still waiting on: <strong>{unreadyNames}</strong>. Ask them to ready up before
+                    starting the session.
+                  </p>
+                </div>
+              </div>
+              {amHost && (
+                <button
+                  onClick={() => void runLaunch(true)}
+                  data-testid="force-launch"
+                  className="vtt-btn vtt-btn-primary text-xs"
+                  title="Launch anyway, skipping the readiness gate (host only)"
+                >
+                  <Zap className="w-4 h-4 fill-current" />
+                  <span>Force Launch Anyway</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right Column: Campaign Invitation & Room Settings */}
