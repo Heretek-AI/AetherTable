@@ -372,3 +372,7 @@ LOW-MEDIUM evict amplification (it.43). Remaining low items queued: #5
 compendium rule-version round-trip caching, #6 fallback-reason doc drift,
 #7 limiter key omits bucket config, #8 projection fail-open comment lies.
 A1/A2 fixes verified intact at HEAD.
+### Iteration 44 — 7d23fbf — fix(gateway): authed session corpora + TTL cache + honest statuses (A3 #5/#6) — pytest 830
+### Iteration 45 — 8fd30c2 — docs(server): projection docstring + residual allowances (A3 #7/#8) — cargo 316/18
+### Iteration 46 — c30fd84 — feat(client): fail-forward outcome bands in check UI (P8) — vitest 286
+### Iteration 47 — 6b43e7d — feat(gateway): campaign quest+faction durability across restarts (P2) — pytest 839
