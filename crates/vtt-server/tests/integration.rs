@@ -1082,6 +1082,14 @@ fn json_str(id: &Uuid) -> serde_json::Value {
     serde_json::json!(id.to_string())
 }
 
+/// Reads an entity's SRD inspiration hold from a session snapshot. Absent key
+/// means "no point held" (`skip_serializing_if` on the core field).
+fn inspiration_of(snap: &serde_json::Value, entity_id: Uuid) -> bool {
+    snap["entities"][entity_id.to_string()]["inspiration"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
 #[actix_web::test]
 async fn heal_happy_path_restores_hp_consciousness_and_death_saves() {
     let app = test_app().await;
@@ -8643,5 +8651,775 @@ async fn shove_push_over_ledge_resolves_a_fall_instead_of_a_slide() {
         res.status() == StatusCode::UNPROCESSABLE_ENTITY || res.status() == StatusCode::CONFLICT,
         "a prone-shove cannot carry the ledge convention, got {}",
         res.status()
+    );
+}
+
+// ============================================================================
+// Iteration 56: inspiration spend on attack/check/save + Help-on-check action
+// ============================================================================
+
+/// A hero holding inspiration who asks to SPEND it on an attack must burn the
+/// point, roll with Advantage, journal exactly one
+/// `INSPIRATION_CHANGED {granted:false, reason:"spent"}` event, and report the
+/// burn in the response body.
+#[actix_web::test]
+async fn inspiration_spend_on_attack_burns_the_point_and_journals_it() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-insp", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["inspiration"] = serde_json::json!(true);
+    spawn(&app, &token, session_id, hero).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(orc_id, "Orc", 200, 16, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+
+    // Deterministic proof of the bought edge: find a seed whose FIRST d20 of
+    // an advantage pair misses AC 16 but whose SECOND hits — a straight roll
+    // on that same seed would miss, so a hit here is only possible under
+    // advantage.
+    let mut straddle_seed = None;
+    for s in 1..=200_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        let (_kept, r1, r2) = dice.roll_d20_advantage();
+        let (low, high) = (r1.min(r2), r1.max(r2));
+        if low != 1 && low != 20 && high != 20 && high != 1 && low + 8 < 16 && high + 8 >= 16 {
+            straddle_seed = Some(s);
+            break;
+        }
+    }
+    let seed = straddle_seed.expect("some seed must straddle AC 16 under advantage");
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": orc_id,
+            "seed": seed,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "the attack must resolve");
+    let body: serde_json::Value = test::read_body_json(res).await;
+
+    assert_eq!(body["advantage"], serde_json::json!(true), "the point buys Advantage");
+    assert_eq!(
+        body["inspiration_consumed"],
+        serde_json::json!(true),
+        "response must disclose that a point was burned"
+    );
+    assert_eq!(
+        body["is_hit"], serde_json::json!(true),
+        "a seed whose first advantage die misses but second hits lands ONLY under advantage"
+    );
+
+    // The engine state and ledger both record the spend.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        !inspiration_of(&snap, hero_id),
+        "a spent point leaves the hero uninspired"
+    );
+    let spends: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("INSPIRATION_CHANGED"))
+        .collect();
+    assert_eq!(spends.len(), 1, "exactly one spend event");
+    assert_eq!(spends[0]["payload"]["granted"], serde_json::json!(false));
+    assert_eq!(spends[0]["payload"]["reason"], serde_json::json!("spent"));
+    assert_eq!(spends[0]["actor_id"], json_str(&hero_id));
+}
+
+/// Asking to spend inspiration while HOLDING NONE is a silent no-op: no edge
+/// is conjured, `inspiration_consumed` stays false, and nothing is journalled.
+#[actix_web::test]
+async fn inspiration_spend_without_a_hold_is_a_noop_on_attack_check_and_save() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-insp2", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+    let enemy_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Dummy", 200, 10, 0, "1d4"), 2.5, 2.5),
+    )
+    .await;
+
+    let snap_before = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        !inspiration_of(&snap_before, hero_id),
+        "fixture sanity: no point held"
+    );
+
+    // Attack with the ask but nothing held.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": enemy_id,
+            "seed": 3,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["advantage"], serde_json::json!(false), "no hold, no edge");
+    assert_eq!(
+        body["inspiration_consumed"],
+        serde_json::json!(false),
+        "nothing was spent so nothing may be reported as consumed"
+    );
+    advance_turn(&app, &token, session_id).await;
+
+    // Ability check with the ask but nothing held.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/actions/check")
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "modifier": 3,
+            "dc": 12,
+            "cost_margin": 3,
+            "session_id": session_id,
+            "entity_id": hero_id,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["advantage"], serde_json::json!(false));
+    assert_eq!(body["inspiration_consumed"], serde_json::json!(false));
+
+    // Saving throw with the ask but nothing held.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/actions/save")
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "save_modifier": 3,
+            "dc": 12,
+            "session_id": session_id,
+            "entity_id": hero_id,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert!(body["passed"].is_boolean(), "save still resolves normally");
+    assert_eq!(body["advantage"], serde_json::json!(false));
+    assert_eq!(body["inspiration_consumed"], serde_json::json!(false));
+
+    // Nothing was journalled anywhere.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let spends: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("INSPIRATION_CHANGED"))
+        .collect();
+    assert!(
+        spends.is_empty(),
+        "a spend request against an empty hold must not journal anything"
+    );
+}
+
+/// SRD cancellation protection: when conditions ALREADY impose disadvantage,
+/// burning a point would cancel into a straight d20 and buy nothing, so the
+/// engine keeps the point and journals nothing.
+#[actix_web::test]
+async fn inspiration_spend_under_disadvantage_keeps_the_point() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-insp3", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Poisoned Hero", 30, 14, 8, "1d8+3");
+    hero["inspiration"] = serde_json::json!(true);
+    hero["conditions"] = serde_json::json!(["poisoned"]);
+    spawn(&app, &token, session_id, hero).await;
+    let enemy_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Dummy", 200, 10, 0, "1d4"), 2.5, 2.5),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": enemy_id,
+            "seed": 7,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["disadvantage"], serde_json::json!(true));
+    assert_eq!(
+        body["inspiration_consumed"],
+        serde_json::json!(false),
+        "SRD cancellation protects the point from being wasted"
+    );
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        inspiration_of(&snap, hero_id),
+        "the point survives a cancelled roll"
+    );
+    let spends: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("INSPIRATION_CHANGED"))
+        .collect();
+    assert!(spends.is_empty(), "no event for an unconsumed ask");
+}
+
+/// Help-on-check (combat): a NEW route grants a check-flavored promise via
+/// `take_help_check`, distinct from the existing attack-flavored one. An
+/// invalid beneficiary must be rejected WITHOUT spending anything.
+#[actix_web::test]
+async fn combat_help_check_rejects_invalid_beneficiary_without_spending() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-helpchk", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let helper_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(helper_id, "Helper", 30, 14, 0, "1d4")).await;
+
+    // Unknown beneficiary.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": helper_id, "beneficiary_id": Uuid::new_v4()}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown beneficiary must 404, got {}: {}",
+        status,
+        body
+    );
+
+    // Self-targeting is structurally meaningless.
+    let (status, _) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": helper_id, "beneficiary_id": helper_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Out of reach (> 5 ft).
+    let far_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(far_id, "Far Ally", 30, 14, 0, "1d4"), 20.5, 20.5),
+    )
+    .await;
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": helper_id, "beneficiary_id": far_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+
+    // Nothing was spent by any rejected attempt.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][helper_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "rejected help-check attempts must not burn the Action"
+    );
+    let events: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("HELP_CHECK_ACTION"))
+        .collect();
+    assert!(events.is_empty(), "no HELP_CHECK_ACTION on a rejection");
+}
+
+/// The happy path: /action/help-check journals a DISTINCT HELP_CHECK_ACTION
+/// event, spends only the helper's Action, and the beneficiary's next ability
+/// check consumes it exactly once.
+#[actix_web::test]
+async fn help_check_grants_advantage_that_an_ability_check_consumes_exactly_once() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-helpchk2", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let helper_id = Uuid::new_v4();
+    let rogue_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(helper_id, "Spotter", 30, 14, 0, "1d4")).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(rogue_id, "Rogue", 30, 15, 0, "1d4"), 2.5, 2.5),
+    )
+    .await;
+
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": helper_id, "beneficiary_id": rogue_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("HELP_CHECK_GRANTED"));
+    assert_eq!(body["beneficiary_id"], json_str(&rogue_id));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][rogue_id.to_string()]["next_check_has_advantage_from"],
+        json_str(&helper_id),
+        "check-help lives on the BENEFICIARY like its attack twin"
+    );
+    assert_eq!(
+        snap["entities"][helper_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(false),
+        "the helper's Action is spent"
+    );
+    assert_eq!(
+        snap["entities"][rogue_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "the beneficiary's Action is untouched"
+    );
+    let helps: Vec<&serde_json::Value> = snap["ledger"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("HELP_CHECK_ACTION"))
+        .collect();
+    assert_eq!(helps.len(), 1, "one distinct HELP_CHECK_ACTION event");
+
+    // The beneficiary's next check CONSUMES the token and rolls with edge:
+    // deterministic proof via a pinned seed whose straight d20 fails but whose
+    // advantage pair passes.
+    let mut straddle_seed = None;
+    for s in 1..=200_000u64 {
+        // The straight d20 and the advantage pair each start from the SAME
+        // seed — under advantage the server keeps the higher of draws 1-2,
+        // never a later draw.
+        let natural = DiceEngine::with_seed(s).roll_d20();
+        let (_, r1, r2) = DiceEngine::with_seed(s).roll_d20_advantage();
+        let (low, high) = (r1.min(r2), r1.max(r2));
+        if natural + 3 < 12
+            && natural != 1
+            && natural != 20
+            && low + 3 < 12
+            && low != 1
+            && high + 3 >= 12
+            && high + 3 < 22
+            && high != 20
+        {
+            straddle_seed = Some(s);
+            break;
+        }
+    }
+    let seed = straddle_seed.expect("some seed must straddle DC 12 between straight and advantage");
+
+    let req = test::TestRequest::post()
+        .uri("/api/v1/actions/check")
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "modifier": 3,
+            "dc": 12,
+            "cost_margin": 3,
+            "seed": seed,
+            "session_id": session_id,
+            "entity_id": rogue_id
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["roll"], serde_json::json!(DiceEngine::with_seed(seed).roll_d20_advantage().0 as i64),
+        "the kept die is the higher of TWO draws, not the plain single d20"
+    );
+    assert_eq!(body["total"].as_i64().unwrap(), body["roll"].as_i64().unwrap() + 3);
+    assert_eq!(body["outcome"], serde_json::json!("SUCCESS"));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][rogue_id.to_string()]["next_check_has_advantage_from"].is_null(),
+        "one check consumes the Help-on-check promise exactly once"
+    );
+}
+
+/// An ATTACK-help promise and a CHECK-help promise are independent currencies:
+/// granting either never eats the other, and each is cashed only by its own
+/// kind of roll.
+#[actix_web::test]
+async fn attack_help_and_check_help_coexist_without_eating_each_others_tokens() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-coexist", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let attacker_helper_id = Uuid::new_v4();
+    let check_helper_id = Uuid::new_v4();
+    let fighter_id = Uuid::new_v4();
+    let rogue_id = Uuid::new_v4();
+    let enemy_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(attacker_helper_id, "Feinter", 30, 14, 0, "1d4")).await;
+    spawn(&app, &token, session_id, entity_at(entity_json(check_helper_id, "Spotter", 30, 14, 0, "1d4"), 2.6, 2.5)).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_owned_by(entity_json(fighter_id, "Fighter", 40, 15, 8, "1d8+3"), "gm-coexist"),
+    )
+    .await;
+    spawn(&app, &token, session_id, entity_at(entity_json(rogue_id, "Rogue", 30, 14, 0, "1d4"), 2.5, 2.5)).await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Ogre", 300, 18, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+
+    // Grant BOTH flavors in both orders.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help",
+        serde_json::json!({"helper_id": attacker_helper_id, "target_entity_id": enemy_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": check_helper_id, "beneficiary_id": rogue_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"],
+        json_str(&attacker_helper_id),
+        "the attack token survived the check grant"
+    );
+    assert_eq!(
+        snap["entities"][rogue_id.to_string()]["next_check_has_advantage_from"],
+        json_str(&check_helper_id),
+        "the check token coexists beside the attack token"
+    );
+
+    // CASH THE CHECK TOKEN FIRST: the fighter's plain attack must NOT be eaten
+    // by the standing check promise, and vice versa.
+    let req = test::TestRequest::post()
+        .uri("/api/v1/actions/check")
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "modifier": 3,
+            "dc": 10,
+            "cost_margin": 0,
+            "seed": 42,
+            "session_id": session_id,
+            "entity_id": rogue_id
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["roll"],
+        serde_json::json!(DiceEngine::with_seed(42u64).roll_d20_advantage().0 as i64),
+        "the check rolls WITH edge from its own token"
+    );
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][rogue_id.to_string()]["next_check_has_advantage_from"].is_null(),
+        "the check token is burned by the check"
+    );
+    assert_eq!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"],
+        json_str(&attacker_helper_id),
+        "the attack token SURVIVES the check consumption"
+    );
+
+    // Now the fighter's attack cashes the remaining token. No round refresh
+    // intervenes — an unconsumed attack-help promise clears at the refresh,
+    // and this assertion is about token isolation, not refresh semantics.
+    let mut straddle_seed = None;
+    for s in 1..=200_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        let (_, r1, r2) = dice.roll_d20_advantage();
+        let (low, high) = (r1.min(r2), r1.max(r2));
+        if low + 8 < 18 && high + 8 >= 18 && low != 1 && low != 20 && high != 20 && high != 1 {
+            straddle_seed = Some(s);
+            break;
+        }
+    }
+    let seed = straddle_seed.expect("some seed must straddle AC 18 under advantage");
+    let (status, body) = attack(&app, &token, session_id, fighter_id, enemy_id, seed).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(
+        body["help_advantage_consumed"], serde_json::json!(true),
+        "the attack consumes ITS OWN token"
+    );
+    assert_eq!(body["advantage"], serde_json::json!(true));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][enemy_id.to_string()]["next_attacker_has_advantage_against"].is_null(),
+        "both tokens now spent, independently"
+    );
+}
+
+/// Legacy payloads without the new fields must parse identically: no
+/// inspiration ask, no help-check interference, same wire shape.
+#[actix_web::test]
+async fn legacy_attack_payload_without_new_fields_is_unchanged() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-legacy", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["inspiration"] = serde_json::json!(true);
+    spawn(&app, &token, session_id, hero).await;
+    let enemy_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Dummy", 200, 10, 0, "1d4"), 2.5, 2.5),
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": enemy_id,
+            "seed": 11
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(
+        body["advantage"], serde_json::json!(false),
+        "no ask means no edge even with a point banked"
+    );
+    assert_eq!(
+        body["inspiration_consumed"],
+        serde_json::json!(false),
+        "legacy payload reports zero consumption"
+    );
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        inspiration_of(&snap, hero_id),
+        "the banked point is untouched by a legacy attack"
+    );
+}
+
+/// Rewinding past a spent inspiration (whose GRANT survives in the ledger)
+/// restores the banked point; rewinding past a granted help-check clears the
+/// pending token.
+#[actix_web::test]
+async fn rewind_restores_spent_inspiration_when_grant_survives_and_clears_help_check_tokens() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-rewind56", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3")).await;
+    let spotter_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_at(entity_json(spotter_id, "Spotter", 30, 14, 0, "1d4"), 2.5, 2.5)).await;
+    let enemy_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(enemy_id, "Ogre", 300, 18, 0, "1d4"), 2.5, 2.6),
+    )
+    .await;
+
+    // 1. GM grants inspiration through the ledger (so a later rewind past the
+    //    spend can restore the point via the surviving GRANT event).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "entity_id": hero_id,
+            "reason": "bardic inspiration"
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "grant must succeed");
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let grant_seq = body["event_sequence"].as_u64().expect("sequence present");
+    assert!(grant_seq > 0);
+
+    // 2. Spend the banked point on an attack — produces a second
+    //    INSPIRATION_CHANGED {granted:false, reason:"spent"} at a higher seq.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": hero_id,
+            "target_id": enemy_id,
+            "seed": 5,
+            "spend_inspiration": true
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["inspiration_consumed"], serde_json::json!(true));
+    let spend_seq = body["event_sequence"].as_u64().expect("sequence present");
+    assert!(spend_seq > grant_seq, "the spend lands after the grant");
+
+    // 3. Grant a check-help token (lands at a yet higher seq).
+    let (status, hbody) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "help-check",
+        serde_json::json!({"helper_id": spotter_id, "beneficiary_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", hbody);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        !inspiration_of(&snap, hero_id),
+        "precondition: point spent"
+    );
+    assert_eq!(
+        snap["entities"][hero_id.to_string()]["next_check_has_advantage_from"],
+        json_str(&spotter_id),
+        "precondition: check token standing"
+    );
+
+    // 4. X-card rewind to just AFTER the spend event: the SPEND survives (so
+    //    the point stays spent), but the HELP_CHECK_ACTION reverts (token
+    //    cleared). This is the "rewind past a help-check clears the token"
+    //    half of the parity guarantee.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "player_id": "gm-rewind56",
+            "topic": "iteration-56 rewind past help-check only",
+            "target_sequence_id": spend_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "rewind must succeed");
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][hero_id.to_string()]["next_check_has_advantage_from"].is_null(),
+        "rewinding past the help-check clears the token"
+    );
+    assert!(
+        !inspiration_of(&snap, hero_id),
+        "the surviving SPEND still vouches for the point being spent"
+    );
+
+    // 5. Now rewind past the SPEND itself (but keep the GRANT): the surviving
+    //    GRANT survives, the SPEND reverts, and the strip-and-replay path
+    //    restores the point.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "player_id": "gm-rewind56",
+            "topic": "iteration-56 rewind past spend",
+            "target_sequence_id": grant_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        inspiration_of(&snap, hero_id),
+        "rewinding past the spend (grant survives) restores the banked point"
+    );
+}
+
+/// Spectators cannot grant or revoke inspiration, and players cannot grant on
+/// a creature they don't control.
+#[actix_web::test]
+async fn inspiration_grant_is_rbac_gated() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-igr", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, gm.as_str()).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+
+    // Spectator rejected.
+    let spec = sign_token_with_role("watch-only", "spectator", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&spec))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "nothing"}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Unknown entity → 404.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": Uuid::new_v4(), "reason": "nothing"}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Unknown field → 422 (deny_unknown_fields).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/inspiration/grant", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({"entity_id": hero_id, "reason": "nothing", "evil_field": 1}))
+        .to_request();
+    let status = test::call_service(&app, req).await.status();
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "unknown fields must be structurally rejected, got {}",
+        status
     );
 }

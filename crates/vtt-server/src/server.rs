@@ -1409,6 +1409,13 @@ pub struct AttackActionReq {
     /// valid — the engine, not the client, decides what the seed means).
     #[serde(default)]
     pub seed: Option<u64>,
+    /// SRD inspiration spend (GOALS.md P5): burn this attacker's held point to
+    /// buy Advantage on THIS roll. The engine decides atomically whether the
+    /// point is actually consumed (a roll already advantaged or disadvantaged
+    /// cancels into a straight d20 and keeps the point); a caller with no hold
+    /// simply gets no edge and nothing is journalled.
+    #[serde(default)]
+    pub spend_inspiration: bool,
 }
 
 async fn resolve_attack(
@@ -1491,15 +1498,24 @@ async fn resolve_attack(
             );
         }
 
-        // Spatial edges: condition-derived adv/dis + cover from the session map.
+        // Spatial edges: condition-derived adv/dis + cover from the session
+        // map, plus the optional SRD inspiration spend computed ATOMICALLY with
+        // the edge decision (so an SRD cancellation never wastes a point).
+        // The spend lands on this scratch copy only; it is persisted to the
+        // live entity and journalled further down, after every rejection gate
+        // has passed — a refused attack must not burn a held point.
+        let mut attacker = attacker;
         let distance = attacker.distance_to_feet(&target);
-        let (advantage, disadvantage) = RulesEvaluator::edge_from_conditions(
-            &attacker,
-            &target,
-            distance,
-            attacker.position.2,
-            target.position.2,
-        );
+        let (attacker_z, target_z) = (attacker.position.2, target.position.2);
+        let (advantage, disadvantage, inspiration_spent) =
+            RulesEvaluator::edge_from_conditions_with_inspiration(
+                &mut attacker,
+                &target,
+                distance,
+                attacker_z,
+                target_z,
+                req.spend_inspiration,
+            );
 
         let grid = build_collision_grid(&session.map);
         let attacker_pos = Vector3::new(attacker.position.0, attacker.position.1, attacker.position.2);
@@ -1556,6 +1572,26 @@ async fn resolve_attack(
         // (consume_help_advantage checks side parity) and leaves it standing.
         let help_advantage = session.consume_help_advantage(req.attacker_id, req.target_id);
         let advantage = advantage || (help_advantage && !disadvantage);
+
+        // The inspiration ask survived every rejection gate: persist the burn
+        // to the live entity and journal exactly ONE spend event so a safety
+        // rewind past this roll restores the point.
+        if inspiration_spent {
+            if let Some(a) = session.entities.get_mut(&req.attacker_id) {
+                a.inspiration = false;
+            }
+            let campaign_id = session.campaign_id;
+            session.ledger.append_event(
+                session_id,
+                campaign_id,
+                req.attacker_id,
+                "INSPIRATION_CHANGED",
+                serde_json::json!({
+                    "granted": false,
+                    "reason": "spent",
+                }),
+            );
+        }
 
         // Reaction interrupt: a readied Shield spell raises AC by +5 when the
         // attack would land. The reaction is spent whether or not it matters.
@@ -1645,6 +1681,7 @@ async fn resolve_attack(
                 body["distance_feet"] = serde_json::json!(distance);
                 body["advantage"] = serde_json::json!(advantage);
                 body["help_advantage_consumed"] = serde_json::json!(help_advantage);
+                body["inspiration_consumed"] = serde_json::json!(inspiration_spent);
                 body["disadvantage"] = serde_json::json!(disadvantage);
                 if shield_interrupt {
                     body["reaction_interrupt"] =
@@ -3331,6 +3368,141 @@ async fn resolve_help_action(
     }
 }
 
+// --- Help action: ability check flavor -----------------------------------------
+//
+// SRD 5e Help aimed at an ABILITY CHECK ("I'll boost you up while you pick
+// that lock"). Mirrors `/action/help` wholesale — attack-identical RBAC on the
+// helper, ids-only `deny_unknown_fields` payload, Action spent only after every
+// validation passes, one ledger event per grant — but delegates to
+// `GameSession::take_help_check`, whose promise lives ON THE BENEFICIARY as
+// `next_check_has_advantage_from` and is cashed exactly once by a session-
+// grounded ability check (`/actions/check` with `session_id` + `entity_id`).
+// The two currencies are deliberately distinct: an attack-help token can never
+// be eaten by a check nor vice versa.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelpCheckActionReq {
+    pub helper_id: Uuid,
+    pub beneficiary_id: Uuid,
+}
+
+async fn resolve_help_check_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<HelpCheckActionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Attack-help-identical RBAC on the HELPER.
+        if !session.entities.contains_key(&req.helper_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "helper_id does not exist in this session");
+        }
+        let owner = session
+            .entities
+            .get(&req.helper_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control the helping entity");
+        }
+
+        // Core enforces reach, liveness, self-targeting and the action
+        // economy; a rejection changes nothing.
+        if let Err(e) = session.take_help_check(req.helper_id, req.beneficiary_id) {
+            let status = match e.as_str() {
+                "ENTITY_NOT_FOUND" | "TARGET_NOT_FOUND" => 404u16,
+                "SELF_TARGET_INVALID" => 422,
+                _ => 409,
+            };
+            return reject(&data, status, &e, "help-check rejected by the rules engine");
+        }
+
+        data.count_valid();
+        let event_sequence = session.ledger.current_sequence;
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "HELP_CHECK_GRANTED",
+            "helper_id": req.helper_id.to_string(),
+            "beneficiary_id": req.beneficiary_id.to_string(),
+            "next_check_has_advantage_from": req.helper_id.to_string(),
+            "event_sequence": event_sequence,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+// --- Inspiration (GM fiat grant/revoke) ----------------------------------------
+//
+// SRD inspiration lives at most ONE point per character. Every accepted
+// transition journals an `INSPIRATION_CHANGED` event so safety rewind replays
+// the correct holding; this route is the HTTP surface for the GRANT side that
+// makes "rewind past a spend restores the point" reachable end-to-end.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspirationGrantReq {
+    pub entity_id: Uuid,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+async fn grant_inspiration_route(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<InspirationGrantReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot mutate sessions");
+    }
+
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Same ownership gate as every other per-entity mutation.
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity_id does not exist in this session");
+        }
+        let owner = session
+            .entities
+            .get(&req.entity_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+
+        if let Err(e) = session.grant_inspiration(req.entity_id, req.reason.as_deref()) {
+            let status = match e.as_str() {
+                "ENTITY_NOT_FOUND" => 404u16,
+                _ => 409,
+            };
+            return reject(&data, status, &e, "inspiration grant rejected by the rules engine");
+        }
+
+        data.count_valid();
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "INSPIRATION_GRANTED",
+            "entity_id": req.entity_id.to_string(),
+            "event_sequence": session.ledger.current_sequence,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
 
 // --- Damage-triggered concentration automation (backlog 4.11) -----------------
 /// One server-side damage-triggered concentration save, serialized additively
@@ -3953,6 +4125,140 @@ pub struct CheckActionReq {
     /// SEED_NOT_PERMITTED rather than a silently-ignored seed. Omitted →
     /// server entropy, always.
     pub seed: Option<u64>,
+    /// Session-scoped engine wiring (iteration 56): supplying BOTH pins this
+    /// roll to a live engine entity. A standing Help-on-check promise held by
+    /// that entity is cashed exactly once by THIS roll, and an optional SRD
+    /// inspiration spend is resolved atomically with the condition edges.
+    /// Omitted → the legacy stateless contract, byte-for-byte unchanged.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub entity_id: Option<Uuid>,
+    /// SRD inspiration spend (GOALS.md P5): burn the checker's held point to
+    /// buy Advantage on THIS roll. The engine decides atomically whether the
+    /// point is actually consumed (a disadvantaged or already-advantaged roll
+    /// cancels into a straight d20 and keeps the point); no hold → no edge,
+    /// nothing journalled.
+    #[serde(default)]
+    pub spend_inspiration: bool,
+}
+
+/// What session-grounding decided for one roll: the effective edge pair after
+/// merging engine-derived edges with the caller's ask, plus the disclosure
+/// flags for the response body.
+struct RollGrounding {
+    advantage: bool,
+    disadvantage: bool,
+    inspiration_consumed: bool,
+    help_check_consumed: bool,
+}
+
+/// Either grounded roll inputs or the ready-to-send refusal. (A dedicated
+/// enum keeps `HttpResponse` out of a `Result`'s `Err` slot — it is far larger
+/// than the `Ok` payload.)
+enum RollGroundingOutcome {
+    Grounded(RollGrounding),
+    Refused(HttpResponse),
+}
+
+/// Session-scoped grounding shared by `/actions/check` and `/actions/save`:
+/// resolves `session_id` + `entity_id` against live engine state under full
+/// mutation RBAC (spectators blocked, ownership enforced), then cashes any
+/// standing Help-on-check promise (`check_only`) and spends inspiration
+/// atomically with the condition-edge decision.
+///
+/// Every rejection path here happens BEFORE any state change: an illegal
+/// request must not cash a token, burn a point, or journal anything.
+fn ground_roll_in_session(
+    data: &AppState,
+    identity: &AuthIdentity,
+    session_id: Uuid,
+    entity_id: Uuid,
+    spend_inspiration: bool,
+    check_only: bool,
+) -> RollGroundingOutcome {
+    let role = Role::from_identity(identity);
+    if !may_mutate_session(data, session_id, role, &identity.user_id) {
+        return RollGroundingOutcome::Refused(reject(
+            data,
+            403,
+            "FORBIDDEN_ROLE",
+            "spectators cannot ground a roll in session state",
+        ));
+    }
+    let Some(session_lock) = data.sessions.get(&session_id) else {
+        return RollGroundingOutcome::Refused(reject(
+            data,
+            404,
+            "SESSION_NOT_FOUND",
+            "session_id does not exist",
+        ));
+    };
+    let mut session = session_lock.write();
+
+    let entity = match session.entities.get(&entity_id) {
+        Some(e) => e.clone(),
+        None => {
+            return RollGroundingOutcome::Refused(reject(
+                data,
+                404,
+                "ENTITY_NOT_FOUND",
+                "entity_id does not exist in this session",
+            ))
+        }
+    };
+    if !may_control_entity(entity.owner_player_id.as_ref(), role, &identity.user_id) {
+        return RollGroundingOutcome::Refused(reject(
+            data,
+            403,
+            "ENTITY_NOT_OWNED",
+            "you do not control this entity",
+        ));
+    }
+
+    // Cash the standing Help-on-check promise FIRST so it can never be eaten
+    // by anything but an ability check (saves pass `check_only == false`).
+    let help_check_consumed = if check_only {
+        session.consume_help_check_advantage(entity_id)
+    } else {
+        false
+    };
+
+    // Condition edges + the inspiration spend, decided atomically on a scratch
+    // copy so a rejection after this point could not have half-spent a point.
+    let mut scratch = entity.clone();
+    let (advantage, disadvantage, spent) = RulesEvaluator::edge_from_conditions_with_inspiration(
+        &mut scratch,
+        &entity,
+        0.0,
+        entity.position.2,
+        entity.position.2,
+        spend_inspiration,
+    );
+    if spent {
+        // Persist the burn and journal exactly ONE spend event so a safety
+        // rewind past this roll restores the point.
+        if let Some(e) = session.entities.get_mut(&entity_id) {
+            e.inspiration = false;
+        }
+        let campaign_id = session.campaign_id;
+        session.ledger.append_event(
+            session_id,
+            campaign_id,
+            entity_id,
+            "INSPIRATION_CHANGED",
+            serde_json::json!({
+                "granted": false,
+                "reason": "spent",
+            }),
+        );
+    }
+    RollGroundingOutcome::Grounded(RollGrounding {
+        advantage,
+        disadvantage,
+        inspiration_consumed: spent,
+        help_check_consumed,
+    })
 }
 
 /// Shared seed policy for EVERY route that consumes a caller-supplied seed —
@@ -3993,21 +4299,46 @@ async fn resolve_check(
     if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
         return resp;
     }
+    // Session-scoped grounding (Help-on-check cash + inspiration spend). Any
+    // rejection here happens before a single die is rolled.
+    let (engine_advantage, engine_disadvantage, inspiration_consumed, help_check_consumed) =
+        match (req.session_id, req.entity_id) {
+            (Some(sid), Some(eid)) => match ground_roll_in_session(
+                &data,
+                &identity,
+                sid,
+                eid,
+                req.spend_inspiration,
+                true,
+            ) {
+                RollGroundingOutcome::Grounded(g) => {
+                    (g.advantage, g.disadvantage, g.inspiration_consumed, g.help_check_consumed)
+                }
+                RollGroundingOutcome::Refused(resp) => return resp,
+            },
+            _ => (false, false, false, false),
+        };
     let mut dice = match req.seed {
         // Privilege already verified above.
         Some(seed) => DiceEngine::with_seed(seed),
         None => DiceEngine::new(),
     };
     // Honor advantage/disadvantage by pre-selecting the kept d20
-    // (tuples are (used_roll, r1, r2)) before 4-tier resolution.
-    let kept_roll = if req.disadvantage.unwrap_or(false) {
+    // (tuples are (used_roll, r1, r2)) before 4-tier resolution. Engine-derived
+    // edges (conditions / cashed Help promise / spent inspiration) merge with
+    // the caller's explicit ask; SRD cancellation resolves in the branch order
+    // below exactly as it did for legacy payloads.
+    let disadvantage = engine_disadvantage || req.disadvantage.unwrap_or(false);
+    let advantage =
+        engine_advantage || help_check_consumed || req.advantage.unwrap_or(false);
+    let kept_roll = if disadvantage {
         Some(dice.roll_d20_disadvantage().0)
-    } else if req.advantage.unwrap_or(false) {
+    } else if advantage {
         Some(dice.roll_d20_advantage().0)
     } else {
         None
     };
-    let res = if let Some(natural_roll) = kept_roll {
+    let mut body = if let Some(natural_roll) = kept_roll {
         let total = natural_roll + req.modifier;
         let outcome = if natural_roll == 20 || total >= req.dc + 10 {
             "CRITICAL_SUCCESS"
@@ -4037,8 +4368,14 @@ async fn resolve_check(
             ActionResolver::resolve_check_4tier(&mut dice, req.modifier, req.dc, req.cost_margin);
         with_fail_forward_fields(serde_json::json!(res), res.roll, req.modifier, req.dc)
     };
+    // Additive disclosure (iteration 56): the effective edges and exactly what
+    // was consumed grounding this roll in session state.
+    body["advantage"] = serde_json::json!(advantage);
+    body["disadvantage"] = serde_json::json!(disadvantage);
+    body["inspiration_consumed"] = serde_json::json!(inspiration_consumed);
+    body["help_check_advantage_consumed"] = serde_json::json!(help_check_consumed);
     data.count_valid();
-    HttpResponse::Ok().json(res)
+    HttpResponse::Ok().json(body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4055,6 +4392,18 @@ pub struct SaveActionReq {
     /// GM/service principals; other callers get 422 SEED_NOT_PERMITTED.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Session-scoped grounding (see `CheckActionReq`): pins this save to a
+    /// live engine entity so an SRD inspiration spend resolves against real
+    /// engine state. Saves never cash Help-on-check promises — that token is
+    /// ability-check currency only.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub entity_id: Option<Uuid>,
+    /// SRD inspiration spend (GOALS.md P5): burn the saver's held point to buy
+    /// Advantage on THIS save, atomically with the condition-edge decision.
+    #[serde(default)]
+    pub spend_inspiration: bool,
 }
 
 async fn resolve_save(
@@ -4069,15 +4418,37 @@ async fn resolve_save(
     if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
         return resp;
     }
+    // Session-scoped grounding (iteration 56): inspiration spend only — a save
+    // never cashes a Help-on-check promise.
+    let (engine_advantage, engine_disadvantage, inspiration_consumed) =
+        match (req.session_id, req.entity_id) {
+            (Some(sid), Some(eid)) => match ground_roll_in_session(
+                &data,
+                &identity,
+                sid,
+                eid,
+                req.spend_inspiration,
+                false,
+            ) {
+                RollGroundingOutcome::Grounded(g) => {
+                    (g.advantage, g.disadvantage, g.inspiration_consumed)
+                }
+                RollGroundingOutcome::Refused(resp) => return resp,
+            },
+            _ => (false, false, false),
+        };
     let mut dice = match req.seed {
         // Privilege already verified above.
         Some(seed) => DiceEngine::with_seed(seed),
         None => DiceEngine::new(),
     };
-    // Advantage tuples are (used_roll, r1, r2).
-    let natural_roll = if req.disadvantage.unwrap_or(false) {
+    // Advantage tuples are (used_roll, r1, r2). Engine-derived edges merge
+    // with the caller's explicit ask; the legacy branch order is preserved.
+    let disadvantage = engine_disadvantage || req.disadvantage.unwrap_or(false);
+    let advantage = engine_advantage || req.advantage.unwrap_or(false);
+    let natural_roll = if disadvantage {
         dice.roll_d20_disadvantage().0
-    } else if req.advantage.unwrap_or(false) {
+    } else if advantage {
         dice.roll_d20_advantage().0
     } else {
         dice.roll_d20()
@@ -4117,6 +4488,11 @@ async fn resolve_save(
     });
     body["margin"] = serde_json::json!(margin);
     body["tier"] = serde_json::json!(tier_wire_name(tier));
+    // Additive disclosure (iteration 56): the effective edges and exactly what
+    // was consumed grounding this save in session state.
+    body["advantage"] = serde_json::json!(advantage);
+    body["disadvantage"] = serde_json::json!(disadvantage);
+    body["inspiration_consumed"] = serde_json::json!(inspiration_consumed);
     if tier == CheckOutcomeTier::SuccessAtCost {
         if let Some(cost) = RulesEvaluator::suggest_cost(margin) {
             body["cost_suggestion"] = serde_json::json!(cost_suggestion_name(&cost));
@@ -5897,6 +6273,7 @@ pub fn configure_app_with(
                         .route("/action/stabilize", web::post().to(resolve_stabilize))
                         .route("/action/offhand", web::post().to(resolve_offhand_action))
                         .route("/action/help", web::post().to(resolve_help_action))
+                        .route("/action/help-check", web::post().to(resolve_help_check_action))
                         .route("/action/cast-spell", web::post().to(resolve_cast_spell))
                         .route("/move", web::post().to(move_entity))
                         .route("/reactions/arm", web::post().to(arm_reaction))
@@ -5908,6 +6285,7 @@ pub fn configure_app_with(
                         .route("/heal", web::post().to(heal_entity))
                         .route("/inventory/transfer", web::post().to(transfer_item))
                         .route("/rest", web::post().to(take_rest))
+                        .route("/inspiration/grant", web::post().to(grant_inspiration_route))
                         .route("/safety/x-card", web::post().to(trigger_safety_rewind))
                         .route("/sync", web::get().to(ws_sync)),
                 ),
