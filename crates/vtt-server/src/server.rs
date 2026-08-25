@@ -71,8 +71,79 @@ fn parse_env_usize(raw: Option<String>, default: usize) -> usize {
     }
 }
 
+/// Rules-content baseline for a session (GOALS.md Pillar 2: the campaign setup
+/// wizard picks SRD 5.1 vs SRD 5.2 and that choice must stick).
+///
+/// HONEST SCOPE: today no engine logic branches on this value — the Rust rules
+/// math (`vtt-core`) implements the SRD 5.1 baseline unconditionally, and all
+/// version-specific CONTENT (spells, stat blocks, glossary) lives gateway-side
+/// in the Python compendium store. This preference is persisted and projected
+/// here so callers CAN branch: the orchestrator reads it back off
+/// `GET /sessions/{id}` to pick which compendium slice it serves for the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleVersion {
+    /// Legacy baseline — what the engine's own math implements (and the
+    /// fleet-wide fallback when a create request omits the choice).
+    #[default]
+    Srd51,
+    /// 2024 revision; content served gateway-side from the srd_5_2_* files.
+    Srd52,
+}
+
+impl RuleVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RuleVersion::Srd51 => "srd_5_1",
+            RuleVersion::Srd52 => "srd_5_2",
+        }
+    }
+
+    /// Strict wire-format parse. Unknown values are REJECTED (422 upstream),
+    /// never silently coerced: a table silently running a different edition
+    /// than its GM configured is worse than a loud error.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "srd_5_1" => Ok(RuleVersion::Srd51),
+            "srd_5_2" => Ok(RuleVersion::Srd52),
+            other => Err(format!(
+                "unknown rule_version {:?}; expected \"srd_5_1\" or \"srd_5_2\"",
+                other
+            )),
+        }
+    }
+}
+
+/// Fail-soft deployment-wide default for sessions created without an explicit
+/// `rule_version` (`RuleVersion::default()` = legacy SRD 5.1, overridable via
+/// VTT_DEFAULT_RULE_VERSION). Unset or unrecognized values fall back to SRD 5.1
+/// baseline with a logged warning rather than refusing to boot.
+fn default_rule_version_from_env() -> RuleVersion {
+    match std::env::var("VTT_DEFAULT_RULE_VERSION") {
+        Err(_) => RuleVersion::default(),
+        Ok(raw) => match RuleVersion::parse(raw.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                log::warn!(
+                    "env VTT_DEFAULT_RULE_VERSION={:?} unusable; falling back to {}",
+                    raw,
+                    RuleVersion::default().as_str()
+                );
+                RuleVersion::default()
+            }
+        },
+    }
+}
+
 pub struct AppState {
     pub sessions: DashMap<Uuid, Arc<RwLock<GameSession>>>,
+    /// Per-session rules baseline (GOALS.md Pillar 2). Kept beside the session
+    /// because `GameSession` itself is owned by `vtt-core` and carries no such
+    /// field; travels through the snapshot persist/hydrate bridge via an
+    /// injected/accepted `rule_version` key on the serialized snapshot.
+    pub session_rule_versions: DashMap<Uuid, RuleVersion>,
+    /// Deployment default when a create request omits `rule_version`
+    /// (`VTT_DEFAULT_RULE_VERSION`, fail-soft; legacy default SRD 5.1).
+    pub default_rule_version: RuleVersion,
     pub crdt_hub: Arc<CrdtRelayHub>,
     pub peers: Arc<PeerRegistry>,
     pub wasm_engine: Arc<SandboxedWasmEngine>,
@@ -103,6 +174,8 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            session_rule_versions: DashMap::new(),
+            default_rule_version: default_rule_version_from_env(),
             crdt_hub: Arc::new(CrdtRelayHub::new()),
             peers: Arc::new(PeerRegistry::new()),
             wasm_engine: Arc::new(SandboxedWasmEngine::new().expect("Failed Wasm engine init")),
@@ -122,6 +195,34 @@ impl AppState {
             total_audits: AtomicU64::new(0),
             auditor_rejections: AtomicU64::new(0),
         }
+    }
+
+    /// Effective rules baseline for a session: the recorded wizard choice, or
+    /// the deployment default when the session predates preference tracking
+    /// (or was hydrated from a snapshot that predated it).
+    pub fn rule_version_for(&self, session_id: Uuid) -> RuleVersion {
+        self.session_rule_versions
+            .get(&session_id)
+            .map(|v| *v)
+            .unwrap_or(self.default_rule_version)
+    }
+
+    /// Stamps the session's effective rule version onto a projected snapshot.
+    /// Applied AFTER `project_snapshot_for_role`: the preference is non-
+    /// sensitive campaign configuration, so every role's projection carries it
+    /// and any role's snapshot can be fed back through `/restore` losslessly.
+    fn attach_rule_version(
+        &self,
+        mut snapshot: serde_json::Value,
+        session_id: Uuid,
+    ) -> serde_json::Value {
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert(
+                "rule_version".to_string(),
+                serde_json::json!(self.rule_version_for(session_id).as_str()),
+            );
+        }
+        snapshot
     }
 
     fn count_request(&self) {
@@ -464,6 +565,12 @@ async fn get_metrics(data: web::Data<AppState>) -> impl Responder {
 pub struct CreateSessionReq {
     pub campaign_id: Uuid,
     pub session_name: String,
+    /// Optional rules baseline (GOALS.md Pillar 2 wizard choice). Absent =>
+    /// the deployment default (`VTT_DEFAULT_RULE_VERSION`, legacy SRD 5.1).
+    /// Parsed manually rather than as an enum so an unknown value yields a
+    /// 422 INVALID_RULE_VERSION instead of actix's generic 400 parse error.
+    #[serde(default)]
+    pub rule_version: Option<String>,
 }
 
 async fn create_session(
@@ -475,15 +582,25 @@ async fn create_session(
     if !may_mutate_session(&data, Uuid::nil(), role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot create sessions");
     }
+    // Validate BEFORE creating anything: a rejected create must not leave a
+    // half-initialized table behind.
+    let rule_version = match req.rule_version.as_deref() {
+        None => data.default_rule_version,
+        Some(raw) => match RuleVersion::parse(raw.trim()) {
+            Ok(v) => v,
+            Err(reason) => return reject(&data, 422, "INVALID_RULE_VERSION", &reason),
+        },
+    };
     let session_id = Uuid::new_v4();
     data.session_owners.insert(session_id, identity.user_id.clone());
+    data.session_rule_versions.insert(session_id, rule_version);
     let mut session = GameSession::new(session_id, req.campaign_id, req.session_name.clone());
     session.ledger.append_event(
         session_id,
         req.campaign_id,
         Uuid::nil(),
         "SESSION_CREATED",
-        serde_json::json!({"name": req.session_name}),
+        serde_json::json!({"name": req.session_name, "rule_version": rule_version.as_str()}),
     );
     data.sessions.insert(session_id, Arc::new(RwLock::new(session)));
 
@@ -491,6 +608,7 @@ async fn create_session(
         "session_id": session_id,
         "campaign_id": req.campaign_id,
         "session_name": req.session_name,
+        "rule_version": rule_version.as_str(),
         "status": "created"
     }))
 }
@@ -511,10 +629,13 @@ async fn get_session(
         // survive (public_board_token always emits `id`), so targeting flows
         // that need them keep working.
         let role = Role::from_identity(&identity);
-        let snapshot = project_snapshot_for_role(
-            serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
-            role,
-            &identity.user_id,
+        let snapshot = data.attach_rule_version(
+            project_snapshot_for_role(
+                serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
+                role,
+                &identity.user_id,
+            ),
+            session_id,
         );
         HttpResponse::Ok().json(snapshot)
     } else {
@@ -526,10 +647,14 @@ async fn get_session(
 /// `get_session`) into live state. This is the durability bridge: the
 /// orchestrator persists snapshots in PostgreSQL and pushes them back here
 /// after an engine restart or when migrating rooms.
+///
+/// The body is parsed from raw JSON rather than typed as `GameSession` so the
+/// `rule_version` preference — which lives server-side beside the session, not
+/// inside the vtt-core struct — survives the persist/hydrate round trip.
 async fn restore_session(
     data: web::Data<AppState>,
     path: web::Path<Uuid>,
-    body: web::Json<GameSession>,
+    body: web::Json<serde_json::Value>,
     identity: AuthIdentity,
 ) -> impl Responder {
     let session_id = path.into_inner();
@@ -553,7 +678,34 @@ async fn restore_session(
             );
         }
     }
-    if body.session_id != session_id {
+    // Rule-version preference rides on the snapshot: validate it BEFORE
+    // touching live state so a corrupted snapshot cannot silently re-baseline
+    // a table (or smuggle an unknown edition past hydration). Absent/null keeps
+    // whatever this process already believes about the table, then the
+    // deployment default — matching legacy snapshots that never carried the key.
+    let payload = body.into_inner();
+    let rule_version = match payload.get("rule_version") {
+        None | Some(serde_json::Value::Null) => data.rule_version_for(session_id),
+        Some(v) => match v.as_str().map(str::trim) {
+            Some(raw) => match RuleVersion::parse(raw) {
+                Ok(parsed) => parsed,
+                Err(reason) => return reject(&data, 422, "INVALID_RULE_VERSION", &reason),
+            },
+            None => {
+                return reject(
+                    &data,
+                    422,
+                    "INVALID_RULE_VERSION",
+                    "rule_version must be a string (\"srd_5_1\" or \"srd_5_2\")",
+                )
+            }
+        },
+    };
+    let session: GameSession = match serde_json::from_value(payload) {
+        Ok(s) => s,
+        Err(e) => return reject(&data, 422, "MALFORMED_SNAPSHOT", &e.to_string()),
+    };
+    if session.session_id != session_id {
         return reject(
             &data,
             422,
@@ -561,10 +713,11 @@ async fn restore_session(
             "snapshot session_id does not match the URL",
         );
     }
-    let entity_count = body.entities.len();
-    let event_count = body.ledger.events.len();
+    let entity_count = session.entities.len();
+    let event_count = session.ledger.events.len();
     data.session_owners.insert(session_id, identity.user_id.clone());
-    data.sessions.insert(session_id, Arc::new(RwLock::new(body.into_inner())));
+    data.session_rule_versions.insert(session_id, rule_version);
+    data.sessions.insert(session_id, Arc::new(RwLock::new(session)));
 
     HttpResponse::Ok().json(serde_json::json!({
         "status": "RESTORED",
@@ -4150,10 +4303,13 @@ async fn trigger_safety_rewind(
         // AUDIT (MED): any non-spectator may raise an X-card, so the snapshot
         // is projected by caller role before it leaves the engine — non-GMs
         // get public board tokens only and never see hidden NPCs' stat blocks.
-        let snapshot = project_snapshot_for_role(
-            serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
-            role,
-            &identity.user_id,
+        let snapshot = data.attach_rule_version(
+            project_snapshot_for_role(
+                serde_json::to_value(&*session).unwrap_or(serde_json::Value::Null),
+                role,
+                &identity.user_id,
+            ),
+            session_id,
         );
 
         HttpResponse::Ok().json(serde_json::json!({
@@ -5028,7 +5184,15 @@ pub async fn run() -> std::io::Result<()> {
 
                     let mut failed = false;
                     if let Err(e) =
-                        crate::persistence::ensure_session_row(&pool, sid, campaign_id, &name, round).await
+                        crate::persistence::ensure_session_row(
+                            &pool,
+                            sid,
+                            campaign_id,
+                            &name,
+                            round,
+                            state2.rule_version_for(sid).as_str(),
+                        )
+                        .await
                     {
                         failed = true;
                         state2.persistence_failures.fetch_add(1, Ordering::Relaxed);

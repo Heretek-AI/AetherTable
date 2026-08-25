@@ -51,6 +51,11 @@ const ENSURE_DDL: &[&str] = &[
          ADD COLUMN IF NOT EXISTS ledger_sequence BIGINT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_log_ledger_seq \
          ON narrative_state.event_sourcing_log (session_id, ledger_sequence)",
+    // GOALS.md Pillar 2: the campaign wizard's SRD 5.1 vs 5.2 choice is durable
+    // server-side, not just in the engine's memory. Backfilled with the legacy
+    // baseline so rows written by older binaries stay valid.
+    r#"ALTER TABLE narrative_state.sessions
+           ADD COLUMN IF NOT EXISTS rule_version TEXT NOT NULL DEFAULT 'srd_5_1'"#,
 ];
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
@@ -71,19 +76,22 @@ pub async fn ensure_session_row(
     campaign_id: Uuid,
     session_name: &str,
     round_number: u32,
+    rule_version: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO narrative_state.sessions
-               (session_id, campaign_id, session_name, round_number)
-           VALUES ($1, $2, $3, $4)
+               (session_id, campaign_id, session_name, round_number, rule_version)
+           VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (session_id) DO UPDATE SET
                round_number = EXCLUDED.round_number,
+               rule_version = EXCLUDED.rule_version,
                updated_at = now()"#,
     )
     .bind(session_id)
     .bind(campaign_id)
     .bind(session_name)
     .bind(round_number as i32)
+    .bind(rule_version)
     .execute(pool)
     .await
     .map(|_| ())

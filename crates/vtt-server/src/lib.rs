@@ -10,4 +10,4 @@ pub mod server;
 
 pub use auth::{AuthIdentity, AuthMiddleware, AuthVerifier};
 pub use ratelimit::RateLimits;
-pub use server::{configure_app, configure_app_with, AppState};
+pub use server::{configure_app, configure_app_with, AppState, RuleVersion};

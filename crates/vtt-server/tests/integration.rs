@@ -6904,3 +6904,146 @@ async fn spawn_event_ingress_rejected_mid_combat_over_http() {
     let res = test::call_service(&app, req).await;
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// --- Rule-version preference (GOALS.md Pillar 2, iteration 34) ----------------
+
+/// Creates a session with an optional explicit `rule_version` and returns
+/// (session_id, create-response body).
+async fn create_session_with_rule_version(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    rule_version: Option<&str>,
+) -> (Uuid, serde_json::Value) {
+    let mut payload = serde_json::json!({
+        "campaign_id": Uuid::new_v4(),
+        "session_name": "Rules Version",
+    });
+    if let Some(v) = rule_version {
+        payload["rule_version"] = serde_json::json!(v);
+    }
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(token))
+        .set_json(payload)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    (body["session_id"].as_str().unwrap_or_default().parse().unwrap_or_default(), {
+        let _ = status;
+        body
+    })
+}
+
+/// The wizard's choice must default honestly: without an explicit pick the
+/// engine reports its legacy SRD 5.1 baseline rather than silently claiming 5.2.
+#[actix_web::test]
+async fn rule_version_defaults_to_legacy_srd_5_1() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-rv", "gm", TEST_SECRET);
+    let (sid, created) = create_session_with_rule_version(&app, &gm, None).await;
+    assert_eq!(created["rule_version"], "srd_5_1");
+
+    let snapshot = snapshot_as(&app, &gm, sid).await;
+    assert_eq!(
+        snapshot["rule_version"], "srd_5_1",
+        "GET /sessions/{{id}} must expose the effective rule version"
+    );
+}
+
+/// The campaign-setup wizard picks SRD 5.2; that preference must stick across
+/// reads by every role AND across the persist -> hydrate bridge (a fresh engine
+/// AppState replaying the persisted snapshot keeps the choice).
+#[actix_web::test]
+async fn rule_version_5_2_persists_through_snapshot_and_hydrate() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-rv2", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-rv2", "player", TEST_SECRET);
+
+    let (sid, created) =
+        create_session_with_rule_version(&app, &gm, Some("srd_5_2")).await;
+    assert_eq!(created["rule_version"], "srd_5_2");
+
+    // Projected through the role projection: GM and player both see the table's
+    // version — it is non-sensitive campaign configuration.
+    assert_eq!(snapshot_as(&app, &gm, sid).await["rule_version"], "srd_5_2");
+    assert_eq!(
+        snapshot_as(&app, &player, sid).await["rule_version"],
+        "srd_5_2"
+    );
+
+    // Persist/hydrate round trip: snapshot as the engine emits it is pushed back
+    // into restore (what the orchestrator does after an engine restart).
+    let snapshot = snapshot_as(&app, &gm, sid).await;
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&service))
+        .set_json(snapshot)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    assert_eq!(snapshot_as(&app, &gm, sid).await["rule_version"], "srd_5_2");
+
+    // True restart semantics: hydrate into a FRESH engine process (empty state).
+    let restarted = test_app().await;
+    let snapshot = snapshot_as(&app, &gm, sid).await;
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&service))
+        .set_json(snapshot.clone())
+        .to_request();
+    assert_eq!(
+        test::call_service(&restarted, req).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        snapshot_as(&restarted, &service, sid).await["rule_version"],
+        "srd_5_2",
+        "restart+hydrate must keep the persisted rule-version choice"
+    );
+}
+
+/// An unknown rules baseline is a contract violation: 422 with an explanatory
+/// code, never a silent fallback to some other edition.
+#[actix_web::test]
+async fn rule_version_unknown_value_is_unprocessable() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-rv3", "gm", TEST_SECRET);
+    let req = test::TestRequest::post()
+        .uri("/api/v1/sessions")
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "campaign_id": Uuid::new_v4(),
+            "session_name": "Bad Version",
+            "rule_version": "pathfinder_1e"
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "INVALID_RULE_VERSION");
+}
+
+/// The same validation guards the durability bridge so a corrupted or
+/// hand-forged snapshot cannot smuggle a bogus baseline past hydration.
+#[actix_web::test]
+async fn rule_version_restore_rejects_unknown_version() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-rv4", "gm", TEST_SECRET);
+    let service = sign_token("orchestrator-service", TEST_SECRET);
+    let (sid, _) = create_session_with_rule_version(&app, &gm, Some("srd_5_1")).await;
+
+    let mut snapshot = snapshot_as(&app, &gm, sid).await;
+    snapshot["rule_version"] = serde_json::json!("dnd_4e");
+    let req = test::TestRequest::put()
+        .uri(&format!("/api/v1/sessions/{}/restore", sid))
+        .insert_header(bearer(&service))
+        .set_json(snapshot)
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
