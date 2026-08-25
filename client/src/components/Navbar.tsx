@@ -70,6 +70,12 @@ interface NavbarProps {
   onOpenCampaignWizard?: () => void;
   onToggleVideoMesh?: () => void;
   onOpenStreamerHUD?: () => void;
+  /**
+   * GOALS.md Pillar 9 (iteration 68): switches into the dedicated full-screen
+   * Streamer View. Only handed to GM seats — App gates it with
+   * canEnterStreamerView() so the entry control cannot even mount elsewhere.
+   */
+  onEnterStreamerView?: () => void;
   onOpenSubscription?: () => void;
   onOpenUserSettings?: () => void;
   onOpenAuth?: () => void;
@@ -96,6 +102,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenCampaignWizard,
   onToggleVideoMesh,
   onOpenStreamerHUD,
+  onEnterStreamerView,
   onOpenSubscription,
   onOpenUserSettings,
   onOpenAuth,
@@ -615,8 +622,27 @@ export const Navbar: React.FC<NavbarProps> = ({
                 >
                   <Video className="w-4 h-4 text-red-400 shrink-0" />
                   <div>
-                    <div className="font-bold">Streamer Broadcast Mode</div>
-                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">OBS clean & Discord webhooks</div>
+                    <div className="font-bold">Streamer Broadcast HUD</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">OBS readout & Discord webhooks</div>
+                  </div>
+                </button>
+              )}
+
+              {/* Dedicated full-screen broadcast surface (Pillar 9). GM-only:
+                  App passes this handler only for the gm seat, so players and
+                  spectators never see the control at all. */}
+              {onEnterStreamerView && (
+                <button
+                  onClick={() => {
+                    onEnterStreamerView();
+                    setActiveDropdown(null);
+                  }}
+                  className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
+                >
+                  <Radio className="w-4 h-4 text-red-400 shrink-0" />
+                  <div>
+                    <div className="font-bold">Go Live: Streamer View</div>
+                    <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Full-screen party-only capture (Esc to exit)</div>
                   </div>
                 </button>
               )}

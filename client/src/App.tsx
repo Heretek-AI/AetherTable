@@ -52,6 +52,7 @@ const SoundscapeJukeboxModal = lazy(() => import('./components/SoundscapeJukebox
 const MapLayerEditorModal = lazy(() => import('./components/MapLayerEditorModal').then((m) => ({ default: m.MapLayerEditorModal })));
 const HandoutManagerModal = lazy(() => import('./components/HandoutManagerModal').then((m) => ({ default: m.HandoutManagerModal })));
 const StreamerHUDModal = lazy(() => import('./components/StreamerHUDModal').then((m) => ({ default: m.StreamerHUDModal })));
+const StreamerView = lazy(() => import('./components/StreamerView').then((m) => ({ default: m.StreamerView })));
 const QuestJournalModal = lazy(() => import('./components/QuestJournalModal').then((m) => ({ default: m.QuestJournalModal })));
 const VideoMeshTiles = lazy(() => import('./components/VideoMeshTiles').then((m) => ({ default: m.VideoMeshTiles })));
 const BossHealthBar = lazy(() => import('./components/BossHealthBar').then((m) => ({ default: m.BossHealthBar })));
@@ -113,6 +114,12 @@ import {
   parseEntityStatusFromSessionState,
   type EntityCombatStatus,
 } from './api/entity_status_state';
+import {
+  canEnterStreamerView,
+  exitStreamerView,
+  enterStreamerView,
+  type StreamerViewMode,
+} from './api/streamer_view_state';
 
 /**
  * Authoritative engine combat state, mirrored from GET /api/v1/engine/session-state
@@ -174,6 +181,10 @@ export function App() {
   const [isCampaignWizardOpen, setIsCampaignWizardOpen] = useState(false);
   const [isVideoMeshVisible, setIsVideoMeshVisible] = useState(true);
   const [isStreamerHUDOpen, setIsStreamerHUDOpen] = useState(false);
+  // Iteration 68 (GOALS.md Pillar 9): the dedicated full-screen Streamer View.
+  // State transitions live in api/streamer_view_state.ts; entry is GM-gated
+  // (the toggle lives in GM Table Tools) and Escape exits back to this view.
+  const [streamerViewMode, setStreamerViewMode] = useState<StreamerViewMode>('off');
   const [activeMapLayer, setActiveMapLayer] = useState<MapLayerType>('tokens');
   const [isSpellbookOpen, setIsSpellbookOpen] = useState(false);
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
@@ -239,6 +250,15 @@ export function App() {
         return;
       }
 
+      // Iteration 68: Escape inside the dedicated Streamer View exits back to
+      // the seated view. Checked before the modal stack — streamer view is the
+      // top-most full-screen surface while live.
+      if (e.key === 'Escape' && streamerViewMode === 'live') {
+        e.preventDefault();
+        setStreamerViewMode(exitStreamerView('live'));
+        return;
+      }
+
       // Escape closes the top-most open modal (first match wins = "top-most"
       // in the fixed stacking priority below).
       if (e.key === 'Escape') {
@@ -286,6 +306,7 @@ export function App() {
     isJukeboxOpen,
     isSubscriptionOpen,
     isUserSettingsOpen,
+    streamerViewMode,
   ]);
 
   const handleBroadcastPing = () => {
@@ -2068,6 +2089,27 @@ export function App() {
 
   return (
     <div className="vtt-scrollbar flex flex-col h-screen w-screen bg-tavern-bg text-[var(--rp-parchment-100)] font-sans overflow-hidden">
+      {/* Dedicated full-screen Streamer View (GOALS.md Pillar 9, iteration 68).
+          While live it REPLACES the entire seated workspace — navbar, GM docks,
+          macro bar, DM-note modals and telemetry chrome are all UNMOUNTED, not
+          hidden by CSS. It receives exactly the filtered props the seated view
+          renders from (visibleTokens / spectatorMessages), so there is one
+          shared projection rather than a parallel filter. Escape or the
+          on-screen button exits back to the seated table. */}
+      {currentView === 'tabletop' && streamerViewMode === 'live' && (
+        <Suspense fallback={<ChunkFallback label="Preparing broadcast…" />}>
+          <StreamerView
+            projectedTokens={visibleTokens}
+            projectedMessages={spectatorMessages}
+            onExit={() => setStreamerViewMode(exitStreamerView('live'))}
+          />
+        </Suspense>
+      )}
+
+      {/* Seated workspace — unmounted entirely while the streamer surface is
+          live so nothing GM-facing can leak into the capture frame. */}
+      {streamerViewMode !== 'live' && (
+        <>
       {/* Top Universal Navbar */}
       <Navbar
         currentView={currentView}
@@ -2086,6 +2128,17 @@ export function App() {
         onOpenQuestJournal={guardGmSurface('the Quest Journal DM notes', () => setIsQuestJournalOpen(true))}
         onToggleVideoMesh={() => setIsVideoMeshVisible(!isVideoMeshVisible)}
         onOpenStreamerHUD={() => setIsStreamerHUDOpen(true)}
+        // Pillar 9: only the GM seat gets the Go Live control (see
+        // canEnterStreamerView in api/streamer_view_state.ts).
+        onEnterStreamerView={
+          canEnterStreamerView(userRole)
+            ? () => {
+                setStreamerViewMode(enterStreamerView(streamerViewMode));
+                setIsLeftDockCollapsed(false);
+                setIsRightDockCollapsed(false);
+              }
+            : undefined
+        }
         onOpenSubscription={() => setIsSubscriptionOpen(true)}
         onOpenUserSettings={() => setIsUserSettingsOpen(true)}
         onOpenAuth={() => setIsAuthOpen(true)}
@@ -2267,6 +2320,8 @@ export function App() {
         )}
       </div>
       </Suspense>
+      </>
+      )}
 
       {/* On-demand modals — each lives in its own lazily-fetched chunk and only
           mounts (and downloads) when first opened. fallback={null} keeps the

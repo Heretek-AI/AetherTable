@@ -68,6 +68,14 @@ interface NarrativeChatProps {
   isStreamingResponse?: boolean;
   activePeerTyping?: string | null;
   onBroadcastPing?: () => void;
+  /**
+   * GOALS.md Pillar 9 (iteration 68): broadcast-safe rendering for the
+   * dedicated StreamerView. Hides the "GM Whispers" channel tab entirely (the
+   * tab is a GM surface even when its log renders nothing) and pins the active
+   * channel to public ones so no private affordance exists in the capture.
+   * Default false — the seated table keeps every channel.
+   */
+  publicOnly?: boolean;
 }
 
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
@@ -102,6 +110,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   isStreamingResponse = false,
   activePeerTyping = null,
   onBroadcastPing,
+  publicOnly = false,
 }) => {
   const [activeChannel, setActiveChannel] = useState<ChatChannel>('all');
   const [inputText, setInputText] = useState('');
@@ -267,7 +276,11 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const channels: Array<{ id: ChatChannel; label: string; icon: React.ReactNode }> = [
     { id: 'all', label: 'All Table', icon: <MessageSquare className="w-3 h-3" /> },
     { id: 'party', label: 'Party', icon: <Users className="w-3 h-3" /> },
-    { id: 'gm', label: 'GM Whispers', icon: <Lock className="w-3 h-3" /> },
+    // Pillar 9: the private channel affordance itself is a GM surface — the
+    // streamer capture must not even show the tab. Omitted in publicOnly mode.
+    ...(publicOnly
+      ? []
+      : [{ id: 'gm' as const, label: 'GM Whispers', icon: <Lock className="w-3 h-3" /> }]),
     { id: 'combat', label: 'Combat Log', icon: <Dices className="w-3 h-3" /> },
   ];
 
