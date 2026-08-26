@@ -73,6 +73,10 @@ import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, formulaModifier, ensureEngineSession } from './api/rules_engine';
+import {
+  extractPendingOpportunityAttacks,
+  formatOpportunityAttackLine,
+} from './api/opportunity_state';
 import { logOutcomeForTier, shapeCheckOutcome } from './api/check_outcome';
 import { authHeaders, getStoredToken } from './api/auth_headers';
 import { openNarrativeStream } from './api/narrative_stream';
@@ -1022,6 +1026,45 @@ export function App() {
     // covers CRDT-remote moves that never pass through this handler.
     // Broadcast the move through the engine's CRDT relay (no-op when offline).
     syncClientRef.current?.updateTokenPosition(tokenId, newX, newY, 0);
+    // Iteration 76: authoritative combat movement also reports to the engine
+    // (POST /api/v1/engine/move). Its response may carry ADDITIVE pending-
+    // opportunity-attack disclosures ({provoked_by, mover_id,
+    // pending_opportunity}) when the mover left an armed enemy's reach — those
+    // surface as system chat lines naming both sides. Fire-and-forget with
+    // honest failure surfacing: a signed-out or unreachable gateway says so
+    // once instead of silently dropping the authoritative half of the move.
+    if (combat.in_combat && combatSessionId) {
+      const token = getStoredToken();
+      if (!token) {
+        addSystemMessage('🔒 Sign in so moves resolve against the authoritative engine.');
+        return;
+      }
+      void fetch('/api/v1/engine/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ session_id: combatSessionId, entity_id: tokenId, x: newX, y: newY, z: 0 }),
+      })
+        .then(async (resp) => {
+          if (!resp.ok) {
+            addSystemMessage(`Move rejected by the engine (HTTP ${resp.status}).`);
+            return;
+          }
+          const body = await resp.json().catch(() => null);
+          const lines = extractPendingOpportunityAttacks(body)
+            .map((oa) =>
+              formatOpportunityAttackLine(oa, (id) => {
+                const fromOrder = combat.order.find((c) => c.entity_id === id);
+                if (fromOrder) return fromOrder.name;
+                return tokens.find((t) => t.id === id)?.name;
+              }),
+            )
+            .filter((l): l is string => l !== null);
+          for (const line of lines) addSystemMessage(line);
+        })
+        .catch(() => {
+          addSystemMessage('Rules engine unreachable — move was not reported for opportunity attacks.');
+        });
+    }
   };
 
   // --- Authoritative combat plumbing (gateway /api/v1/engine/* proxies) ----
