@@ -32,7 +32,6 @@ import {
   balanceEncounter,
   createDebouncedBalancer,
   fetchPartyDefaults,
-  unknownMonsterIdsFrom,
   type DifficultyTier,
   type EncounterBalanceResult,
 } from '../api/encounter_balance_store';
@@ -193,9 +192,18 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
   // Monotonic token so a slow in-flight response can never overwrite a newer
   // verdict computed from later roster state.
   const balanceRunRef = useRef(0);
+  // GM visibility: an explicit prop wins; otherwise "has a session token" is
+  // the optimistic gate and the route's own 403 retracts the strip for any
+  // seat that is not gm/admin. The token can appear at any moment (login), so
+  // this is state refreshed on each render pass through a storage read.
+  const [gmSeen, setGmSeen] = useState<boolean>(
+    () => typeof getStoredToken() === 'string',
+  );
+  const effectiveIsGM = typeof isGM === 'boolean' ? isGM : gmSeen;
+  const [forbiddenByServer, setForbiddenByServer] = useState(false);
 
   useEffect(() => {
-    if (!isGM) return;
+    if (!effectiveIsGM || forbiddenByServer) return;
     let cancelled = false;
     void fetchPartyDefaults().then((defaults) => {
       if (cancelled) return;
@@ -205,12 +213,12 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
     return () => {
       cancelled = true;
     };
-    // Runs once on mount; the sliders stay user-adjustable afterwards.
+    // Runs once when GM visibility begins; sliders stay user-adjustable after.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isGM]);
+  }, [effectiveIsGM, forbiddenByServer]);
 
   useEffect(() => {
-    if (!isGM) return;
+    if (!effectiveIsGM || forbiddenByServer) return;
     const balancer = createDebouncedBalancer<BalanceParams>({
       delayMs: BALANCE_DEBOUNCE_MS,
       invoke: async (params) => {
@@ -232,11 +240,13 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
           setBalanceState({ phase: 'idle' });
           break;
         case 'not_signed_in':
-          setBalanceState({ phase: 'error', text: outcome.message });
+          setGmSeen(false);
+          setBalanceState({ phase: 'idle' });
           break;
         case 'forbidden':
           // GM-only route answered 403 to this seat: hide the strip rather
           // than wave an error at a player who was never supposed to see it.
+          setForbiddenByServer(true);
           setBalanceState({ phase: 'idle' });
           break;
         case 'unknown_monster':
@@ -265,7 +275,7 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
       balancer.cancel();
       balancerRef.current = null;
     };
-  }, [isGM]);
+  }, [effectiveIsGM, forbiddenByServer]);
 
   // Re-schedule whenever anything that rides the wire changes.
   const rosterWire = useMemo(
@@ -275,7 +285,7 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
   );
 
   useEffect(() => {
-    if (!isGM) return;
+    if (!effectiveIsGM || forbiddenByServer) return;
     if (rosterWire.length === 0) {
       balancerRef.current?.cancel();
       setBalanceState({ phase: 'idle' });
@@ -286,7 +296,7 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
       partySize,
       roster: rosterWire.map((line) => ({ ...line })),
     });
-  }, [isGM, partyLevel, partySize, rosterWire]);
+  }, [effectiveIsGM, forbiddenByServer, partyLevel, partySize, rosterWire]);
 
   const balanceBadge = useMemo(() => {
     const tier = balanceState.phase === 'ok' ? balanceState.data.difficulty : undefined;
@@ -563,7 +573,7 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
           {/* Server balance verdict — GM-only strip (iteration 13).
               Non-GM seats render nothing at all: balance data is DM
               information and the gateway 403s anyone else anyway. */}
-          {isGM && (
+          {effectiveIsGM && !forbiddenByServer && (
             <div className="vtt-surface rounded-xl p-5 shadow-xl space-y-3">
               <div className="flex items-center justify-between border-b border-tavern-border pb-3">
                 <h3 className="vtt-section-header text-sm font-bold">
