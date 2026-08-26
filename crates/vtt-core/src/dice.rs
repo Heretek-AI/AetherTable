@@ -141,8 +141,13 @@ impl DiceEngine {
                     }
 
                     let resolved = self.resolve_dice_pool(sides, &term, expression)?;
-                    // The global cap counts explosion bonus dice too.
-                    total_dice += resolved.dropped.len();
+                    // The global cap counts every value actually ROLLED: the
+                    // declared dice plus reroll replacements and keep-discarded
+                    // dice (both land in `dropped`) AND explosion bonus rolls
+                    // (`extras`). Counting only `dropped` let pools without
+                    // keep/reroll suffixes ("1000d2!+1000d2!") roll ~20k values
+                    // against the 2000 cap.
+                    total_dice += resolved.dropped.len() + resolved.extras.len();
                     if total_dice > MAX_DICE_PER_EXPRESSION {
                         return Err(format!(
                             "Dice expression '{}' exceeds cap of {} total dice",
@@ -731,9 +736,40 @@ mod tests {
     }
 
     #[test]
+    fn test_explosion_extras_count_against_global_dice_cap() {
+        let mut engine = DiceEngine::with_seed(43);
+
+        // A small exploding pool is fine.
+        let res = engine.roll_expression("4d6!").unwrap();
+        assert!(res.rolls.len() >= 4 && res.rolls.len() <= 44);
+
+        // A pool whose DECLARED count fits the cap but whose rolled values do
+        // not must be rejected. Each exploding d2 grants a bonus roll on max
+        // face (p=1/2 per chain step, mean ~1 extra per die), so 2000 declared
+        // dice roll ~4000 values — double the budget. The first term alone may
+        // squeak under 2000, but the second term's declaration plus the first
+        // term's extras cannot fit, whichever order the checks fire in.
+        let err = engine
+            .roll_expression("1000d2!+1000d2!")
+            .unwrap_err();
+        assert!(err.contains("cap"), "got: {}", err);
+
+        // Same escape hatch one die narrower: both terms' declarations sum to
+        // 1999 <= cap, yet the extras alone push the true rolled count past it.
+        let err = engine
+            .roll_expression("999d2!+1000d2!")
+            .unwrap_err();
+        assert!(err.contains("cap"), "got: {}", err);
+
+        // Non-exploding pools near the boundary stay accepted.
+        assert!(engine.roll_expression("1000d2+1000d2").is_ok());
+    }
+
+    #[test]
     fn test_modifier_overflow_rejected() {
         let mut engine = DiceEngine::with_seed(41);
         assert!(engine.roll_expression("2 000000000 000d6").is_err());
         assert!(engine.roll_expression("99999999999999999999").is_err());
     }
 }
+

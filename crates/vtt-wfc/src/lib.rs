@@ -158,15 +158,26 @@ impl DungeonGenerator {
     }
 
     pub fn generate_room(desc: &RoomDescriptor, seed: Option<u64>) -> Result<Vec<Vec<u8>>, String> {
+        let map = Self::generate_room_map(desc, seed)?;
+        Ok(Self::encode_tiles(map.grid))
+    }
+
+    /// Full-map variant of [`Self::generate_room`] (audit A5 F4): returns the
+    /// complete [`DungeonMap`], including the seeded `loot_containers` the
+    /// dressing pass exports, so wire callers can spawn treasure where the
+    /// chest tiles actually are. Same seed and same tile encoding as the
+    /// legacy helper.
+    pub fn generate_room_map(desc: &RoomDescriptor, seed: Option<u64>) -> Result<DungeonMap, String> {
         let w = desc.width;
         let h = desc.height;
         let s = seed.unwrap_or(1337);
-        let gen = DungeonGenerator::new(w, h);
-        let map = gen.generate(s);
+        Ok(DungeonGenerator::new(w, h).generate(s))
+    }
 
-        let tiles = map
-            .grid
-            .into_iter()
+    /// Encodes a tile grid as the legacy u8 matrix used by the server's
+    /// `/maps/generate` route (wall 1, floor 0, door 2, altar 3, chest 4).
+    pub fn encode_tiles(grid: Vec<Vec<TileType>>) -> Vec<Vec<u8>> {
+        grid.into_iter()
             .map(|row| {
                 row.into_iter()
                     .map(|t| match t {
@@ -179,9 +190,7 @@ impl DungeonGenerator {
                     })
                     .collect()
             })
-            .collect();
-
-        Ok(tiles)
+            .collect()
     }
 }
 
@@ -675,6 +684,57 @@ mod tests {
 
         let empty: Vec<Vec<TileType>> = Vec::new();
         assert!(place_loot_containers(&empty, 1, 3).is_empty());
+    }
+
+    #[test]
+    fn generated_containers_respect_the_tier_three_rarity_cap() {
+        // TREASURE_TIER is 3: the low-hero band. Very-rare rows must never
+        // leak into generated dungeon containers.
+        let gen = DungeonGenerator::new(24, 16);
+        for seed in 0..300u64 {
+            let map = gen.generate(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            for c in &map.loot_containers {
+                assert_eq!(c.tier, TREASURE_TIER);
+                assert!(
+                    c.contents
+                        .iter()
+                        .all(|i| i.rarity != loot_tables::Rarity::VeryRare),
+                    "seed {seed}: tier-{} container rolled a very_rare item",
+                    c.tier
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_room_map_returns_full_map_with_containers_and_tile_encoding() {
+        let desc = RoomDescriptor {
+            room_id: 1,
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 10,
+            theme: "Catacombs".to_string(),
+        };
+        let map = DungeonGenerator::generate_room_map(&desc, Some(42)).unwrap();
+        assert_eq!(map.width, 12);
+        assert_eq!(map.height, 10);
+        // The full-map helper replays identically with the legacy tiles-only
+        // helper, so callers can migrate without changing the tile contract.
+        let legacy = DungeonGenerator::generate_room(&desc, Some(42)).unwrap();
+        let encoded = DungeonGenerator::encode_tiles(map.grid.clone());
+        assert_eq!(encoded, legacy);
+        assert_eq!(
+            map.loot_containers.len(),
+            TREASURE_CONTAINERS_PER_DUNGEON,
+            "the full-map payload carries the exported treasure"
+        );
+        // Seed defaulting matches the legacy helper (None => 1337).
+        assert_eq!(
+            DungeonGenerator::generate_room_map(&desc, None).unwrap().seed,
+            1337
+        );
+        assert_eq!(map.seed, 42);
     }
 
     #[test]

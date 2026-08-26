@@ -28,6 +28,10 @@
 //! | 5..=10 | x3         |
 //! | 11..=16| x9         |
 //! | 17..=20| x27        |
+//!
+//! The tier also gates item RARITY (audit A5 F5): tiers 1-3 cap at
+//! [`Rarity::Rare`]; [`Rarity::VeryRare`] unlocks at tier 4. See
+//! [`max_rarity_for_tier`].
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -36,8 +40,9 @@ use serde::{Deserialize, Serialize};
 /// Number of themed tables available for RNG selection.
 const THEMES: usize = 3;
 
-/// Item rarity, carrying its canonical relative table weight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Item rarity, carrying its canonical relative table weight. Declaration
+/// order is the power order, so `Ord` compares "how rare" directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rarity {
     Common,
@@ -171,15 +176,35 @@ fn clamp_tier(tier: u8) -> u8 {
     tier.clamp(1, 20)
 }
 
+/// Maximum item rarity a treasure tier may roll (audit A5 F5).
+///
+/// The tier parameter is the party level / CR band, so tiers 1-3 are the
+/// low-hero band generated dungeons live in: a +1-equivalent Rare find is a
+/// memorable highlight there, but a VeryRare item (DMG ~level 11+ benchmark,
+/// 6000-10000 gp rows on these tables) trivializes a level-1 dungeon. VeryRare
+/// therefore unlocks at tier 4 and stays available above.
+///
+/// | Tier   | Max rarity |
+/// |--------|------------|
+/// | 1..=3  | Rare       |
+/// | 4..=20 | VeryRare   |
+pub fn max_rarity_for_tier(tier: u8) -> Rarity {
+    match clamp_tier(tier) {
+        1..=3 => Rarity::Rare,
+        _ => Rarity::VeryRare,
+    }
+}
+
 pub struct LootTableGenerator;
 
 impl LootTableGenerator {
     /// Rolls a full themed hoard using independent seeded RNG draws.
     ///
     /// `treasure_tier` is clamped to 1..=20 and interpreted as the party
-    /// level / encounter CR band (see [`treasure_tier_multiplier`]).
-    /// Degenerate inputs (tier 0, empty or all-zero-weight tables) never
-    /// panic: they yield fewer or zero items.
+    /// level / encounter CR band (see [`treasure_tier_multiplier`]); it also
+    /// caps item rarity via [`max_rarity_for_tier`]. Degenerate inputs
+    /// (tier 0, empty or all-zero-weight tables) never panic: they yield fewer
+    /// or zero items.
     pub fn roll_themed_hoard(treasure_tier: u8, seed: u64) -> ThematicLootRoll {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -193,8 +218,14 @@ impl LootTableGenerator {
         // Draw 2: hoard size.
         let slots = rng.gen_range(1..=3usize);
 
-        // Remaining selectable indices; picked entries cannot repeat.
-        let mut remaining: Vec<usize> = (0..table.len()).collect();
+        // Remaining selectable indices; picked entries cannot repeat. Rows
+        // above the tier's rarity ceiling are excluded up front (audit A5 F5):
+        // their weight simply never enters the roll, so the surviving rows
+        // keep their documented relative frequencies.
+        let max_rarity = max_rarity_for_tier(treasure_tier);
+        let mut remaining: Vec<usize> = (0..table.len())
+            .filter(|&i| table[i].rarity <= max_rarity)
+            .collect();
         let mut items = Vec::with_capacity(slots);
 
         for _ in 0..slots {
@@ -377,9 +408,11 @@ mod tests {
         // ~5000 commons and ~127 very rares; asserting a 5x margin and at
         // least one very_rare hit is robust against any plausible fluctuation
         // (P(no very_rare in 8000 draws) < 1e-160).
+        // Tier 4 is the first tier allowed to roll very_rare (see
+        // `max_rarity_for_tier`), so the dominance probe runs there.
         let mut counts: HashMap<Rarity, u32> = HashMap::new();
         for seed in 0..4000u64 {
-            for item in LootTableGenerator::roll_themed_hoard(2, seed).items {
+            for item in LootTableGenerator::roll_themed_hoard(4, seed).items {
                 *counts.entry(item.rarity).or_insert(0) += 1;
             }
         }
@@ -397,8 +430,58 @@ mod tests {
     }
 
     #[test]
-    fn values_stay_within_entry_bands_scaled_by_tier() {
-        for seed in 0..200u64 {
+    fn max_rarity_for_tier_convention() {
+        // Tiers 1-3 (the low-hero band generated dungeons live in) cap at
+        // Rare; very_rare unlocks at tier 4 and stays available above.
+        assert_eq!(max_rarity_for_tier(1), Rarity::Rare);
+        assert_eq!(max_rarity_for_tier(2), Rarity::Rare);
+        assert_eq!(max_rarity_for_tier(3), Rarity::Rare);
+        assert_eq!(max_rarity_for_tier(4), Rarity::VeryRare);
+        assert_eq!(max_rarity_for_tier(11), Rarity::VeryRare);
+        assert_eq!(max_rarity_for_tier(20), Rarity::VeryRare);
+        // Out-of-range tiers clamp instead of misbehaving.
+        assert_eq!(max_rarity_for_tier(0), Rarity::Rare);
+        assert_eq!(max_rarity_for_tier(u8::MAX), Rarity::VeryRare);
+    }
+
+    #[test]
+    fn tiers_below_four_never_roll_very_rare_items() {
+        for tier in [1u8, 2, 3] {
+            for seed in 0..2000u64 {
+                let roll = LootTableGenerator::roll_themed_hoard(tier, seed);
+                assert!(
+                    roll.items.iter().all(|i| i.rarity != Rarity::VeryRare),
+                    "tier {tier} seed {seed}: very_rare leaked past the rarity gate: {:?}",
+                    roll.items
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn very_rare_unlocks_at_tier_four_and_above() {
+        // At the unlocked tiers the very-rare rows keep their positive weight,
+        // so across thousands of hoards they must actually appear again.
+        for tier in [4u8, 7, 15] {
+            let mut hits = 0usize;
+            for seed in 0..3000u64 {
+                if LootTableGenerator::roll_themed_hoard(tier, seed)
+                    .items
+                    .iter()
+                    .any(|i| i.rarity == Rarity::VeryRare)
+                {
+                    hits += 1;
+                }
+            }
+            assert!(
+                hits >= 5,
+                "tier {tier}: very_rare never rolled ({hits} hits in 3000 hoards)"
+            );
+        }
+    }
+
+    #[test]
+    fn values_stay_within_entry_bands_scaled_by_tier() {        for seed in 0..200u64 {
             let roll = LootTableGenerator::roll_themed_hoard(11, seed);
             let table: HashMap<&str, &LootEntry> =
                 roll.theme.table().iter().map(|e| (e.name, e)).collect();

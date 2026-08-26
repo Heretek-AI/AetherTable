@@ -5666,6 +5666,11 @@ pub struct WfcReq {
 /// WFC determinism is a design feature (same seed ⇒ identical tile grid for
 /// collaborative map editing) and a pre-computed dungeon reveals nothing an
 /// attacker can exploit. The ROUTE itself is still spectator-gated.
+///
+/// The response exports the full dressing payload (audit A5 F4): the legacy
+/// u8 `tiles` grid PLUS `loot_containers` — the seeded treasure rolls that sit
+/// on the map's chest tiles — so the gateway proxy and client WFC studio can
+/// see (and later spawn as inventory entities) where the loot actually is.
 async fn generate_wfc_map(
     data: web::Data<AppState>,
     identity: AuthIdentity,
@@ -5677,11 +5682,13 @@ async fn generate_wfc_map(
     {
         return resp;
     }
-    match DungeonGenerator::generate_room(&req.room_desc, req.seed) {
-        Ok(tiles) => HttpResponse::Ok().json(serde_json::json!({
-            "width": req.room_desc.width,
-            "height": req.room_desc.height,
-            "tiles": tiles
+    match DungeonGenerator::generate_room_map(&req.room_desc, req.seed) {
+        Ok(map) => HttpResponse::Ok().json(serde_json::json!({
+            "width": map.width,
+            "height": map.height,
+            "seed": map.seed,
+            "tiles": DungeonGenerator::encode_tiles(map.grid),
+            "loot_containers": map.loot_containers,
         })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e})),
     }

@@ -6790,10 +6790,66 @@ async fn spectators_cannot_generate_maps_or_query_spatial_solvers() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+#[actix_web::test]
+async fn map_generate_response_exports_seeded_loot_containers() {
+    // Audit A5 F4: DungeonMap.loot_containers were computed by vtt-wfc but
+    // dropped by the route payload — the WFC studio and the gateway proxy
+    // could never see where the treasure actually is. The response must carry
+    // them alongside the legacy tile grid.
+    let app = test_app().await;
+    let player = sign_token_with_role("p1", "player", TEST_SECRET);
+    let (status, body) = post_raw(&app, &player, "/api/v1/maps/generate", wfc_payload()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let width = body["width"].as_u64().expect("width in payload") as usize;
+    let height = body["height"].as_u64().expect("height in payload") as usize;
+
+    // Legacy contract preserved: a full u8 tile grid of the requested size.
+    let tiles = body["tiles"].as_array().expect("tiles array");
+    assert_eq!(tiles.len(), height);
+    for row in tiles {
+        assert_eq!(row.as_array().unwrap().len(), width);
+    }
+
+    let containers = body["loot_containers"].as_array().expect(
+        "loot_containers must be exported so callers can spawn treasure",
+    );
+    assert!(
+        !containers.is_empty(),
+        "generated dungeons always dress at least one container"
+    );
+    for c in containers {
+        let cx = c["x"].as_u64().expect("container x") as usize;
+        let cy = c["y"].as_u64().expect("container y") as usize;
+        assert!(cx < width && cy < height, "container out of bounds: {c}");
+        // Each container sits on a chest tile (u8 encoding 4) and carries its
+        // rolled contents with positive gp values.
+        assert_eq!(tiles[cy][cx], serde_json::json!(4));
+        let contents = c["contents"].as_array().expect("container contents");
+        assert!(!contents.is_empty());
+        for item in contents {
+            assert!(
+                item["value_gp"].as_u64().unwrap_or(0) > 0,
+                "rolled loot carries positive gp: {item}"
+            );
+        }
+    }
+
+    // Determinism: same seed ⇒ identical container payload.
+    let mut seeded = wfc_payload();
+    seeded["seed"] = serde_json::json!(424242);
+    let (status_a, body_a) = post_raw(&app, &player, "/api/v1/maps/generate", seeded.clone()).await;
+    let (status_b, body_b) = post_raw(&app, &player, "/api/v1/maps/generate", seeded).await;
+    assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(
+        body_a["loot_containers"], body_b["loot_containers"],
+        "same seed must replay byte-identical containers"
+    );
+}
+
 /// Payload for `/api/v1/spatial/visibility`: viewer at world (0,0), empty
 /// 16x16 grid, 30 ft sight radius.
-fn visibility_payload() -> serde_json::Value {
-    serde_json::json!({
+fn visibility_payload() -> serde_json::Value {    serde_json::json!({
         "origin": {"x": 2.5, "y": 2.5, "z": 0.0},
         "grid_width": 16,
         "grid_height": 16,

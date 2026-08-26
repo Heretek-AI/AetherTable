@@ -2623,6 +2623,35 @@ impl GameSession {
     /// Rolls are drawn through the caller's [`DiceEngine`] in sorted-id order,
     /// so a seeded engine reproduces identical initiative for identical state.
     /// Returns the full rolled order for reporting.
+    /// Sweeps the round-scoped combat offers that must not cross a combat
+    /// boundary (audit A5 F7): pending opportunity attacks are dropped and
+    /// every readied action expires, each loss ledgered as
+    /// READIED_ACTION_EXPIRED exactly like the round refresh does. Returns
+    /// `(dropped_oas, expired_readied_ids)`.
+    fn sweep_cross_combat_state(&mut self) -> (usize, Vec<Uuid>) {
+        let dropped_oas = self.pending_opportunity_attacks.len();
+        self.pending_opportunity_attacks.clear();
+
+        let mut expired_readied = Vec::new();
+        for (id, entity) in self.entities.iter_mut() {
+            if let Some(expired) = entity.readied_action.take() {
+                expired_readied.push(*id);
+                self.ledger.append_event(
+                    self.session_id,
+                    self.campaign_id,
+                    *id,
+                    "READIED_ACTION_EXPIRED",
+                    serde_json::json!({
+                        "description": expired.description,
+                        "set_on_round": expired.set_on_round,
+                        "trigger": expired.trigger,
+                    }),
+                );
+            }
+        }
+        (dropped_oas, expired_readied)
+    }
+
     pub fn begin_combat(&mut self, dice: &mut DiceEngine) -> Vec<InitiativeEntry> {
         // Deterministic visit order — HashMap iteration order must never leak
         // into which die lands on which entity.
@@ -2643,6 +2672,9 @@ impl GameSession {
         }
         sort_initiative_entries(&mut entries);
 
+        // Nothing left over from a previous fight may leak into this one.
+        let (cleared_oas, cleared_readied) = self.sweep_cross_combat_state();
+
         self.combat.in_combat = true;
         self.combat.round = 1;
         self.combat.turn_index = 0;
@@ -2658,23 +2690,33 @@ impl GameSession {
                     "entity_id": e.entity_id,
                     "initiative_total": e.initiative_total,
                 })).collect::<Vec<_>>(),
+                "cleared_pending_opportunity_attacks": cleared_oas,
+                "cleared_readied_actions": cleared_readied,
             }),
         );
         entries
     }
 
     /// Ends combat and clears the initiative tracker. Entities stay on the
-    /// board untouched; returns how many combatants were tracked.
+    /// board untouched apart from the combat-scoped sweep (pending OAs and
+    /// readied actions do not survive the fight); returns how many combatants
+    /// were tracked.
     pub fn end_combat(&mut self) -> usize {
         let cleared = self.combat.order.len();
         let round_fought = self.combat.round;
         self.combat = InitiativeCombatState::default();
+
+        let (cleared_oas, cleared_readied) = self.sweep_cross_combat_state();
         self.ledger.append_event(
             self.session_id,
             self.campaign_id,
             Uuid::nil(),
             "COMBAT_ENDED",
-            serde_json::json!({ "rounds_fought": round_fought }),
+            serde_json::json!({
+                "rounds_fought": round_fought,
+                "cleared_pending_opportunity_attacks": cleared_oas,
+                "cleared_readied_actions": cleared_readied,
+            }),
         );
         cleared
     }
@@ -3127,6 +3169,96 @@ mod tests {
         assert!(
             session.entities[&enemy_id].action_budget.reaction,
             "the untaken reaction refreshes too"
+        );
+    }
+
+    #[test]
+    fn test_begin_combat_sweeps_pending_oas_and_stale_readied_actions() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert_eq!(outcome.opportunity_attacks.len(), 1);
+        assert!(!session.pending_opportunity_attacks.is_empty());
+
+        // A readied action declared OUTSIDE this fight must not carry in.
+        session
+            .ready_action(mover_id, "Swing when it returns", ReadiedTrigger::EnemyEntersReach)
+            .unwrap();
+        assert!(session.entities[&mover_id].readied_action.is_some());
+
+        session.begin_combat(&mut DiceEngine::with_seed(9));
+        assert!(
+            session.pending_opportunity_attacks.is_empty(),
+            "pending OAs are combat-scoped offers; they must not survive into a new fight"
+        );
+        assert!(
+            session
+                .entities
+                .values()
+                .all(|e| e.readied_action.is_none()),
+            "a readied action must not persist across the combat boundary"
+        );
+    }
+
+    #[test]
+    fn test_end_combat_sweeps_pending_oas_and_readied_actions_with_ledger_visibility() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.begin_combat(&mut DiceEngine::with_seed(5));
+
+        // Pending OA left standing mid-fight plus a live readied action.
+        session.pending_opportunity_attacks.push(PendingOpportunityAttack {
+            attacker_id: enemy_id,
+            mover_id,
+        });
+        session
+            .ready_action(enemy_id, "Swing when it moves", ReadiedTrigger::EnemyAttacks)
+            .unwrap();
+
+        session.end_combat();
+        assert!(
+            session.pending_opportunity_attacks.is_empty(),
+            "combat end must sweep pending OAs"
+        );
+        assert!(
+            session.entities.values().all(|e| e.readied_action.is_none()),
+            "combat end must sweep readied actions"
+        );
+
+        // Ledger visibility matches the round-refresh expiry convention: each
+        // dropped readied action is ledgered as READIED_ACTION_EXPIRED, and
+        // the combat-transition event discloses what it swept.
+        assert!(
+            session
+                .ledger
+                .events
+                .iter()
+                .any(|e| e.event_type == "READIED_ACTION_EXPIRED" && e.actor_id == enemy_id),
+            "the dropped readied action must be visible in the ledger"
+        );
+        let ended = session
+            .ledger
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "COMBAT_ENDED")
+            .expect("COMBAT_ENDED must be ledgered");
+        assert_eq!(
+            ended.payload.get("cleared_pending_opportunity_attacks"),
+            Some(&serde_json::json!(1)),
+            "COMBAT_ENDED must disclose how many pending OAs were swept"
+        );
+        assert_eq!(
+            session.combat.round, 0,
+            "end_combat still resets the tracker"
         );
     }
 
