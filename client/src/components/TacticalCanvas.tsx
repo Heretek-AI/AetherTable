@@ -36,6 +36,7 @@ import {
 } from '../render/elevation_projection';
 import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
+import { isTagSfxAllowed } from '../api/tag_sfx';
 import type { YjsCrdtClient } from '../sync/yjs_doc_client';
 import { boardBackdropStyle } from '../theme/board_atmosphere';
 import { User } from '../types/auth';
@@ -137,6 +138,15 @@ interface TacticalCanvasProps {
   /** True while a token-art generation is in flight (drives button state). */
   isGeneratingArt?: boolean;
   /**
+   * Loop 3 iteration 31 — "Tag SFX": right-click a token to play a generated
+   * one-shot at its board coordinates through the spatial engine. GM/admin
+   * seats (and anonymous solo sessions) only — `isTagSfxAllowed` gates it here
+   * too, and the App shell only wires the handler for staff (the gateway's
+   * MEDIA_SFX_FORBIDDEN remains the real authority). Absent → no affordance
+   * (honest absence, same rule as onGenerateArt).
+   */
+  onTagTokenSfx?: (tokenId: string) => void;
+  /**
    * Iteration 9 (Loop 3, visuals): active atmosphere-preset id from the App
    * shell's DUAL-source truth (theme/atmospheres.ts). Tints the decorative
    * board-backdrop wash (vignette/grain/candle-glow — see .vtt-board-backdrop
@@ -173,6 +183,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   onGenerateArt,
   isGeneratingArt = false,
   atmosphereId,
+  onTagTokenSfx,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -915,6 +926,22 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
             return (
               <div
                 key={token.id}
+                onContextMenu={(e) => {
+                  // Loop 3 iteration 31 — "Tag SFX": right-click plays a
+                  // generated one-shot at this token's board coordinates via
+                  // the spatial engine. Gated for GM/admin seats (and the
+                  // network authority) only; non-staff right-clicks expose the
+                  // browser's ordinary context menu instead.
+                  if (isTagSfxAllowed(currentUser?.role, spectatorMode)) {
+                    e.preventDefault();
+                    onTagTokenSfx?.(token.id);
+                  }
+                }}
+                title={
+                  isTagSfxAllowed(currentUser?.role, spectatorMode)
+                    ? `Right-click to play a tag SFX at ${token.name} (GM action)`
+                    : undefined
+                }
                 onClick={(e) => {
                   e.stopPropagation();
                   onSelectToken(token.id);

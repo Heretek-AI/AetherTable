@@ -2,13 +2,17 @@
  * Positional 3D Web Audio Spatial Engine
  * Computes azimuth stereo panning and distance-attenuated gain based on token coordinates.
  *
- * Two kinds of spatialization live here:
+ * Three kinds of spatialization live here:
  *  1. One-shot cues (impact/spell/roar/dice) built per play call.
  *  2. PERSISTENT VOICE SOURCES (Pillar 9): one long-lived HRTF PannerNode chain
  *     per remote peer microphone, registered via `attachMediaStream` and moved
  *     across the board with `setSourcePosition(peerId, x, y)` as the peer's
  *     bound token moves. Distance attenuation and azimuth therefore track the
  *     tactical map in real time.
+ *  3. DECODED-BUFFER one-shots (Loop 3 iteration 31): `playSpatialBuffer`
+ *     routes a gateway-generated AudioBuffer (the Tag SFX lane, api/tag_sfx.ts)
+ *     through the same spatial chain as the synthesized cues, so a generated
+ *     jingle hears true azimuth/distance/occlusion instead of flat stereo.
  *
  * Honest limits:
  *  - A peer with no identifiable board token is PINNED at the listener's
@@ -552,6 +556,45 @@ export class SpatialAudioEngine {
     osc.connect(soundGain);
     osc.start(now);
     osc.stop(now + 0.15);
+  }
+
+  /**
+   * Loop 3 iteration 31 — routes a DECODED AudioBuffer (e.g. a gateway-
+   * generated WAV from the Tag SFX lane, api/tag_sfx.ts) through the SAME
+   * spatial chain as the synthesized cues: input gain → PannerNode (HRTF,
+   * inverse rolloff) → master, falling back to StereoPannerNode + computed
+   * gain when HRTF is unavailable. The cue's own envelope plays naturally;
+   * unlike the synthesized one-shots, no artificial attack/decay ramp is
+   * folded into a finished jingle.
+   *
+   * Returns false (no silent fake) when muted, Web Audio is unavailable, or
+   * the browser refuses to start the buffer source.
+   *
+   * HONEST MONO NOTE: a monaural (1-channel) generated cue is STILL a point
+   * source — HRTF binaural azimuth/distance/occlusion and the StereoPannerNode
+   * fallback (pan by board-x relative to the listener, gain by distance) all
+   * remain meaningful for it. Callers can read the decoded channel count from
+   * the buffer and note it honestly instead of pretending it is stereo.
+   */
+  public playSpatialBuffer(
+    buffer: AudioBuffer,
+    sourceX: number,
+    sourceY: number,
+    sourceElevationFeet = 0,
+  ): boolean {
+    if (this.isMuted) return false;
+    this.initContext();
+    if (!this.ctx || !this.masterGain) return false;
+    try {
+      const { input } = this.buildSpatialChain(sourceX, sourceY, sourceElevationFeet);
+      const src = this.ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(input);
+      src.start(this.ctx.currentTime, 0, buffer.duration);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 

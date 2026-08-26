@@ -36,6 +36,12 @@
  * master element volume, NO HRTF azimuth/distance/occlusion. That is a
  * deliberate, documented downgrade — generated cues are ambience, not
  * positional events.
+ *
+ * Loop 3 ITERATION 31 added a spatial buffer lane to spatial_audio.ts
+ * (`playSpatialBuffer`), used by `api/tag_sfx.ts` for Board-tagged one-shots
+ * that CARRY a token's world coordinates. `playCachedSfx` here stays on the
+ * plain-element path because it has no board position — both lanes are honest
+ * about what they can spatialize.
  */
 
 import { getStoredToken } from './auth_headers';

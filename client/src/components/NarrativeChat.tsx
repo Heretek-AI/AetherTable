@@ -21,6 +21,12 @@ import {
 } from 'lucide-react';
 import { globalVoiceCapture } from '../render/voice_capture';
 import { globalAudio } from '../render/audio_manager';
+import {
+  LocalVadMeter,
+  deriveVadMeterStatus,
+  hasMediaDevices,
+} from '../render/local_vad_meter';
+import { LocalVadMeterStrip } from './LocalVadMeterStrip';
 import type { SpotlightView } from '../sync/speech_ledger';
 import {
   MIN_TRANSCRIBABLE_MS,
@@ -93,6 +99,12 @@ interface NarrativeChatProps {
    *  Iteration 29 (F3): 'admin' added so admin seats inherit the staff
    *  default-open behaviour that gm already gets. */
   userRole?: 'gm' | 'admin' | 'player' | 'spectator';
+  /**
+   * Loop 3 iteration 31 — the local seat's display name for the local-mic VAD
+   * meter strip. The meter hears ONLY this browser's mic (each seat runs its
+   * own copy); remote seats' voices are never visible in it.
+   */
+  localSeatName?: string;
 }
 
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
@@ -130,6 +142,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   publicOnly = false,
   narrationSessionId = null,
   userRole,
+  localSeatName,
 }) => {
   const [activeChannel, setActiveChannel] = useState<ChatChannel>('all');
   const [inputText, setInputText] = useState('');
@@ -137,6 +150,13 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const [isSpeechActive, setIsSpeechActive] = useState(false);
   const [vadReady, setVadReady] = useState(false);
   const [voiceVolume, setVoiceVolume] = useState(0);
+  // Local-mic VAD meter (Loop 3 iteration 31): EMA of speaking seconds from
+  // THIS browser's Silero VAD bursts. Feature-detected so CI/happy-dom (no
+  // getUserMedia) renders the off-state instead of pretending a mic exists.
+  const vadMeterRef = useRef<LocalVadMeter>(new LocalVadMeter());
+  const [vadLevel, setVadLevel] = useState(0);
+  const [vadSupported, setVadSupported] = useState<boolean>(() => hasMediaDevices());
+  const [micStartFailed, setMicStartFailed] = useState(false);
   /** Voice drafts: captured VAD segments moving through transcription. */
   const [voiceUtterances, setVoiceUtterances] = useState<VoiceUtterance[]>([]);
   /**
@@ -162,6 +182,16 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isStreamingResponse, activePeerTyping]);
+
+  // Decay the local-mic VAD meter on a light interval so the dot ring settles
+  // after silence. The meter itself holds no AudioContext and touches no
+  // hardware — it only integrates the VAD timestamps fed below.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setVadLevel(vadMeterRef.current.tick(Date.now()));
+    }, 250);
+    return () => window.clearInterval(id);
+  }, []);
 
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -256,6 +286,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       setIsRecording(true);
       setIsSpeechActive(false);
       setVadReady(false);
+      setMicStartFailed(false);
+      vadMeterRef.current.reset();
+      setVadLevel(0);
       globalAudio.playTurnAdvance();
       const started = await globalVoiceCapture.startRecording({
         onVolumeUpdate: (volume) => setVoiceVolume(volume),
@@ -263,10 +296,12 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         // speech ledger that powers spotlight balance (App accumulates and
         // syncs them; we never fabricate utterance text).
         onSpeechStart: () => {
+          vadMeterRef.current.begin(Date.now());
           setIsSpeechActive(true);
           onSpeechStart?.();
         },
         onSpeechEnd: (audio) => {
+          vadMeterRef.current.end(Date.now());
           setIsSpeechActive(false);
           onSpeechSegment?.(audio);
           // Previously discarded; now captured for opt-in transcription.
@@ -274,8 +309,10 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         },
       });
       if (!started) {
-        // Microphone inaccessible — do not pretend a session is live.
+        // Microphone inaccessible — do not pretend a session is live. The
+        // strip reads this as a compact "denied" off-state with a Retry.
         setIsRecording(false);
+        setMicStartFailed(true);
         setVoiceVolume(0);
       } else {
         setVadReady(globalVoiceCapture.isUsingNeuralVad());
@@ -288,6 +325,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       // phantom live tail keeps accruing after the mic is off.
       onCaptureStop?.();
       setVoiceVolume(0);
+      // The local meter starts clean for the next session.
+      vadMeterRef.current.reset();
+      setVadLevel(0);
       // Release retained mic audio; transcription already in flight keeps its
       // own reference and still lands as a draft bubble.
       segmentBufferRef.current.releaseAll();
@@ -349,6 +389,19 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
               <span className="hidden sm:inline">Map Ping</span>
             </button>
           )}
+
+          {/* Local-mic VAD meter (Loop 3 iteration 31): the dot ring next to
+              the local seat's name tracks THIS browser's own speaking EMA.
+              Local-only by definition — remote seats' voices are never heard
+              here (the room-wide balance right beside it comes from the CRDT
+              speech ledger instead). */}
+          <LocalVadMeterStrip
+            seatName={localSeatName}
+            status={deriveVadMeterStatus(vadSupported, isRecording, micStartFailed)}
+            levelSeconds={vadLevel}
+            isSpeaking={isSpeechActive}
+            onRetry={() => void toggleRecording()}
+          />
 
           {/* Speaker-balance indicator — real VAD-derived shares, or an honest
               empty state. Never seeded with demo speakers. */}

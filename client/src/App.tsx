@@ -75,6 +75,7 @@ const ChunkFallback = ({ label }: { label: string }) => (
 );
 import { User, DEMO_ACCOUNTS } from './types/auth';
 import { globalSpatialAudio } from './render/spatial_audio';
+import { playTagSfx, TAG_SFX_PROMPT } from './api/tag_sfx';
 import { globalWebRTCMesh } from './render/webrtc_mesh';
 import { engineAttack, engineCheck, formulaModifier, ensureEngineSession } from './api/rules_engine';
 import {
@@ -739,6 +740,9 @@ export function App() {
   // (auto-dismissing toast). Cleared when a fresh disclosure arrives so the
   // next one takes over instead of stacking.
   const [concentrationToast, setConcentrationToast] = useState<string | null>(null);
+  // Iteration 31: transient Tag SFX failure line (auto-dismissing, reusing the
+  // same toast shell). Null while the last tag either played or never ran.
+  const [tagSfxNotice, setTagSfxNotice] = useState<string | null>(null);
   // Engine session this browser talks to through the orchestrator proxies;
   // null while the engine is unreachable (tracker then shows its empty state).
   const [combatSessionId, setCombatSessionId] = useState<string | null>(null);
@@ -1133,6 +1137,35 @@ export function App() {
         });
     }
   };
+
+  /**
+   * Loop 3 iteration 31 — "Tag SFX": right-click a token in TacticalCanvas to
+   * play a generated one-shot at its board coordinates through the spatial
+   * engine. Staff seats only (the canvas gates on the same rule; this double
+   * check keeps a miswired render from spending the table's synthesis bucket).
+   * The transient notice surfaces any honest failure verbatim.
+   */
+  const handleTagTokenSfx = useCallback(
+    (tokenId: string) => {
+      if (userRole === 'player' || userRole === 'spectator') return;
+      const token = visibleTokens.find((t) => t.id === tokenId);
+      if (!token) return;
+      void playTagSfx({
+        prompt: TAG_SFX_PROMPT,
+        x: token.x,
+        y: token.y,
+        elevationFeet: token.elevationFeet ?? 0,
+      }).then((result) => {
+        if (result.outcome === 'PLAYED') return;
+        // NOT_PLAYED carries a reason; every other failure carries the
+        // gateway/session detail — surface it honestly, never silently drop.
+        setTagSfxNotice(
+          result.outcome === 'NOT_PLAYED' ? `Tag SFX not played: ${result.detail}` : result.detail,
+        );
+      });
+    },
+    [userRole, visibleTokens],
+  );
 
   // --- Authoritative combat plumbing (gateway /api/v1/engine/* proxies) ----
 
@@ -2370,6 +2403,7 @@ export function App() {
                     const t = visibleTokens.find((tok) => tok.id === id);
                     if (t) setTokenArtDialogFor({ ...t, artDataUrl: tokenArtByToken[id] });
                   }}
+                  onTagTokenSfx={handleTagTokenSfx}
                 />
 
                 {/* Session dice audit log — floats over the map's free corner */}
@@ -2443,6 +2477,7 @@ export function App() {
               isStreamingResponse={isStreamingResponse}
               activePeerTyping={activePeerTyping}
               onBroadcastPing={handleBroadcastPing}
+              localSeatName={currentUser.displayName}
             />
           </div>
         )}
@@ -2667,6 +2702,13 @@ export function App() {
       <TransientSaveToast
         message={concentrationToast}
         onDismiss={() => setConcentrationToast(null)}
+      />
+      {/* Iteration 31: transient Tag SFX failure line — same auto-dismissing
+          shell, so a refused tag (forbidden / rate-limited / not played)
+          surfaces once instead of disappearing into a silent no-op. */}
+      <TransientSaveToast
+        message={tagSfxNotice}
+        onDismiss={() => setTagSfxNotice(null)}
       />
       </Suspense>
     </div>
