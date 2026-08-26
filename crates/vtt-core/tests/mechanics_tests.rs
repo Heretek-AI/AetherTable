@@ -3,7 +3,9 @@
 
 use vtt_core::dice::DiceEngine;
 use vtt_core::rules::{RulesEvaluator, SpellDefinition};
-use vtt_core::state::{EndOfTurnSave, EntityState, GameSession, ReadiedAction, ReactionType};
+use vtt_core::state::{
+    EndOfTurnSave, EntityState, GameSession, ReadiedAction, ReadiedTrigger, ReactionType,
+};
 use vtt_core::{AbilityScores};
 use vtt_core::types::{Ability, Condition, DamageType, IngressEvent, IngressType};
 
@@ -1598,7 +1600,11 @@ fn test_ready_action_stores_description_spends_action_and_ledgers() {
     let actor = *session.entities.keys().next().unwrap();
 
     let ready = session
-        .ready_action(actor, "I attack the goblin", Some("when it moves"))
+        .ready_action(
+            actor,
+            "I attack the goblin",
+            ReadiedTrigger::Freeform("when it moves".to_string()),
+        )
         .unwrap();
     assert_eq!(ready.set_on_round, 4);
     assert!(
@@ -1614,6 +1620,11 @@ fn test_ready_action_stores_description_spends_action_and_ledgers() {
         .expect("readied action stored on the entity");
     assert_eq!(stored.description, ready.description);
     assert_eq!(stored.set_on_round, 4);
+    assert_eq!(
+        stored.trigger,
+        ReadiedTrigger::Freeform("when it moves".to_string()),
+        "the structured trigger survives alongside the display text"
+    );
     assert!(
         !session.entities[&actor].action_budget.action,
         "Ready spends the entity's Action"
@@ -1626,7 +1637,9 @@ fn test_ready_action_stores_description_spends_action_and_ledgers() {
 
     // The Action is gone: a second Ready this turn is rejected WITHOUT
     // overwriting the stored description.
-    let err = session.ready_action(actor, "second try", None).unwrap_err();
+    let err = session
+        .ready_action(actor, "second try", ReadiedTrigger::default())
+        .unwrap_err();
     assert_eq!(err, "ACTION_ECONOMY_EXHAUSTED");
     assert_eq!(
         session.entities[&actor].readied_action.as_ref().unwrap().description,
@@ -1636,7 +1649,9 @@ fn test_ready_action_stores_description_spends_action_and_ledgers() {
 
     // Unknown entity.
     assert_eq!(
-        session.ready_action(uuid::Uuid::new_v4(), "ghost", None).unwrap_err(),
+        session
+            .ready_action(uuid::Uuid::new_v4(), "ghost", ReadiedTrigger::default())
+            .unwrap_err(),
         "ENTITY_NOT_FOUND"
     );
 }
@@ -1646,7 +1661,9 @@ fn test_ready_action_clears_at_the_next_round_refresh() {
     let mut session = session_with_pair();
     let actor = *session.entities.keys().next().unwrap();
 
-    session.ready_action(actor, "I hold my strike", None).unwrap();
+    session
+        .ready_action(actor, "I hold my strike", ReadiedTrigger::default())
+        .unwrap();
     assert!(session.entities[&actor].readied_action.is_some());
 
     // A readied action lasts until the actor's next turn refresh — the round
@@ -1670,7 +1687,9 @@ fn test_ready_action_rejects_incapacitated_actors() {
         .unwrap()
         .add_condition(Condition::Unconscious);
     assert_eq!(
-        session.ready_action(actor, "while unconscious", None).unwrap_err(),
+        session
+            .ready_action(actor, "while unconscious", ReadiedTrigger::default())
+            .unwrap_err(),
         "ENTITY_CANNOT_ACT"
     );
     assert!(
@@ -1685,6 +1704,7 @@ fn test_readied_action_round_trips_and_legacy_payloads_default_to_none() {
     e.readied_action = Some(ReadiedAction {
         description: "I attack when it moves".to_string(),
         set_on_round: 2,
+        trigger: ReadiedTrigger::EnemyEntersReach,
     });
     let serialized = serde_json::to_value(&e).unwrap();
     let parsed: EntityState = serde_json::from_value(serialized).unwrap();
@@ -1694,6 +1714,212 @@ fn test_readied_action_round_trips_and_legacy_payloads_default_to_none() {
     let legacy: EntityState = serde_json::from_value(serde_json::to_value(hero("legacy", 30, 15)).unwrap())
         .expect("legacy payload without readied_action");
     assert!(legacy.readied_action.is_none());
+}
+
+#[test]
+fn test_ready_trigger_is_a_structured_enum_with_legacy_freeform_default() {
+    // Wire names are snake_case; the freeform variant carries its text.
+    assert_eq!(
+        serde_json::to_value(ReadiedTrigger::EnemyEntersReach).unwrap(),
+        serde_json::json!("enemy_enters_reach")
+    );
+    assert_eq!(
+        serde_json::to_value(ReadiedTrigger::EnemyAttacks).unwrap(),
+        serde_json::json!("enemy_attacks")
+    );
+    assert_eq!(
+        serde_json::to_value(ReadiedTrigger::TurnStart).unwrap(),
+        serde_json::json!("turn_start")
+    );
+    assert_eq!(
+        serde_json::to_value(ReadiedTrigger::Freeform("the bell tolls".into())).unwrap(),
+        serde_json::json!({"freeform": "the bell tolls"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ReadiedTrigger>(serde_json::json!("turn_start")).unwrap(),
+        ReadiedTrigger::TurnStart
+    );
+
+    // A readied action persisted BEFORE triggers were structured still
+    // deserializes — it was pure GM adjudication, so it defaults to an empty
+    // freeform rather than inventing a mechanical trigger it never had.
+    let legacy = serde_json::json!({
+        "description": "I attack when it moves",
+        "set_on_round": 2,
+    });
+    let parsed: ReadiedAction = serde_json::from_value(legacy).unwrap();
+    assert_eq!(parsed.trigger, ReadiedTrigger::default());
+}
+
+/// SRD: releasing a readied action (resolving its trigger) takes the actor's
+/// Reaction. Iteration 74: the release is now an engine operation that spends
+/// the Reaction and ledgers itself, instead of being pure GM adjudication.
+#[test]
+fn test_release_readied_action_spends_the_reaction_and_ledgers() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+
+    let readied = session
+        .ready_action(actor, "I attack the goblin", ReadiedTrigger::EnemyEntersReach)
+        .unwrap();
+    assert!(session.entities[&actor].action_budget.reaction);
+
+    let released = session.release_readied_action(actor).unwrap();
+    assert_eq!(released, readied, "the released declaration is echoed back");
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "releasing clears the stored declaration"
+    );
+    assert!(
+        !session.entities[&actor].action_budget.reaction,
+        "release spends the entity's Reaction per SRD"
+    );
+
+    let ev = session
+        .ledger
+        .events
+        .iter()
+        .find(|e| e.event_type == "READY_ACTION_RELEASED" && e.actor_id == actor)
+        .expect("release is ledgered");
+    assert_eq!(
+        ev.payload["reaction_spent"], serde_json::json!(true),
+        "the ledger records WHY the reaction is gone"
+    );
+    assert_eq!(ev.payload["trigger"], serde_json::json!("enemy_enters_reach"));
+
+    // Releasing twice is impossible: nothing is left to release.
+    assert_eq!(
+        session.release_readied_action(actor).unwrap_err(),
+        "NO_READIED_ACTION"
+    );
+}
+
+#[test]
+fn test_release_readied_action_rejects_without_reaction_or_capacity() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+    let other = *session.entities.keys().find(|k| **k != actor).unwrap();
+
+    // Nothing readied: rejected without touching any budget.
+    assert_eq!(
+        session.release_readied_action(actor).unwrap_err(),
+        "NO_READIED_ACTION"
+    );
+    // Unknown entity.
+    assert_eq!(
+        session.release_readied_action(uuid::Uuid::new_v4()).unwrap_err(),
+        "ENTITY_NOT_FOUND"
+    );
+    assert!(
+        session.entities[&other].action_budget.reaction,
+        "a rejected release must not spend anyone's Reaction"
+    );
+
+    // Reaction already spent this round: 409-shaped rejection, and the held
+    // action SURVIVES so the GM can still resolve it next turn if desired.
+    session
+        .ready_action(actor, "I hold my strike", ReadiedTrigger::TurnStart)
+        .unwrap();
+    session.entities.get_mut(&actor).unwrap().action_budget.reaction = false;
+    assert_eq!(
+        session.release_readied_action(actor).unwrap_err(),
+        "REACTION_SPENT"
+    );
+    assert!(
+        session.entities[&actor].readied_action.is_some(),
+        "a failed release must not consume the readied declaration"
+    );
+
+    // Incapacitated actors cannot take reactions at all.
+    session.entities.get_mut(&actor).unwrap().action_budget.reaction = true;
+    session
+        .entities
+        .get_mut(&actor)
+        .unwrap()
+        .add_condition(Condition::Unconscious);
+    assert_eq!(
+        session.release_readied_action(actor).unwrap_err(),
+        "ENTITY_CANNOT_ACT"
+    );
+    assert!(session.entities[&actor].readied_action.is_some());
+    assert!(session.entities[&actor].action_budget.reaction);
+}
+
+/// The expiry of an UNreleased readied action must be visible in both the
+/// ledger and the round report — a silently-vanishing held Action hides the
+/// fact that the actor's Action economy was spent for nothing.
+#[test]
+fn test_unreadied_actions_expire_at_round_end_with_ledger_visibility() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+    let bystander = *session.entities.keys().find(|k| **k != actor).unwrap();
+
+    session
+        .ready_action(actor, "I hold my strike", ReadiedTrigger::EnemyAttacks)
+        .unwrap();
+
+    let mut dice = DiceEngine::with_seed(3);
+    let report = session.advance_round(&mut dice);
+
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "the refresh still clears the expired readied action"
+    );
+    assert_eq!(
+        report.readied_expired,
+        vec![actor],
+        "the round report names exactly who lost a readied action"
+    );
+    assert!(!report.readied_expired.contains(&bystander));
+    assert!(
+        session
+            .ledger
+            .events
+            .iter()
+            .any(|e| e.event_type == "READIED_ACTION_EXPIRED" && e.actor_id == actor),
+        "the expiry lands in the ledger for replay/audit"
+    );
+    // A round with no readied actions expires nobody.
+    let report2 = session.advance_round(&mut dice);
+    assert!(report2.readied_expired.is_empty());
+
+    // Round reports from before the field existed deserialize cleanly.
+    let legacy_report: vtt_core::state::RoundAdvanceReport =
+        serde_json::from_value(serde_json::json!({"round": 3, "ticks": []})).unwrap();
+    assert!(legacy_report.readied_expired.is_empty());
+}
+
+/// Rewind consistency: rewinding past a READY_ACTION_SET must not leave the
+/// declaration armed on the entity (its backing event may have been reverted).
+#[test]
+fn test_rewind_clears_readied_actions_consistently() {
+    let mut session = session_with_pair();
+    let actor = *session.entities.keys().next().unwrap();
+
+    session
+        .ready_action(actor, "I attack when it moves", ReadiedTrigger::EnemyEntersReach)
+        .unwrap();
+    assert!(session.entities[&actor].readied_action.is_some());
+
+    // Rewind to exactly now — every event including READY_ACTION_SET reverts.
+    session.safety_rewind(session.ledger.current_sequence);
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "a rewind past the Ready must clear the drifted declaration"
+    );
+
+    // Same for a rewind past a RELEASE: the wholesale clear keeps state and
+    // ledger consistent even though the SET event survives the rewind point.
+    session
+        .ready_action(actor, "hold again", ReadiedTrigger::TurnStart)
+        .unwrap();
+    let pre_release = session.ledger.current_sequence - 1;
+    session.release_readied_action(actor).unwrap();
+    session.safety_rewind(pre_release);
+    assert!(
+        session.entities[&actor].readied_action.is_none(),
+        "after rewinding past a release the declaration stays cleared (conservative)"
+    );
 }
 
 // ------------------------------------------------- Two-Weapon Fighting & Help
