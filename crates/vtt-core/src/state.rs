@@ -83,6 +83,13 @@ pub struct EndOfTurnSave {
 pub struct ConditionTimer {
     pub condition: Condition,
     pub remaining_rounds: u32,
+    /// The creature the condition came from (the Frightened source, the
+    /// grappler holding a Grappled victim). Serde default keeps legacy
+    /// serialized timers deserializing; absent means "no attributed source"
+    /// and every enforcement that consults sources treats that as
+    /// "unattributed — no directional clause applies".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_entity_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_of_turn_save: Option<EndOfTurnSave>,
 }
@@ -522,6 +529,17 @@ impl EntityState {
         let before = self.conditions.len();
         self.conditions.retain(|c| std::mem::discriminant(c) != disc);
         before != self.conditions.len()
+    }
+
+    /// The Frightened condition's source creature, when this session recorded
+    /// one for it. Delegates to the session's ledger lookup — the engine
+    /// primitive that owns CONDITION_APPLIED history.
+    pub(crate) fn frightened_source_of(
+        &self,
+        session: &GameSession,
+        entity_id: &Uuid,
+    ) -> Option<Uuid> {
+        session.condition_source(entity_id, &Condition::Frightened)
     }
 }
 
@@ -1661,7 +1679,13 @@ impl GameSession {
             .is_some()
     }
 
-    /// Applies a timed condition and registers its duration clock.
+    /// Applies a timed condition and registers its duration clock. An optional
+    /// `source_entity_id` attributes the condition to the creature it came
+    /// from — the Frightened source of a fear effect, the grappler holding a
+    /// Grappled victim. Directional SRD clauses ("can't willingly move closer
+    /// to the source") are enforced against the source's LIVE position, so the
+    /// attribution must name an existing entity; naming an unknown id is
+    /// rejected rather than silently downgraded to unattributed.
     pub fn apply_timed_condition(
         &mut self,
         entity_id: Uuid,
@@ -1669,6 +1693,29 @@ impl GameSession {
         duration_rounds: u32,
         end_of_turn_save: Option<EndOfTurnSave>,
     ) -> Result<(), String> {
+        self.apply_timed_condition_from(
+            entity_id,
+            condition,
+            duration_rounds,
+            None,
+            end_of_turn_save,
+        )
+    }
+
+    /// Source-attributing variant of [`Self::apply_timed_condition`].
+    pub fn apply_timed_condition_from(
+        &mut self,
+        entity_id: Uuid,
+        condition: Condition,
+        duration_rounds: u32,
+        source_entity_id: Option<Uuid>,
+        end_of_turn_save: Option<EndOfTurnSave>,
+    ) -> Result<(), String> {
+        if let Some(src) = source_entity_id {
+            if !self.entities.contains_key(&src) {
+                return Err("SOURCE_ENTITY_NOT_FOUND".to_string());
+            }
+        }
         let entity = self
             .entities
             .get_mut(&entity_id)
@@ -1679,6 +1726,7 @@ impl GameSession {
         entity.condition_timers.push(ConditionTimer {
             condition,
             remaining_rounds: duration_rounds,
+            source_entity_id,
             end_of_turn_save,
         });
         self.ledger.append_event(
@@ -1689,9 +1737,43 @@ impl GameSession {
             serde_json::json!({
                 "condition": condition,
                 "duration_rounds": duration_rounds,
+                "source_entity_id": source_entity_id.map(|s| s.to_string()),
             }),
         );
         Ok(())
+    }
+
+    /// The recorded source creature of the given condition on this session —
+    /// the Frightened source of a fear effect, for instance — from its most
+    /// recent CONDITION_APPLIED ledger event carrying one. The LEDGER is the
+    /// authority (not the in-memory timer list) because that is exactly what a
+    /// safety rewind replays; unstamped legacy grants simply have no source and
+    /// no directional clause applies.
+    ///
+    /// A source that has since LEFT the board still resolves here when the
+    /// surviving ledger vouches for the grant: the fear outlasts the fleeing
+    /// source, and movement away from a departed creature is never "closer".
+    pub fn condition_source(&self, entity_id: &Uuid, condition: &Condition) -> Option<Uuid> {
+        let disc = std::mem::discriminant(condition);
+        self.ledger
+            .events
+            .iter()
+            .rev()
+            .filter(|e| !e.is_reverted && e.event_type == "CONDITION_APPLIED")
+            .filter(|e| e.actor_id == *entity_id)
+            .find(|e| {
+                e.payload
+                    .get("condition")
+                    .and_then(|c| c.as_str())
+                    .map(|name| condition_matches_name(disc, name))
+                    .unwrap_or(false)
+            })
+            .and_then(|e| {
+                e.payload
+                    .get("source_entity_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+            })
     }
 
     /// End-of-round lifecycle pass over every entity:
@@ -1833,6 +1915,32 @@ impl GameSession {
         let dx = to.0 - from.0;
         let dy = to.1 - from.1;
         let distance = (dx * dx + dy * dy).sqrt();
+
+        // SRD Frightened: "the creature can't willingly move closer to the
+        // source of its fear." Enforced against the source's LIVE position —
+        // the fear follows the creature, not the spot it was standing in when
+        // the spell landed. Unattributed fright (legacy grants predating
+        // source stamping, or sources that have since left the board) enforces
+        // nothing: a clause naming no one cannot be violated by anyone.
+        if self.entities[&entity_id].has_condition(&Condition::Frightened) {
+            let mover = &self.entities[&entity_id];
+            if let Some(source_id) = mover.frightened_source_of(self, &entity_id) {
+                if let Some(source) = self.entities.get(&source_id) {
+                    let old_gap = mover.distance_to_feet(source);
+                    // The destination's gap is computed against the source's
+                    // current position with the mover already hypothetically
+                    // moved — pure geometry, no second mutable borrow.
+                    let (sx, sy, sz) = source.position;
+                    let ndx = to.0 - sx;
+                    let ndy = to.1 - sy;
+                    let ndz = to.2 - sz;
+                    let new_gap = (ndx * ndx + ndy * ndy + ndz * ndz).sqrt();
+                    if new_gap < old_gap - 0.001 {
+                        return Err("FRIGHTENED_CANNOT_APPROACH".to_string());
+                    }
+                }
+            }
+        }
 
         // Adjacency snapshot BEFORE moving (5 ft adjacency in feet units).
         let adjacent_enemies_before: Vec<Uuid> = self
@@ -2309,6 +2417,123 @@ impl GameSession {
         for (id, level) in exhaustion_state {
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.set_exhaustion(level);
+                restored += 1;
+            }
+        }
+
+        // Timed-condition replay (iteration 19): a reverted CONDITION_APPLIED
+        // must un-grant its condition, or an X-card rewind past the fear
+        // effect would leave the victim frightened by a spell that never
+        // happened. Rebuild each entity's clock list from the surviving
+        // CONDITION_APPLIED history (chronological, last grant wins per
+        // condition variant), seeded first from the REVERTED grants' own
+        // payloads so entities with no earlier grant history end clean.
+        // Conditions granted OUTSIDE the timed pipeline (Grappled / Prone via
+        // the contest routes) are replayed further down from their own events
+        // and are excluded here — their CONDITION_APPLIED-equivalents carry
+        // different event types.
+        let mut surviving_timed: HashMap<Uuid, Vec<ConditionTimer>> = HashMap::new();
+        let mut reverted_timed: HashMap<Uuid, Vec<ConditionTimer>> = HashMap::new();
+        for ev in self.ledger.events.iter() {
+            if ev.event_type != "CONDITION_APPLIED" {
+                continue;
+            }
+            let Some(condition) = ev
+                .payload
+                .get("condition")
+                .and_then(|c| c.as_str())
+                .and_then(|name| {
+                    [
+                        Condition::Blinded,
+                        Condition::Charmed,
+                        Condition::Deafened,
+                        Condition::Frightened,
+                        Condition::Incapacitated,
+                        Condition::Invisible,
+                        Condition::Paralyzed,
+                        Condition::Petrified,
+                        Condition::Poisoned,
+                        Condition::Prone,
+                        Condition::Restrained,
+                        Condition::Stunned,
+                        Condition::Unconscious,
+                    ]
+                    .into_iter()
+                    .find(|rep| {
+                        serde_json::to_string(rep).unwrap_or_default().trim_matches('"') == name
+                    })
+                })
+            else {
+                continue;
+            };
+            let timer = ConditionTimer {
+                condition,
+                remaining_rounds: ev
+                    .payload
+                    .get("duration_rounds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                source_entity_id: ev
+                    .payload
+                    .get("source_entity_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                end_of_turn_save: None,
+            };
+            if ev.is_reverted {
+                reverted_timers_entry(&mut reverted_timed, ev.actor_id).push(timer);
+            } else {
+                surviving_timed.entry(ev.actor_id).or_default().push(timer);
+            }
+        }
+        // Apply: strip every timed condition whose ONLY backing was reverted
+        // (or that has no surviving grant at all), then re-arm the clocks of
+        // exactly what the surviving ledger still vouches for.
+        for (id, reverted) in reverted_timed {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                for timer in &reverted {
+                    let still_vouched = surviving_timed
+                        .get(&id)
+                        .map(|list| {
+                            list.iter().any(|t| {
+                                std::mem::discriminant(&t.condition)
+                                    == std::mem::discriminant(&timer.condition)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !still_vouched {
+                        entity.remove_condition(&timer.condition);
+                        // Drop the ghost clock too — the live timer list must
+                        // never outlive the ledger's vouching.
+                        let disc = std::mem::discriminant(&timer.condition);
+                        entity
+                            .condition_timers
+                            .retain(|t| std::mem::discriminant(&t.condition) != disc);
+                    }
+                }
+            }
+        }
+        for (id, mut timers) in surviving_timed {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                // Keep only the newest surviving timer per condition variant —
+                // re-applying the same condition replaces the older clock.
+                let mut seen: Vec<std::mem::Discriminant<Condition>> = Vec::new();
+                timers.retain(|t| {
+                    let disc = std::mem::discriminant(&t.condition);
+                    if seen.contains(&disc) {
+                        false
+                    } else {
+                        seen.push(disc);
+                        true
+                    }
+                });
+                entity.condition_timers.retain(|t| {
+                    !timers.iter().any(|fresh| {
+                        std::mem::discriminant(&fresh.condition)
+                            == std::mem::discriminant(&t.condition)
+                    })
+                });
+                entity.condition_timers.extend(timers);
                 restored += 1;
             }
         }
@@ -2867,9 +3092,17 @@ impl GameSession {
     }
 }
 
+/// HashMap entry helper for the timed-condition rewind replay: returns the
+/// existing vec for `id` or creates an empty one.
+fn reverted_timers_entry(
+    map: &mut HashMap<Uuid, Vec<ConditionTimer>>,
+    id: Uuid,
+) -> &mut Vec<ConditionTimer> {
+    map.entry(id).or_default()
+}
+
 /// Parses a `[x, y, z]` payload coordinate array into a position tuple.
-fn parse_payload_position(value: Option<&serde_json::Value>) -> Option<(f32, f32, f32)> {
-    let a = value?.as_array()?;
+fn parse_payload_position(value: Option<&serde_json::Value>) -> Option<(f32, f32, f32)> {    let a = value?.as_array()?;
     Some((
         a.first()?.as_f64()? as f32,
         a.get(1)?.as_f64()? as f32,
@@ -2886,6 +3119,38 @@ fn parse_contest_condition(value: Option<&serde_json::Value>) -> Option<Conditio
         Some("prone") => Some(Condition::Prone),
         _ => None,
     }
+}
+
+/// True when the serde name of a condition variant (as serialized into a ledger
+/// payload) names a condition with the given discriminant. Exhaustion's payload
+/// form is level-bearing, so it is matched by its bare-name prefix rather than
+/// an exact string.
+fn condition_matches_name(disc: std::mem::Discriminant<Condition>, name: &str) -> bool {
+    // Probe variants cheaply by serializing each discriminant's representative.
+    let representatives = [
+        Condition::Blinded,
+        Condition::Charmed,
+        Condition::Deafened,
+        Condition::Frightened,
+        Condition::Grappled,
+        Condition::Incapacitated,
+        Condition::Invisible,
+        Condition::Paralyzed,
+        Condition::Petrified,
+        Condition::Poisoned,
+        Condition::Prone,
+        Condition::Restrained,
+        Condition::Stunned,
+        Condition::Unconscious,
+    ];
+    for rep in representatives {
+        if std::mem::discriminant(&rep) == disc {
+            let rep_name = serde_json::to_string(&rep).unwrap_or_default();
+            return rep_name.trim_matches('"') == name;
+        }
+    }
+    // Exhaustion(level): match on the variant name regardless of payload level.
+    disc == std::mem::discriminant(&Condition::Exhaustion(0)) && name.starts_with("{\"exhaustion")
 }
 
 #[cfg(test)]

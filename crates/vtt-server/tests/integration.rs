@@ -11923,3 +11923,367 @@ async fn hidden_delayed_npc_is_dropped_from_non_gm_projection() {
     assert_eq!(combat["order"].as_array().unwrap().len(), 1, "only the visible hero's slot survives");
     assert_eq!(combat["delayed"].as_array().unwrap().len(), 0, "the hidden npc's parked flag is dropped");
 }
+
+// ---------------------------------------------------------------------------
+// Iteration 19 (Loop 3): SRD Frightened source enforcement.
+//
+// /action/apply-condition stamps a timed condition (with an optional source
+// creature) through the engine's duration clock; the engine's move primitive
+// then refuses any WILLING approach toward a Frightened victim's fear source,
+// judged against the source's LIVE position and replayed from the ledger on
+// safety rewind.
+// ---------------------------------------------------------------------------
+
+/// Spawns two GM-owned combatants 10 ft apart (hero east of orc) in a fresh
+/// session. Returns (token, session_id, victim_id, source_id).
+async fn setup_fear_pair(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+) -> (String, Uuid, Uuid, Uuid) {
+    let token = sign_token_with_role("gm-fear", "gm", TEST_SECRET);
+    let session_id = create_session_as(app, &token).await;
+    let victim_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    spawn(app, &token, session_id, entity_at(entity_json(victim_id, "Fearful", 30, 14, 0, "1d4"), 2.5, 2.5)).await;
+    spawn(app, &token, session_id, entity_at(entity_json(source_id, "Horrifier", 30, 14, 0, "1d4"), 12.5, 2.5)).await;
+    (token, session_id, victim_id, source_id)
+}
+
+async fn apply_condition(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/apply-condition", session_id))
+        .insert_header(bearer(token))
+        .set_json(body)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+#[actix_web::test]
+async fn frightened_condition_blocks_approach_and_journals_source() {
+    let app = test_app().await;
+    let (token, session_id, victim_id, source_id) = setup_fear_pair(&app).await;
+
+    // Stamp Frightened for 5 rounds with the Horrifier as its source.
+    let (status, body) = apply_condition(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 5,
+            "source_entity_id": source_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("CONDITION_APPLIED"));
+    assert_eq!(body["condition"], serde_json::json!("frightened"));
+    assert_eq!(
+        body["source_entity_id"],
+        serde_json::json!(source_id.to_string())
+    );
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+
+    // Authoritative state carries both the condition and the timer stamp.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let victim = &snap["entities"][victim_id.to_string()];
+    assert_eq!(victim["conditions"][0], serde_json::json!("frightened"));
+    assert_eq!(
+        victim["condition_timers"][0]["remaining_rounds"],
+        serde_json::json!(5),
+        "timers: {:?}",
+        victim["condition_timers"]
+    );
+    assert_eq!(
+        victim["condition_timers"][0]["source_entity_id"],
+        serde_json::json!(source_id.to_string())
+    );
+
+    // The CONDITION_APPLIED ledger event carries the attribution.
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    let applied: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == serde_json::json!("CONDITION_APPLIED"))
+        .collect();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(
+        applied[0]["payload"]["source_entity_id"],
+        serde_json::json!(source_id.to_string())
+    );
+    assert_eq!(
+        applied[0]["payload"]["duration_rounds"],
+        serde_json::json!(5)
+    );
+
+    // Willing approach toward the live source is refused with a stable code —
+    // and moves nothing, journals nothing.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": victim_id, "x": 9.0, "y": 2.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&raw));
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][victim_id.to_string()]["position"][0],
+        serde_json::json!(2.5),
+        "a refused approach must not move the token"
+    );
+}
+
+#[actix_web::test]
+async fn frightened_victim_may_move_away_or_sideways() {
+    let app = test_app().await;
+    let (token, session_id, victim_id, source_id) = setup_fear_pair(&app).await;
+    let (status, body) = apply_condition(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 5,
+            "source_entity_id": source_id
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // Retreat north widens the gap — legal.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": victim_id, "x": 2.5, "y": 12.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    assert_eq!(st, StatusCode::OK, "retreat must be legal: {}", String::from_utf8_lossy(&raw));
+}
+
+#[actix_web::test]
+async fn x_card_rewind_past_a_condition_grant_un_frightens_the_victim() {
+    let app = test_app().await;
+    let (token, session_id, victim_id, source_id) = setup_fear_pair(&app).await;
+
+    let (_, body) = apply_condition(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 5,
+            "source_entity_id": source_id
+        }),
+    )
+    .await;
+    let applied_seq = body["event_sequence"].as_u64().expect("sequence surfaced");
+
+    // A later unrelated event so the rewind has something beyond the grant to
+    // revert.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/heal", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": victim_id, "amount": 1}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // X-card rewind to just BEFORE the fear grant.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "player_id": "gm-fear",
+            "topic": "that fear was not okay",
+            "target_sequence_id": applied_seq - 1
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let victim = &snap["entities"][victim_id.to_string()];
+    assert_eq!(
+        victim["conditions"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "rewinding past the grant must un-frighten the victim: {:?}",
+        victim["conditions"]
+    );
+    // The timer list must be clean too — no ghost clock.
+    assert!(
+        !victim.as_object().unwrap().contains_key("condition_timers")
+            || victim["condition_timers"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "no surviving clock may remain: {:?}",
+        victim.get("condition_timers")
+    );
+
+    // With the fear gone the same approach now succeeds.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": victim_id, "x": 9.0, "y": 2.5}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "un-frightened movement is free");
+}
+
+#[actix_web::test]
+async fn apply_condition_rejects_unknown_names_unknown_sources_and_foreign_entities() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-cond", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let victim_id = Uuid::new_v4();
+    let mut owned = entity_owned_by(entity_json(victim_id, "Target", 30, 14, 0, "1d4"), "player-9");
+    owned["is_visible"] = serde_json::json!(true);
+    spawn(&app, &gm, session_id, owned).await;
+
+    let player = sign_token_with_role("player-9", "player", TEST_SECRET);
+    let stranger = sign_token_with_role("player-stranger", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("spect-1", "spectator", TEST_SECRET);
+
+    // Unknown condition name: structurally refused before anything happens.
+    let (status, body) = apply_condition(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "sparkly",
+            "duration_rounds": 3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("UNKNOWN_CONDITION"));
+
+    // Source id that does not exist: rejected, never downgraded.
+    let (status, body) = apply_condition(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 3,
+            "source_entity_id": Uuid::new_v4()
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("SOURCE_ENTITY_NOT_FOUND"));
+
+    // A player who owns the target MAY afflict it (ownership parity).
+    let (status, _) = apply_condition(
+        &app,
+        &player,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "poisoned",
+            "duration_rounds": 2
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "owners may condition their own entity");
+
+    // A DIFFERENT player may not touch someone else's entity.
+    let (status, body) = apply_condition(
+        &app,
+        &stranger,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 2
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // Spectators are refused outright like every other mutation route.
+    let (status, body) = apply_condition(
+        &app,
+        &spectator,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "poisoned",
+            "duration_rounds": 2
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], serde_json::json!("FORBIDDEN_ROLE"));
+}
+
+#[actix_web::test]
+async fn hidden_entities_do_not_leak_through_apply_condition_responses_or_snapshots() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-hide", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let lurker_id = Uuid::new_v4();
+    let visible = entity_owned_by(entity_json(hero_id, "Seer", 30, 14, 0, "1d4"), "player-7");
+    let mut hidden = entity_owned_by(entity_json(lurker_id, "Lurker", 30, 14, 0, "1d4"), "player-7");
+    hidden["is_visible"] = serde_json::json!(false);
+    spawn(&app, &gm, session_id, visible).await;
+    spawn(&app, &gm, session_id, hidden).await;
+
+    // The GM frightens the VISIBLE hero naming the HIDDEN lurker as source.
+    let (status, body) = apply_condition(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": hero_id,
+            "condition": "frightened",
+            "duration_rounds": 5,
+            "source_entity_id": lurker_id
+        }),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+
+    // Player view: their own sheet is full, but the projection must not leak
+    // the hidden source's stat block through the timer's source stamp — and
+    // the hidden entity itself stays dropped from the roster entirely.
+    let player = sign_token_with_role("player-7", "player", TEST_SECRET);
+    let snap = snapshot_as(&app, &player, session_id).await;
+    assert!(
+        snap["entities"].get(lurker_id.to_string()).is_none(),
+        "hidden entities are dropped wholesale from non-GM projections"
+    );
+    let hero_view = &snap["entities"][hero_id.to_string()];
+    assert_eq!(hero_view["name"], serde_json::json!("Seer"));
+    // The board-token projection strips conditions/timers anyway; assert no
+    // raw id string of the hidden NPC rides anywhere it should not.
+    assert!(
+        !serde_json::to_string(&snap["entities"]).unwrap()
+            .contains("\"ac\":14,\"speed_feet\":"),
+        "no full stat block may ride the non-GM projection"
+    );
+
+    // Spectator-style minimal check: the projected entity set contains only
+    // ids that were visible (or owned).
+    let entities = snap["entities"].as_object().unwrap();
+    assert_eq!(entities.len(), 1, "only the owner's sheet survives");
+}

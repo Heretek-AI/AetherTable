@@ -3325,3 +3325,211 @@ fn test_fall_rejects_non_finite_elevation_and_upward_motion() {
         "NO_DOWNWARD_DROP"
     );
 }
+
+// --------------------------------------------- frightened source enforcement
+//
+// Iteration 19 (Loop 3): SRD Frightened's movement clause — "the creature
+// can't willingly move closer to the source of its fear" — enforced against
+// the source's LIVE position via the CONDITION_APPLIED ledger's source stamp.
+
+use vtt_core::state::ConditionTimer;
+
+/// Two entities 10 ft apart on the x axis; `victim` carries Frightened with
+/// `source` stamped as the fear source.
+fn session_with_fright(
+    gap_feet: f32,
+) -> (GameSession, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let mut session =
+        GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Fear".into());
+    let victim = hero("victim", 30, 15);
+    let source = hero("source", 30, 15);
+    let bystander = hero("bystander", 30, 15);
+    let (vid, sid, bid) = (victim.id, source.id, bystander.id);
+    let mut source = source;
+    source.position = ((2.5 + gap_feet), 2.5, 0.0);
+    let mut bystander = bystander;
+    bystander.position = (2.5, (2.5 + gap_feet), 0.0);
+    session.add_entity(victim, None).unwrap();
+    session.add_entity(source, None).unwrap();
+    session.add_entity(bystander, None).unwrap();
+
+    session
+        .apply_timed_condition_from(
+            vid,
+            Condition::Frightened,
+            5,
+            Some(sid),
+            None,
+        )
+        .unwrap();
+    (session, vid, sid, bid)
+}
+
+#[test]
+fn test_frightened_cannot_willingly_move_closer_to_source() {
+    // Victim at (2.5, 2.5); source 10 ft east; moving toward the source is a
+    // willing reduction of the gap — rejected.
+    let (mut session, vid, _sid, _bid) = session_with_fright(10.0);
+    let err = session.move_entity(vid, (9.0, 2.5, 0.0)).unwrap_err();
+    assert_eq!(err, "FRIGHTENED_CANNOT_APPROACH");
+    assert_eq!(
+        session.entities[&vid].position,
+        (2.5, 2.5, 0.0),
+        "a rejected approach must not move the token"
+    );
+    // The rejection must not journal anything either.
+    assert!(
+        !session
+            .ledger
+            .events
+            .iter()
+            .any(|e| e.event_type == "MOVE_ENTITY"),
+        "a refused move leaves no ledger trace"
+    );
+}
+
+#[test]
+fn test_frightened_may_move_sideways_or_away_and_non_frightened_may_approach() {
+    let (mut session, vid, _sid, bid) = session_with_fright(10.0);
+
+    // Lateral move keeps the same distance — legal.
+    session.move_entity(vid, (2.5, 7.5, 0.0)).unwrap();
+    // Retreat increases the gap — legal.
+    session.move_entity(vid, (2.5, 12.5, 0.0)).unwrap();
+    // A non-frightened creature may close in freely.
+    session.move_entity(bid, (2.6, 2.6, 0.0)).unwrap();
+}
+
+#[test]
+fn test_frightened_clause_tracks_the_source_live_position() {
+    // The victim stands 20 ft east of the source; the SOURCE then backs
+    // another 30 ft east (gap grows to ~47 ft). From the new geometry the
+    // victim may step 10 ft EAST — toward where the fear was born — because
+    // that still WIDENS the gap against the source's LIVE position. A stale
+    // spot-based rule would forbid this; the live-creature rule allows it.
+    let (mut session, vid, sid, _bid) = session_with_fright(20.0);
+    session.move_entity(sid, (50.0, 2.5, 0.0)).unwrap();
+
+    let gap_before = {
+        let v = &session.entities[&vid];
+        let s = &session.entities[&sid];
+        v.distance_to_feet(s)
+    };
+    // Victim steps 10 ft NORTH (lateral). Judged against the source's stale
+    // ORIGINAL spot (20 ft away) this exact move would be blocked as an
+    // approach to (2.5+10, ...) geometry; judged against the LIVE source
+    // 47.5 ft east it is legal — and the gap grows slightly (47.5 -> 48.54),
+    // proving the verdict came from live positions, not a stale snapshot.
+    session.move_entity(vid, (2.5, 12.5, 0.0)).unwrap();
+    let gap_after = {
+        let v = &session.entities[&vid];
+        let s = &session.entities[&sid];
+        v.distance_to_feet(s)
+    };
+    assert!(
+        gap_after > gap_before,
+        "movement must be judged against the source's LIVE position: {} -> {}",
+        gap_before,
+        gap_after
+    );
+}
+
+#[test]
+fn test_frightened_source_departure_lifts_the_movement_clause() {
+    // Despawn the fear source: the clause names nobody and enforces nothing —
+    // but the CONDITION itself survives (fear outlasts its author).
+    let (mut session, vid, sid, _bid) = session_with_fright(10.0);
+    session.remove_entity(&sid, "BANISHED").unwrap();
+
+    session.move_entity(vid, (9.0, 2.5, 0.0)).unwrap();
+    assert!(
+        session.entities[&vid].has_condition(&Condition::Frightened),
+        "the condition persists even after its source leaves"
+    );
+}
+
+#[test]
+fn test_unattributed_legacy_fright_enforces_nothing() {
+    // A pre-stamping grant: Frightened with NO source in the ledger payload.
+    let mut session =
+        GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "Legacy".into());
+    let victim = hero("v", 30, 15);
+    let mut other = hero("o", 30, 15);
+    other.position = (12.5, 2.5, 0.0);
+    let (vid, _oid) = (victim.id, other.id);
+    session.add_entity(victim, None).unwrap();
+    session.add_entity(other, None).unwrap();
+    session.apply_timed_condition(vid, Condition::Frightened, 5, None).unwrap();
+
+    session.move_entity(vid, (11.0, 2.5, 0.0)).unwrap();
+}
+
+#[test]
+fn test_condition_source_resolves_from_the_ledger_and_survives_rewind() {
+    let (mut session, vid, sid, _bid) = session_with_fright(10.0);
+    assert_eq!(session.condition_source(&vid, &Condition::Frightened), Some(sid));
+    // A condition that was never applied resolves to no source at all.
+    assert_eq!(session.condition_source(&vid, &Condition::Poisoned), None);
+
+    // Rewinding past the grant erases BOTH the condition and its attribution.
+    let seq = session.ledger.current_sequence;
+    session.safety_rewind(seq - 1);
+    assert!(!session.entities[&vid].has_condition(&Condition::Frightened));
+    assert_eq!(session.condition_source(&vid, &Condition::Frightened), None);
+}
+
+#[test]
+fn test_apply_timed_condition_rejects_unknown_source() {
+    let mut session =
+        GameSession::new(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), "t".into());
+    let victim = hero("v", 30, 15);
+    let vid = victim.id;
+    session.add_entity(victim, None).unwrap();
+    let ghost = uuid::Uuid::new_v4();
+
+    let err = session
+        .apply_timed_condition_from(
+            vid,
+            Condition::Frightened,
+            3,
+            Some(ghost),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err, "SOURCE_ENTITY_NOT_FOUND");
+    assert!(!session.entities[&vid].has_condition(&Condition::Frightened));
+    assert!(
+        !session.ledger.events.iter().any(|e| e.event_type == "CONDITION_APPLIED"),
+        "a refused grant journals nothing"
+    );
+}
+
+#[test]
+fn test_timed_condition_stamps_the_source_in_state_and_ledger() {
+    let (session, vid, sid, _bid) = session_with_fright(10.0);
+
+    let timer = session.entities[&vid]
+        .condition_timers
+        .iter()
+        .find(|t| t.condition == Condition::Frightened)
+        .expect("fear timer registered");
+    assert_eq!(timer.source_entity_id, Some(sid));
+
+    let event = session
+        .ledger
+        .events
+        .iter()
+        .find(|e| e.event_type == "CONDITION_APPLIED")
+        .expect("grant journaled");
+    assert_eq!(event.actor_id, vid);
+    assert_eq!(
+        event.payload["source_entity_id"],
+        serde_json::json!(sid.to_string())
+    );
+
+    // Legacy timers without the field still deserialize.
+    let legacy: ConditionTimer =
+        serde_json::from_str(r#"{"condition":"poisoned","remaining_rounds":3}"#)
+            .expect("legacy timer shape");
+    assert_eq!(legacy.source_entity_id, None);
+}

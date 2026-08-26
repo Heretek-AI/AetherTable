@@ -3996,6 +3996,118 @@ async fn revoke_inspiration_route(
     )
 }
 
+// --- Timed condition application ------------------------------------------------
+//
+// SRD duration lifecycle: conditions with a round countdown (Hold Person,
+// Fear, Ray of Enfeeblement, a GM's "poisoned for 3 rounds" fiat) are applied
+// THROUGH the engine's clock so the existing end-of-round tick (countdown,
+// optional repeat save, expiry, CONDITION_EXPIRED journal) owns the whole
+// story. The engine journals CONDITION_APPLIED itself, so safety rewinds
+// replay grants exactly like every other mechanic.
+//
+// RBAC mirrors Dodge/Grapple/Help: `may_mutate_session` plus ownership of the
+// TARGET entity — afflicting a combatant is a mutation OF that combatant's
+// sheet, so a player may condition only their own creature and the GM may
+// afflict anyone. Spectators are rejected outright.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyConditionReq {
+    pub entity_id: Uuid,
+    /// Serde name of the condition variant ("frightened", "poisoned",
+    /// "restrained", ...). Exhaustion travels as `{"exhaustion": level}`.
+    pub condition: serde_json::Value,
+    pub duration_rounds: u32,
+    /// Creature the condition came from (the Frightened source, the grappler).
+    /// Optional; naming an unknown entity is rejected, never downgraded.
+    #[serde(default)]
+    pub source_entity_id: Option<Uuid>,
+    /// Optional "save ends" configuration re-rolled at each end-of-round tick.
+    #[serde(default)]
+    pub end_of_turn_save: Option<vtt_core::state::EndOfTurnSave>,
+}
+
+/// Parses the request's `condition` value back into a typed [`Condition`] by
+/// round-tripping through the engine's own serde representation. Unknown
+/// names fail closed with `UNKNOWN_CONDITION`.
+fn parse_condition_value(value: &serde_json::Value) -> Result<Condition, String> {
+    serde_json::from_value::<Condition>(value.clone())
+        .map_err(|_| "UNKNOWN_CONDITION".to_string())
+}
+
+async fn resolve_apply_condition(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<ApplyConditionReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Malformed condition names are refused BEFORE any state is touched.
+    let condition = match parse_condition_value(&req.condition) {
+        Ok(c) => c,
+        Err(e) => return reject(&data, 422, &e, "unrecognized condition name"),
+    };
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity_id does not exist in this session");
+        }
+        let target_owner = session
+            .entities
+            .get(&req.entity_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !may_control_entity(target_owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+        if let Some(src) = req.source_entity_id {
+            if !session.entities.contains_key(&src) {
+                return reject(
+                    &data,
+                    404,
+                    "SOURCE_ENTITY_NOT_FOUND",
+                    "source_entity_id does not exist in this session",
+                );
+            }
+        }
+
+        match session.apply_timed_condition_from(
+            req.entity_id,
+            condition,
+            req.duration_rounds,
+            req.source_entity_id,
+            req.end_of_turn_save.clone(),
+        ) {
+            Ok(()) => {
+                data.count_valid();
+                HttpResponse::Ok().json(serde_json::json!({
+                    "status": "CONDITION_APPLIED",
+                    "entity_id": req.entity_id.to_string(),
+                    "condition": condition,
+                    "duration_rounds": req.duration_rounds,
+                    "source_entity_id": req.source_entity_id.map(|s| s.to_string()),
+                    "event_sequence": session.ledger.current_sequence,
+                }))
+            }
+            Err(e) => {
+                let status = match e.as_str() {
+                    "ENTITY_NOT_FOUND" | "SOURCE_ENTITY_NOT_FOUND" => 404u16,
+                    _ => 409,
+                };
+                reject(&data, status, &e, "condition application rejected by the rules engine")
+            }
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
 // --- Damage-triggered concentration automation (backlog 4.11) -----------------
 /// One server-side damage-triggered concentration save, serialized additively
 /// into action responses as `concentration_check` when a check was triggered.
@@ -7011,6 +7123,7 @@ pub fn configure_app_with(
                         .route("/rest", web::post().to(take_rest))
                         .route("/inspiration/grant", web::post().to(grant_inspiration_route))
                         .route("/inspiration/revoke", web::post().to(revoke_inspiration_route))
+                        .route("/action/apply-condition", web::post().to(resolve_apply_condition))
                         .route("/safety/x-card", web::post().to(trigger_safety_rewind))
                         .route("/sync", web::get().to(ws_sync)),
                 ),
