@@ -510,4 +510,12 @@ TDD red-first → gates → commit → push → row below.
 ### L3.5 — 2532120 — refactor(gateway): generic MediaGatewayClient + capability discovery — pytest 1082
 ### L3.6 — 29ea23a — feat(gateway): narration TTS + session narration log — pytest 1110
 ### L3.4 — 9286063 — feat(client): GM-gated SFX ambience panel — vitest 438
-### L3.3 — this wave — feat(client): AI token art on the CRDT board — vitest 438
+### L3.3 — 4ffd2d5 — feat(client): AI token art on the CRDT board — vitest
+### L3.7 — d2da5dc — feat(client): server-side STT engine option — vitest
+### L3.8 — e58ee13 — feat(client): narration playback UI on the media gateway — vitest
+### L3.9 — c8af95a + 9149678 — feat(client): atmosphere-reactive board backdrop — vitest
+### L3.10 — 9dedfe4 — fix(gateway): media self-audit (cache headers, caps, slash alias) — pytest
+### L3.11 — 88d1a8b — feat(client): free-form dice roller w/ local notation eval — vitest 573
+### L3.12 — 13e49cf — feat(gateway): DMG encounter balance endpoint — pytest 1151
+### L3.14 — bae055f — feat(client): character vault gallery with deploy/delete — vitest 588
+### L3.13 — d1ff6c5 — feat(client): GM-visibility hardening for balance strip — vitest 588
