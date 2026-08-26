@@ -414,3 +414,16 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 80 — 759594d — feat(wfc): seeded loot containers on generated maps (P8) — cargo 440/20
 ### Iteration 81 — this wave — feat(gateway): campaign sim OA + ready/release reactions (P5) — pytest 989
 ### Iteration 82 — 70533c5 — fix(gateway): ready trigger field rename + release proxy
+### Iteration 86+88b — f2994e8 — feat(engine): SRD short rest w/ hit dice + move OA projection (A5 F3) — cargo 452/21
+### Iteration 87 — 7526b52 — fix(gateway): autosave standing verification (A5 F1 blocker) — pytest 996
+### Iteration 88a — 3799a73 — fix(gateway): player-tier ledger summaries (A5 F2) — pytest 1006
+
+## Audit sweep A5 (~it.83) — one blocker + two ship-blockers, all closed
+
+F1 fabricated-GM autosave authority + unverified policy standing (it.87,
+fail-closed lobby-membership derivation, fresh re-verification per cycle);
+F2 player-tier ledger fallback dumped raw payloads of new event types
+(it.88a, modeled summaries); F3 move wire named hidden adjacent enemies
+(it.88b, per-role projection). Quality debt queued: F4 loot containers
+not wired to the wire end-to-end, F5 tier-3 rarity gating, F6 explosion
+cap accounting, F7 pending-OA combat-boundary sweep.
