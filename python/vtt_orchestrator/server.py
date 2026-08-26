@@ -3905,11 +3905,18 @@ async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(
 def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:
     """Converts a bundle token into an engine AddEntity payload. The engine's
     request flattens the EntityState with an optional `ingress` sibling;
-    ingress gating is validated server-side (the verified flag is advisory)."""
+    ingress gating is validated server-side (the verified flag is advisory).
+
+    UNITS: bundle tokens carry GRID-CELL coordinates (the board convention),
+    but EntityState.position is WORLD FEET ("world units == feet",
+    vtt-core/src/state.rs distance_to_feet). Cell centers convert as
+    (cell + 0.5) * 5.0 ft — the same center-offset the client board uses
+    when converting back for rendering."""
     entity_id = engine_client._coerce_uuid(str(tok.get("id") or tok.get("name", "token")))
     hp = int(tok.get("hp", tok.get("max_hp", 10)) or 10)
-    x = float(tok.get("x", 2.5) or 2.5)
-    y = float(tok.get("y", 2.5) or 2.5)
+    _BUNDLE_CELL_SIZE_FEET = 5.0  # matches import route's cell_size_feet
+    x = (float(tok.get("x", 0.0) or 0.0) + 0.5) * _BUNDLE_CELL_SIZE_FEET
+    y = (float(tok.get("y", 0.0) or 0.0) + 0.5) * _BUNDLE_CELL_SIZE_FEET
     return {
         "id": entity_id,
         "compendium_id": str(tok.get("compendium_id", "bundle_token")),
