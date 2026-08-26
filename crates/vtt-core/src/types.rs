@@ -145,6 +145,14 @@ impl Condition {
         )
     }
 
+    /// SRD Restrained: "Disadvantage on Dexterity saving throws." Distinct
+    /// from [`Self::fails_str_dex_saves`] (an auto-fail, not a roll penalty)
+    /// and from [`Self::inflicts_disadvantage_on_attacks`] — the save clause is
+    /// its own line of the Restrained entry, so it gets its own helper.
+    pub fn inflicts_disadvantage_on_dex_saves(&self) -> bool {
+        matches!(self, Condition::Restrained)
+    }
+
     pub fn grants_auto_crit_within_5ft(&self, distance_feet: f32) -> bool {
         matches!(self, Condition::Paralyzed | Condition::Unconscious) && distance_feet <= 5.0
     }

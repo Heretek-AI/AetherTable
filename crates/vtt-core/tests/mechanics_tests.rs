@@ -1574,6 +1574,69 @@ fn test_grappled_budget_seeding_and_move_entity_reject_movement() {
 }
 
 #[test]
+fn test_restrained_condition_reduces_effective_speed_to_zero() {
+    // SRD 5.1 Restrained: "Speed becomes 0." Restrained shares Grappled's
+    // speed clause (plus the attack/save clauses), so the speed chokepoint
+    // (`effective_speed_feet`) must honour it — otherwise a webbed creature
+    // walks out of the web at full speed.
+    let mut e = hero("webbed_scout", 30, 15);
+    assert_eq!(e.effective_speed_feet(), 30.0, "unrestrained baseline");
+
+    e.add_condition(Condition::Restrained);
+    assert_eq!(
+        e.effective_speed_feet(),
+        0.0,
+        "SRD Restrained zeroes effective speed"
+    );
+
+    // The condition dropping (web burned away, spell ends) restores full speed.
+    e.remove_condition(&Condition::Restrained);
+    assert_eq!(e.effective_speed_feet(), 30.0, "freed restores full speed");
+}
+
+#[test]
+fn test_restrained_budget_seeding_and_move_entity_reject_movement() {
+    let mut session = session_with_pair();
+    let id = *session.entities.keys().next().unwrap();
+    session
+        .entities
+        .get_mut(&id)
+        .unwrap()
+        .add_condition(Condition::Restrained);
+
+    let mut dice = DiceEngine::with_seed(6);
+    session.advance_round(&mut dice);
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 0.0,
+        "round refresh must seed a zero budget while restrained"
+    );
+
+    let err = session.move_entity(id, (2.6, 2.5, 0.0)).unwrap_err();
+    assert!(err.starts_with("MOVE_BUDGET_EXCEEDED"), "got: {}", err);
+
+    // Dash cannot buy movement out of a restraint either.
+    let dash = session.entities.get_mut(&id).unwrap().take_dash();
+    assert!(dash.is_ok(), "dash itself is legal, but:");
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 0.0,
+        "a restrained creature dashes for 0 ft"
+    );
+
+    // Grappled and Restrained stack to the same zero; dropping one keeps speed
+    // pinned at 0 until both are gone.
+    let mut e = hero("double_bound", 30, 15);
+    e.add_condition(Condition::Grappled);
+    e.add_condition(Condition::Restrained);
+    assert_eq!(e.effective_speed_feet(), 0.0);
+    e.remove_condition(&Condition::Grappled);
+    assert_eq!(
+        e.effective_speed_feet(),
+        0.0,
+        "still restrained after escaping the grapple"
+    );
+}
+
+#[test]
 fn test_exhaustion_level_6_kills_the_entity() {
     let mut e = hero("collapsed", 12, 15);
     e.set_exhaustion(6);

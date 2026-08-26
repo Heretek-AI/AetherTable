@@ -581,11 +581,12 @@ impl EntityState {
     /// Speed as modified by conditions: SRD Grappled zeroes it outright
     /// (see [`crate::actions::GrappleResolution`] — a grapple applies
     /// `Condition::Grappled`, NOT Restrained, and "its speed becomes 0"),
-    /// exhaustion halves it at level >= 2 and zeroes it at level >= 5.
-    /// All movement-budget seeding must use THIS value instead of the raw
-    /// `speed_feet`.
+    /// SRD Restrained zeroes it too ("Speed becomes 0" — the heavier sibling of
+    /// Grappled, e.g. from a Web or an Entangle), and exhaustion halves it at
+    /// level >= 2 and zeroes it at level >= 5. All movement-budget seeding must
+    /// use THIS value instead of the raw `speed_feet`.
     pub fn effective_speed_feet(&self) -> f32 {
-        if self.has_condition(&Condition::Grappled) {
+        if self.has_condition(&Condition::Grappled) || self.has_condition(&Condition::Restrained) {
             return 0.0;
         }
         match self.exhaustion_level() {

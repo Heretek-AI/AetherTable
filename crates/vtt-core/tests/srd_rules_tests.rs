@@ -129,6 +129,51 @@ fn test_srd_conditions_and_auto_crit_mechanics() {
 }
 
 #[test]
+fn test_srd_restrained_condition_clauses() {
+    // SRD 5.1 Restrained, clause by clause:
+    // - "Attack rolls against the creature have advantage." (no range limit,
+    //   unlike Prone's within-5ft rule)
+    // - "The creature's attack rolls have disadvantage."
+    // - "The creature has disadvantage on Dexterity saving throws."
+    // - "Speed becomes 0." (covered by the effective_speed tests in
+    //   mechanics_tests.rs; asserted here via the helper contract only.)
+    let restrained = Condition::Restrained;
+    assert!(
+        restrained.grants_advantage_to_attacker(5.0),
+        "attackers get advantage in melee"
+    );
+    assert!(
+        restrained.grants_advantage_to_attacker(120.0),
+        "attack advantage is NOT limited to 5 ft"
+    );
+    assert!(restrained.inflicts_disadvantage_on_attacks());
+
+    // The save clause is its own helper (added this iteration) and must not
+    // leak into the auto-fail or attack-disadvantage semantics.
+    assert!(
+        restrained.inflicts_disadvantage_on_dex_saves(),
+        "Restrained imposes disadvantage on Dex saves"
+    );
+    assert!(!restrained.fails_str_dex_saves(), "disadvantage != auto-fail");
+
+    // No other condition carries the Dex-save disadvantage.
+    for c in [
+        Condition::Grappled,
+        Condition::Blinded,
+        Condition::Poisoned,
+        Condition::Prone,
+        Condition::Frightened,
+        Condition::Exhaustion(6),
+    ] {
+        assert!(
+            !c.inflicts_disadvantage_on_dex_saves(),
+            "{:?} must not impose Dex-save disadvantage",
+            c
+        );
+    }
+}
+
+#[test]
 fn test_srd_attack_resolution() {
     // 1. Natural 20 is always Critical Hit with 2x damage dice multiplier
     let nat20_res = ActionResolver::resolve_attack(20, 3, 25, &[], &[], 10.0);
