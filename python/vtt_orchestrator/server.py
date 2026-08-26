@@ -6803,6 +6803,225 @@ async def foundry_import_preview(token: str = Depends(_require_auth)):
     )
 
 
+# --- Session event timeline (Loop 3, iteration 26) ---------------------------
+#
+# GET  /api/v1/sessions/{id}/timeline — merged feed of engine ledger events
+#                                      and narrative chat messages, paginated
+#                                      by cursor.
+# POST /api/v1/sessions/{id}/chat     — append one message to the session's
+#                                      narrative log (anchors the timeline's
+#                                      narrative side; the React chat is still
+#                                      client-local until that bridge ships).
+#
+# Authorization mirrors the safety boundaries contract: the gateway's
+# authoritative session-existence data IS the lobby binding (host launch
+# wrote ``engine_session_id`` onto the lobby record). Sessions with no
+# binding are SESSION_NOT_FOUND (404) for everyone — uniform answer regardless
+# of role so the route cannot be probed as an existence oracle. Non-staff
+# outsiders (authenticated but not a participant) get 403
+# TIMELINE_NOT_A_PARTICIPANT.
+
+from .timeline import (
+    DEFAULT_LIMIT as _TIMELINE_DEFAULT_LIMIT,
+    encode_cursor as _timeline_encode_cursor,
+    filter_after_cursor as _timeline_filter_after_cursor,
+    format_engine_event as _timeline_format_engine_event,
+    format_narrative_message as _timeline_format_narrative_message,
+    merge_timeline as _timeline_merge,
+    project_timeline_entry as _timeline_project_entry,
+)
+
+
+class SessionChatAppendRequest(BaseModel):
+    """Body for POST /api/v1/sessions/{id}/chat."""
+
+    content: str = Field(..., min_length=1, max_length=2000)
+    channel: Literal["public", "gm", "ooc", "system"] = "public"
+
+
+async def _session_timeline_gate(
+    session_id: str, token: str
+) -> Dict[str, str]:
+    """Shared auth gate for the timeline and chat-append routes.
+
+    Returns the verified actor when authorized; raises HTTPException(404) on
+    an unknown session and 403 on an authenticated outsider.
+    """
+    actor = _caller_actor(token)
+    bound_lobby = await storage_backend.get_lobby_by_engine_session(session_id)
+    if bound_lobby is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "SESSION_NOT_FOUND",
+                "message": (
+                    f"No table is bound to engine session {session_id}; "
+                    "the timeline attaches to launched sessions."
+                ),
+            },
+        )
+    is_staff = actor.get("role", "") in ("gm", "admin")
+    if not is_staff and not await _caller_is_session_participant(
+        actor["user_id"], session_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "TIMELINE_NOT_A_PARTICIPANT",
+                "message": (
+                    "The session timeline is visible only to this session's "
+                    "participants (lobby members) and GM/admin."
+                ),
+            },
+        )
+    return actor
+
+
+@app.post("/api/v1/sessions/{session_id}/chat")
+async def append_session_chat_message(
+    session_id: str,
+    req: SessionChatAppendRequest,
+    token: str = Depends(_require_auth),
+):
+    """Append one chat message to a session's narrative log.
+
+    Iteration 26 (Loop 3): the React chat lives in client-local state today
+    and ships no wire protocol, so this endpoint is the gateway-side anchor
+    of the timeline's narrative stream. Once a future iteration wires the
+    client to mirror local messages here, this route is already in place;
+    until then, it stays ready for tests and for any server-side narrator
+    that wants to append directly.
+
+    Authorization: the same participant-or-staff gate as the timeline; an
+    unknown session is 404 (not 403) so the route cannot be used as an
+    existence oracle.
+    """
+    actor = await _session_timeline_gate(session_id, token)
+    role = actor.get("role", "player")
+    # Players are never allowed to broadcast on the GM channel — the
+    # client may tag local whispers freely, but the server-side anchor
+    # refuses them so the timeline cannot be seeded with forged GM lines.
+    if req.channel == "gm" and role not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "CHAT_CHANNEL_FORBIDDEN",
+                "message": "Only GM/admin may post on the gm channel.",
+            },
+        )
+    display_name = actor.get("user_id")
+    profile = await _profile_of(actor["user_id"])
+    if isinstance(profile, dict):
+        display_name = profile.get("displayName") or display_name
+    record = await storage_backend.append_chat_message(
+        session_id,
+        actor["user_id"],
+        str(display_name or actor["user_id"]),
+        role,
+        req.channel,
+        req.content,
+    )
+    return record
+
+
+@app.get("/api/v1/sessions/{session_id}/timeline")
+async def session_timeline(
+    session_id: str,
+    cursor: Optional[str] = Query(None),
+    limit: int = Query(_TIMELINE_DEFAULT_LIMIT, ge=1, le=500),
+    token: str = Depends(_require_auth),
+):
+    """Merged engine + narrative timeline for one session, paginated by cursor.
+
+    Combines the engine ledger events (authoritative combat/mechanics stream)
+    with the session's narrative chat log and sorts by creation time.
+    Pagination is by an opaque cursor of ``<created_at_ms>:<sequence_id>``
+    pointing at the LAST seen entry on the previous page.
+
+    Projection rules (delegated to :mod:`vtt_orchestrator.timeline`):
+
+    * GM / admin: verbatim. Hidden entities surface as their real name;
+      private channels surface with content intact.
+    * Player: public events stay verbatim; events whose ``actor_id`` or
+      resolved target references a hidden entity surface ``[Unknown]`` and
+      no detail. Private (gm/whisper) chat lines collapse to
+      ``Something happens`` so the player knows something was said but
+      learns nothing of substance.
+    * Spectator: private channels drop entirely (``None``); hidden entities
+      collapse like the player tier.
+
+    Hidden-entity collapse honors the engine's ``is_visible`` flag — an
+    absent flag defaults to visible (engine contract); only an explicit
+    ``False`` hides the entity. The same convention the existing entity
+    projection matrix on ``/api/v1/engine/session-state`` uses.
+    """
+    actor = await _session_timeline_gate(session_id, token)
+    role = actor.get("role", "player")
+    privileged = role in ("gm", "admin")
+    redact_numbers = role not in _PLAYER_VISIBLE_ROLES
+
+    # Engine ledger is authoritative for combat events. Fetched via the same
+    # proxy path as /api/v1/engine/session-state so the engine's RBAC
+    # authorizes the real participant (a player cannot see entities they
+    # don't own through this surface either).
+    raw = await _engine_call(
+        engine_client.engine_request(
+            "GET",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(session_id)}",
+            actor=actor,
+        )
+    )
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=502, detail="ENGINE_PAYLOAD_INVALID")
+    entities = raw.get("entities") if isinstance(raw.get("entities"), dict) else {}
+    ledger_events: List[Dict[str, Any]] = []
+    ledger = raw.get("ledger")
+    if isinstance(ledger, dict) and isinstance(ledger.get("events"), list):
+        ledger_events = [e for e in ledger["events"] if isinstance(e, dict)]
+
+    engine_entries = [
+        _timeline_format_engine_event(
+            e,
+            roster=entities,
+            privileged=privileged,
+            redact_numbers=redact_numbers,
+        )
+        for e in ledger_events
+    ]
+
+    # Narrative stream from gateway storage. Append-only per-session
+    # monotonic counter; list_chat_messages returns oldest-first.
+    chat_records = await storage_backend.list_chat_messages(session_id)
+    narrative_entries = [
+        _timeline_format_narrative_message(m) for m in chat_records
+    ]
+
+    merged = _timeline_merge(engine_entries, narrative_entries)
+
+    viewer_user_id: Optional[str] = actor.get("user_id")
+    projected: List[Dict[str, Any]] = []
+    for entry in merged:
+        projected_entry = _timeline_project_entry(
+            entry,
+            role=role,
+            viewer_user_id=viewer_user_id,
+            roster=entities,
+        )
+        if projected_entry is not None:
+            projected.append(projected_entry)
+
+    page = _timeline_filter_after_cursor(projected, cursor=cursor, limit=limit)
+    next_cursor: Optional[str] = None
+    if len(page) == limit:
+        next_cursor = _timeline_encode_cursor(page[-1])
+    return {
+        "session_id": session_id,
+        "entries": page,
+        "next_cursor": next_cursor,
+        "has_more": next_cursor is not None,
+    }
+
+
 def start_server():
     uvicorn.run(app, host="0.0.0.0", port=8000)
 

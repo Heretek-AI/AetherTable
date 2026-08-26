@@ -164,6 +164,26 @@ CREATE TABLE IF NOT EXISTS narrative_state.narrations (
 
 CREATE INDEX IF NOT EXISTS idx_narrations_session_created
     ON narrative_state.narrations (session_id, created_at DESC);
+
+-- Per-session chat messages (Loop 3, iteration 26). Anchors the session
+-- event timeline: narrative messages share the merged feed alongside the
+-- engine ledger. Sequence numbers are PER-SESSION monotonic so the timeline
+-- can mix engine (``e_<n>``) and narrative (``n_<n>``) ids without colliding.
+-- channel is text rather than an enum so the future client/server convention
+-- can grow (``ooc``, ``whisper``, …) without a schema migration.
+CREATE TABLE IF NOT EXISTS narrative_state.session_chat_messages (
+    message_id   BIGSERIAL PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT 'player',
+    channel      TEXT NOT NULL DEFAULT 'public',
+    content      TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_chat_messages_session
+    ON narrative_state.session_chat_messages (session_id, message_id);
 """
 
 #: Bound on the stored narration text. The full script goes to the TTS
@@ -197,6 +217,11 @@ class MemoryStore:
         # Spoken-narration log (Loop 3, iteration 6), newest-last insertion
         # order; list_narrations sorts per session on read.
         self.narrations: List[Dict[str, Any]] = []
+        # Per-session chat messages (Loop 3, iteration 26), ordered append;
+        # the timeline endpoint paginates after a cursor over the merged
+        # engine+narrative feed. Newest-last insertion order, list_chat
+        # filters per session.
+        self.chat_messages: List[Dict[str, Any]] = []
         # Periodic autosave policy + progress (iteration 77), keyed by
         # (owner_user_id, engine_session_id). Progress is deliberately separate
         # from the policy so disabling a policy does not erase the movement
@@ -588,6 +613,40 @@ class MemoryStore:
         ]
         rows.sort(key=lambda n: n["created_at"], reverse=True)
         return [dict(n) for n in rows[:limit]]
+
+    # -- session chat messages (Loop 3, iteration 26) --
+
+    async def append_chat_message(self, session_id: str, user_id: str,
+                                  display_name: str, role: str,
+                                  channel: str, content: str) -> Dict[str, Any]:
+        """Appends one chat message to a session's narrative log.
+
+        Returns the persisted record including the per-session monotonic
+        ``sequence_id``. Per-session, NOT global — the same integer space
+        can be reused across sessions without colliding on the timeline
+        because the timeline key combines session_id (URL-scoped) with the
+        per-session sequence.
+        """
+        rows = [m for m in self.chat_messages if m["session_id"] == session_id]
+        next_seq = (max((m["sequence_id"] for m in rows), default=0)) + 1
+        record = {
+            "sequence_id": next_seq,
+            "session_id": session_id,
+            "user_id": user_id,
+            "display_name": display_name,
+            "role": role,
+            "channel": channel,
+            "content": content,
+            "created_at": time.time(),
+        }
+        self.chat_messages.append(record)
+        return dict(record)
+
+    async def list_chat_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """Returns one session's chat log in append (oldest-first) order."""
+        rows = [m for m in self.chat_messages if m["session_id"] == session_id]
+        rows.sort(key=lambda m: m["sequence_id"])
+        return [dict(m) for m in rows]
 
 
 class PostgresStore:
@@ -1132,6 +1191,42 @@ class PostgresStore:
             session_id, limit,
         )
         return [self._narration_row(r) for r in rows]
+
+    # -- session chat messages (Loop 3, iteration 26) --
+
+    _CHAT_COLUMNS = """message_id, session_id, user_id, display_name, role,
+                       channel, content, created_at"""
+
+    @staticmethod
+    def _chat_row(row: Any) -> Dict[str, Any]:
+        record = dict(row)
+        record["sequence_id"] = int(record.pop("message_id"))
+        record["created_at"] = str(record.get("created_at", ""))
+        return record
+
+    async def append_chat_message(self, session_id: str, user_id: str,
+                                  display_name: str, role: str,
+                                  channel: str, content: str) -> Dict[str, Any]:
+        # Per-session monotonic counter via the BIGSERIAL primary key;
+        # list_chat_messages reads them in append order on the same index.
+        row = await self.pool.fetchrow(
+            f"""INSERT INTO narrative_state.session_chat_messages
+                    (session_id, user_id, display_name, role, channel, content)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING {self._CHAT_COLUMNS}""",
+            session_id, user_id, display_name, role, channel, content,
+        )
+        return self._chat_row(row)
+
+    async def list_chat_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        rows = await self.pool.fetch(
+            f"""SELECT {self._CHAT_COLUMNS}
+                FROM narrative_state.session_chat_messages
+                WHERE session_id = $1
+                ORDER BY message_id ASC""",
+            session_id,
+        )
+        return [self._chat_row(r) for r in rows]
 
 
 def json_dumps(value: Any) -> str:
