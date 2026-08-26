@@ -522,3 +522,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.15 — 4f7b365 — feat(engine): SRD-optional Delay action, rewind-consistent — cargo 477
 ### L3.17 — 6f1c03a — feat(gateway): curated ambience presets, bounded LRU + coalescing — pytest 1190
 ### L3.16 — 7acddad — feat(client): Delay/Resume controls in the initiative tracker — vitest 616
+### L3.18 — e2a7f98 — feat(client): ambience preset panel in the audio mixer — vitest 642
