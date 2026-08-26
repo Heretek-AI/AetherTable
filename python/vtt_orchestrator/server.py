@@ -29,6 +29,11 @@ from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
 from .routing.engine_client import EngineRejectedError, EngineUnavailableError
+from .routing.lemonade_client import (
+    LemonadeClient,
+    LemonadeRejectedError,
+    LemonadeUnavailableError,
+)
 from .storage import MemoryStore, PostgresStore, init_storage, public_user
 from . import ratelimit
 from .lore.epistemic_graph import EpistemicLoreGraphManager
@@ -167,6 +172,12 @@ safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
 tool_agent = EngineToolAgent(streaming_gateway)
+# Self-hosted Lemonade multimedia upstream (images / TTS / STT / SFX). Reads
+# LEMONADE_BASE_URL + LEMONADE_API_KEY at construction so a deployment can
+# repoint it without a code change; every call raises
+# LemonadeUnavailableError/LemonadeRejectedError on failure — routes built on
+# this client must degrade honestly, never synthesize placeholder media.
+lemonade_client = LemonadeClient()
 pdf_renderer = CharacterSheetPDFRenderer()
 empirical_playtester = EmpiricalPlaytester()
 
@@ -598,6 +609,12 @@ async def _init_storage_backend():
     # Resolve the rate-limit backend eagerly so a REDIS_URL misconfiguration is
     # reported once, at startup, instead of on the first request.
     _get_rate_backend()
+    # Report the Lemonade multimedia upstream target once, at startup, so an
+    # operator sees which host media generation will hit (or that it still
+    # points at a default) before the first image/SFX request fails.
+    logging.getLogger("aethertable.lemonade").info(
+        "lemonade upstream configured: base_url=%s", lemonade_client.base_url
+    )
 
 
 class AuthSignupRequest(BaseModel):
