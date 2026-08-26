@@ -64,6 +64,12 @@
   --encounter-token-ring: var(--tavern-accent);
   --encounter-crit-flash: var(--rp-crimson-400);
 
+  /* Board backdrop grain (iteration 9, Loop 3) — neutral iron-fleck noise,
+     inline SVG feTurbulence, no binary assets (same technique as
+     --parchment-fiber above, tuned dark instead of warm). The layer's opacity
+     is themed per atmosphere preset by theme/board_atmosphere.ts. */
+  --board-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.85 0 0 0 0 0.78 0 0 0 0 0.62 0 0 0 0.06 0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23g)'/%3E%3C/svg%3E");
+
   /* Statblock (official-5e-book) semantics */
   --statblock-header: var(--rp-crimson-600);
   --statblock-rule: color-mix(in srgb, var(--rp-crimson-650) 55%, transparent);
@@ -525,6 +531,48 @@
 .vtt-glow-border {
   border-color: var(--tavern-accent);
   box-shadow: 0 0 18px rgba(217, 119, 6, 0.35);
+}
+
+/* ── Atmospheric board backdrop (iteration 9, Loop 3) ──────────────────────
+   Decorative wash painted BEHIND the GPU floor grid: a candle-warm focal glow
+   up top, an iron-fleck grain over the whole surface, and a soft vignette
+   sinking into the frame edges. Purely presentational — it renders below the
+   PixiJS stage and never participates in hit-testing, so lighting, fog masks,
+   elevation and token interaction are untouched.
+   Theming contract: every color/intensity comes from custom properties set
+   inline by theme/board_atmosphere.ts (boardBackdropStyle), with stock-token
+   fallbacks here so the class is safe to use without any wiring at all.
+   Because shipped presets resolve --board-glow to their own
+   encounter.tokenRingColor, the board automatically retints when the GM
+   switches atmosphere — no component change required. */
+.vtt-board-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    /* 1. Focal candle-glow from above the table (atmosphere-tinted). */
+    radial-gradient(
+      ellipse 95% 75% at 50% 14%,
+      color-mix(in srgb, var(--board-glow, var(--tavern-accent)) calc(var(--board-glow-strength, 0.1) * 100%), transparent),
+      transparent 72%
+    ),
+    /* 2. Vignette: edges sink into darkness, center stays readable. */
+    radial-gradient(
+      ellipse at 50% 50%,
+      transparent 42%,
+      color-mix(in srgb, var(--board-vignette, #000000) calc(var(--board-vignette-strength, 0.55) * 100%), transparent) 100%
+    ),
+    /* 3. Stock base so the layer is never fully transparent on its own. */
+    var(--tavern-bg);
+}
+/* Grain rides a pseudo-element because opacity must scale independently of
+   the gradient stack (and blend cleanly over both glow and vignette). */
+.vtt-board-backdrop::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: var(--board-grain);
+  opacity: var(--board-grain-opacity, 0.5);
 }
 
 @keyframes pulseGlow {
