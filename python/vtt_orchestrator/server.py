@@ -1117,6 +1117,28 @@ def _policy_role_or_403(token: str) -> Dict[str, str]:
     return actor
 
 
+async def _has_session_standing(user_id: str, engine_session_id: str) -> bool:
+    """Audit A5/F1 (iteration 87): standing over a session is derived from
+    gateway-owned data, never from a role claim.
+
+    The gateway's authoritative relationship to an engine session IS its lobby
+    binding (storage.set_lobby_session at launch) plus membership of that
+    roster — the same derivation ``_caller_is_session_participant`` uses for
+    x-card and agentic turns. A periodic autosave grants MORE than either of
+    those surfaces (a rolling full-fidelity snapshot including hidden
+    entities), so it demands the same evidence rather than more.
+
+    Deliberately fail-closed: there is no admin bypass. Global staff standing
+    says nothing about a particular table; an unbound or unknown session UUID
+    has no roster to belong to, so nobody — admin included — has standing over
+    it and every request is refused with AUTOSAVE_POLICY_NO_STANDING.
+    """
+    lobbies = await storage_backend.list_lobbies_for_user(user_id)
+    return any(
+        lobby.get("engine_session_id") == engine_session_id for lobby in lobbies
+    )
+
+
 @app.put("/api/v1/campaign/autosave/policy")
 async def set_autosave_policy(
     req: AutosavePolicyRequest, token: str = Depends(_require_auth)
@@ -1127,9 +1149,18 @@ async def set_autosave_policy(
     minutes must never be a deployment default. Ownership scopes the row, so
     another GM enabling a policy for the same session label cannot touch this
     owner's schedule.
+
+    Audit A5/F1 (iteration 87): the role gate alone was forgeable standing —
+    any GM could point a policy at an ARBITRARY session UUID and receive that
+    table's complete hidden-entity state within one poll interval. Creating or
+    re-pointing a policy therefore additionally requires lobby-derived
+    standing over ``req.session_id`` (see ``_has_session_standing``); requests
+    without it get 403 AUTOSAVE_POLICY_NO_STANDING before any row is written.
     """
     _policy_role_or_403(token)
     owner = _owner_or_401(token)
+    if not await _has_session_standing(owner, req.session_id):
+        raise HTTPException(status_code=403, detail="AUTOSAVE_POLICY_NO_STANDING")
     meta = await storage_backend.upsert_autosave_policy(
         owner, req.session_id, req.enabled, req.interval_minutes
     )
@@ -1178,6 +1209,29 @@ async def run_autosave_cycle(now: float) -> List[Dict[str, Any]]:
             last_saved_at = policy.get("last_saved_at")
             if last_saved_at is not None and (now - float(last_saved_at)) < interval:
                 continue  # interval not elapsed
+
+            # Audit A5/F1 (iteration 87): standing is re-derived FRESH each
+            # cycle from the gateway-owned lobby roster, never carried forward
+            # from enablement time and never inferred from a role claim. The
+            # engine call below signs {"role": "gm"} for ``owner`` — a claim
+            # this process mints, which is exactly why it must be earned
+            # here first: only an owner whose CURRENT lobby membership still
+            # binds them to this engine session may borrow the GM projection
+            # for their own table's snapshot. Standing lost => the policy is
+            # disabled (persisted) with one honest log line and NOTHING is
+            # fetched; the loop does not keep resurrecting authority.
+            if not await _has_session_standing(owner, str(session_id)):
+                await storage_backend.upsert_autosave_policy(
+                    owner, str(session_id), False,
+                    int(policy.get("interval_minutes") or 5),
+                )
+                _autosave_log.warning(
+                    "periodic autosave policy DISABLED for session %s "
+                    "(owner %s): lobby standing no longer holds — skipping "
+                    "fetch",
+                    session_id, owner,
+                )
+                continue
 
             raw = await engine_client.engine_request(
                 "GET",

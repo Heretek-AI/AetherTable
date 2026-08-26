@@ -31,6 +31,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from vtt_orchestrator import server as server_module
 from vtt_orchestrator.routing import engine_client
 from vtt_orchestrator.server import app
 
@@ -87,7 +88,23 @@ def _put_policy(token: str, session_id: str, **overrides):
     )
 
 
+def _ensure_standing(token: str, session_id: str) -> None:
+    """Iteration 87 (audit A5/F1): policies require lobby-derived standing,
+    so every legitimate-policy scenario binds a lobby owned by the caller to
+    the engine session first (exactly what launch does via set_lobby_session).
+    """
+    created = client.post(
+        "/api/v1/lobbies",
+        params={"token": token},
+        json={"name": f"Standing · {session_id[:8]}"},
+    )
+    assert created.status_code == 200, created.text
+    asyncio.run(server_module.storage_backend.set_lobby_session(
+        created.json()["lobby_id"], session_id))
+
+
 def _enable_policy(token: str, session_id: str, interval: int = 5) -> None:
+    _ensure_standing(token, session_id)
     resp = _put_policy(token, session_id, interval_minutes=interval)
     assert resp.status_code == 200, resp.text
 
@@ -95,6 +112,7 @@ def _enable_policy(token: str, session_id: str, interval: int = 5) -> None:
 class TestAutosavePolicyRoutes:
     def test_gm_sets_and_reads_back_policy(self, gm_token):
         session_id = f"s-{abs(hash('setread')) % 10**8}"
+        _ensure_standing(gm_token, session_id)
         resp = _put_policy(gm_token, session_id, interval_minutes=7)
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -123,6 +141,7 @@ class TestAutosavePolicyRoutes:
 
     def test_disable_via_put_turns_policy_off(self, gm_token):
         session_id = f"s-{abs(hash('disable')) % 10**8}"
+        _ensure_standing(gm_token, session_id)
         assert _put_policy(gm_token, session_id).status_code == 200
         off = _put_policy(gm_token, session_id, enabled=False)
         assert off.status_code == 200, off.text
@@ -166,6 +185,7 @@ class TestAutosavePolicyRoutes:
         GM identity sees nothing (per-owner rows), and the SAME owner still
         reads the policy back after unrelated traffic."""
         session_id = f"s-{abs(hash('persist')) % 10**8}"
+        _ensure_standing(gm_token, session_id)
         assert _put_policy(gm_token, session_id, interval_minutes=15).status_code == 200
         # Owner-scoped: a different GM has no policy row for this session.
         got = client.get(
@@ -277,6 +297,7 @@ class TestPeriodicAutosaveCycle:
         monkeypatch.setattr(engine_client, "engine_request", spy)
         # Disabled policy: opted out entirely.
         session_off = f"s-{abs(hash('off')) % 10**8}"
+        _ensure_standing(gm_token, session_off)
         assert _put_policy(gm_token, session_off, enabled=False).status_code == 200
         asyncio.run(srv.run_autosave_cycle(now=time.time()))
         assert called == []
@@ -380,3 +401,196 @@ class TestBackgroundLoopWiring:
                     pass
 
         assert asyncio.run(scenario()) is True
+
+
+# --- Iteration 87 (audit A5/F1): the policy loop must not fabricate authority -
+#
+# Two defects pinned red here:
+#
+#   (a) PUT /campaign/autosave/policy gated ONLY on the caller's role. Any GM
+#       could point a policy at an ARBITRARY session UUID (no lobby binding,
+#       no relationship to req.session_id) and receive that table's complete
+#       hidden-entity state one poll interval later.
+#   (b) run_autosave_cycle called the engine as {"user_id": owner,
+#       "role": "gm"} — a claim the gateway signs itself and the engine
+#       trusts — so once enabled, the loop kept pulling FULL state forever on
+#       behalf of an owner whose GM standing had since been revoked or who had
+#       left the table.
+#
+# The fix derives standing from gateway-owned data (the lobby roster bound to
+# the session via set_lobby_session — the same derivation as
+# _caller_is_session_participant), re-checked FRESH each cycle, and fails
+# closed even for admin tokens on unbound sessions.
+
+
+def _lobby(token: str, name: str) -> dict:
+    created = client.post(
+        "/api/v1/lobbies", params={"token": token}, json={"name": name}
+    )
+    assert created.status_code == 200, created.text
+    return created.json()
+
+
+def _join(lobby: dict, token: str) -> None:
+    joined = client.post(
+        f"/api/v1/lobbies/{lobby['lobby_id']}/join",
+        params={"token": token},
+        json={"invite_code": lobby["invite_code"]},
+    )
+    assert joined.status_code == 200, joined.text
+
+
+def _bind(lobby_id: str, session_id: str) -> None:
+    asyncio.run(
+        server_module.storage_backend.set_lobby_session(lobby_id, session_id)
+    )
+
+
+class TestPolicyStandingGate:
+    def test_policy_on_arbitrary_unbound_session_rejected_403(self, gm_token):
+        """The core defect: role alone is not standing. A GM naming a session
+        UUID they have no lobby relationship with gets 403 and NO row."""
+        arbitrary = "99999999-9999-9999-9999-999999999991"
+        resp = _put_policy(gm_token, arbitrary)
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "AUTOSAVE_POLICY_NO_STANDING"
+        got = client.get(
+            "/api/v1/campaign/autosave/policy",
+            params={"token": gm_token, "session_id": arbitrary},
+        ).json()
+        assert got["enabled"] is False
+
+    def test_admin_also_requires_lobby_binding(self):
+        """Fail closed even for admins: global staff standing is not table
+        standing over an unbound session UUID."""
+        admin_token = _sign("usr_admin87", "admin")
+        arbitrary = "99999999-9999-9999-9999-999999999992"
+        resp = _put_policy(admin_token, arbitrary)
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "AUTOSAVE_POLICY_NO_STANDING"
+
+    def test_host_of_bound_lobby_has_standing(self, gm_token):
+        lobby = _lobby(gm_token, "Autosave Host Lobby")
+        session_id = "88888888-8888-8888-8888-888888888881"
+        _bind(lobby["lobby_id"], session_id)
+        resp = _put_policy(gm_token, session_id)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is True
+
+    def test_member_of_bound_lobby_has_standing(self):
+        """A GM who is an ordinary MEMBER (not host) of a lobby bound to the
+        session has standing — membership itself is the evidence, host or not."""
+        member_token = _sign("usr_member87", "gm")
+        host_lobby = _lobby(_sign("usr_host87", "player"), "Member Standing Lobby")
+        _join(host_lobby, member_token)
+        session_id = "88888888-8888-8888-8888-888888888882"
+        _bind(host_lobby["lobby_id"], session_id)
+        resp = _put_policy(member_token, session_id)
+        assert resp.status_code == 200, resp.text
+
+    def test_gm_with_no_lobby_relationship_to_bound_session_rejected(
+            self, gm_token):
+        """A lobby exists and is bound to the session — but THIS caller is not
+        in it. Role 'gm' alone still confers nothing."""
+        outsider_lobby = _lobby(_sign("usr_host88", "player"), "Not Theirs")
+        session_id = "88888888-8888-8888-8888-888888888883"
+        _bind(outsider_lobby["lobby_id"], session_id)
+        resp = _put_policy(gm_token, session_id)
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["detail"] == "AUTOSAVE_POLICY_NO_STANDING"
+
+
+class TestCycleReverifiesStanding:
+    def test_removed_owner_policy_disabled_and_fetch_skipped(self, gm_token,
+                                                             monkeypatch):
+        """The loop-side half of the defect: standing is re-derived FRESH each
+        cycle. When the owner's membership ends (removed / left), the next
+        tick disables the policy and never touches the engine for it."""
+        import vtt_orchestrator.server as srv
+
+        lobby = _lobby(gm_token, "Revocation Lobby")
+        session_id = "88888888-8888-8888-8888-888888888884"
+        _bind(lobby["lobby_id"], session_id)
+        owner = srv._verify_token(gm_token)["user_id"]
+        assert _put_policy(gm_token, session_id).status_code == 200
+
+        calls = []
+
+        async def spy(method, path, payload=None, *, actor=None):
+            calls.append(path)
+            return _live_state(events=4)
+
+        monkeypatch.setattr(engine_client, "engine_request", spy)
+
+        # Standing intact: first tick saves and does reach the engine.
+        # (Call count is scoped to THIS session's path: other tests' policies
+        # legitimately share the shared storage backend and may also save.)
+        mine = f"/api/v1/sessions/{session_id}"
+
+        def my_calls() -> int:
+            return sum(1 for c in calls if c == mine)
+
+        first = asyncio.run(srv.run_autosave_cycle(now=time.time()))
+        assert any(s["session_id"] == session_id for s in first)
+        assert my_calls() == 1
+
+        # Standing lost: drop every lobby membership for this user (the
+        # storage-level equivalent of being removed or leaving; the gateway
+        # exposes no leave route, so membership ends exactly here).
+        async def strip():
+            owned = [
+                lb["lobby_id"]
+                for lb in await srv.storage_backend.list_lobbies_for_user(owner)
+            ]
+            for lobby_id in owned:
+                record = srv.storage_backend.lobbies.get(lobby_id)
+                if record is not None:
+                    record["members"] = [
+                        m for m in record["members"] if m["user_id"] != owner
+                    ]
+
+        asyncio.run(strip())
+
+        second = asyncio.run(srv.run_autosave_cycle(now=time.time() + 3600))
+        # No further fetch happened on the owner's behalf...
+        assert my_calls() == 1
+        assert all(s["session_id"] != session_id for s in second)
+        # ...the policy was persisted DISABLED so later ticks stop asking...
+        got = client.get(
+            "/api/v1/campaign/autosave/policy",
+            params={"token": gm_token, "session_id": session_id},
+        ).json()
+        assert got["enabled"] is False
+        # ...and the disabled row is invisible to future cycles.
+        remaining = [
+            p for p in asyncio.run(
+                server_module.storage_backend.list_enabled_autosave_policies())
+            if p["owner_user_id"] == owner
+            and p["engine_session_id"] == session_id
+        ]
+        assert remaining == []
+
+    def test_standing_intact_cycle_continues_saving(self, gm_token, monkeypatch):
+        import vtt_orchestrator.server as srv
+
+        lobby = _lobby(gm_token, "Durable Standing Lobby")
+        session_id = "88888888-8888-8888-8888-888888888885"
+        _bind(lobby["lobby_id"], session_id)
+        assert _put_policy(gm_token, session_id).status_code == 200
+
+        ticks = {"n": 0}
+
+        async def live(method, path, payload=None, *, actor=None):
+            ticks["n"] += 1
+            return _live_state(events=3 + ticks["n"])
+
+        monkeypatch.setattr(engine_client, "engine_request", live)
+
+        t0 = time.time()
+        assert any(s["session_id"] == session_id
+                   for s in asyncio.run(srv.run_autosave_cycle(now=t0)))
+        assert any(s["session_id"] == session_id
+                   for s in asyncio.run(srv.run_autosave_cycle(now=t0 + 3600)))
+        # Both cycles actually reached the engine: the standing re-check
+        # passed both times rather than silently dropping the campaign.
+        assert ticks["n"] >= 2
