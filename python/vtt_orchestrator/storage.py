@@ -146,7 +146,29 @@ CREATE TABLE IF NOT EXISTS narrative_state.autosave_policies (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (owner_user_id, engine_session_id)
 );
+
+-- Spoken-narration log (Loop 3, iteration 6). One row per SUCCESSFUL TTS
+-- narration; ``text_snippet`` is truncated to NARRATION_SNIPPET_CHARS at
+-- write time so a max-length script cannot bloat log rows. session_id is
+-- TEXT (not uuid) because narration without a bound session stores NULL.
+-- Same idempotent CREATE TABLE IF NOT EXISTS approach as the tables above so
+-- volumes created before this iteration are migrated in place at startup.
+CREATE TABLE IF NOT EXISTS narrative_state.narrations (
+    narration_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id   TEXT,
+    user_id      TEXT NOT NULL,
+    voice        TEXT NOT NULL,
+    text_snippet TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_narrations_session_created
+    ON narrative_state.narrations (session_id, created_at DESC);
 """
+
+#: Bound on the stored narration text. The full script goes to the TTS
+#: upstream; only this prefix is persisted for the per-session log.
+NARRATION_SNIPPET_CHARS = 200
 
 
 # --- Credential helpers ------------------------------------------------------
@@ -172,6 +194,9 @@ class MemoryStore:
         self.lobbies: Dict[str, Dict[str, Any]] = {}           # lobby_id -> record
         self.characters: Dict[str, Dict[str, Any]] = {}        # character_id -> record
         self.handouts: Dict[str, Dict[str, Any]] = {}          # handout_id -> record
+        # Spoken-narration log (Loop 3, iteration 6), newest-last insertion
+        # order; list_narrations sorts per session on read.
+        self.narrations: List[Dict[str, Any]] = []
         # Periodic autosave policy + progress (iteration 77), keyed by
         # (owner_user_id, engine_session_id). Progress is deliberately separate
         # from the policy so disabling a policy does not erase the movement
@@ -523,6 +548,31 @@ class MemoryStore:
 
     async def delete_handout(self, handout_id: str) -> bool:
         return self.handouts.pop(handout_id, None) is not None
+
+    # -- narrations (Loop 3, iteration 6) --
+
+    async def record_narration(self, session_id: Optional[str], user_id: str,
+                               voice: str, text: str) -> Dict[str, Any]:
+        """Logs one successful narration; only a bounded snippet is kept."""
+        self._counter += 1
+        record = {
+            "narration_id": f"nar_{self._counter:08d}",
+            "session_id": session_id,
+            "user_id": user_id,
+            "voice": voice,
+            "text_snippet": text[:NARRATION_SNIPPET_CHARS],
+            "created_at": time.time(),
+        }
+        self.narrations.append(record)
+        return dict(record)
+
+    async def list_narrations(self, session_id: str,
+                              limit: int = 50) -> List[Dict[str, Any]]:
+        rows = [
+            n for n in self.narrations if n["session_id"] == session_id
+        ]
+        rows.sort(key=lambda n: n["created_at"], reverse=True)
+        return [dict(n) for n in rows[:limit]]
 
 
 class PostgresStore:
@@ -1014,6 +1064,41 @@ class PostgresStore:
             handout_id,
         )
         return status.endswith("1")
+
+    # -- narrations (Loop 3, iteration 6) --
+
+    _NARRATION_COLUMNS = """narration_id, session_id, user_id, voice,
+                            text_snippet, created_at"""
+
+    @staticmethod
+    def _narration_row(row: Any) -> Dict[str, Any]:
+        record = dict(row)
+        record["narration_id"] = str(record["narration_id"])
+        record["created_at"] = str(record.get("created_at", ""))
+        return record
+
+    async def record_narration(self, session_id: Optional[str], user_id: str,
+                               voice: str, text: str) -> Dict[str, Any]:
+        row = await self.pool.fetchrow(
+            f"""INSERT INTO narrative_state.narrations
+                    (session_id, user_id, voice, text_snippet)
+                VALUES ($1, $2, $3, $4)
+                RETURNING {self._NARRATION_COLUMNS}""",
+            session_id, user_id, voice, text[:NARRATION_SNIPPET_CHARS],
+        )
+        return self._narration_row(row)
+
+    async def list_narrations(self, session_id: str,
+                              limit: int = 50) -> List[Dict[str, Any]]:
+        rows = await self.pool.fetch(
+            f"""SELECT {self._NARRATION_COLUMNS}
+                FROM narrative_state.narrations
+                WHERE session_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2""",
+            session_id, limit,
+        )
+        return [self._narration_row(r) for r in rows]
 
 
 def json_dumps(value: Any) -> str:

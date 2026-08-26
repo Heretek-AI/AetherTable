@@ -4140,6 +4140,11 @@ def _bucket_for_path(path: str) -> str:
     # bucket. Must be matched before the generic media prefix below.
     if path == "/api/v1/media/image":
         return "media"
+    # Spoken narration (POST /api/v1/media/narrate): same model spend as
+    # speech but with a far longer per-call allowance — its own 20/min bucket,
+    # also matched before the generic media prefix below.
+    if path == "/api/v1/media/narrate":
+        return "narration"
     # Other media surfaces (TTS / STT): model spend, llm bucket.
     if path.startswith("/api/v1/media/"):
         return "llm"
@@ -4429,10 +4434,38 @@ async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(
 #     detail verbatim; no route ever fabricates placeholder media or masks a
 #     generation failure with canned content;
 #   * rate limiting is bucket-assigned by _bucket_for_path: diffusion images
-#     meter in their own tight `media` bucket (10/min), TTS/STT/SFX share the
-#     `llm` bucket because they all spend model time per call.
+#     meter in their own tight `media` bucket (10/min), spoken narration in
+#     its own `narration` bucket (20/min), TTS/STT/SFX share the `llm` bucket
+#     because they all spend model time per call.
 _MEDIA_MAX_TTS_BYTES = 20 * 1024 * 1024          # 20 MB speech response cap
 _MEDIA_MAX_UPLOAD_BYTES = 25 * 1024 * 1024       # 25 MB transcription upload cap
+
+#: Default narration voice; operators retune the table's storyteller voice via
+#: ``MEDIA_TTS_VOICE`` without a redeploy. Read per-request (not at import) so
+#: tests and long-lived processes see env changes.
+DEFAULT_NARRATION_VOICE = "af_sky"
+
+
+def _default_tts_voice() -> str:
+    return os.environ.get("MEDIA_TTS_VOICE") or DEFAULT_NARRATION_VOICE
+
+
+def _narration_max_chars() -> int:
+    """Per-call narration script bound from ``MEDIA_NARRATION_MAX_CHARS``.
+
+    Read at VALIDATION time on purpose: an operator (or test) can tighten the
+    cap live. Unparseable or non-positive values fall back to the documented
+    default of 2000 rather than disabling the cap entirely — fail closed.
+    """
+    raw = os.environ.get("MEDIA_NARRATION_MAX_CHARS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return value
+    return 2000
 
 
 class MediaImageRequest(BaseModel):
@@ -4445,6 +4478,30 @@ class MediaSpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     voice: str = Field(default="af_sky", min_length=1, max_length=64)
     fmt: Literal["wav", "mp3"] = "wav"
+
+
+class MediaNarrateRequest(BaseModel):
+    """One spoken narration. Deliberately NOT an overload of /media/speech:
+    narration allows a much longer script (MEDIA_NARRATION_MAX_CHARS, default
+    2000 vs speech's fixed 1000), meters in its own bucket, and records a
+    narration event per session."""
+
+    text: str = Field(min_length=1)
+    # None → MEDIA_TTS_VOICE env, else the documented af_sky default.
+    voice: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    # Optional session attribution; when set, the caller must hold standing in
+    # that session (lobby membership or staff) — see media_narrate.
+    session_id: Optional[str] = None
+
+    @field_validator("text")
+    @classmethod
+    def _text_within_env_cap(cls, value: str) -> str:
+        cap = _narration_max_chars()
+        if len(value) > cap:
+            raise ValueError(
+                f"text exceeds MEDIA_NARRATION_MAX_CHARS ({cap} characters)"
+            )
+        return value
 
 
 class MediaSfxRequest(BaseModel):
@@ -4609,6 +4666,96 @@ async def media_sfx(req: MediaSfxRequest, token: str = Depends(_require_auth)):
     except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
         raise _media_error_to_http(exc)
     return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.post("/api/v1/media/narrate")
+async def media_narrate(
+    req: MediaNarrateRequest, token: str = Depends(_require_auth)
+):
+    """Speak one narration aloud; any authenticated seat, OWN text only.
+
+    Separate from POST /media/speech because the contract differs: longer
+    scripts are allowed (MEDIA_NARRATION_MAX_CHARS, default 2000), metering
+    lands in the dedicated `narration` bucket (20/min), and every successful
+    synthesis is recorded into the per-session narration log.
+
+    Trust decisions:
+
+    * An authenticated HMAC token is REQUIRED. A seat may narrate only text
+      attributed to itself — the log row always carries the CALLER's user id,
+      never one from the request body.
+    * ``session_id`` is optional attribution. When set by a non-staff caller,
+      standing derives from lobby membership bound to that engine session —
+      the same derivation as the x-card gate; otherwise 403. GM/admin may
+      narrate into any session.
+    * The narration event is logged ONLY on a successful synthesis: a failed
+      or oversized response leaves no log row.
+    """
+    actor = _caller_actor(token)
+    if req.session_id and actor.get("role", "") not in ("gm", "admin"):
+        participant = await _caller_is_session_participant(
+            actor["user_id"], req.session_id
+        )
+        if not participant:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "NARRATION_NOT_A_PARTICIPANT: only session participants "
+                    "(via a lobby bound to that session) or GMs may narrate "
+                    f"into session {req.session_id}."
+                ),
+            )
+    voice = req.voice or _default_tts_voice()
+    try:
+        audio = await media_client.text_to_speech(req.text, voice=voice, fmt="wav")
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
+    if len(audio) > _MEDIA_MAX_TTS_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Synthesized narration exceeds the {_MEDIA_MAX_TTS_BYTES} "
+                f"byte response cap ({len(audio)} bytes returned upstream)."
+            ),
+        )
+    await storage_backend.record_narration(
+        session_id=req.session_id,
+        user_id=actor["user_id"],
+        voice=voice,
+        text=req.text,
+    )
+    return Response(content=audio, media_type="audio/wav")
+
+
+@app.get("/api/v1/media/narrations")
+async def list_media_narrations(
+    session_id: str = Query(...),
+    token: str = Depends(_require_auth),
+):
+    """Recent narrations (newest first, max 50) for one session.
+
+    Authenticated reads with standing in that session: any lobby member bound
+    to it or gm/admin — the same derivation the x-card gate uses. Everyone
+    else, including valid tokens naming sessions they never joined, gets 403;
+    sessions with no roster fail closed to staff for the same reason x-card
+    does.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        participant = await _caller_is_session_participant(
+            actor["user_id"], session_id
+        )
+        if not participant:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "NARRATION_LIST_FORBIDDEN: only session participants (via "
+                    "a lobby bound to that session) or GMs may read the "
+                    f"narration log of session {session_id}."
+                ),
+            )
+    rows = await storage_backend.list_narrations(session_id, limit=50)
+    return {"session_id": session_id, "count": len(rows), "narrations": rows}
 
 
 def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:
