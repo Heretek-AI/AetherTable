@@ -40,6 +40,12 @@ pub struct DungeonMap {
     pub grid: Vec<Vec<TileType>>,
     pub seed: u64,
     pub rooms: Vec<RoomDescriptor>,
+    /// Treasure containers placed by the dressing pass, each carrying its
+    /// seeded loot roll. Positions are a deterministic function of the seed
+    /// (dead-end-first placement) and always coincide with a
+    /// [`TileType::Chest`] grid cell.
+    #[serde(default)]
+    pub loot_containers: Vec<LootContainer>,
 }
 
 pub struct DungeonGenerator {
@@ -106,6 +112,7 @@ impl DungeonGenerator {
                     grid,
                     seed,
                     rooms: derive_room_descriptors_fallback(self.width, self.height),
+                    loot_containers: Vec::new(),
                 };
             }
         };
@@ -134,8 +141,9 @@ impl DungeonGenerator {
         // region; every other pocket is sealed as wall (Pillar 8 anti-orphan).
         enforce_single_region(&mut grid, self.width, self.height);
 
-        // Deterministic dressing inside the walkable region.
-        dress_dungeon(&mut grid, seed);
+        // Deterministic dressing inside the walkable region (altar + the
+        // treasure containers that are exported in the payload).
+        let loot_containers = dress_dungeon(&mut grid, seed);
 
         let rooms = derive_room_descriptors(&grid);
 
@@ -145,6 +153,7 @@ impl DungeonGenerator {
             grid,
             seed,
             rooms,
+            loot_containers,
         }
     }
 
@@ -245,35 +254,42 @@ fn enforce_single_region(grid: &mut [Vec<TileType>], width: usize, height: usize
     }
 }
 
-/// Places an altar and a few chests deterministically within open cells.
-fn dress_dungeon(grid: &mut [Vec<TileType>], seed: u64) {
+/// Places the altar plus [`TREASURE_CONTAINERS_PER_DUNGEON`] treasure
+/// containers deterministically within open cells.
+///
+/// Chest tiles on the finished map are EXACTLY the exported containers:
+/// `place_loot_containers` picks dead-end-first positions from still-floor
+/// cells, each is stamped [`TileType::Chest`], and every container carries its
+/// seeded loot roll so the map payload alone describes all treasure.
+fn dress_dungeon(grid: &mut [Vec<TileType>], seed: u64) -> Vec<LootContainer> {
     let height = grid.len();
     let width = grid.first().map(|r| r.len()).unwrap_or(0);
     if width == 0 || height == 0 {
-        return;
+        return Vec::new();
     }
 
-    let mut rng = StdRng::seed_from_u64(seed ^ 0xD00D_5EED);
-    let open_cells: Vec<(usize, usize)> = (0..height)
-        .flat_map(|y| (0..width).map(move |x| (x, y)))
-        .filter(|&(x, y)| grid[y][x] == TileType::Floor)
-        .collect();
-    if open_cells.is_empty() {
-        return;
-    }
-
-    let pick = |rng: &mut StdRng| open_cells[rng.gen_range(0..open_cells.len())];
-
-    let altar = pick(&mut rng);
-    grid[altar.1][altar.0] = TileType::Altar;
-
-    let chest_count = rng.gen_range(1..=3);
-    for _ in 0..chest_count {
-        let cell = pick(&mut rng);
-        if grid[cell.1][cell.0] == TileType::Floor {
-            grid[cell.1][cell.0] = TileType::Chest;
+    // Altar first, drawn from a dedicated stream so adding/removing containers
+    // never shifts the altar draw.
+    let altar = {
+        let mut altar_rng = StdRng::seed_from_u64(seed ^ 0xA17A_9000);
+        let open: Vec<(usize, usize)> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| grid[y][x] == TileType::Floor)
+            .collect();
+        match open.is_empty() {
+            true => None,
+            false => Some(open[altar_rng.gen_range(0..open.len())]),
         }
+    };
+    if let Some((ax, ay)) = altar {
+        grid[ay][ax] = TileType::Altar;
     }
+
+    let containers = place_loot_containers(grid, seed, TREASURE_CONTAINERS_PER_DUNGEON);
+    for c in &containers {
+        grid[c.y][c.x] = TileType::Chest;
+    }
+    containers
 }
 
 /// Derives themed room rectangles from the remaining open space.
@@ -320,6 +336,117 @@ fn derive_room_descriptors(grid: &[Vec<TileType>]) -> Vec<RoomDescriptor> {
         height: height - 2,
         theme: "Great Hall".to_string(),
     }]
+}
+
+/// Treasure containers exported per generated dungeon.
+pub const TREASURE_CONTAINERS_PER_DUNGEON: usize = 4;
+
+/// Party-level / CR band used for every container's loot roll. Tier 3 keeps
+/// generated-dungeon treasure in the low-hero band; the multiplier convention
+/// lives in [`loot_tables::treasure_tier_multiplier`].
+const TREASURE_TIER: u8 = 3;
+
+/// One placed treasure container: its grid position plus the seeded loot roll
+/// it carries (see [`loot_tables::LootTableGenerator::roll_themed_hoard`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LootContainer {
+    pub x: usize,
+    pub y: usize,
+    /// Party-level / CR band used to scale the contents' gp values.
+    pub tier: u8,
+    pub contents: Vec<loot_tables::LootItem>,
+}
+
+/// Deterministic dead-end-first placement of `count` treasure containers.
+///
+/// Candidates are walkable [`TileType::Floor`] cells with exactly one
+/// orthogonal walkable neighbour (dead ends); when those run out, remaining
+/// open floor is used so the requested count is honoured whenever the map has
+/// enough space. Positions and rolled contents are pure functions of
+/// `(grid, seed)` — same inputs, byte-identical payload.
+fn place_loot_containers(
+    grid: &[Vec<TileType>],
+    seed: u64,
+    count: usize,
+) -> Vec<LootContainer> {
+    let height = grid.len();
+    let width = grid.first().map(|r| r.len()).unwrap_or(0);
+    if width == 0 || height == 0 || count == 0 {
+        return Vec::new();
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x7EA5_11D0);
+
+    let mut dead_ends = Vec::new();
+    let mut open_floor = Vec::new();
+    for (y, row) in grid.iter().enumerate() {
+        for (x, cell) in row.iter().enumerate() {
+            if *cell != TileType::Floor {
+                continue;
+            }
+            let neighbours = [
+                x.checked_sub(1).map(|nx| (nx, y)),
+                Some((x + 1, y)).filter(|&(nx, _)| nx < width),
+                y.checked_sub(1).map(|ny| (x, ny)),
+                Some((x, y + 1)).filter(|&(_, ny)| ny < height),
+            ];
+            let walkable_neighbours = neighbours
+                .into_iter()
+                .flatten()
+                .filter(|&(nx, ny)| is_walkable(grid[ny][nx]))
+                .count();
+            if walkable_neighbours == 1 {
+                dead_ends.push((x, y));
+            }
+            open_floor.push((x, y));
+        }
+    }
+
+    // Non-dead-end open floor forms the overflow pool.
+    let mut overflow: Vec<(usize, usize)> = open_floor
+        .into_iter()
+        .filter(|cell| !dead_ends.contains(cell))
+        .collect();
+
+    // Deterministic Fisher-Yates shuffles of each pool.
+    for pool in [&mut dead_ends, &mut overflow] {
+        for i in (1..pool.len()).rev() {
+            let j = rng.gen_range(0..=i);
+            pool.swap(i, j);
+        }
+    }
+
+    // Dead ends always outrank ordinary floor regardless of draw order.
+    let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(count);
+    chosen.extend(dead_ends.into_iter().take(count));
+    if chosen.len() < count {
+        chosen.extend(overflow.into_iter().take(count - chosen.len()));
+    }
+
+    chosen.sort(); // stable export order independent of RNG draw order
+
+    chosen
+        .into_iter()
+        .enumerate()
+        .map(|(slot, (x, y))| LootContainer {
+            x,
+            y,
+            tier: TREASURE_TIER,
+            contents: loot_tables::LootTableGenerator::roll_thematic_loot(
+                TREASURE_TIER,
+                seed ^ mix_container_seed(slot),
+            ),
+        })
+        .collect()
+}
+
+/// Per-container seed derivation (SplitMix64 finalizer): distinct draws per
+/// container slot without ever reusing the base seed directly.
+fn mix_container_seed(slot: usize) -> u64 {
+    let mut z = (slot as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -412,6 +539,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generated_maps_export_n_seeded_treasure_containers_on_chest_tiles() {
+        let gen = DungeonGenerator::new(24, 16);
+        for seed in [1u64, 42, 1337, 90210] {
+            let map = gen.generate(seed);
+            assert_eq!(
+                map.loot_containers.len(),
+                TREASURE_CONTAINERS_PER_DUNGEON,
+                "seed {}: expected {} exported containers",
+                seed,
+                TREASURE_CONTAINERS_PER_DUNGEON
+            );
+            let mut seen = std::collections::HashSet::new();
+            for c in &map.loot_containers {
+                assert!(c.x < map.width && c.y < map.height, "seed {seed}: out of bounds");
+                assert_eq!(
+                    map.grid[c.y][c.x],
+                    TileType::Chest,
+                    "seed {seed}: container at ({},{}) must sit on a chest tile",
+                    c.x,
+                    c.y
+                );
+                assert!(
+                    seen.insert((c.x, c.y)),
+                    "seed {seed}: duplicate container position"
+                );
+                assert!(
+                    !c.contents.is_empty(),
+                    "seed {seed}: every exported container carries rolled contents"
+                );
+                assert!(
+                    c.contents.iter().all(|item| item.value_gp > 0),
+                    "seed {seed}: rolled contents must carry positive gp values"
+                );
+            }
+            // Every chest tile on the map is accounted for by the payload.
+            let chest_tiles: Vec<(usize, usize)> = (0..map.height)
+                .flat_map(|y| (0..map.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| map.grid[y][x] == TileType::Chest)
+                .collect();
+            assert_eq!(
+                chest_tiles.len(),
+                map.loot_containers.len(),
+                "seed {seed}: every chest tile must correspond to one exported container"
+            );
+        }
+    }
+
+    #[test]
+    fn container_payload_replays_identically_per_seed_and_diverges_across_seeds() {
+        let gen = DungeonGenerator::new(24, 16);
+
+        let payload = |m: &DungeonMap| {
+            m.loot_containers
+                .iter()
+                .map(|c| {
+                    (
+                        c.x,
+                        c.y,
+                        c.tier,
+                        c.contents
+                            .iter()
+                            .map(|i| (i.name.clone(), i.value_gp, i.quantity))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for seed in [7u64, 555, 31_337] {
+            let a = payload(&gen.generate(seed));
+            let b = payload(&gen.generate(seed));
+            assert_eq!(a, b, "same seed must reproduce the full container payload");
+        }
+
+        let mut distinct = std::collections::HashSet::new();
+        for seed in 0..40u64 {
+            distinct.insert(format!("{:?}", payload(&gen.generate(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)))));
+        }
+        assert!(
+            distinct.len() >= 20,
+            "container payloads barely diverge across seeds: {} distinct of 40",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn placement_prefers_dead_end_cells_when_available() {
+        // Synthetic corridor map: a wide-open hall with a one-cell spur off
+        // its west side. With one container requested it must land on the
+        // dead-end spur cell (2,3), whose only walkable neighbour is (3,3).
+        let mut grid = vec![vec![TileType::Wall; 9]; 7];
+        for row in grid.iter_mut().skip(2).take(3) {
+            for cell in row.iter_mut().skip(3).take(5) {
+                *cell = TileType::Floor;
+            }
+        }
+        grid[3][2] = TileType::Floor;
+
+        let containers = place_loot_containers(&grid, 1234, 1);
+        assert_eq!(containers.len(), 1);
+        assert_eq!(
+            (containers[0].x, containers[0].y),
+            (2, 3),
+            "sole container must occupy the dead-end cell"
+        );
+
+        // With more containers than dead ends, the remainder spill onto open
+        // floor rather than being dropped.
+        let mut grid2 = vec![vec![TileType::Wall; 9]; 7];
+        for row in grid2.iter_mut().skip(2).take(3) {
+            for cell in row.iter_mut().skip(3).take(5) {
+                *cell = TileType::Floor;
+            }
+        }
+        let many = place_loot_containers(&grid2, 99, 4);
+        assert_eq!(many.len(), 4, "overflow placements go to ordinary floor");
+        let mut spots = std::collections::HashSet::new();
+        for c in &many {
+            assert!(spots.insert((c.x, c.y)), "no two containers share a cell");
+            assert_eq!(grid2[c.y][c.x], TileType::Floor);
+        }
+    }
+
+    #[test]
+    fn degenerate_grids_place_containers_without_panic_or_overflow() {
+        let single = vec![vec![TileType::Floor]];
+        assert_eq!(place_loot_containers(&single, 1, TREASURE_CONTAINERS_PER_DUNGEON).len(), 1);
+
+        let sealed = vec![vec![TileType::Wall; 6]; 6];
+        assert!(place_loot_containers(&sealed, 1, TREASURE_CONTAINERS_PER_DUNGEON).is_empty());
+
+        let empty: Vec<Vec<TileType>> = Vec::new();
+        assert!(place_loot_containers(&empty, 1, 3).is_empty());
     }
 
     #[test]
