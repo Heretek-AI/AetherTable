@@ -2297,6 +2297,7 @@ export function App() {
                   diceBoxRef={diceBoxRef}
                   spectatorMode={isSpectator}
                   concentrationByToken={concentrationByEntity}
+                  atmosphereId={atmosphereId}
                   onGenerateArt={(id) => {
                     const t = visibleTokens.find((tok) => tok.id === id);
                     if (t) setTokenArtDialogFor({ ...t, artDataUrl: tokenArtByToken[id] });

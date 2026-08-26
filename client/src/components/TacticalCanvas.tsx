@@ -37,6 +37,7 @@ import {
 import { ServerDiceBox } from '../render/dice_box_real';
 import { globalAudio } from '../render/audio_manager';
 import type { YjsCrdtClient } from '../sync/yjs_doc_client';
+import { boardBackdropStyle } from '../theme/board_atmosphere';
 import { User } from '../types/auth';
 import { ConcentrationBadge, concentrationBadgeLabel } from './ConcentrationBadge';
 import type { ConcentrationInfo } from '../api/concentration_state';
@@ -129,6 +130,14 @@ interface TacticalCanvasProps {
   onGenerateArt?: (tokenId: string) => void;
   /** True while a token-art generation is in flight (drives button state). */
   isGeneratingArt?: boolean;
+  /**
+   * Iteration 9 (Loop 3, visuals): active atmosphere-preset id from the App
+   * shell's DUAL-source truth (theme/atmospheres.ts). Tints the decorative
+   * board-backdrop wash (vignette/grain/candle-glow — see .vtt-board-backdrop
+   * in index.css and theme/board_atmosphere.ts). Absent or unknown → stock
+   * obsidian/amber backdrop; presentation-only either way.
+   */
+  atmosphereId?: string;
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
@@ -157,6 +166,7 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   concentrationByToken = {},
   onGenerateArt,
   isGeneratingArt = false,
+  atmosphereId,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -823,6 +833,17 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
           className="relative rounded-xl border-2 border-tavern-border shadow-2xl bg-tavern-bg overflow-hidden"
           style={{ width: gridWidth * cellSize, height: gridHeight * cellSize }}
         >
+          {/* Atmospheric backdrop (iteration 9): vignette + grain + candle-glow
+              wash painted BEHIND the GPU floor. First child = bottom of the
+              stacking order, so the PixiJS stage (appended after) and every
+              canvas overlay still render on top; pointer-events-none keeps
+              the click-mapping surface below fully authoritative. */}
+          <div
+            aria-hidden="true"
+            data-testid="board-backdrop"
+            className="vtt-board-backdrop"
+            style={boardBackdropStyle(atmosphereId)}
+          />
           {/* GPU-batched floor/wall layer (PixiJS v8 WebGL/WebGPU). */}
           <div ref={pixiHostRef} className="absolute inset-0" />
           {/* Physics dice overlay: full-stage WASM canvas, click-transparent. */}
