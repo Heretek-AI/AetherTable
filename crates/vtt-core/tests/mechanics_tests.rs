@@ -1523,6 +1523,57 @@ fn test_exhaustion_level_5_reduces_speed_to_zero() {
 }
 
 #[test]
+fn test_grappled_condition_reduces_effective_speed_to_zero() {
+    // SRD 5.1 Grappled: "Its speed becomes 0." The doc comment on
+    // `GrappleResolution` (actions.rs) states the same modelling intent, so the
+    // speed chokepoint (`effective_speed_feet`) must honour it — otherwise a
+    // grappled creature walks away from its grappler at full speed.
+    let mut e = hero("held_scout", 30, 15);
+    assert_eq!(e.effective_speed_feet(), 30.0, "ungrappled baseline");
+
+    e.add_condition(Condition::Grappled);
+    assert_eq!(
+        e.effective_speed_feet(),
+        0.0,
+        "SRD Grappled zeroes effective speed"
+    );
+
+    // Escape (condition dropped) restores full speed immediately.
+    e.remove_condition(&Condition::Grappled);
+    assert_eq!(e.effective_speed_feet(), 30.0, "escape restores full speed");
+}
+
+#[test]
+fn test_grappled_budget_seeding_and_move_entity_reject_movement() {
+    let mut session = session_with_pair();
+    let id = *session.entities.keys().next().unwrap();
+    session
+        .entities
+        .get_mut(&id)
+        .unwrap()
+        .add_condition(Condition::Grappled);
+
+    let mut dice = DiceEngine::with_seed(6);
+    session.advance_round(&mut dice);
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 0.0,
+        "round refresh must seed a zero budget while grappled"
+    );
+
+    // Even a one-step shuffle is rejected, exactly like exhaustion level 5.
+    let err = session.move_entity(id, (2.6, 2.5, 0.0)).unwrap_err();
+    assert!(err.starts_with("MOVE_BUDGET_EXCEEDED"), "got: {}", err);
+
+    // Dash cannot buy movement out of a hold either.
+    let dash = session.entities.get_mut(&id).unwrap().take_dash();
+    assert!(dash.is_ok(), "dash itself is legal, but:");
+    assert_eq!(
+        session.entities[&id].action_budget.movement_remaining_feet, 0.0,
+        "a grappled creature dashes for 0 ft"
+    );
+}
+
+#[test]
 fn test_exhaustion_level_6_kills_the_entity() {
     let mut e = hero("collapsed", 12, 15);
     e.set_exhaustion(6);
