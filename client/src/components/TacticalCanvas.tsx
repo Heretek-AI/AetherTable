@@ -41,6 +41,12 @@ import { boardBackdropStyle } from '../theme/board_atmosphere';
 import { User } from '../types/auth';
 import { ConcentrationBadge, concentrationBadgeLabel } from './ConcentrationBadge';
 import type { ConcentrationInfo } from '../api/concentration_state';
+import {
+  CONDITION_RING_THEMES,
+  CONDITION_BADGE_MAX,
+  conditionBadgeStack,
+  resolveConditionRingStyle,
+} from '../theme/condition_ring';
 
 export interface Token {
   id: string;
@@ -982,13 +988,115 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                   />
                 )}
 
-                {/* Token Condition Aura Ring */}
-                {token.conditions && token.conditions.length > 0 && (
-                  <div
-                    className="absolute -inset-1 rounded-full border-2 border-dashed border-rule-red animate-spin pointer-events-none z-20"
-                    title={`Active Conditions: ${token.conditions.join(', ')}`}
-                  />
-                )}
+                {/* Token Condition Ring (iteration 25) — colour chosen by the
+                    highest-priority themed condition. Solid (not dashed) so
+                    it never reads as the spinning engine-only indicator
+                    that lived here before. Only painted when at least one
+                    themed condition is on the wire; entities with only
+                    engine-only conditions (incapacitated / invisible /
+                    petrified / exhaustion) and entities with no conditions
+                    at all simply get no condition ring — the InitiativeTracker
+                    and CharacterSheet still surface those statuses, and the
+                    unconditional fallback would have meant a bare-bordered
+                    ring on tokens we have no theme for. prefers-reduced-
+                    motion users get no pulse.
+
+                    HIDDEN-ENTITY GATE (Pillar 9): the upstream projection
+                    already drops `isVisible: false` tokens for spectators
+                    (App.tsx), so this gate is defensive — but the new ring
+                    /badge surface is a per-token reveal, not part of the
+                    base sprite. A leaked hidden token (eg. a non-spectator
+                    seat passing through a GM draft) must NEVER show its
+                    conditions here; the upstream filter is the primary
+                    control, this `isVisible` check is the belt to that
+                    suspenders. */}
+                {token.isVisible !== false && (() => {
+                  const ring = resolveConditionRingStyle(token.conditions);
+                  if (!ring) return null;
+                  return (
+                    <div
+                      data-testid="token-condition-ring"
+                      data-condition={ring.label.toLowerCase()}
+                      className={
+                        'absolute -inset-1 rounded-full border-2 pointer-events-none z-20 ' +
+                        'transition-all duration-200 ease-out ' +
+                        'motion-safe:animate-pulse-glow ' +
+                        ring.ringBorderClass
+                      }
+                      style={{ boxShadow: ring.ringBoxShadow }}
+                      title={`Active Conditions: ${(token.conditions ?? []).join(', ')} (${ring.label})`}
+                      aria-hidden="true"
+                    />
+                  );
+                })()}
+
+                {/* Token Condition Badges (iteration 25) — up to
+                    CONDITION_BADGE_MAX stacked lucide icons + overflow chip.
+                    Pinned to the top-right corner of the lifted sprite stack
+                    so they never collide with the elevation pill (+Xft) or
+                    the concentration badge that already live there. The
+                    overflow chip is a plain "+N" — we do NOT re-render
+                    dropped names so a heavily-debuffed token stays readable.
+                    prefers-reduced-motion: no spin; fade-in is the only
+                    motion and it survives the global reduced-motion
+                    contract already in index.css (0.01ms).
+
+                    Same HIDDEN-ENTITY GATE as the ring above: hidden tokens
+                    paint no condition badges. The upstream App.tsx filter is
+                    authoritative; this `isVisible !== false` guard is the
+                    second layer. */}
+                {token.isVisible !== false && (() => {
+                  const stack = conditionBadgeStack(token.conditions, CONDITION_BADGE_MAX);
+                  if (stack.badges.length === 0 && stack.overflow === 0) return null;
+                  return (
+                    <div
+                      data-testid="token-condition-badges"
+                      className="absolute -top-2 left-1/2 -translate-x-1/2 z-40 flex items-center gap-0.5 pointer-events-none"
+                    >
+                      {stack.badges.map((name, idx) => {
+                        const theme = CONDITION_RING_THEMES[name];
+                        const Icon = theme.icon;
+                        return (
+                          <span
+                            key={name}
+                            data-testid={`condition-badge-${name}`}
+                            role="img"
+                            aria-label={`${theme.label} condition`}
+                            title={theme.label}
+                            className={
+                              'inline-flex items-center justify-center w-4 h-4 rounded-full ' +
+                              'shadow-md ring-1 ring-black/40 ' +
+                              'transition-transform duration-150 ease-out ' +
+                              'hover:scale-110 motion-reduce:transition-none ' +
+                              theme.badgeBgClass +
+                              ' ' +
+                              theme.badgeTextClass
+                            }
+                            style={{
+                              // Stagger badges left-to-right so the stack
+                              // visibly reads as separate icons rather than
+                              // a single blob.
+                              transform: `translateX(${(idx - (stack.badges.length - 1) / 2) * 10}px)`,
+                            }}
+                          >
+                            <Icon className="w-2.5 h-2.5" aria-hidden="true" />
+                          </span>
+                        );
+                      })}
+                      {stack.overflow > 0 && (
+                        <span
+                          data-testid="condition-overflow"
+                          role="img"
+                          aria-label={`${stack.overflow} additional conditions`}
+                          title={`${stack.overflow} additional conditions`}
+                          className="inline-flex items-center justify-center min-w-4 h-4 px-1 rounded-full bg-black/80 ring-1 ring-parchment-aged/60 text-[9px] font-mono font-bold text-parchment-aged"
+                        >
+                          +{stack.overflow}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* Concentration ring accent (iteration 58). Solid violet —
                     deliberately NOT dashed/spinning so it never reads as the
