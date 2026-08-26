@@ -51,7 +51,9 @@ PYTHONPATH=python pytest python/tests -v
 
 ### Client Build & Typecheck
 ```bash
-cd client && npm run build
+cd client && npm run build        # tsc typecheck + vite build
+npm run test                      # Vitest unit suite (407 tests across 33 files)
+npx vitest run --config vitest.relay.config.mjs   # relay unit suite (66 tests in scripts/__tests__)
 ```
 
 ### Generate SRD Compendiums from Markdown
@@ -63,8 +65,8 @@ PYTHONPATH=python python3 -m vtt_orchestrator.compendium.srd_importer
 
 ## 4. Codebase Navigation Map
 
-* **`crates/vtt-core/`**: D&D 5e SRD 5.1 rules, 15 conditions, attack & saving throw resolvers, concentration checks, death save state machine, 4-tier task resolution.
-* **`crates/vtt-spatial/`**: Bresenham LoS raycasting, half/three-quarters/total cover, A* pathfinding.
+* **`crates/vtt-core/`**: D&D 5e SRD 5.1 rules, 15 conditions, attack & saving throw resolvers, concentration checks, death save state machine, dice notation parsing (`kh`/`kl`, `ro` reroll-once, exploding), opportunity attacks with Disengage suppression, Ready actions with structured `ReadiedTrigger`s, inspiration lifecycle, hit-dice short rests, and the exhaustion ladder.
+* **`crates/vtt-spatial/`**: Bresenham LoS raycasting, half/three-quarters/total cover, lighting zones & vision modes, visibility polygons (`visibility.rs`), A* pathfinding.
 * **`crates/vtt-wfc/`**: Wave Function Collapse procedural map & dungeon synthesis.
 * **`crates/vtt-crdt-sync/`**: Real-time Yjs CRDT relay server (default transport via HMAC-authenticated upgrade; falls back to the engine LWW relay).
 * **`crates/vtt-scripting/`**: Sandboxed Rhai and Wasmtime execution engines with an absolute 1,000,000-fuel ceiling (`MAX_FUEL_CEILING`; client-requested limits are clamped, never raised) and a max-operation cap on Rhai.

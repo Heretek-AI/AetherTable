@@ -14,14 +14,14 @@ This repository contains the **AI-Native Virtual Tabletop (VTT)** system. Use th
 ### Rust Engine (`crates/`)
 ```bash
 cargo build --workspace
-cargo test --workspace        # 235 tests across 18 suites
+cargo test --workspace        # 461 tests across 21 suites
 cargo test -p vtt-core --test srd_rules_tests
 ```
 
 ### Python Orchestrator (`python/`)
 ```bash
 # Run pytest with PYTHONPATH
-PYTHONPATH=python pytest python/tests -v   # ~580 collected tests (engine-live and live-LLM suites skip when unset)
+PYTHONPATH=python pytest python/tests -v   # 1035 collected (1006 pass, 29 skip; engine-live and live-LLM suites skip when unset)
 
 # Run a specific test module
 PYTHONPATH=python pytest python/tests/test_srd_importer.py -k test_srd_spell_parser
@@ -33,7 +33,8 @@ cd client
 npm install
 npm run build      # Typechecks via tsc and runs vite build (typically well under 15s)
 npm run dev        # Starts Vite dev server on http://localhost:3000
-npm run test       # Vitest unit suite (69 tests across 4 files)
+npm run test       # Vitest unit suite (407 tests across 33 files)
+npx vitest run --config vitest.relay.config.mjs   # relay unit suite (66 tests in scripts/__tests__)
 ```
 
 ---
@@ -63,8 +64,8 @@ npm run test       # Vitest unit suite (69 tests across 4 files)
 ## 🛡️ Invariant Checklists
 
 Before finalizing changes:
-- [ ] All Rust crates compile cleanly with 0 errors; `cargo test --workspace` passes (235 tests across 18 suites).
-- [ ] `PYTHONPATH=python pytest python/tests` passes (~580 collected tests; the engine-live and live-LLM suites skip when unset).
-- [ ] `cd client && npm run test` passes (69 Vitest tests across 4 files).
+- [ ] All Rust crates compile cleanly with 0 errors; `cargo test --workspace` passes (461 tests across 21 suites).
+- [ ] `PYTHONPATH=python pytest python/tests` passes (1035 collected tests; the engine-live and live-LLM suites skip when unset).
+- [ ] `cd client && npm run test` passes (407 Vitest tests across 33 files), plus the relay suite (`npx vitest run --config vitest.relay.config.mjs`, 66 tests).
 - [ ] Synthetic playtest benchmark achieves MCR ≥ 98.5%, HCI ≥ 0.95, AFPR ≤ 1.5%, auditor recall ≥ 95% (`./scripts/run_all_benchmarks.sh`).
 - [ ] `cd client && npm run build` completes in under 15s with zero TypeScript diagnostics.
