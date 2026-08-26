@@ -14,6 +14,7 @@ import stat
 import tempfile
 import time
 import zipfile
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
@@ -4864,6 +4865,168 @@ async def media_narrate(
     )
     return Response(
         content=audio, media_type="audio/wav", headers=_MEDIA_NO_STORE_HEADERS
+    )
+
+
+# --- Ambience presets (iteration 17) ----------------------------------------
+#
+# Curated D&D soundscapes (see compendium/ambience_presets.py) generated on
+# demand through the SFX capability and cached in-process. Contract notes:
+#
+#   * GET  /api/v1/media/ambience          — list presets + cache metadata;
+#     any authenticated seat (a picker is read-only, no generation spend).
+#   * POST /api/v1/media/ambience/{slug}   — generate (or serve cached) wav.
+#     GM/admin ONLY, exactly like POST /media/sfx: ambient beds reach every
+#     seat at the table, so triggering one is a staff decision. Meters in the
+#     generic `llm` bucket via _bucket_for_path, same as /media/sfx — the LRU
+#     cache absorbs repeat spends that bucket metering alone cannot.
+#   * Cache is keyed by (slug, model), bounded by _AMBIENCE_CACHE_MAX_ENTRIES
+#     (LRU), and coalesces concurrent duplicate generations onto one upstream
+#     call. Failures and over-cap payloads are NEVER cached; upstream errors
+#     surface verbatim through _media_error_to_http like every other route.
+
+_AMBIENCE_CACHE_MAX_ENTRIES = 12
+
+_ambience_cache: "OrderedDict[tuple[str, str], bytes]" = OrderedDict()
+#: In-flight generation futures keyed like the cache; concurrent duplicate
+#: requests for one slug await a single upstream call instead of racing it.
+_ambience_inflight: Dict[tuple[str, str], "asyncio.Future[bytes]"] = {}
+
+
+def reset_ambience_cache() -> None:
+    """Drops cached ambience audio and in-flight state (tests/admin tooling)."""
+    _ambience_cache.clear()
+    _ambience_inflight.clear()
+
+
+async def _load_ambience(slug: str, model: Optional[str] = None) -> bytes:
+    """Returns preset ``slug``'s wav bytes, generating through SFX at most once.
+
+    Cache lookup → in-flight join → upstream generation → cap check → insert,
+    with LRU eviction of the least-recently-used entry past
+    ``_AMBIENCE_CACHE_MAX_ENTRIES``. Failures propagate to every waiter and
+    leave no cache trace; oversized payloads raise before touching the cache.
+    """
+    from .compendium.ambience_presets import get_preset
+
+    preset = get_preset(slug)
+    if preset is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"UNKNOWN_AMBIENCE_PRESET: no soundscape named {slug!r}",
+        )
+    key = (slug, model or media_client.sfx_model)
+
+    cached = _ambience_cache.get(key)
+    if cached is not None:
+        _ambience_cache.move_to_end(key)  # LRU touch on hit
+        return cached
+
+    existing = _ambience_inflight.get(key)
+    if existing is not None:
+        # Join an identical in-flight generation rather than doubling the
+        # spend on the self-hosted box.
+        return await asyncio.shield(existing)
+
+    loop = asyncio.get_running_loop()
+    future: "asyncio.Future[bytes]" = loop.create_future()
+    _ambience_inflight[key] = future
+    try:
+        # No ``model=`` passthrough: the gateway's configured MEDIA_SFX_MODEL
+        # is the single source of truth for ambience generation.
+        wav_bytes = await media_client.generate_sfx(preset.prompt)
+        if len(wav_bytes) > _MEDIA_MAX_SFX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Generated ambience exceeds the {_MEDIA_MAX_SFX_BYTES} "
+                    f"byte response cap ({len(wav_bytes)} bytes returned "
+                    f"upstream)."
+                ),
+            )
+        future.set_result(wav_bytes)
+    except BaseException as exc:
+        # Never cache failures: wake every coalesced waiter with the error
+        # and drop the in-flight slot so a retry actually retries.
+        if not future.done():
+            future.set_exception(exc)
+        raise
+    finally:
+        _ambience_inflight.pop(key, None)
+
+    _ambience_cache[key] = wav_bytes
+    _ambience_cache.move_to_end(key)
+    while len(_ambience_cache) > _AMBIENCE_CACHE_MAX_ENTRIES:
+        _ambience_cache.popitem(last=False)
+    return wav_bytes
+
+
+class AmbiencePresetOut(BaseModel):
+    slug: str
+    label: str
+    description: str
+    prompt: str
+    loop_seconds: float
+    cached: bool
+
+
+class AmbienceListResponse(BaseModel):
+    presets: List[AmbiencePresetOut]
+
+
+@app.get("/api/v1/media/ambience")
+async def list_ambience_presets(token: str = Depends(_require_auth)):
+    """List curated soundscapes with availability metadata; any seat.
+
+    Read-only catalog access costs nothing upstream, so listing stays open to
+    every authenticated seat while generation remains staff-only. ``cached``
+    reflects THIS gateway process's in-memory LRU only — another replica may
+    still need a cold generation.
+    """
+    from .compendium.ambience_presets import AMBIENCE_PRESETS
+
+    sfx_model = media_client.sfx_model
+    presets = [
+        AmbiencePresetOut(
+            slug=p.slug,
+            label=p.label,
+            description=p.description,
+            prompt=p.prompt,
+            loop_seconds=p.loop_seconds,
+            cached=(p.slug, sfx_model) in _ambience_cache,
+        )
+        for p in AMBIENCE_PRESETS
+    ]
+    return JSONResponse(
+        content=AmbienceListResponse(presets=presets).model_dump(),
+        headers=_MEDIA_NO_STORE_HEADERS,
+    )
+
+
+@app.post("/api/v1/media/ambience/{slug}")
+async def generate_ambience(slug: str, token: str = Depends(_require_auth)):
+    """Generate (or serve cached) one curated soundscape; GM/admin ONLY.
+
+    Same authorization posture as POST /media/sfx: ambient beds play to the
+    whole table, so triggering them is a staff decision. Repeat requests for
+    an already-generated (slug, model) pair are answered from the bounded LRU
+    without touching the upstream box.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "MEDIA_AMBIENCE_FORBIDDEN: ambient soundscapes play to the "
+                "whole table; only GM or admin seats may trigger them."
+            ),
+        )
+    try:
+        wav_bytes = await _load_ambience(slug)
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
+    return Response(
+        content=wav_bytes, media_type="audio/wav", headers=_MEDIA_NO_STORE_HEADERS
     )
 
 

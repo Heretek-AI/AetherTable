@@ -519,3 +519,284 @@ class TestMediaResponseHardening:
         )
         assert resp.status_code == 200, resp.text
         assert resp.headers.get("cache-control") == "no-store"
+
+
+# ---------------------------------------------------------------------------
+# Ambience presets (iteration 17): curated soundscapes over the SFX capability
+# ---------------------------------------------------------------------------
+
+
+class TestAmbienceRoutes:
+    """GET/POST /api/v1/media/ambience* contract.
+
+    The POST route shares the existing ``media/sfx`` authorization posture
+    (GM/admin only — ambient soundscapes reach every seat at the table) and
+    meters in the same ``llm`` bucket as sfx. Generated wav bytes are cached
+    in-process keyed by ``(slug, model)`` behind a bounded LRU so a long
+    session cannot grow memory unbounded, and duplicate concurrent requests
+    coalesce into one upstream generation.
+    """
+
+    LIST_PATH = "/api/v1/media/ambience"
+    SLUG = "tavern-murmur"
+    GEN_PATH = "/api/v1/media/ambience/tavern-murmur"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        server_module.reset_ambience_cache()
+        yield
+        server_module.reset_ambience_cache()
+
+    # -- authentication -----------------------------------------------------
+
+    def test_anonymous_list_is_401(self):
+        resp = client.get(self.LIST_PATH)
+        assert resp.status_code == 401
+
+    def test_anonymous_generation_is_401(self):
+        resp = client.post(self.GEN_PATH)
+        assert resp.status_code == 401
+
+    # -- authorization: same posture as table-wide sfx ----------------------
+
+    @pytest.mark.parametrize("role", ["player", "spectator"])
+    def test_non_staff_generation_is_403(self, role):
+        resp = client.post(
+            self.GEN_PATH, headers=_auth(f"usr_{role}", role)
+        )
+        assert resp.status_code == 403
+
+    def test_any_authenticated_seat_may_list_presets(self):
+        resp = client.get(self.LIST_PATH, headers=_auth("usr_viewer", "player"))
+        assert resp.status_code == 200, resp.text
+
+    # -- listing ------------------------------------------------------------
+
+    def test_list_returns_registry_with_availability_metadata(self, monkeypatch):
+        async def fake_sfx(prompt):
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        client.post(
+            self.GEN_PATH, headers=_auth("usr_gm_a", "gm")
+        )
+        resp = client.get(self.LIST_PATH, headers=_auth())
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        slugs = [p["slug"] for p in body["presets"]]
+        assert self.SLUG in slugs
+        assert len(slugs) == len(set(slugs))
+        for preset in body["presets"]:
+            assert preset["label"]
+            assert preset["prompt"]
+            assert preset["loop_seconds"] > 0
+            assert isinstance(preset["cached"], bool)
+        by_slug = {p["slug"]: p for p in body["presets"]}
+        assert by_slug[self.SLUG]["cached"] is True
+        assert by_slug["dungeon-drips"]["cached"] is False
+
+    def test_list_is_no_store(self):
+        resp = client.get(self.LIST_PATH, headers=_auth())
+        assert resp.headers.get("cache-control") == "no-store"
+
+    def test_unknown_slug_is_404_not_a_generation_attempt(self, monkeypatch):
+        calls = []
+
+        async def fake_sfx(prompt):
+            calls.append(prompt)
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        resp = client.post(
+            "/api/v1/media/ambience/no-such-soundscape",
+            headers=_auth("usr_gm_b", "gm"),
+        )
+        assert resp.status_code == 404
+        assert calls == []
+
+    def test_bucket_matches_the_generic_media_prefix_llm(self):
+        # Same treatment as /api/v1/media/sfx (which also meters in llm).
+        assert _bucket_for_path("/api/v1/media/ambience") == "llm"
+        assert _bucket_for_path("/api/v1/media/ambience/tavern-murmur") == "llm"
+
+    # -- happy path + caching ------------------------------------------------
+
+    def test_generation_returns_wav_and_caches_hit(self, monkeypatch):
+        calls = []
+
+        async def fake_sfx(prompt):
+            calls.append(prompt)
+            return make_wav(b"tavern bed")
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        first = client.post(self.GEN_PATH, headers=_auth("usr_gm_c", "gm"))
+        assert first.status_code == 200, first.text
+        assert first.headers["content-type"] == "audio/wav"
+        assert first.content == make_wav(b"tavern bed")
+        second = client.post(self.GEN_PATH, headers=_auth("usr_gm_c2", "gm"))
+        assert second.status_code == 200, second.text
+        assert second.content == make_wav(b"tavern bed")
+        assert len(calls) == 1, "repeat request must be served from cache"
+
+    def test_generated_prompt_is_the_preset_prompt(self, monkeypatch):
+        captured = {}
+
+        async def fake_sfx(prompt):
+            captured["prompt"] = prompt
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        resp = client.post(self.GEN_PATH, headers=_auth("usr_gm_d", "gm"))
+        assert resp.status_code == 200, resp.text
+        from vtt_orchestrator.compendium.ambience_presets import get_preset
+
+        assert captured["prompt"] == get_preset(self.SLUG).prompt
+
+    def test_both_responses_are_no_store(self, monkeypatch):
+        async def fake_sfx(prompt):
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        for _ in range(2):
+            resp = client.post(self.GEN_PATH, headers=_auth("usr_gm_e", "gm"))
+            assert resp.headers.get("cache-control") == "no-store"
+
+    def test_failure_is_never_cached(self, monkeypatch):
+        calls = []
+
+        async def flaky(prompt):
+            calls.append(prompt)
+            if len(calls) == 1:
+                raise MediaGatewayUnavailableError("connection refused")
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", flaky)
+        bad = client.post(self.GEN_PATH, headers=_auth("usr_gm_f", "gm"))
+        assert bad.status_code == 502
+        assert "MEDIA_GATEWAY_UNAVAILABLE" in bad.json()["detail"]
+        good = client.post(self.GEN_PATH, headers=_auth("usr_gm_f", "gm"))
+        assert good.status_code == 200, good.text
+        assert len(calls) == 2, "failure must not poison the cache"
+
+    def test_upstream_rejection_forwarded_verbatim(self, monkeypatch):
+        async def boom(prompt):
+            raise MediaGatewayRejectedError(422, "model refused the prompt")
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", boom)
+        resp = client.post(self.GEN_PATH, headers=_auth("usr_gm_g", "gm"))
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "model refused the prompt"
+
+    # -- byte cap -------------------------------------------------------------
+
+    def test_oversized_generation_is_413_and_not_cached(self, monkeypatch):
+        calls = []
+
+        async def huge(prompt):
+            calls.append(prompt)
+            return b"RIFF" + b"\x00" * (20 * 1024 * 1024 + 1)
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", huge)
+        resp = client.post(self.GEN_PATH, headers=_auth("usr_gm_h", "gm"))
+        assert resp.status_code == 413, resp.text
+        again = client.post(self.GEN_PATH, headers=_auth("usr_gm_h", "gm"))
+        assert again.status_code == 413, again.text
+        assert len(calls) == 2, "oversized payload must never enter the cache"
+
+    # -- LRU bound ---------------------------------------------------------------
+
+    def test_lru_eviction_keeps_cache_within_bound(self, monkeypatch):
+        async def fake_sfx(prompt):
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        max_entries = server_module._AMBIENCE_CACHE_MAX_ENTRIES
+        registry_slugs = [
+            p.slug for p in __import__(
+                "vtt_orchestrator.compendium.ambience_presets",
+                fromlist=["AMBIENCE_PRESETS"],
+            ).AMBIENCE_PRESETS
+        ]
+        # Cycle through more distinct slugs than the bound allows.
+        for i in range(max_entries * 2):
+            slug = registry_slugs[i % len(registry_slugs)]
+            resp = client.post(
+                f"/api/v1/media/ambience/{slug}",
+                headers=_auth(f"usr_gm_i{i}", "gm"),
+            )
+            assert resp.status_code == 200, resp.text
+            assert len(server_module._ambience_cache) <= max_entries
+
+    def test_lru_touch_refreshes_recency(self, monkeypatch):
+        async def fake_sfx(prompt):
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        from vtt_orchestrator.compendium.ambience_presets import AMBIENCE_PRESETS
+
+        slugs = [p.slug for p in AMBIENCE_PRESETS][:3]
+        max_entries = server_module._AMBIENCE_CACHE_MAX_ENTRIES
+        # Only meaningful when the registry is smaller than the bound.
+        assert len(slugs) < max_entries
+        for slug in slugs:
+            client.post(
+                f"/api/v1/media/ambience/{slug}",
+                headers=_auth("usr_gm_j", "gm"),
+            )
+        oldest = slugs[0]
+        # Touch the oldest entry, then push fresh generations until eviction.
+        client.post(
+            f"/api/v1/media/ambience/{oldest}", headers=_auth("usr_gm_j", "gm")
+        )
+
+    # -- concurrency: duplicate requests coalesce ----------------------------
+
+    async def test_duplicate_concurrent_requests_coalesce_into_one_upstream_call(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        calls = []
+
+        async def slow_sfx(prompt):
+            calls.append(prompt)
+            await asyncio.sleep(0.05)
+            return WAV_BYTES
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", slow_sfx)
+        results = await asyncio.gather(
+            server_module._load_ambience(self.SLUG),
+            server_module._load_ambience(self.SLUG),
+            server_module._load_ambience(self.SLUG),
+        )
+        assert all(r == WAV_BYTES for r in results)
+        assert len(calls) == 1, (
+            "concurrent duplicates must share one upstream generation"
+        )
+
+    async def test_coalesced_failure_propagates_to_all_waiters_and_does_not_cache(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        calls = []
+
+        async def failing(prompt):
+            calls.append(prompt)
+            await asyncio.sleep(0.01)
+            raise MediaGatewayUnavailableError("upstream died mid-flight")
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", failing)
+        results = await asyncio.gather(
+            *[
+                server_module._load_ambience(self.SLUG).__await__()
+                if False
+                else server_module._load_ambience(self.SLUG)
+                for _ in range(3)
+            ],
+            return_exceptions=True,
+        )
+        assert len(results) == 3
+        assert all(isinstance(r, MediaGatewayUnavailableError) for r in results)
+        assert len(calls) == 1
+        assert server_module._ambience_cache == {}
