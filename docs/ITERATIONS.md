@@ -479,3 +479,29 @@ post-loop pre-audit), every finding remediated red-first.
 Trajectory: cargo ~163→466 · pytest ~444 collected→1036 · vitest 0→473.
 Five adversarial audit sweeps this loop (A1-A5); every finding remediated
 red-first. All prior-loop remediations re-verified intact at close.
+
+---
+
+# Loop 3 (2026-08-26) — Multimedia Platform, Visuals, UI/UX
+
+Focus: gameplay depth + web platform + visuals/UI/UX. New capability
+surface: self-hosted Lemonade server at LEMONADE_BASE_URL (image gen via
+SD-Turbo/Anima-Base, TTS via kokoro-v1, STT via Whisper-Large-v3-Turbo,
+SFX via ThinkSound-SFX, embeddings via harrier-oss). Same cadence:
+TDD red-first → gates → commit → push → row below.
+
+## Backlog
+
+### Phase 1 — Lemonade integration foundation
+- [ ] L3.1 LemonadeClient service (python): models/media routes w/ timeouts
+- [ ] L3.2 Media proxy gateway routes (auth-gated, size caps, mime checks)
+- [ ] L3.3 Image gen: token/portrait art generation + caching
+- [ ] L3.4 SFX library: dungeon ambience one-shots bound to spatial audio
+- [ ] L3.5 GM narration TTS (kokoro voices, streamed to table)
+- [ ] L3.6 Server-side STT replacing/augmenting browser Whisper opt-in
+
+### Phase 2 — Visuals/UI/UX
+- [ ] P2.x board polish, theme work, accessibility passes, UX flows
+
+## Iteration log
+
