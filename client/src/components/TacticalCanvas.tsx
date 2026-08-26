@@ -14,7 +14,8 @@ import {
   Triangle,
   Eye,
   Users,
-  CloudRain
+  CloudRain,
+  Loader2
 } from 'lucide-react';
 import { ParticleFXManager } from '../render/particle_effects';
 import { DiceBox3D, ActiveDiceRoll } from '../render/dice_box_3d';
@@ -65,6 +66,12 @@ export interface Token {
    * them. Defaults to `true` (undefined = visible).
    */
   isVisible?: boolean;
+  /**
+   * Iteration 3 (Loop 3): generated portrait art for the token disc. A dataURL
+   * persisted via updateTokenArt on the CRDT tokens map; when present it is
+   * rendered as the disc's background fill instead of the flat color + icon.
+   */
+  artDataUrl?: string;
 }
 
 interface TacticalCanvasProps {
@@ -114,6 +121,14 @@ interface TacticalCanvasProps {
    * simply don't render — absence of data is not painted as "not concentrating".
    */
   concentrationByToken?: Record<string, ConcentrationInfo>;
+  /**
+   * Iteration 3 (Loop 3): opens the "Generate Art…" dialog for the given
+   * token. Absent → the affordance renders nowhere (honest absence of the
+   * media route wiring, never a dead button).
+   */
+  onGenerateArt?: (tokenId: string) => void;
+  /** True while a token-art generation is in flight (drives button state). */
+  isGeneratingArt?: boolean;
 }
 
 export type VisionPerspective = 'party' | 'selected' | 'gm_omniscient';
@@ -140,6 +155,8 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
   syncClient = null,
   spectatorMode = false,
   concentrationByToken = {},
+  onGenerateArt,
+  isGeneratingArt = false,
 }) => {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 30, y: 30 });
@@ -986,12 +1003,30 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 ) : null}
 
                 <div
-                  className={`w-11 h-11 rounded-full flex items-center justify-center shadow-xl border-2 transition-transform ${
+                  className={`relative w-11 h-11 rounded-full flex items-center justify-center shadow-xl border-2 transition-transform overflow-hidden ${
                     isSelected ? 'border-tavern-accent scale-110 shadow-amber-600/50' : 'border-parchment-aged/80 shadow-black/80'
                   }`}
                   style={{ backgroundColor: token.color }}
                 >
-                  {renderTokenIcon(token)}
+                  {/* Generated token art (iteration 3): when present it fills
+                      the disc; the icon drops away rather than stacking on
+                      top of the portrait. No art → the classic flat disc. */}
+                  {token.artDataUrl ? (
+                    <>
+                      <img
+                        src={token.artDataUrl}
+                        alt={`${token.name} token art`}
+                        className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+                      />
+                      {/* Thin scrim keeps the selected ring legible over busy
+                          portraits without hiding the art itself. */}
+                      {isSelected && (
+                        <div className="absolute inset-0 ring-2 ring-inset ring-tavern-accent/60 pointer-events-none" />
+                      )}
+                    </>
+                  ) : (
+                    renderTokenIcon(token)
+                  )}
                 </div>
 
                 <div className="w-10 h-1.5 bg-black/60 rounded-full mt-1 overflow-hidden border border-tavern-border shadow-sm">
@@ -1010,6 +1045,31 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                 <span className="text-[10px] font-mono font-semibold text-parchment-aged px-1.5 py-0.5 bg-black/70 border border-tavern-border rounded mt-0.5 backdrop-blur-md whitespace-nowrap shadow">
                   {token.name}
                 </span>
+
+                {/* "Generate Art…" affordance (iteration 3): only on the
+                    selected token, only when the app shell wired the media
+                    route, and never for spectators — a read-only seat must not
+                    spend the table's shared GPU budget (same Pillar-9 stance
+                    as fog writes). */}
+                {isSelected && onGenerateArt && !spectatorMode && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onGenerateArt(token.id);
+                    }}
+                    disabled={isGeneratingArt}
+                    className="mt-1 px-1.5 py-0.5 rounded bg-black/70 hover:bg-black/90 border border-tavern-border text-[9px] font-mono text-parchment-aged/90 flex items-center gap-1 transition disabled:opacity-50"
+                    title={`Generate diffusion art for ${token.name}`}
+                    data-testid={`token-art-trigger-${token.id}`}
+                  >
+                    {isGeneratingArt ? (
+                      <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                    ) : (
+                      <Wand2 className="w-2.5 h-2.5" />
+                    )}
+                    Generate Art…
+                  </button>
+                )}
                 </div>
               </div>
             );

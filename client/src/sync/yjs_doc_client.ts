@@ -339,6 +339,59 @@ export class YjsCrdtClient {
   }
 
   /**
+   * Persist generated token art onto the CRDT tokens map (iteration 3,
+   * Loop 3). Parallel to updateTokenPosition: same map, same keying — the
+   * entry is a superset record so position and art writes merge under Y.Map's
+   * per-key LWW without clobbering each other's fields.
+   *
+   * HONESTY NOTE: this write is LOCAL-FIRST. On the legacy engine LWW relay
+   * there is no art channel at all, so peers see it only when both sides run
+   * the Yjs transport; the local replica always renders it because the data
+   * lives in our own Y.Doc (+ IndexedDB restore).
+   */
+  public setTokenArt(tokenId: string, artDataUrl: string): void {
+    const prev = this.getTokenPosition(tokenId);
+    this.tokens.set(tokenId, {
+      tokenId,
+      x: prev?.x ?? 0,
+      y: prev?.y ?? 0,
+      z: prev?.z ?? 0,
+      rotation: prev?.rotation ?? 0,
+      scale: prev?.scale ?? 1,
+      elevation: prev?.elevation ?? 0,
+      timestamp: Date.now(),
+      art_data_url: artDataUrl,
+    });
+  }
+
+  /** The stored art for one token, or null when none was ever applied. */
+  public getTokenArt(tokenId: string): string | null {
+    const raw = this.tokens.get(tokenId) as Record<string, unknown> | undefined;
+    return typeof raw?.art_data_url === 'string' ? raw.art_data_url : null;
+  }
+
+  /**
+   * Observe every art change (local Apply, remote peer, IndexedDB restore).
+   * Fires immediately with all currently-stored art so late joiners render
+   * portraits that predate them; returns an unsubscribe fn.
+   */
+  public observeTokenArt(cb: (artByToken: Record<string, string>) => void): () => void {
+    const emit = () => {
+      const out: Record<string, string> = {};
+      Array.from(this.tokens.keys()).forEach((id) => {
+        const art = this.getTokenArt(id);
+        if (art) out[id] = art;
+      });
+      cb(out);
+    };
+    emit();
+    this.tokens.observe(emit);
+    return () => {
+      this.tokens.unobserve(emit);
+    };
+  }
+
+  /**
    * Fog layers keyed per owner, stored as bitmasks over the grid.
    *
    * CONVENTION (mirrored by render/fog_overlay.ts and TacticalCanvas):

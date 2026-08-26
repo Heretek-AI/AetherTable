@@ -59,6 +59,7 @@ const BossHealthBar = lazy(() => import('./components/BossHealthBar').then((m) =
 const CampaignSaveModal = lazy(() => import('./components/CampaignSaveModal').then((m) => ({ default: m.CampaignSaveModal })));
 const ShortcutsModal = lazy(() => import('./components/ShortcutsModal').then((m) => ({ default: m.ShortcutsModal })));
 const CampaignWizardModal = lazy(() => import('./components/CampaignWizardModal').then((m) => ({ default: m.CampaignWizardModal })));
+const TokenArtDialog = lazy(() => import('./components/TokenArtDialog').then((m) => ({ default: m.TokenArtDialog })));
 
 /** Themed loading placeholder shown while a lazily-split view/modal chunk loads. */
 const ChunkFallback = ({ label }: { label: string }) => (
@@ -98,6 +99,7 @@ import {
   parseRewoundSnapshot,
 } from './ui/safetyXCard';
 import { fetchSessionState, triggerXCard } from './api/safety_xcard';
+
 import { canMoveTokensOnTransport, type BoundTransport } from './sync/transport_gate';
 import {
   REPROBE_INTERVAL_MS,
@@ -513,6 +515,23 @@ export function App() {
     if (!yjsClient) return undefined;
     return yjsClient.observeSpotlight(setSpotlightView);
   }, [yjsClient]);
+
+  // --- Iteration 3 (Loop 3): generated token art ---------------------------
+  // Art lives on the CRDT tokens map (setTokenArt, parallel to
+  // updateTokenPosition). This mirror state drives TacticalCanvas's render;
+  // the observer fires immediately with already-stored art (late joiners and
+  // IndexedDB restores included) then again on each local Apply / remote write.
+  // Generation itself runs inside TokenArtDialog against /api/v1/media/image;
+  // its failures (sign-in required, 10/min bucket, upstream refusal) surface
+  // in the dialog rather than as silent no-ops.
+  const [tokenArtByToken, setTokenArtByToken] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!yjsClient) return undefined;
+    return yjsClient.observeTokenArt(setTokenArtByToken);
+  }, [yjsClient]);
+
+  /** Which token's "Generate Art…" dialog is open, if any. */
+  const [tokenArtDialogFor, setTokenArtDialogFor] = useState<Token | null>(null);
 
   // --- Pillar-11: local mic → speech ledger ---------------------------------
   // This browser's own VAD bursts accumulate here; NarrativeChat forwards the
@@ -2278,6 +2297,10 @@ export function App() {
                   diceBoxRef={diceBoxRef}
                   spectatorMode={isSpectator}
                   concentrationByToken={concentrationByEntity}
+                  onGenerateArt={(id) => {
+                    const t = visibleTokens.find((tok) => tok.id === id);
+                    if (t) setTokenArtDialogFor({ ...t, artDataUrl: tokenArtByToken[id] });
+                  }}
                 />
 
                 {/* Session dice audit log — floats over the map's free corner */}
@@ -2285,6 +2308,27 @@ export function App() {
                   entries={rollHistory}
                   onClear={() => setRollHistory([])}
                 />
+
+                {/* Iteration 3 (Loop 3): "Generate Art…" dialog for the selected
+                    token. Suspense boundary because TokenArtDialog is a split
+                    chunk like every other modal. */}
+                {tokenArtDialogFor && (
+                  <Suspense fallback={null}>
+                    <TokenArtDialog
+                      token={tokenArtDialogFor}
+                      onApply={(tokenId, dataUrl) => {
+                        // Apply persists the ALREADY-GENERATED preview — never
+                        // a second diffusion run (the media bucket is 10/min).
+                        yjsClientRef.current?.setTokenArt(tokenId, dataUrl);
+                        setTokens((prev) =>
+                          prev.map((t) => (t.id === tokenId ? { ...t, artDataUrl: dataUrl } : t))
+                        );
+                        setTokenArtDialogFor(null);
+                      }}
+                      onClose={() => setTokenArtDialogFor(null)}
+                    />
+                  </Suspense>
+                )}
               </main>
 
               {/* Right Dock: Character Sheet */}
