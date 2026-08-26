@@ -29,11 +29,15 @@ from .routing.intent_router import IntentClassificationRouter
 from .routing.llm_client import LLMStreamingGateway, LLMConfig
 from .routing import engine_client
 from .routing.engine_client import EngineRejectedError, EngineUnavailableError
-from .routing.lemonade_client import (
-    LemonadeClient,
-    LemonadeRejectedError,
-    LemonadeUnavailableError,
+from .routing.media_gateway_client import (
+    MediaGatewayClient,
+    MediaGatewayRejectedError,
+    MediaGatewayUnavailableError,
 )
+# Pre-rename names stay importable for older callers.
+LemonadeClient = MediaGatewayClient
+LemonadeRejectedError = MediaGatewayRejectedError
+LemonadeUnavailableError = MediaGatewayUnavailableError
 from .storage import MemoryStore, PostgresStore, init_storage, public_user
 from . import ratelimit
 from .lore.epistemic_graph import EpistemicLoreGraphManager
@@ -172,12 +176,15 @@ safety_gateway = SafetyGateway()
 faction_sim = FactionSimulationGOAP("Shadow Cabal", resources=100)
 streaming_gateway = LLMStreamingGateway()
 tool_agent = EngineToolAgent(streaming_gateway)
-# Self-hosted Lemonade multimedia upstream (images / TTS / STT / SFX). Reads
-# LEMONADE_BASE_URL + LEMONADE_API_KEY at construction so a deployment can
-# repoint it without a code change; every call raises
-# LemonadeUnavailableError/LemonadeRejectedError on failure — routes built on
-# this client must degrade honestly, never synthesize placeholder media.
-lemonade_client = LemonadeClient()
+# Self-hosted OpenAI-compatible multimedia upstream (images / TTS / STT /
+# SFX). Reads MEDIA_GATEWAY_URL + MEDIA_GATEWAY_API_KEY plus the per-capability
+# MEDIA_*_MODEL vars at construction (legacy LEMONADE_BASE_URL/API_KEY still
+# honored as deprecated fallbacks) so a deployment can repoint it without a
+# code change; every call raises MediaGatewayUnavailableError /
+# MediaGatewayRejectedError on failure — routes built on this client must
+# degrade honestly, never synthesize placeholder media.
+media_client = MediaGatewayClient()
+lemonade_client = media_client  # pre-rename alias; do not extend its use
 pdf_renderer = CharacterSheetPDFRenderer()
 empirical_playtester = EmpiricalPlaytester()
 
@@ -600,6 +607,7 @@ TOKEN_TTL_SECONDS = 12 * 3600
 storage_backend: Any = MemoryStore()
 
 _autosave_log = logging.getLogger("aethertable.autosave")
+_media_log = logging.getLogger("aethertable.media")
 
 
 @app.on_event("startup")
@@ -609,11 +617,37 @@ async def _init_storage_backend():
     # Resolve the rate-limit backend eagerly so a REDIS_URL misconfiguration is
     # reported once, at startup, instead of on the first request.
     _get_rate_backend()
-    # Report the Lemonade multimedia upstream target once, at startup, so an
-    # operator sees which host media generation will hit (or that it still
-    # points at a default) before the first image/SFX request fails.
-    logging.getLogger("aethertable.lemonade").info(
-        "lemonade upstream configured: base_url=%s", lemonade_client.base_url
+    # Report the media gateway target once, at startup, so an operator sees
+    # which host media generation will hit (or that it still points at a
+    # default) before the first image/SFX request fails. The advertised-
+    # capability probe is best-effort: a gateway that labels its models gives
+    # an honest per-capability readout; one that doesn't (or is down) is
+    # logged as unknown — routes still ATTEMPT their calls regardless.
+    try:
+        capabilities = await media_client.discover_capabilities()
+        advertised = sorted(
+            name for name, ok in capabilities.items() if ok
+        )
+        capability_note = ",".join(advertised) or "none"
+    except Exception:
+        _media_log.exception(
+            "media gateway capability probe failed at %s", media_client.base_url
+        )
+        capability_note = "unknown"
+    _media_log.info(
+        "media gateway configured: base_url=%s models(image=%s tts=%s stt=%s sfx=%s) "
+        "advertised_capabilities=%s%s",
+        media_client.base_url,
+        media_client.image_model,
+        media_client.tts_model,
+        media_client.stt_model,
+        media_client.sfx_model,
+        capability_note,
+        (
+            " [deprecated LEMONADE_* env in use]"
+            if media_client.used_legacy_env_url or media_client.used_legacy_env_key
+            else ""
+        ),
     )
 
 
@@ -4106,7 +4140,7 @@ def _bucket_for_path(path: str) -> str:
     # bucket. Must be matched before the generic media prefix below.
     if path == "/api/v1/media/image":
         return "media"
-    # Other Lemonade media surfaces (TTS / STT): model spend, llm bucket.
+    # Other media surfaces (TTS / STT): model spend, llm bucket.
     if path.startswith("/api/v1/media/"):
         return "llm"
     # LLM-spend surfaces: intent classification and every orchestrator
@@ -4384,14 +4418,14 @@ async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(
     }
 
 
-# --- Lemonade multimedia gateway routes (Loop 3, iteration 2) ------------------
+# --- Media gateway routes (Loop 3, iteration 2) ------------------------------
 #
 # Four authenticated surfaces over the self-hosted upstream wired in iteration
 # 1. Shared contract:
 #   * every route requires a session token (header Bearer first, ?token=
 #     fallback) — media generation is never anonymous;
 #   * failures degrade HONESTLY: an unreachable host maps to 502
-#     LEMONADE_UNAVAILABLE and an upstream rejection forwards its status +
+#     MEDIA_GATEWAY_UNAVAILABLE and an upstream rejection forwards its status +
 #     detail verbatim; no route ever fabricates placeholder media or masks a
 #     generation failure with canned content;
 #   * rate limiting is bucket-assigned by _bucket_for_path: diffusion images
@@ -4421,14 +4455,14 @@ class MediaImageResponse(BaseModel):
     image_b64: str
 
 
-def _lemonade_error_to_http(exc: Exception) -> HTTPException:
-    """Maps one Lemonade client exception onto the honest HTTP surface."""
-    if isinstance(exc, LemonadeUnavailableError):
+def _media_error_to_http(exc: Exception) -> HTTPException:
+    """Maps one media-gateway client exception onto the honest HTTP surface."""
+    if isinstance(exc, MediaGatewayUnavailableError):
         return HTTPException(
-            status_code=502, detail=f"LEMONADE_UNAVAILABLE: {exc}"
+            status_code=502, detail=f"MEDIA_GATEWAY_UNAVAILABLE: {exc}"
         )
-    # LemonadeRejectedError: forward the upstream status + detail verbatim so
-    # the client sees exactly what the model host refused (and why).
+    # MediaGatewayRejectedError: forward the upstream status + detail verbatim
+    # so the client sees exactly what the model host refused (and why).
     status = getattr(exc, "status_code", 502)
     if not isinstance(status, int) or not (400 <= status <= 599):
         status = 502
@@ -4498,11 +4532,11 @@ async def media_image(req: MediaImageRequest, token: str = Depends(_require_auth
     """
     _require_user_id(token)
     try:
-        png_bytes = await lemonade_client.generate_image(
+        png_bytes = await media_client.generate_image(
             req.prompt, size=req.size, steps=req.steps
         )
-    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
-        raise _lemonade_error_to_http(exc)
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
     return MediaImageResponse(image_b64=base64.b64encode(png_bytes).decode())
 
 
@@ -4516,11 +4550,11 @@ async def media_speech(req: MediaSpeechRequest, token: str = Depends(_require_au
     """
     _require_user_id(token)
     try:
-        audio = await lemonade_client.text_to_speech(
+        audio = await media_client.text_to_speech(
             req.text, voice=req.voice, fmt=req.fmt
         )
-    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
-        raise _lemonade_error_to_http(exc)
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
     if len(audio) > _MEDIA_MAX_TTS_BYTES:
         raise HTTPException(
             status_code=413,
@@ -4547,9 +4581,9 @@ async def media_transcribe(
     payload = await _read_capped_upload(file, _MEDIA_MAX_UPLOAD_BYTES)
     _validate_wav_upload(file.filename or "", payload)
     try:
-        text = await lemonade_client.transcribe(payload, filename=file.filename or "input.wav")
-    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
-        raise _lemonade_error_to_http(exc)
+        text = await media_client.transcribe(payload, filename=file.filename or "input.wav")
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
     return {"text": text}
 
 
@@ -4571,9 +4605,9 @@ async def media_sfx(req: MediaSfxRequest, token: str = Depends(_require_auth)):
             ),
         )
     try:
-        wav_bytes = await lemonade_client.generate_sfx(req.prompt)
-    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
-        raise _lemonade_error_to_http(exc)
+        wav_bytes = await media_client.generate_sfx(req.prompt)
+    except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
+        raise _media_error_to_http(exc)
     return Response(content=wav_bytes, media_type="audio/wav")
 
 

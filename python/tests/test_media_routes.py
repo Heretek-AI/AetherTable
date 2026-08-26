@@ -1,7 +1,7 @@
-"""Authenticated gateway routes over the Lemonade multimedia upstream.
+"""Authenticated gateway routes over the media gateway upstream.
 
-Iteration 2 of Loop 3 wires four ``/api/v1/media/*`` routes onto the
-iteration-1 ``LemonadeClient``. These tests pin the server-side contract:
+Iteration 2 of Loop 3 wires four ``/api/v1/media/*`` routes onto the media
+gateway client (renamed in iteration 5 from ``LemonadeClient``). These tests pin the server-side contract:
 
 * every route requires a session token (401 without one);
 * request bodies validate through Pydantic (422 on empty/oversized prompts,
@@ -13,7 +13,7 @@ iteration-1 ``LemonadeClient``. These tests pin the server-side contract:
   RIFF/WAVE magic bytes must both agree;
 * POST /api/v1/media/sfx is GM/admin-only because table-wide ambience is a
   staff decision;
-* upstream failures degrade honestly: unreachable → 502 LEMONADE_UNAVAILABLE,
+* upstream failures degrade honestly: unreachable → 502 MEDIA_GATEWAY_UNAVAILABLE,
   rejected → the upstream status and detail forwarded verbatim.
 """
 
@@ -24,9 +24,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from vtt_orchestrator import server as server_module
-from vtt_orchestrator.routing.lemonade_client import (
-    LemonadeRejectedError,
-    LemonadeUnavailableError,
+from vtt_orchestrator.routing.media_gateway_client import (
+    MediaGatewayRejectedError,
+    MediaGatewayUnavailableError,
 )
 from vtt_orchestrator.server import (
     _RATE_LIMITS,
@@ -164,7 +164,7 @@ class TestSfxStaffOnly:
         async def fake_sfx(prompt):
             return WAV_BYTES
 
-        monkeypatch.setattr(server_module.lemonade_client, "generate_sfx", fake_sfx)
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
         resp = client.post(
             "/api/v1/media/sfx",
             headers=_auth("usr_gm", "gm"),
@@ -174,7 +174,7 @@ class TestSfxStaffOnly:
 
 
 # ---------------------------------------------------------------------------
-# Happy paths against a monkeypatched Lemonade client
+# Happy paths against a monkeypatched media gateway client
 # ---------------------------------------------------------------------------
 
 
@@ -186,7 +186,7 @@ class TestMediaHappyPaths:
             captured.update(prompt=prompt, size=size, steps=steps)
             return PNG_BYTES
 
-        monkeypatch.setattr(server_module.lemonade_client, "generate_image", fake_image)
+        monkeypatch.setattr(server_module.media_client, "generate_image", fake_image)
         resp = client.post(
             "/api/v1/media/image",
             headers=_auth(),
@@ -208,7 +208,7 @@ class TestMediaHappyPaths:
             captured.update(text=text, voice=voice, fmt=fmt)
             return WAV_BYTES
 
-        monkeypatch.setattr(server_module.lemonade_client, "text_to_speech", fake_tts)
+        monkeypatch.setattr(server_module.media_client, "text_to_speech", fake_tts)
         resp = client.post(
             "/api/v1/media/speech",
             headers=_auth(),
@@ -223,7 +223,7 @@ class TestMediaHappyPaths:
         async def fake_tts(text, voice="af_sky", fmt="wav"):
             return b"ID3 mp3-frame-data"
 
-        monkeypatch.setattr(server_module.lemonade_client, "text_to_speech", fake_tts)
+        monkeypatch.setattr(server_module.media_client, "text_to_speech", fake_tts)
         resp = client.post(
             "/api/v1/media/speech",
             headers=_auth(),
@@ -240,7 +240,7 @@ class TestMediaHappyPaths:
             captured.update(bytes=wav_bytes, filename=filename)
             return "I attack the darkness"
 
-        monkeypatch.setattr(server_module.lemonade_client, "transcribe", fake_transcribe)
+        monkeypatch.setattr(server_module.media_client, "transcribe", fake_transcribe)
         resp = client.post(
             "/api/v1/media/transcribe",
             headers=_auth(),
@@ -255,7 +255,7 @@ class TestMediaHappyPaths:
         async def fake_sfx(prompt):
             return WAV_BYTES
 
-        monkeypatch.setattr(server_module.lemonade_client, "generate_sfx", fake_sfx)
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
         resp = client.post(
             "/api/v1/media/sfx",
             headers=_auth("usr_gm2", "admin"),
@@ -269,7 +269,7 @@ class TestMediaHappyPaths:
         async def fake_tts(text, voice="af_sky", fmt="wav"):
             return b"\x00" * (20 * 1024 * 1024 + 1)
 
-        monkeypatch.setattr(server_module.lemonade_client, "text_to_speech", fake_tts)
+        monkeypatch.setattr(server_module.media_client, "text_to_speech", fake_tts)
         resp = client.post(
             "/api/v1/media/speech", headers=_auth(), json={"text": "loop forever"}
         )
@@ -282,22 +282,22 @@ class TestMediaHappyPaths:
 
 
 class TestLemonadeErrorMapping:
-    def test_unavailable_maps_to_502_lemonade_unavailable(self, monkeypatch):
+    def test_unavailable_maps_to_502_media_gateway_unavailable(self, monkeypatch):
         async def boom(prompt, size="512x512", steps=4):
-            raise LemonadeUnavailableError("Lemonade timed out after 300s")
+            raise MediaGatewayUnavailableError("Lemonade timed out after 300s")
 
-        monkeypatch.setattr(server_module.lemonade_client, "generate_image", boom)
+        monkeypatch.setattr(server_module.media_client, "generate_image", boom)
         resp = client.post(
             "/api/v1/media/image", headers=_auth(), json={"prompt": "a keep"}
         )
         assert resp.status_code == 502
-        assert "LEMONADE_UNAVAILABLE" in resp.json()["detail"]
+        assert "MEDIA_GATEWAY_UNAVAILABLE" in resp.json()["detail"]
 
     def test_rejected_status_and_detail_forwarded_verbatim(self, monkeypatch):
         async def boom(text, voice="af_sky", fmt="wav"):
-            raise LemonadeRejectedError(422, "voice 'nope' is not served")
+            raise MediaGatewayRejectedError(422, "voice 'nope' is not served")
 
-        monkeypatch.setattr(server_module.lemonade_client, "text_to_speech", boom)
+        monkeypatch.setattr(server_module.media_client, "text_to_speech", boom)
         resp = client.post(
             "/api/v1/media/speech", headers=_auth(), json={"text": "hi"}
         )
@@ -306,20 +306,20 @@ class TestLemonadeErrorMapping:
 
     def test_sfx_unavailable_maps_to_502(self, monkeypatch):
         async def boom(prompt):
-            raise LemonadeUnavailableError("connection refused")
+            raise MediaGatewayUnavailableError("connection refused")
 
-        monkeypatch.setattr(server_module.lemonade_client, "generate_sfx", boom)
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", boom)
         resp = client.post(
             "/api/v1/media/sfx", headers=_auth("usr_gm3", "gm"), json={"prompt": "rain"}
         )
         assert resp.status_code == 502
-        assert "LEMONADE_UNAVAILABLE" in resp.json()["detail"]
+        assert "MEDIA_GATEWAY_UNAVAILABLE" in resp.json()["detail"]
 
     def test_transcribe_rejected_status_forwarded(self, monkeypatch):
         async def boom(wav_bytes, filename="input.wav"):
-            raise LemonadeRejectedError(400, "wav decode failed")
+            raise MediaGatewayRejectedError(400, "wav decode failed")
 
-        monkeypatch.setattr(server_module.lemonade_client, "transcribe", boom)
+        monkeypatch.setattr(server_module.media_client, "transcribe", boom)
         resp = client.post(
             "/api/v1/media/transcribe",
             headers=_auth(),
@@ -356,7 +356,7 @@ class TestTranscribeUploadValidation:
         async def fake_transcribe(wav_bytes, filename="input.wav"):
             return "ok"
 
-        monkeypatch.setattr(server_module.lemonade_client, "transcribe", fake_transcribe)
+        monkeypatch.setattr(server_module.media_client, "transcribe", fake_transcribe)
         resp = client.post(
             "/api/v1/media/transcribe",
             headers=_auth(),
@@ -380,7 +380,7 @@ class TestTranscribeUploadValidation:
             sent["bytes"] = wav_bytes
             return "should never happen"
 
-        monkeypatch.setattr(server_module.lemonade_client, "transcribe", fake_transcribe)
+        monkeypatch.setattr(server_module.media_client, "transcribe", fake_transcribe)
         big = make_wav(b"\x00" * (25 * 1024 * 1024))
         resp = client.post(
             "/api/v1/media/transcribe",
