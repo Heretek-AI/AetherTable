@@ -406,3 +406,330 @@ class TestRedactionRuleOverHttp:
             params={"token": _token("usr_admin106", "admin")},
         ).json()
         assert [l["topic"] for l in admin_view["lines"]] == ["torture"]
+
+
+# ---------------------------------------------------------------------------
+# Routes: counts-only summary projection
+#
+# The summary endpoint is the privacy-cheap counterpart to the full listing:
+# it lets the client render badges ("you've declared 3 lines") without ever
+# pulling the topic text. The contract documented here:
+#
+# * auth gate is the same _boundary_gate (HMAC 401, unknown session 404,
+#   outsider 403 SAFETY_NOT_A_PARTICIPANT — uniform for staff).
+# * response carries ONLY counts: {you.{lines, veils}, others.{lines, veils},
+#   redacted.lines}; no topic strings, no actor ids, no timestamps.
+# * "you" is what the caller themselves filed; "others" is everyone else's,
+#   collapsed into a single integer per kind (no per-actor breakdown).
+# * "redacted.lines" == others.lines for non-staff (every other line is
+#   redacted to a player); == 0 for staff (lines are never redacted to gm/admin).
+# * Empty registry -> all zeros, never 404 (the gate already proved the
+#   session exists).
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryAuth:
+    def test_anonymous_get_rejected(self):
+        resp = client.get(f"/api/v1/sessions/{_session_id()}/safety/boundaries/summary")
+        assert resp.status_code == 401
+
+    def test_invalid_token_rejected(self):
+        resp = client.get(
+            f"/api/v1/sessions/{_session_id()}/safety/boundaries/summary",
+            params={"token": "forged"},
+        )
+        assert resp.status_code == 401
+
+    def test_unknown_session_404_even_for_gm(self):
+        """The gate must answer 404 SESSION_NOT_FOUND for an id no lobby
+        binds — staff get the same uniform 404 so the route is not an
+        existence oracle for other deployments' tables."""
+        resp = client.get(
+            f"/api/v1/sessions/{_session_id()}/safety/boundaries/summary",
+            params={"token": _token("usr_gm_summary0", "gm")},
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error"] == "SESSION_NOT_FOUND"
+
+    def test_outsider_on_real_session_403(self):
+        session_id = _bound_table("usr_h_sum1", "usr_p_sum1")
+        outsider = _token("usr_stranger_sum1", "player")
+        resp = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": outsider},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error"] == "SAFETY_NOT_A_PARTICIPANT"
+
+    def test_spectator_member_is_a_participant(self):
+        """Survey result: spectators join lobbies as full roster members and
+        _caller_is_session_participant is role-blind, so a spectator seat can
+        read the table's boundaries summary."""
+        host_token = _token("usr_h_sum_spec", "player")
+        created = client.post(
+            "/api/v1/lobbies",
+            params={"token": host_token},
+            json={"name": "Spec Summary Table"},
+        )
+        lobby_id = created.json()["lobby_id"]
+        spec_token = _token("usr_spec_sum", "spectator")
+        client.post(
+            f"/api/v1/lobbies/{lobby_id}/join",
+            params={"token": spec_token},
+            json={"invite_code": created.json()["invite_code"]},
+        )
+        session_id = _session_id()
+        asyncio.run(server_module.storage_backend.set_lobby_session(lobby_id, session_id))
+        resp = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": spec_token},
+        )
+        assert resp.status_code == 200
+
+
+class TestSummaryCounts:
+    def test_empty_registry_returns_all_zeros(self):
+        """The route must never 404 on an empty table — the gate already
+        proved the session exists; an unused table is the legitimate
+        pre-declaration state."""
+        session_id = _bound_table("usr_h_sum_empty", "usr_p_sum_empty")
+        resp = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_p_sum_empty", "player")},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "you": {"lines": 0, "veils": 0},
+            "others": {"lines": 0, "veils": 0},
+            "redacted": {"lines": 0},
+        }
+
+    def test_mixed_entries_split_between_you_and_others(self):
+        session_id = _bound_table(
+            "usr_h_sum_mix", "usr_p_sum_mix_a", "usr_p_sum_mix_b"
+        )
+        lines_url = f"/api/v1/sessions/{session_id}/safety/lines"
+        veils_url = f"/api/v1/sessions/{session_id}/safety/veils"
+        # p_a declares 2 lines + 1 veil; p_b declares 1 line + 2 veils.
+        for topic in ("self-harm", "spiders"):
+            client.post(
+                lines_url,
+                params={"token": _token("usr_p_sum_mix_a", "player")},
+                json={"topic": topic},
+            )
+        client.post(
+            veils_url,
+            params={"token": _token("usr_p_sum_mix_a", "player")},
+            json={"topic": "romance"},
+        )
+        client.post(
+            lines_url,
+            params={"token": _token("usr_p_sum_mix_b", "player")},
+            json={"topic": "animal cruelty"},
+        )
+        for topic in ("gore", "torture"):
+            client.post(
+                veils_url,
+                params={"token": _token("usr_p_sum_mix_b", "player")},
+                json={"topic": topic},
+            )
+
+        a_view = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_p_sum_mix_a", "player")},
+        ).json()
+        assert a_view == {
+            "you": {"lines": 2, "veils": 1},
+            "others": {"lines": 1, "veils": 2},
+            "redacted": {"lines": 1},
+        }
+        b_view = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_p_sum_mix_b", "player")},
+        ).json()
+        assert b_view == {
+            "you": {"lines": 1, "veils": 2},
+            "others": {"lines": 2, "veils": 1},
+            "redacted": {"lines": 2},
+        }
+
+    def test_gm_sees_full_breakdown_with_redacted_zero(self):
+        """gm/admin must see everyone's lines, so 'others' carries the total
+        and 'redacted' collapses to 0 — nothing is redacted to staff."""
+        session_id = _bound_table("usr_h_sum_gm", "usr_p_sum_gm_a", "usr_p_sum_gm_b")
+        lines_url = f"/api/v1/sessions/{session_id}/safety/lines"
+        client.post(
+            lines_url,
+            params={"token": _token("usr_p_sum_gm_a", "player")},
+            json={"topic": "needleplay"},
+        )
+        client.post(
+            lines_url,
+            params={"token": _token("usr_p_sum_gm_b", "player")},
+            json={"topic": "claustrophobia"},
+        )
+        gm_view = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_gm_sum_staff", "gm")},
+        ).json()
+        assert gm_view == {
+            "you": {"lines": 0, "veils": 0},
+            "others": {"lines": 2, "veils": 0},
+            "redacted": {"lines": 0},
+        }
+
+    def test_admin_sees_full_breakdown_with_redacted_zero(self):
+        """Same contract for admin role (mirrors the verbatim view)."""
+        session_id = _bound_table("usr_h_sum_admin", "usr_p_sum_admin")
+        client.post(
+            f"/api/v1/sessions/{session_id}/safety/veils",
+            params={"token": _token("usr_p_sum_admin", "player")},
+            json={"topic": "romance"},
+        )
+        admin_view = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_admin_sum_staff", "admin")},
+        ).json()
+        assert admin_view == {
+            "you": {"lines": 0, "veils": 0},
+            "others": {"lines": 0, "veils": 1},
+            "redacted": {"lines": 0},
+        }
+
+    def test_add_increments_you(self):
+        session_id = _bound_table("usr_h_sum_inc", "usr_p_sum_inc")
+        url = f"/api/v1/sessions/{session_id}/safety/boundaries/summary"
+        token = _token("usr_p_sum_inc", "player")
+        before = client.get(f"/api/v1/sessions/{session_id}/safety/boundaries/summary", params={"token": token}).json()
+        client.post(
+            f"/api/v1/sessions/{session_id}/safety/lines",
+            params={"token": token},
+            json={"topic": "spiders"},
+        )
+        after = client.get(url, params={"token": token}).json()
+        assert after["you"]["lines"] == before["you"]["lines"] + 1
+        assert after["you"]["veils"] == before["you"]["veils"]
+        assert after["others"] == before["others"]
+
+    def test_delete_decrements_you(self):
+        session_id = _bound_table("usr_h_sum_dec", "usr_p_sum_dec")
+        token = _token("usr_p_sum_dec", "player")
+        entry = client.post(
+            f"/api/v1/sessions/{session_id}/safety/veils",
+            params={"token": token},
+            json={"topic": "romance"},
+        ).json()["entry"]
+        before = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": token},
+        ).json()
+        client.delete(
+            f"/api/v1/sessions/{session_id}/safety/veils/{entry['entry_id']}",
+            params={"token": token},
+        )
+        after = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": token},
+        ).json()
+        assert after["you"]["veils"] == before["you"]["veils"] - 1
+        assert after["you"]["lines"] == before["you"]["lines"]
+
+
+class TestSummaryNoLeakage:
+    def test_response_body_carries_no_topic_strings(self):
+        """The endpoint's whole point is to AVOID topic leakage. After adding
+        sensitive topics, the response body must literally not contain any of
+        them — and likewise must not echo entry_id / added_by / created_at
+        from the registry."""
+        session_id = _bound_table("usr_h_sum_leak", "usr_p_sum_leak_a", "usr_p_sum_leak_b")
+        sensitive = [
+            ("line", "TOPIC_LEAK_NEEDLEPLAY", "usr_p_sum_leak_a"),
+            ("line", "TOPIC_LEAK_CLAUSTROPHOBIA", "usr_p_sum_leak_b"),
+            ("veil", "TOPIC_LEAK_ROMANCE", "usr_p_sum_leak_b"),
+            ("veil", "TOPIC_LEAK_GORE", "usr_p_sum_leak_a"),
+        ]
+        for kind, topic, actor in sensitive:
+            url = (
+                f"/api/v1/sessions/{session_id}/safety/lines"
+                if kind == "line"
+                else f"/api/v1/sessions/{session_id}/safety/veils"
+            )
+            client.post(
+                url,
+                params={"token": _token(actor, "player")},
+                json={"topic": topic},
+            )
+        # Also fetch the full listing so we can use its entry_ids / actor ids
+        # as canary strings — none of them must leak into the summary either.
+        full = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries",
+            params={"token": _token("usr_p_sum_leak_a", "player")},
+        ).json()
+        canary_strings = {topic for _, topic, _ in sensitive}
+        for entry in full["lines"] + full["veils"]:
+            canary_strings.add(entry["entry_id"])
+            canary_strings.add(entry["added_by"])
+
+        for viewer in ("usr_p_sum_leak_a", "usr_p_sum_leak_b", "usr_gm_sum_leak"):
+            role = "gm" if viewer.startswith("usr_gm_") else "player"
+            body = client.get(
+                f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+                params={"token": _token(viewer, role)},
+            ).text
+            for canary in canary_strings:
+                assert canary not in body, (
+                    f"Summary leaked {canary!r} to viewer {viewer}: {body!r}"
+                )
+
+    def test_response_shape_is_exactly_documented(self):
+        """Lock the contract: keys MUST be exactly {you, others, redacted};
+        nested keys MUST be exactly the documented ones. Clients will code
+        against this structure."""
+        session_id = _bound_table("usr_h_sum_shape", "usr_p_sum_shape")
+        resp = client.get(
+            f"/api/v1/sessions/{session_id}/safety/boundaries/summary",
+            params={"token": _token("usr_p_sum_shape", "player")},
+        )
+        body = resp.json()
+        assert set(body.keys()) == {"you", "others", "redacted"}
+        assert set(body["you"].keys()) == {"lines", "veils"}
+        assert set(body["others"].keys()) == {"lines", "veils"}
+        assert set(body["redacted"].keys()) == {"lines"}
+        for nested in (body["you"], body["others"], body["redacted"]):
+            for value in nested.values():
+                assert isinstance(value, int)
+
+
+class TestRegistrySummary:
+    """Direct unit coverage of the registry's summary projection so the
+    route layer is provably a thin wrapper."""
+
+    def test_staff_redacted_lines_is_zero(self):
+        registry = SafetyBoundaryRegistry()
+        registry.add("s1", "line", "self-harm", added_by="u_a")
+        registry.add("s1", "line", "spiders", added_by="u_b")
+        out = registry.summary("s1", viewer_id="gm1", privileged=True)
+        assert out == {
+            "you": {"lines": 0, "veils": 0},
+            "others": {"lines": 2, "veils": 0},
+            "redacted": {"lines": 0},
+        }
+
+    def test_player_redacted_lines_equals_others_lines(self):
+        registry = SafetyBoundaryRegistry()
+        registry.add("s1", "line", "self-harm", added_by="u_a")
+        registry.add("s1", "line", "spiders", added_by="u_b")
+        registry.add("s1", "line", "gore", added_by="u_a")
+        out = registry.summary("s1", viewer_id="u_a", privileged=False)
+        assert out["you"]["lines"] == 2
+        assert out["others"]["lines"] == 1
+        assert out["redacted"]["lines"] == 1
+
+    def test_unknown_session_returns_all_zeros(self):
+        registry = SafetyBoundaryRegistry()
+        out = registry.summary("missing", viewer_id="u_a", privileged=False)
+        assert out == {
+            "you": {"lines": 0, "veils": 0},
+            "others": {"lines": 0, "veils": 0},
+            "redacted": {"lines": 0},
+        }

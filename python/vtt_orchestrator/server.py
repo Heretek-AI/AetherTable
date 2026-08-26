@@ -1795,6 +1795,38 @@ async def get_safety_boundaries(
     }
 
 
+@app.get("/api/v1/sessions/{session_id}/safety/boundaries/summary")
+async def get_safety_boundaries_summary(
+    session_id: str, token: str = Depends(_require_auth)
+):
+    """Participant-safe COUNTS-ONLY projection of this session's boundaries.
+
+    Built so a client can render a "you've declared 3 lines this session"
+    badge without paying the cost — or accepting the topic leakage — of
+    fetching the full registry. The response carries:
+
+    * ``you.{lines, veils}`` — declarations filed by the caller themselves.
+    * ``others.{lines, veils}`` — declarations filed by anyone else at the
+      table, aggregated into a single integer per kind (presence-oracle
+      resistant: 3 could mean three players declared one, or one player
+      declared three).
+    * ``redacted.lines`` — count of OTHER participants' lines that appear
+      redacted to THIS caller. For non-staff viewers this equals
+      ``others.lines`` (every other line is redacted to a player); for
+      gm/admin it is always 0 (staff see every line verbatim).
+
+    No topic strings, no actor ids, no timestamps are ever returned. Empty
+    registry yields all zeros — the route never 404s on an empty table
+    because the session's existence is already proven by ``_boundary_gate``,
+    which returns 404 SESSION_NOT_FOUND for ids no lobby binds (uniform
+    answer for staff and players, matching the full-listing route above)."""
+    actor = await _boundary_gate(session_id, token)
+    privileged = actor.get("role", "") in ("gm", "admin")
+    return safety_boundaries.summary(
+        session_id, viewer_id=actor["user_id"], privileged=privileged
+    )
+
+
 @app.post("/api/v1/sessions/{session_id}/safety/lines")
 async def add_safety_line(
     session_id: str,

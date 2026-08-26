@@ -151,3 +151,49 @@ class SafetyBoundaryRegistry:
             self._sessions.clear()
         else:
             self._sessions.pop(session_id, None)
+
+    def summary(
+        self, session_id: str, viewer_id: str, privileged: bool
+    ) -> Dict[str, Dict[str, int]]:
+        """Participant-safe counts ONLY — never the topics, actors, or times.
+
+        Privacy contract (mirrored by tests in tests/test_safety_boundaries.py):
+
+        * ``you`` counts entries the CALLER themselves declared (lines AND
+          veils). It is the only field that exposes any signal about a
+          specific person, and that signal is about the caller themselves.
+        * ``others`` counts entries declared by OTHER participants. For a
+          non-staff viewer this collapses lines from N other participants
+          into a single integer — the route cannot say whether N=3 means
+          three players declared one line each, or one player declared
+          three, because that would be a presence oracle.
+        * ``redacted.lines`` is the count of OTHER participants' lines that
+          appear redacted to THIS caller. For non-staff viewers that equals
+          ``others.lines`` (every other line is redacted to a player). For
+          gm/admin it is always 0 because staff see every line verbatim and
+          nothing is ever redacted in their view.
+        * Empty/unknown registry yields all zeros — the summary is never a
+          404, because the route already validated the session exists in
+          ``_boundary_gate``.
+        """
+        bucket = self._sessions.get(session_id) or {k: [] for k in _KINDS}
+        you_lines = 0
+        you_veils = 0
+        others_lines = 0
+        others_veils = 0
+        for entry in bucket.get("line", []):
+            if entry["added_by"] == viewer_id:
+                you_lines += 1
+            else:
+                others_lines += 1
+        for entry in bucket.get("veil", []):
+            if entry["added_by"] == viewer_id:
+                you_veils += 1
+            else:
+                others_veils += 1
+        redacted_lines = 0 if privileged else others_lines
+        return {
+            "you": {"lines": you_lines, "veils": you_veils},
+            "others": {"lines": others_lines, "veils": others_veils},
+            "redacted": {"lines": redacted_lines},
+        }
