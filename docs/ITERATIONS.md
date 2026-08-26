@@ -536,3 +536,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.27 — d788f4b — refactor(engine): dead-code purge + public-API guard — cargo 503
 ### L3.31 — ab220ca — feat(client): 3D tag SFX + local VAD spotlight meter — vitest 751
 ### L3.30 — d3f5130 — fix(engine): Exhaustion tuple-variant rewind replay — cargo 504
+### L3.33 — 4c1196b — feat(gateway): session spotlight aggregation — pytest 1347
