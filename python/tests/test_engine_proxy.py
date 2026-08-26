@@ -136,6 +136,10 @@ class TestProxyAuthRequired:
             "/api/v1/engine/opportunity-attack",
             {"session_id": "s", "attacker_id": "a", "target_id": "t"},
         ),
+        "ready-release": (
+            "/api/v1/engine/ready/release",
+            {"session_id": "s", "entity_id": "e"},
+        ),
     }
 
     def test_missing_token_is_401_on_every_narrative_route(self):
@@ -1390,7 +1394,6 @@ class TestEscapeGrappleProxy:
         assert resp.status_code == 401
         assert resp.json().get("detail")
 
-
 class TestInspirationFiatProxies:
     """Iteration 64: GM-only gateway surfaces for the engine's iteration-60
     /inspiration/grant | /inspiration/revoke routes (SRD inspiration is GM
@@ -1964,7 +1967,33 @@ class TestCombatProxy:
 
 class TestReadyActionProxy:
     """The Ready action's gateway proxy: identity-forwarded, strict body,
-    description required — same trust contract as the other maneuvers."""
+    description required — same trust contract as the other maneuvers.
+
+    Iteration 82: the engine's ``ReadyActionReq`` is ``deny_unknown_fields``
+    with an optional ``trigger`` field (shorthand "enemy_enters_reach" |
+    "enemy_attacks" | "turn_start", else freeform text for GM adjudication).
+    The gateway previously declared ``trigger_hint`` — a field the engine does
+    not know — so any request that used it was rejected 422 upstream. The
+    regression contract:
+
+    - the trigger rides forward as ``trigger``, never as ``trigger_hint``;
+    - the legacy ``trigger_hint`` field is refused locally (422, no dial);
+    - POST /api/v1/engine/ready/release proxies the engine's
+      /action/ready/release (the Reaction spend) ids-only, identity forwarded;
+    - smuggled fields are refused before any engine traffic, anonymous callers
+      get an honest 401, and engine rejections surface verbatim.
+    """
+
+    SESSION_ID = "3a2b1c0d-9e8f-4766-8594-b2c1d0e9f8a7"
+    ENTITY_NAME = "watchful-ranger"
+
+    READY_BODY = {
+        "session_id": SESSION_ID,
+        "entity_id": ENTITY_NAME,
+        "description": "I attack the goblin when it moves",
+        "trigger": "enemy_enters_reach",
+    }
+    RELEASE_BODY = {"session_id": SESSION_ID, "entity_id": ENTITY_NAME}
 
     @staticmethod
     def _token(user_id: str = "gm-9", role: str = "gm") -> str:
@@ -1974,26 +2003,188 @@ class TestReadyActionProxy:
 
         return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
 
-    def test_ready_forwards_identity_path_and_payload(self, monkeypatch):
+    def _capture(self, monkeypatch, response):
         captured: dict = {}
 
         async def fake_engine_request(method, path, payload=None, *, actor=None):
-            captured["method"], captured["path"] = method, path
-            captured["payload"], captured["actor"] = payload, actor
-            return {"status": "READY_ACTION_SET"}
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
 
         monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_ready_forwards_identity_path_and_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "READY_ACTION_SET"})
+        resp = client.post(
+            "/api/v1/engine/ready",
+            params={"token": self._token("player-7", "player")},
+            json=self.READY_BODY,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "READY_ACTION_SET"}
+        assert captured["method"] == "POST"
+        assert captured["path"] == f"/api/v1/sessions/{self.SESSION_ID}/action/ready"
+        # Real caller identity reaches the engine RBAC, never a service
+        # principal.
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        # The deny_unknown_fields ReadyActionReq knows `trigger` — and nothing
+        # else. The session reference rides the PATH, not the body.
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, self.ENTITY_NAME)),
+            "description": "I attack the goblin when it moves",
+            "trigger": "enemy_enters_reach",
+        }
+        assert "trigger_hint" not in captured["payload"]
+
+    def test_freeform_trigger_passes_through_verbatim(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "READY_ACTION_SET"})
+        body = {k: v for k, v in self.READY_BODY.items() if k != "trigger"}
         resp = client.post(
             "/api/v1/engine/ready",
             params={"token": self._token()},
-            json={"session_id": "s", "entity_id": "e",
-                  "description": "I attack it", "trigger_hint": "when it moves"},
+            json={**body, "trigger": "when the bell tolls thrice"},
         )
         assert resp.status_code == 200
-        assert captured["path"].endswith("/action/ready")
-        assert captured["payload"]["description"] == "I attack it"
-        assert captured["payload"]["trigger_hint"] == "when it moves"
-        assert captured["actor"]["role"] == "gm"
+        assert captured["payload"]["trigger"] == "when the bell tolls thrice"
+
+    def test_omitted_trigger_is_not_forwarded_at_all(self, monkeypatch):
+        """The engine treats an absent trigger as Freeform(""); the gateway must
+        not invent either key for it."""
+        captured = self._capture(monkeypatch, {"status": "READY_ACTION_SET"})
+        body = {k: v for k, v in self.READY_BODY.items() if k != "trigger"}
+        resp = client.post(
+            "/api/v1/engine/ready", params={"token": self._token()}, json=body
+        )
+        assert resp.status_code == 200
+        assert "trigger" not in captured["payload"]
+        assert "trigger_hint" not in captured["payload"]
+
+    def test_legacy_trigger_hint_is_refused_locally(self, monkeypatch):
+        """Regression: `trigger_hint` used to be forwarded under its own name
+        and got the WHOLE request 422'd by the engine's deny_unknown_fields.
+        It is no longer part of the schema at all."""
+
+        async def refuse(method, path, payload=None, *, actor=None):
+            raise AssertionError("engine must not be dialed for an unknown field")
+
+        monkeypatch.setattr(engine_client, "engine_request", refuse)
+        body = {k: v for k, v in self.READY_BODY.items() if k != "trigger"}
+        resp = client.post(
+            "/api/v1/engine/ready",
+            params={"token": self._token()},
+            json={**body, "trigger_hint": "enemy_enters_reach"},
+        )
+        assert resp.status_code == 422
+
+    def test_release_forwards_identity_and_ids_only_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "READY_ACTION_RELEASED"})
+        resp = client.post(
+            "/api/v1/engine/ready/release",
+            params={"token": self._token("bard-3", "player")},
+            json=self.RELEASE_BODY,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "READY_ACTION_RELEASED"}
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/action/ready/release"
+        )
+        assert captured["actor"] == {"user_id": "bard-3", "role": "player"}
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, self.ENTITY_NAME)),
+        }
+
+    def test_gm_identity_is_forwarded_on_release(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"status": "READY_ACTION_RELEASED"})
+        resp = client.post(
+            "/api/v1/engine/ready/release",
+            params={"token": self._token("gm-1", "gm")},
+            json=self.RELEASE_BODY,
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_smuggled_fields_are_rejected_422(self):
+        """Trust-inversion regression: no seeds, no math, no auto-success on
+        either ready route."""
+        token = self._token()
+        ready_no_trigger = {
+            k: v for k, v in self.READY_BODY.items() if k != "trigger"
+        }
+        cases = [
+            ("/api/v1/engine/ready", {**self.READY_BODY, "seed": 42}),
+            ("/api/v1/engine/ready", {**ready_no_trigger, "attack_bonus": 999}),
+            (
+                "/api/v1/engine/ready/release",
+                {**self.RELEASE_BODY, "auto_success": True},
+            ),
+            ("/api/v1/engine/ready/release", {**self.RELEASE_BODY, "seed": 7}),
+            (
+                "/api/v1/engine/ready/release",
+                {**self.RELEASE_BODY, "description": "smuggled"},
+            ),
+        ]
+        for path, body in cases:
+            resp = client.post(path, params={"token": token}, json=body)
+            assert resp.status_code == 422, f"{path} {body}: refused before dialing"
+
+    def test_missing_token_is_401_and_invalid_token_is_401(self):
+        for path, body in (
+            ("/api/v1/engine/ready", self.READY_BODY),
+            ("/api/v1/engine/ready/release", self.RELEASE_BODY),
+        ):
+            resp = client.post(path, json=body)
+            assert resp.status_code == 401, f"{path}: anonymous access refused"
+            assert resp.json().get("detail"), f"{path}: honest error body required"
+            resp = client.post(
+                path, params={"token": "not.a.valid.token"}, json=body
+            )
+            assert resp.status_code == 401, f"{path}: invalid credential refused"
+
+    def test_engine_rejections_surface_verbatim(self, monkeypatch):
+        async def rejected(method, path, payload=None, *, actor=None):
+            if path.endswith("/action/ready"):
+                raise engine_client.EngineRejectedError(
+                    409,
+                    '{"error": "ACTION_ECONOMY_EXHAUSTED", '
+                    '"message": "action rejected by the action economy"}',
+                )
+            raise engine_client.EngineRejectedError(
+                409,
+                '{"error": "NO_READIED_ACTION", "message": "nothing is readied"}',
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        token = self._token()
+        resp = client.post(
+            "/api/v1/engine/ready", params={"token": token}, json=self.READY_BODY
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "error": "ACTION_ECONOMY_EXHAUSTED",
+            "message": "action rejected by the action economy",
+        }
+        resp = client.post(
+            "/api/v1/engine/ready/release",
+            params={"token": token},
+            json=self.RELEASE_BODY,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "error": "NO_READIED_ACTION",
+            "message": "nothing is readied",
+        }
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        for path, body in (
+            ("/api/v1/engine/ready", self.READY_BODY),
+            ("/api/v1/engine/ready/release", self.RELEASE_BODY),
+        ):
+            resp = client.post(path, params={"token": self._token()}, json=body)
+            assert resp.status_code == 502, path
+            assert "unreachable" in resp.json()["detail"].lower()
 
     def test_missing_description_is_422(self):
         resp = client.post(

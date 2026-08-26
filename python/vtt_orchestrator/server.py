@@ -2979,10 +2979,33 @@ async def engine_stabilize(req: EngineStabilizeRequest, token: str = Depends(_re
 
 
 class EngineReadyActionRequest(BaseModel):
+    """Mirrors the engine's ReadyActionReq (deny_unknown_fields): WHO readies,
+    WHAT they hold, and the optional declared ``trigger``. The trigger uses the
+    engine's shorthand strings ("enemy_enters_reach", "enemy_attacks",
+    "turn_start"); anything else is forwarded verbatim and kept by the engine
+    as a freeform string for GM adjudication. The field is named ``trigger`` —
+    NOT ``trigger_hint`` — because the engine refuses unknown fields outright:
+    forwarding under any other name 422s the whole request upstream."""
+
     session_id: str
     entity_id: str
     description: str
-    trigger_hint: Optional[str] = None
+    trigger: Optional[str] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class EngineReadyReleaseRequest(BaseModel):
+    """Mirrors the engine's ReleaseReadyReq (deny_unknown_fields): resolving a
+    readied action spends the actor's Reaction, so only WHO releases is
+    client-suppliable — everything mechanical is engine-owned."""
+
+    session_id: str
+    entity_id: str
+
+    class Config:
+        extra = "forbid"
 
 
 @app.post("/api/v1/engine/ready")
@@ -2992,9 +3015,23 @@ async def engine_ready_action(req: EngineReadyActionRequest, token: str = Depend
         "entity_id": engine_client._coerce_uuid(req.entity_id),
         "description": req.description,
     }
-    if req.trigger_hint:
-        payload["trigger_hint"] = req.trigger_hint
+    if req.trigger:
+        payload["trigger"] = req.trigger
     return await _maneuver_proxy("ready", payload, _caller_actor(token))
+
+
+@app.post("/api/v1/engine/ready/release")
+async def engine_ready_release(
+    req: EngineReadyReleaseRequest, token: str = Depends(_require_auth)
+):
+    return await _maneuver_proxy(
+        "ready/release",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
 
 
 class EngineEscapeGrappleRequest(BaseModel):
