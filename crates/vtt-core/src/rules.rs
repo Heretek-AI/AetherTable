@@ -821,13 +821,4 @@ impl RulesEvaluator {
         }
     }
 
-    /// Evaluates plunge attack: converts half of falling kinetic energy into bonus melee damage
-    pub fn calculate_plunge_attack_bonus(
-        dice: &mut DiceEngine,
-        fall_distance_feet: f32,
-    ) -> (i32, i32) {
-        let (self_dmg, _) = Self::calculate_fall_damage(dice, fall_distance_feet, None);
-        let bonus_melee_dmg = self_dmg / 2;
-        (bonus_melee_dmg, self_dmg)
     }
-}

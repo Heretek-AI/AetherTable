@@ -276,32 +276,6 @@ impl LootTableGenerator {
     pub fn roll_thematic_loot(cr_tier: u8, seed: u64) -> Vec<LootItem> {
         LootTableGenerator::roll_themed_hoard(cr_tier, seed).items
     }
-
-    pub fn generate_room_dressing(room_id: usize, theme: &str, seed: u64) -> DungeonRoomDressing {
-        let dressings = match theme {
-            "Baron's Crypt" => vec![
-                ("Ancient Sarcophagus", "A heavy stone sarcophagus carved with the likeness of a forgotten knight. The stone lid is slightly ajar.", Some("Signet Ring of House Vane (50 gp)"), None),
-                ("Desecrated Altar", "An obsidian altar stained with ancient wax and soot. Cold air radiates from its hollow basin.", None, Some("Necrotic Frost (DC 13 CON save or 1d6 cold damage)")),
-                ("Shattered Reliquary", "Glass shards and splintered gold-leaf wood litter the floor.", Some("Intact Vial of Holy Water"), None),
-            ],
-            _ => vec![
-                ("Iron Maiden Casket", "Rusted torture apparatus embedded into the stone alcove.", None, Some("Rusted Spring Trap")),
-                ("Rotting Supply Crate", "A moldering wooden crate bearing the insignia of the castle garrison.", Some("12 Iron Crossbow Bolts, 15 GP"), None),
-                ("Fungal Bloom Patch", "Luminescent violet spores growing in thick carpets across the damp stones.", None, Some("Choking Spores (DC 12 CON save or Blinded 1 turn)")),
-            ],
-        };
-
-        let idx = ((seed as usize) + room_id) % dressings.len();
-        let (feat, desc, loot, haz) = dressings[idx];
-
-        DungeonRoomDressing {
-            room_id,
-            feature_name: feat.to_string(),
-            description: desc.to_string(),
-            searchable_loot: loot.map(|s| s.to_string()),
-            environmental_hazard: haz.map(|s| s.to_string()),
-        }
-    }
 }
 
 /// Weighted index selection. Returns `None` for empty or all-zero weight
@@ -321,15 +295,6 @@ fn weighted_pick<R: Rng>(rng: &mut R, weights: &[u32]) -> Option<usize> {
     }
     // Only reachable on overflow-style inconsistencies; degrade gracefully.
     Some(weights.len().saturating_sub(1))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DungeonRoomDressing {
-    pub room_id: usize,
-    pub feature_name: String,
-    pub description: String,
-    pub searchable_loot: Option<String>,
-    pub environmental_hazard: Option<String>,
 }
 
 #[cfg(test)]

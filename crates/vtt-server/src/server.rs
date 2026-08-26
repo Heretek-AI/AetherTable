@@ -426,11 +426,6 @@ impl PeerRegistry {
         }
     }
 
-    /// Live connection count for one user (test/metrics introspection).
-    pub fn user_connection_count(&self, user_id: &str) -> usize {
-        self.user_connections.get(user_id).map(|c| *c).unwrap_or(0)
-    }
-
     fn join(&self, room_id: &str, session: &actix_ws::Session, role: Role) -> u64 {
         let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         self.rooms
@@ -5319,14 +5314,6 @@ async fn resolve_concentration(
         "passed": passed,
         "concentration_maintained": passed,
     }))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeathSaveActionReq {
-    pub successes: Option<u8>,
-    pub failures: Option<u8>,
-    pub is_stabilized: bool,
-    pub is_dead: bool,
 }
 
 /// Death saves now operate on the SERVER-side entity's death save state when

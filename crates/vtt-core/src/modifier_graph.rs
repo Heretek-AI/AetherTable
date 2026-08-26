@@ -89,10 +89,6 @@ impl AbilityScoreNode {
         }
     }
 
-    pub fn add_modifier(&mut self, name: &str, priority: ModifierPriority, value: i32) {
-        self.add_sourced_modifier(name, priority, value, None);
-    }
-
     pub fn add_sourced_modifier(
         &mut self,
         name: &str,
@@ -262,29 +258,6 @@ impl ArmorClassCalculator {
         unarmored_secondary_score: Option<i32>,
     ) -> i32 {
         calculate_armor_class(armor_type, base_ac, dex_score, has_shield, unarmored_secondary_score)
-    }
-}
-
-pub struct MulticlassSpellSlotMatrix;
-impl MulticlassSpellSlotMatrix {
-    pub fn slots_for_level(level: u32) -> [u8; 9] {
-        calculate_multiclass_spell_slots(level)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpellcastingStats {
-    pub spell_save_dc: i32,
-    pub spell_attack_bonus: i32,
-}
-
-impl SpellcastingStats {
-    pub fn calculate(ability_score: i32, prof_bonus: i32) -> Self {
-        let mod_val = calculate_ability_modifier(ability_score);
-        Self {
-            spell_save_dc: 8 + prof_bonus + mod_val,
-            spell_attack_bonus: prof_bonus + mod_val,
-        }
     }
 }
 

@@ -110,10 +110,6 @@ impl InventoryManager {
         self.items.insert(item.id, item);
     }
 
-    pub fn remove_item(&mut self, item_id: &Uuid) -> Option<Item> {
-        self.items.remove(item_id)
-    }
-
     /// Weight of the item's NESTED CONTENTS only (its own weight excluded —
     /// callers add that separately, whether the item is a stored map entry or
     /// a fresh payload). Cycle-guarded identically to
@@ -405,42 +401,6 @@ impl InventoryManager {
         }
         total
     }
-
-    pub fn check_encumbrance(&self, str_score: i32) -> EncumbranceStatus {
-        let total_weight = self.total_inventory_weight();
-        let max_carry = (str_score * 15) as f32;
-        let heavy_enc = (str_score * 10) as f32;
-        let enc = (str_score * 5) as f32;
-
-        if total_weight > max_carry {
-            EncumbranceStatus::OverEncumbered { current: total_weight, max: max_carry }
-        } else if total_weight > heavy_enc {
-            EncumbranceStatus::HeavilyEncumbered { current: total_weight, speed_penalty: 20 }
-        } else if total_weight > enc {
-            EncumbranceStatus::Encumbered { current: total_weight, speed_penalty: 10 }
-        } else {
-            EncumbranceStatus::Unencumbered { current: total_weight }
-        }
-    }
-
-    pub fn reveal_curse(&mut self, item_id: &Uuid, check_total: i32, dc: i32) -> bool {
-        if let Some(item) = self.items.get_mut(item_id) {
-            if item.is_cursed && check_total >= dc {
-                item.is_curse_revealed = true;
-                return true;
-            }
-        }
-        false
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum EncumbranceStatus {
-    Unencumbered { current: f32 },
-    Encumbered { current: f32, speed_penalty: u32 },
-    HeavilyEncumbered { current: f32, speed_penalty: u32 },
-    OverEncumbered { current: f32, max: f32 },
 }
 
 #[cfg(test)]

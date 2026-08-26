@@ -598,22 +598,9 @@ impl ActionResolver {
         }
     }
 
-    /// Massive Damage Instant Death: excess damage >= max_hp when dropping to 0 HP
+    /// Massive Damage Instant death: excess damage >= max_hp when dropping to 0 HP
     pub fn check_instant_death(damage_taken: i32, current_hp: i32, max_hp: i32) -> bool {
         damage_taken >= current_hp + max_hp
-    }
-
-    pub fn calculate_rule_of_cool_dc(
-        base_dc: i32,
-        cinematic_praise: bool,
-        environmental_hazard_rating: i32,
-    ) -> i32 {
-        let mut dc = base_dc;
-        if cinematic_praise {
-            dc -= 2;
-        }
-        dc += environmental_hazard_rating;
-        dc.max(5)
     }
 }
 
