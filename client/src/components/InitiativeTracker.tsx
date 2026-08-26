@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   Swords,
   ChevronRight,
@@ -11,7 +11,9 @@ import {
   Play,
   Square,
   Zap,
+  Hourglass,
 } from 'lucide-react';
+import { delayEntity, resumeEntity } from '../api/combat_delay';
 import { Token } from './TacticalCanvas';
 import { ConcentrationBadge } from './ConcentrationBadge';
 import {
@@ -174,6 +176,31 @@ export function parseTurnAdvancement(raw: unknown): TurnAdvancementNotice | null
 
 const EMPTY_STATUS_MAP: Record<string, EntityCombatStatus> = {};
 const EMPTY_CONCENTRATION_MAP: Record<string, ConcentrationInfo> = {};
+const EMPTY_DELAYED: string[] = [];
+
+/**
+ * Iteration 16 — the visible "Delayed" badge. Rendered ONLY for ids present in
+ * the engine-projected `combat.delayed` list; presence in that array is the
+ * whole truth, so there is nothing here to derive or guess.
+ */
+const DelayedMarker: React.FC<{ variant?: 'row' | 'rail'; entityId?: string }> = ({
+  variant = 'row',
+  entityId,
+}) => (
+  <span
+    data-testid={`delayed-marker-${entityId ?? (variant === 'rail' ? 'slot' : '')}`.replace(/-$/, '')}
+    title="Delayed — acting later this round at the current initiative count"
+    aria-label="Delayed"
+    className={`inline-flex items-center gap-0.5 rounded bg-sky-950/60 border border-sky-400/40 text-sky-200 font-mono font-bold ${
+      variant === 'rail'
+        ? 'absolute -top-1 -right-1 w-3 h-3 justify-center text-[7px]'
+        : 'px-1.5 py-px text-[9px] uppercase tracking-wide'
+    }`}
+  >
+    <Hourglass className={variant === 'rail' ? 'w-2 h-2' : 'w-2.5 h-2.5'} />
+    {variant !== 'rail' && 'Delayed'}
+  </span>
+);
 
 interface InitiativeTrackerProps {
   tokens: Token[];
@@ -215,6 +242,27 @@ interface InitiativeTrackerProps {
    * inside `entities[id].conditions` (`Exhaustion(u8)` → `{"exhaustion": N}`).
    */
   sessionStateRaw?: unknown;
+  /**
+   * Iteration 16 — ids the authoritative engine currently has parked out of
+   * turn order (`combat.delayed` from the projected snapshot, verbatim). The
+   * server projection already filtered this list per role; it is trusted as
+   * given and NEVER re-filtered client-side. Absent entries simply mean "not
+   * delaying".
+   */
+  delayedIds?: string[];
+  /** Engine session id these delay/resume calls act through (null = no engine). */
+  combatSessionIdForActions?: string | null;
+  /**
+   * Entity ids THIS seat may act for — the caller's ownership projection.
+   * GMs pass every visible entity; players only their own bound token(s);
+   * spectators an empty list. Delay/Resume buttons render only for these.
+   */
+  controlledEntityIds?: string[];
+  /**
+   * Called after a delay/resume resolves so the caller re-pulls the
+   * authoritative snapshot. The tracker never mutates order/turn_index itself.
+   */
+  onRefreshCombatState?: () => void;
 }
 
 export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
@@ -236,11 +284,53 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   entityStatusByEntity = EMPTY_STATUS_MAP,
   concentrationByEntity = EMPTY_CONCENTRATION_MAP,
   sessionStateRaw,
+  delayedIds = EMPTY_DELAYED,
+  combatSessionIdForActions = null,
+  controlledEntityIds = EMPTY_DELAYED,
+  onRefreshCombatState,
 }) => {
   // Additive turn report: whatever the engine's last advance actually
   // disclosed (OA provocations, concentration saves). Nothing here is derived
   // or remembered across advances beyond what the caller hands us.
   const turnNotice = useMemo(() => parseTurnAdvancement(lastTurnResponse), [lastTurnResponse]);
+
+  // Iteration 16 — who is parked out of turn order, straight from the
+  // projection. Set membership only; never re-filtered client-side.
+  const delayedSet = useMemo(() => new Set(delayedIds), [delayedIds]);
+  const controlledSet = useMemo(() => new Set(controlledEntityIds), [controlledEntityIds]);
+  // Transient verbatim engine rejection from the most recent delay/resume try.
+  // Cleared on the next attempt; display-only, it never gates anything.
+  const [delayError, setDelayError] = useState<string | null>(null);
+
+  const runDelayAction = useCallback(
+    async (entityId: string, mode: 'take' | 'resume') => {
+      if (!combatSessionIdForActions) {
+        setDelayError('Rules engine unavailable — delay needs a live session.');
+        return;
+      }
+      setDelayError(null);
+      const outcome =
+        mode === 'take'
+          ? await delayEntity({ sessionId: combatSessionIdForActions, entityId })
+          : await resumeEntity({ sessionId: combatSessionIdForActions, entityId });
+      if (outcome.kind === 'applied') {
+        // Optimistic-state discipline: no hand-mutation of order — re-pull the
+        // authoritative snapshot and let its combat.delayed/order render.
+        onRefreshCombatState?.();
+        return;
+      }
+      if (outcome.kind === 'rejected') {
+        setDelayError(
+          outcome.code
+            ? `${outcome.code}${outcome.message ? ` — ${outcome.message}` : ''}`
+            : (outcome.message ?? `HTTP ${outcome.status}`),
+        );
+        return;
+      }
+      setDelayError('Rules engine unreachable — nothing was changed.');
+    },
+    [combatSessionIdForActions, onRefreshCombatState],
+  );
 
   /** Best-effort id → display name using ONLY data we already have. */
   const displayNameFor = (entityId?: string): string => {
@@ -325,15 +415,17 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
           <div className="flex flex-col items-center gap-2">
             {combatOrder.map((entry) => {
               const isActiveTurn = entry.entity_id === activeEntityId;
+              const isDelayed = delayedSet.has(entry.entity_id);
               return (
                 <div
                   key={entry.entity_id}
                   onClick={() => onSelectToken(entry.entity_id)}
-                  className={`w-7 h-7 rounded-full flex items-center justify-center cursor-pointer border transition-transform ${
+                  className={`w-7 h-7 rounded-full flex items-center justify-center cursor-pointer border transition-transform relative ${
                     isActiveTurn ? 'border-[var(--tavern-accent)] scale-110 shadow-md shadow-amber-900/50' : 'border-[var(--tavern-border)]'
                   }`}
                 >
                   {renderAvatar(entry.entity_id, entry.name)}
+                  {isDelayed && <DelayedMarker variant="rail" entityId={entry.entity_id} />}
                 </div>
               );
             })}
@@ -417,6 +509,13 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
               const isSelected = selectedTokenId === entry.entity_id;
               const isDead = token ? token.hp <= 0 : false;
               const status = rowStatus.get(entry.entity_id);
+              // Iteration 16 — Delay/Resume affordances. Visibility mirrors the
+              // tracker's existing per-entity gating discipline: only entities
+              // THIS seat controls get controls (GM passes everyone; players
+              // their own bound tokens; spectators an empty list), while the
+              // marker renders from the projection for all seats to see.
+              const canControl = controlledSet.has(entry.entity_id);
+              const isDelayed = delayedSet.has(entry.entity_id);
 
               return (
                 <div
@@ -437,6 +536,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                         <div className="font-semibold text-xs text-[var(--rp-parchment-100)] flex items-center gap-1.5 truncate">
                           {entry.name}
                           {isDead && <Skull className="w-3 h-3 text-rose-500 shrink-0" />}
+                          {isDelayed && <DelayedMarker entityId={entry.entity_id} />}
                         </div>
                         <div className="text-[10px] text-[var(--rp-parchment-300)] font-mono">
                           DEX {entry.dexterity >= 0 ? `+${entry.dexterity}` : entry.dexterity}
@@ -528,6 +628,47 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                       ))}
                     </div>
                   )}
+
+                  {/* Iteration 16 — Delay (SRD-optional, FREE: the cost is
+                      forfeiting this round's slot) and Resume. Offered ONLY
+                      for entities this seat controls; success never mutates
+                      order locally — onRefreshCombatState re-pulls the
+                      authoritative snapshot instead. Engine rejections
+                      surface verbatim (ALREADY_DELAYED, NOT_DELAYED,
+                      NOT_IN_COMBAT, ENTITY_CANNOT_ACT, …). */}
+                  {inCombat && canControl && (
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      {isDelayed ? (
+                        <button
+                          data-testid={`delay-resume-${entry.entity_id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void runDelayAction(entry.entity_id, 'resume');
+                          }}
+                          disabled={!combatSessionIdForActions}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-950/60 hover:bg-sky-900/70 disabled:opacity-40 disabled:cursor-not-allowed border border-sky-400/40 text-sky-200 text-[9px] font-mono font-bold uppercase tracking-wide transition"
+                          title="Re-seat this combatant right after the current actor"
+                        >
+                          <Hourglass className="w-2.5 h-2.5" />
+                          <span>Resume</span>
+                        </button>
+                      ) : (
+                        <button
+                          data-testid={`delay-action-${entry.entity_id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void runDelayAction(entry.entity_id, 'take');
+                          }}
+                          disabled={!combatSessionIdForActions || isDead}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-black/40 hover:bg-[var(--rp-leather-700)]/60 disabled:opacity-40 disabled:cursor-not-allowed border border-[var(--tavern-border)] text-[var(--rp-parchment-200)] text-[9px] font-mono font-bold uppercase tracking-wide transition"
+                          title="Delay — step out of turn order until a better initiative count (free, forfeits this round's slot)"
+                        >
+                          <Hourglass className="w-2.5 h-2.5" />
+                          <span>Delay</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -575,6 +716,19 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Iteration 16 — verbatim engine rejection from the last delay/resume
+          attempt. Display-only honesty: the engine's machine code is quoted,
+          never rewritten into friendlier fiction. */}
+      {inCombat && delayError && (
+        <div
+          data-testid="delay-error"
+          role="alert"
+          className="mx-3 mb-2 px-2.5 py-1.5 rounded-lg border border-rose-400/40 bg-rose-950/40 text-[10px] font-mono text-rose-200"
+        >
+          ⏳ {delayError}
         </div>
       )}
 

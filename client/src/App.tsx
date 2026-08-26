@@ -125,6 +125,7 @@ import {
   parseEntityStatusFromSessionState,
   type EntityCombatStatus,
 } from './api/entity_status_state';
+import { delayedIdsFromSnapshot } from './api/combat_delay';
 import {
   canEnterStreamerView,
   exitStreamerView,
@@ -143,6 +144,12 @@ interface EngineCombatSnapshot {
   round: number;
   turn_index: number;
   order: CombatantEntry[];
+  /**
+   * Iteration 16 — ids the engine currently has parked out of turn order
+   * (verbatim `combat.delayed` from the projected snapshot). Empty when the
+   * projection said nothing; never derived client-side.
+   */
+  delayed: string[];
 }
 
 const IDLE_COMBAT_SNAPSHOT: EngineCombatSnapshot = {
@@ -150,6 +157,7 @@ const IDLE_COMBAT_SNAPSHOT: EngineCombatSnapshot = {
   round: 0,
   turn_index: 0,
   order: [],
+  delayed: [],
 };
 
 // --- Roll history persistence ---------------------------------------------
@@ -828,6 +836,21 @@ export function App() {
   const selectedToken =
     visibleTokens.find((t) => t.id === spectatorSelectedId) || visibleTokens[0];
 
+  /**
+   * Iteration 16 — entity ids THIS seat may act for, feeding the tracker's
+   * Delay/Resume gating. Mirrors the engine's own `may_control_entity` RBAC:
+   * GM/admin act on anyone; players only the tokens bound to their seat
+   * (assignedTokenIds, '*' = authority without a body); spectators nothing.
+   * The engine re-verifies every call — this list only shapes the UI.
+   */
+  const controlledEntityIds = useMemo(() => {
+    if (userRole === 'gm') return visibleTokens.map((t) => t.id);
+    if (userRole !== 'player') return [];
+    return visibleTokens
+      .filter((t) => t.isPlayer && currentUser.assignedTokenIds.includes(t.id))
+      .map((t) => t.id);
+  }, [userRole, visibleTokens, currentUser.assignedTokenIds]);
+
   // Private-channel chat is excluded from what NarrativeChat receives. The
   // channel tab UI stays (NarrativeChat owns it) — it just renders nothing
   // private. Every private-tagging path in the app is covered:
@@ -1129,6 +1152,9 @@ export function App() {
         round: Number(c.round ?? 0),
         turn_index: Number(c.turn_index ?? 0),
         order: Array.isArray(c.order) ? c.order : [],
+        // Iteration 16: the engine's parked-out-of-turn-order list, read
+        // verbatim from this same snapshot (role-projected server-side).
+        delayed: delayedIdsFromSnapshot(snap),
       });
       // Iteration 58: same snapshot also mirrors per-entity concentration
       // (`entities[id].concentration = {spell_id, started_round}`). Parsed
@@ -1188,7 +1214,13 @@ export function App() {
       const data = await resp.json();
       const order: CombatantEntry[] = Array.isArray(data.order) ? data.order : [];
       const round = Number(data.round ?? 1);
-      setCombat({ in_combat: true, round, turn_index: Number(data.turn_index ?? 0), order });
+      setCombat({
+        in_combat: true,
+        round,
+        turn_index: Number(data.turn_index ?? 0),
+        order,
+        delayed: delayedIdsFromSnapshot(data),
+      });
       setRoundNumber(round || 1);
       setCurrentTurnIndex(Number(data.turn_index ?? 0));
       const first = order[0];
@@ -2282,6 +2314,10 @@ export function App() {
                 entityStatusByEntity={entityStatusByEntity}
                 concentrationByEntity={concentrationByEntity}
                 sessionStateRaw={sessionStateRaw}
+                delayedIds={combat.delayed}
+                combatSessionIdForActions={combatSessionId}
+                controlledEntityIds={controlledEntityIds}
+                onRefreshCombatState={() => void refreshCombatState()}
               />
 
               {/* Center Tactical Canvas */}
