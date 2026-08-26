@@ -106,6 +106,8 @@ import {
   shouldAttemptReprobe,
 } from './sync/transport_reprobe';
 import { DiceHistoryPanel, type RollLogEntry } from './components/DiceHistoryPanel';
+// Iteration 11: local ad-hoc dice roller (theater only — see mount comment).
+import { DiceRollerPanel } from './components/DiceRollerPanel';
 import type { CombatantEntry } from './components/InitiativeTracker';
 import {
   TransientSaveToast,
@@ -2309,6 +2311,15 @@ export function App() {
                   entries={rollHistory}
                   onClear={() => setRollHistory([])}
                 />
+
+                {/* Iteration 11 (Loop 3): free-form ad-hoc dice roller. Local
+                    theater only — rolls never reach the engine or the ledger;
+                    the panel badges every result accordingly. Placed in the
+                    same floating stack as the audit log, offset upward so the
+                    two headers don't overlap. */}
+                <div className="absolute bottom-24 left-4 w-64" style={{ marginBottom: '3.5rem' }}>
+                  <DiceRollerPanel defaultExpanded={false} />
+                </div>
 
                 {/* Iteration 3 (Loop 3): "Generate Art…" dialog for the selected
                     token. Suspense boundary because TokenArtDialog is a split
