@@ -752,16 +752,60 @@ pub struct ArmedReaction {
     pub reaction_type: ReactionType,
 }
 
+/// The structured trigger specification of a readied action (SRD Ready).
+///
+/// Mechanical variants let clients render and eventually auto-detect the
+/// common triggers; [`ReadiedTrigger::Freeform`] keeps anything else as a
+/// string for GM adjudication — the engine never *fires* a trigger by itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadiedTrigger {
+    /// A hostile creature moves into the actor's melee reach.
+    EnemyEntersReach,
+    /// A hostile creature attacks (the actor or an ally).
+    EnemyAttacks,
+    /// The actor's own next turn begins.
+    TurnStart,
+    /// Any other declared condition ("when the bell tolls") — GM adjudicated.
+    Freeform(String),
+}
+
+impl Default for ReadiedTrigger {
+    fn default() -> Self {
+        // Legacy readied actions predate structured triggers: they were pure
+        // GM adjudication, so they default to an empty freeform rather than
+        // inventing a mechanical trigger they never had.
+        ReadiedTrigger::Freeform(String::new())
+    }
+}
+
+impl ReadiedTrigger {
+    /// Human-readable text folded into the stored description for display.
+    /// Empty for an empty freeform so legacy-style declarations stay clean.
+    pub fn hint_text(&self) -> String {
+        match self {
+            ReadiedTrigger::EnemyEntersReach => "enemy enters reach".to_string(),
+            ReadiedTrigger::EnemyAttacks => "enemy attacks".to_string(),
+            ReadiedTrigger::TurnStart => "turn start".to_string(),
+            ReadiedTrigger::Freeform(text) => text.trim().to_string(),
+        }
+    }
+}
+
 /// SRD Ready action: an Action spent to hold a triggered response ("I attack
-/// the goblin when it moves"). The engine stores and surfaces the declaration
-/// only — matching the trigger and resolving the held action stays a GM
-/// adjudication. The entry clears at the actor's next turn refresh (see
-/// [`GameSession::advance_round`]).
+/// the goblin when it moves"). The engine stores and surfaces the declaration;
+/// resolving the held action goes through [`GameSession::release_readied_action`]
+/// (which spends the Reaction). An unreleased entry clears at the round refresh
+/// (see [`GameSession::advance_round`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReadiedAction {
     pub description: String,
     /// Combat round the action was readied on (0 outside combat).
     pub set_on_round: u32,
+    /// Structured trigger spec; `serde(default)` keeps legacy payloads
+    /// deserializing as an empty [`ReadiedTrigger::Freeform`].
+    #[serde(default)]
+    pub trigger: ReadiedTrigger,
 }
 
 /// Outcome of a round tick for one entity's condition clocks.
@@ -776,6 +820,11 @@ pub struct ConditionTickOutcome {
 pub struct RoundAdvanceReport {
     pub round: u32,
     pub ticks: Vec<ConditionTickOutcome>,
+    /// Entities whose UNRELEASED readied action expired this round (SRD: the
+    /// held Action is lost when the trigger never fires). Serde default keeps
+    /// legacy reports deserializing.
+    #[serde(default)]
+    pub readied_expired: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -785,8 +834,23 @@ pub struct RewindReport {
     pub removed_entities: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 pub struct OpportunityAttackTrigger {
+    pub attacker_id: Uuid,
+    pub mover_id: Uuid,
+}
+
+/// A provoked-but-NOT-YET-RESOLVED opportunity attack: the mover left an
+/// armed enemy's reach and the enemy may now take one melee swing against the
+/// REACTION economy through [`GameSession::take_opportunity_attack`]. The
+/// entry is cleared when taken, cancelled by Disengage
+/// ([`GameSession::cancel_opportunity_attacks_against`]), or expired by the
+/// round refresh — never carried across rounds.
+///
+/// Serde default keeps legacy serialized sessions (without pending OAs)
+/// deserializing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PendingOpportunityAttack {
     pub attacker_id: Uuid,
     pub mover_id: Uuid,
 }
@@ -812,6 +876,13 @@ pub struct GameSession {
     pub map: SessionMap,
     #[serde(default)]
     pub reaction_arms: Vec<ArmedReaction>,
+    /// Opportunity attacks provoked this round but not yet resolved. Written
+    /// by [`GameSession::move_entity`], consumed by
+    /// [`GameSession::take_opportunity_attack`], cancelled by Disengage and by
+    /// the round refresh (an OA offer does not survive the round).
+    /// Serde default keeps legacy serialized sessions deserializing.
+    #[serde(default)]
+    pub pending_opportunity_attacks: Vec<PendingOpportunityAttack>,
     pub ledger: EventSourcingLedger,
     pub ingress_stack: Vec<IngressEvent>,
     pub egress_stack: Vec<EgressEvent>,
@@ -835,6 +906,7 @@ impl GameSession {
             combat: InitiativeCombatState::default(),
             map: SessionMap::default(),
             reaction_arms: Vec::new(),
+            pending_opportunity_attacks: Vec::new(),
             ledger: EventSourcingLedger::new(),
             ingress_stack: Vec::new(),
             egress_stack: Vec::new(),
@@ -906,18 +978,70 @@ impl GameSession {
             .any(|r| r.entity_id == entity_id && r.reaction_type == reaction_type)
     }
 
+    // -------------------------------------------- opportunity attack resolution
+
+    /// SRD Opportunity Attack RESOLUTION: the reacting side takes its melee
+    /// swing against a mover who just left its reach. Spends the REACTION —
+    /// never the Action — and clears the pending trigger.
+    ///
+    /// Only legal against the exact attacker/mover pairing whose movement
+    /// armed it this round (`OA_NOT_PENDING` otherwise): a stranger cannot
+    /// borrow someone else's provocation. A spent or unavailable reaction is
+    /// rejected with `REACTION_UNAVAILABLE` and leaves the pending entry
+    /// standing (it expires at the round refresh either way).
+    pub fn take_opportunity_attack(
+        &mut self,
+        attacker_id: Uuid,
+        mover_id: Uuid,
+    ) -> Result<PendingOpportunityAttack, String> {
+        let index = self.pending_opportunity_attacks.iter().position(|p| {
+            p.attacker_id == attacker_id && p.mover_id == mover_id
+        });
+        let index = match index {
+            Some(i) => i,
+            None => return Err("OA_NOT_PENDING".to_string()),
+        };
+        if !self.consume_reaction(attacker_id, ReactionType::OpportunityAttack) {
+            // The pairing is real but the reaction is gone: leave the entry
+            // standing (it expires at the round refresh) — a caller that
+            // re-arms and retries must find the trigger, not a black hole.
+            return Err("REACTION_UNAVAILABLE".to_string());
+        }
+        let pending = self.pending_opportunity_attacks.remove(index);
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            attacker_id,
+            "OPPORTUNITY_ATTACK_TAKEN",
+            serde_json::json!({
+                "attacker_id": attacker_id,
+                "mover_id": mover_id,
+            }),
+        );
+        Ok(pending)
+    }
+
+    /// Withdraws every pending opportunity attack AGAINST this mover — the
+    /// Disengage path. The provoking enemies keep their readied reactions:
+    /// nothing fired, so nothing is consumed. Returns how many entries were
+    /// dropped.
+    pub fn cancel_opportunity_attacks_against(&mut self, mover_id: Uuid) -> usize {
+        let before = self.pending_opportunity_attacks.len();
+        self.pending_opportunity_attacks
+            .retain(|p| p.mover_id != mover_id);
+        before - self.pending_opportunity_attacks.len()
+    }
+
     // ------------------------------------------------------------ ready action
 
     /// SRD Ready: spends the entity's Action to hold a triggered response
     /// ("I attack the goblin when it moves") until its next turn refresh.
     ///
-    /// Deliberately MINIMAL: this only stores, surfaces and clears the
-    /// declaration. There is no automatic trigger matching — when the player
-    /// declares the trigger has fired, the GM resolves the held action
-    /// manually (e.g. through the normal attack endpoint as a Reaction).
-    ///
-    /// The optional `trigger_hint` is folded into the stored description so a
-    /// single string carries the whole declaration for display.
+    /// The declaration carries a STRUCTURED [`ReadiedTrigger`] spec; its text
+    /// is folded into the stored description so a single string carries the
+    /// whole declaration for display. The engine never fires the trigger by
+    /// itself — resolving it goes through [`GameSession::release_readied_action`]
+    /// or stays a GM adjudication.
     ///
     /// Rejections: `ENTITY_NOT_FOUND`, `ENTITY_CANNOT_ACT`,
     /// `ACTION_ECONOMY_EXHAUSTED`. A rejected Ready stores nothing and
@@ -926,10 +1050,11 @@ impl GameSession {
         &mut self,
         entity_id: Uuid,
         description: &str,
-        trigger_hint: Option<&str>,
+        trigger: ReadiedTrigger,
     ) -> Result<ReadiedAction, String> {
         let mut description = description.trim().to_string();
-        if let Some(hint) = trigger_hint.map(str::trim).filter(|h| !h.is_empty()) {
+        let hint = trigger.hint_text();
+        if !hint.is_empty() {
             description = format!("{} (trigger: {})", description, hint);
         }
         let round = self.combat.round;
@@ -945,6 +1070,7 @@ impl GameSession {
         let readied = ReadiedAction {
             description,
             set_on_round: round,
+            trigger,
         };
         entity.readied_action = Some(readied.clone());
 
@@ -956,9 +1082,52 @@ impl GameSession {
             serde_json::json!({
                 "description": readied.description,
                 "set_on_round": readied.set_on_round,
+                "trigger": readied.trigger,
             }),
         );
         Ok(readied)
+    }
+
+    /// SRD: resolving a readied action ("I attack the goblin when it moves" —
+    /// and now it moved) takes the actor's REACTION. This spends that Reaction,
+    /// clears the stored declaration and ledgers READY_ACTION_RELEASED with an
+    /// explicit `reaction_spent` marker so replay can see WHY the budget is
+    /// gone. The engine resolves only the bookkeeping — the held action itself
+    /// (the attack roll, the spell) still flows through its normal endpoint.
+    ///
+    /// Rejections (nothing spent, nothing cleared): `ENTITY_NOT_FOUND`,
+    /// `NO_READIED_ACTION`, `ENTITY_CANNOT_ACT` (an incapacitated creature
+    /// cannot take reactions), `REACTION_SPENT`.
+    pub fn release_readied_action(&mut self, entity_id: Uuid) -> Result<ReadiedAction, String> {
+        let entity = self
+            .entities
+            .get_mut(&entity_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        if entity.readied_action.is_none() {
+            return Err("NO_READIED_ACTION".to_string());
+        }
+        if !entity.can_act() {
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if !entity.action_budget.reaction {
+            return Err("REACTION_SPENT".to_string());
+        }
+        entity.action_budget.reaction = false;
+        let released = entity.readied_action.take().expect("checked above");
+
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "READY_ACTION_RELEASED",
+            serde_json::json!({
+                "description": released.description,
+                "set_on_round": released.set_on_round,
+                "trigger": released.trigger,
+                "reaction_spent": true,
+            }),
+        );
+        Ok(released)
     }
 
     // ------------------------------------------------------------- help action
@@ -1386,7 +1555,14 @@ impl GameSession {
         let mut report = RoundAdvanceReport {
             round: self.combat.round,
             ticks: Vec::new(),
+            readied_expired: Vec::new(),
         };
+
+        // An unresolved opportunity attack is a THIS-round offer: the mover is
+        // already gone and the reacting side's readied reaction refreshes
+        // below, so carrying the trigger across the round boundary would let a
+        // stale pairing swing out of turn.
+        self.pending_opportunity_attacks.clear();
 
         for (id, entity) in self.entities.iter_mut() {
             entity.shield_ac_bonus_active = false; // Shield lasts until the start of the caster's next turn
@@ -1400,8 +1576,24 @@ impl GameSession {
             entity.next_attacker_has_advantage_against = None;
             entity.next_check_has_advantage_from = None;
             // SRD: a readied action lasts until the start of the actor's next
-            // turn. If the trigger never fired, the held Action is simply lost.
-            entity.readied_action = None;
+            // turn. If the trigger never fired, the held Action is simply lost
+            // — but the LOSS is ledgered and reported so audit/replay can see
+            // an actor's spent Action evaporating instead of it vanishing
+            // silently.
+            if let Some(expired) = entity.readied_action.take() {
+                report.readied_expired.push(*id);
+                self.ledger.append_event(
+                    self.session_id,
+                    self.campaign_id,
+                    *id,
+                    "READIED_ACTION_EXPIRED",
+                    serde_json::json!({
+                        "description": expired.description,
+                        "set_on_round": expired.set_on_round,
+                        "trigger": expired.trigger,
+                    }),
+                );
+            }
             // Start-of-round action-economy refresh. Exhaustion modifies the
             // speed the budget seeds from (halved at level 2+, zero at 5+).
             entity.action_budget.reset(entity.effective_speed_feet());
@@ -1528,6 +1720,12 @@ impl GameSession {
         // A mover who took the Disengage action provokes nothing this turn —
         // and a provoked-but-suppressed enemy keeps its readied reaction,
         // because no trigger actually fired.
+        //
+        // Detection PENDS the swing instead of spending it: the reacting side
+        // resolves through [`GameSession::take_opportunity_attack`] against its
+        // REACTION budget (one per round). Forced displacement — a shove push,
+        // a ledge fall landing — never passes through here at all, so it never
+        // arms an OA in the first place.
         let mut opportunity_attacks = Vec::new();
         {
             let (mover_pos, disengaged) = match self.entities.get(&entity_id) {
@@ -1535,6 +1733,9 @@ impl GameSession {
                 None => return Err("ENTITY_NOT_FOUND".to_string()),
             };
             for enemy_id in adjacent_enemies_before {
+                if disengaged {
+                    break;
+                }
                 let still_adjacent = self
                     .entities
                     .get(&enemy_id)
@@ -1544,15 +1745,17 @@ impl GameSession {
                         (dx * dx + dy * dy).sqrt() <= 5.5
                     })
                     .unwrap_or(false);
-                if !still_adjacent
-                    && !disengaged
-                    && self.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack)
+                if !still_adjacent && self.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack)
                 {
-                    opportunity_attacks.push(OpportunityAttackTrigger {
+                    let trigger = OpportunityAttackTrigger {
+                        attacker_id: enemy_id,
+                        mover_id: entity_id,
+                    };
+                    opportunity_attacks.push(trigger);
+                    self.pending_opportunity_attacks.push(PendingOpportunityAttack {
                         attacker_id: enemy_id,
                         mover_id: entity_id,
                     });
-                    self.consume_reaction(enemy_id, ReactionType::OpportunityAttack);
                 }
             }
         }
@@ -2618,6 +2821,166 @@ mod tests {
         session.entities.get_mut(&mover_id).unwrap().action_budget.movement_remaining_feet = 30.0;
         let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
         assert_eq!(outcome.opportunity_attacks.len(), 1, "protection expires");
+    }
+
+    // ---------------------------------------------------- opportunity attacks
+
+    #[test]
+    fn test_move_out_of_reach_pends_oa_without_spending_the_reaction() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+
+        let outcome = session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert_eq!(outcome.opportunity_attacks.len(), 1);
+        assert_eq!(outcome.opportunity_attacks[0].attacker_id, enemy_id);
+        assert_eq!(outcome.opportunity_attacks[0].mover_id, mover_id);
+
+        // Detection PENDS the trigger; it must NOT silently eat the reaction —
+        // the reacting side resolves the swing through the OA attack path.
+        assert_eq!(
+            session.pending_opportunity_attacks,
+            vec![PendingOpportunityAttack {
+                attacker_id: enemy_id,
+                mover_id,
+            }],
+            "leaving reach must disclose exactly one pending OA"
+        );
+        assert!(
+            session.entities[&enemy_id].action_budget.reaction,
+            "arming a pending OA must not spend the enemy's reaction"
+        );
+        assert!(session.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack));
+    }
+
+    #[test]
+    fn test_oa_resolution_spends_reaction_not_action_and_second_is_refused() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+
+        // The trigger is live but the enemy's reaction is already gone (spent
+        // on something else this round): the swing is refused with
+        // REACTION_UNAVAILABLE and nothing else changes.
+        session.consume_reaction(enemy_id, ReactionType::OpportunityAttack);
+        assert_eq!(
+            session.take_opportunity_attack(enemy_id, mover_id).unwrap_err(),
+            "REACTION_UNAVAILABLE"
+        );
+        assert_eq!(session.pending_opportunity_attacks.len(), 1);
+
+        // Re-arm, then resolve properly.
+        session.entities.get_mut(&enemy_id).unwrap().action_budget.reaction = true;
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.take_opportunity_attack(enemy_id, mover_id).unwrap();
+        assert!(
+            !session.entities[&enemy_id].action_budget.reaction,
+            "resolving the OA spends the REACTION"
+        );
+        assert!(
+            session.entities[&enemy_id].action_budget.action,
+            "an opportunity attack must NEVER spend the Action"
+        );
+        assert!(
+            session.pending_opportunity_attacks.is_empty(),
+            "a resolved trigger must be cleared"
+        );
+
+        // One reaction per round: a second OA attempt against the same pairing
+        // finds no pending trigger left (the first take CONSUMED it) — refused
+        // with OA_NOT_PENDING, and the Action stays unspent.
+        assert_eq!(
+            session.take_opportunity_attack(enemy_id, mover_id).unwrap_err(),
+            "OA_NOT_PENDING"
+        );
+        assert!(session.entities[&enemy_id].action_budget.action);
+    }
+
+    #[test]
+    fn test_oa_only_legal_against_the_mover_whose_movement_triggered_it() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let bystander_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.add_entity(entity(bystander_id, "Bystander", 10), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+
+        // Right attacker, wrong target: nobody else's movement armed this.
+        assert_eq!(
+            session.take_opportunity_attack(enemy_id, bystander_id).unwrap_err(),
+            "OA_NOT_PENDING"
+        );
+        // A stranger with no trigger at all cannot invent one.
+        assert_eq!(
+            session.take_opportunity_attack(bystander_id, mover_id).unwrap_err(),
+            "OA_NOT_PENDING"
+        );
+        // The real pairing still resolves.
+        assert!(session.take_opportunity_attack(enemy_id, mover_id).is_ok());
+    }
+
+    #[test]
+    fn test_disengage_cancels_pending_oas_but_keeps_the_readied_reaction() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert_eq!(session.pending_opportunity_attacks.len(), 1);
+
+        // Disengage AFTER the move withdraws the invitation: the pending OA is
+        // dropped and the enemy's readied reaction is handed back intact.
+        let cancelled = session.cancel_opportunity_attacks_against(mover_id);
+        assert_eq!(cancelled, 1, "exactly the mover's own pending OA is dropped");
+        assert!(session.pending_opportunity_attacks.is_empty());
+        assert!(
+            session.has_armed_reaction(enemy_id, ReactionType::OpportunityAttack),
+            "cancelling the OA must not consume the readied reaction"
+        );
+        assert!(session.entities[&enemy_id].action_budget.reaction);
+
+        // Cancelling twice finds nothing the second time.
+        assert_eq!(session.cancel_opportunity_attacks_against(mover_id), 0);
+    }
+
+    #[test]
+    fn test_round_refresh_expires_untaken_opportunity_attacks() {
+        let mover_id = Uuid::new_v4();
+        let enemy_id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(mover_id, "Mover", 10), None).unwrap();
+        session.add_entity(enemy(enemy_id, "Enemy"), None).unwrap();
+        session.entities.get_mut(&enemy_id).unwrap().position = (5.0, 0.0, 0.0);
+        session.arm_reaction(enemy_id, ReactionType::OpportunityAttack).unwrap();
+        session.move_entity(mover_id, (30.0, 0.0, 0.0)).unwrap();
+        assert!(!session.pending_opportunity_attacks.is_empty());
+
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice);
+        assert!(
+            session.pending_opportunity_attacks.is_empty(),
+            "a pending OA is a THIS-round offer; the refresh sweeps it"
+        );
+        assert!(
+            session.entities[&enemy_id].action_budget.reaction,
+            "the untaken reaction refreshes too"
+        );
     }
 
     #[test]

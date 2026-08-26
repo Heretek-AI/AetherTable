@@ -39,7 +39,8 @@ use uuid::Uuid;
 
 use vtt_core::{
     Ability, ActionResolver, CheckOutcomeTier, Condition, CostSuggestion, DiceEngine,
-    EntityState, GameSession, LightingZoneCell, RulesEvaluator, SessionMap, VisionMode,
+    EntityState, GameSession, LightingZoneCell, ReadiedTrigger, RulesEvaluator, SessionMap,
+    VisionMode,
 };
 use vtt_crdt_sync::{
     CrdtRelayHub, CrdtSyncMessage, FogOfWarMask, SnapshotToken, SyncSnapshot, TokenTransform,
@@ -1322,19 +1323,20 @@ async fn move_entity(
                 // Additive Pillar-3 report: when leaving adjacency provoked an
                 // opportunity attack from an enemy with an ARMED reaction, say
                 // so in the response instead of resolving silently. The OA is
-                // NOT auto-executed here — polling/prompting the reacting
-                // entity is the reaction stack's behavior. The field is
-                // omitted entirely when nothing could be provoked (mover
-                // disengaged / no adjacent armed enemy / reaction already
-                // spent) — matching `GameSession::move_entity` semantics,
-                // which consumes the readied reaction at detection time.
-                let mut body = serde_json::json!({ "status": "MOVED", "outcome": outcome });
+                // NOT auto-executed here — the reacting side resolves it
+                // through /action/opportunity-attack against its REACTION
+                // budget. The fields are omitted entirely when nothing could be
+                // provoked (mover disengaged / no adjacent armed enemy).
+                let mut body = serde_json::json!({ "status": "MOVED", "outcome": outcome.clone() });
                 if !outcome.opportunity_attacks.is_empty() {
-                    // Full report: EVERY provoked attacker, not just the first.
+                    // Full report: EVERY pending OA, not just the first. Each
+                    // entry carries `pending_opportunity` naming the endpoint
+                    // that actually takes the swing.
                     body["opportunity_attacks_detail"] = serde_json::json!(
                         outcome.opportunity_attacks.iter().map(|trigger| serde_json::json!({
                             "provoked_by": trigger.attacker_id,
                             "reaction_type": "opportunity_attack",
+                            "pending_opportunity": "/action/opportunity-attack",
                             "available": true,
                         })).collect::<Vec<_>>()
                     );
@@ -1344,6 +1346,7 @@ async fn move_entity(
                     body["opportunity_attack"] = serde_json::json!({
                         "provoked_by": trigger.attacker_id,
                         "reaction_type": "opportunity_attack",
+                        "pending_opportunity": "/action/opportunity-attack",
                         "available": true,
                     });
                 }
@@ -1702,6 +1705,153 @@ async fn resolve_attack(
                     }
                 }
                 body["event_sequence"] = serde_json::json!(seq);
+                HttpResponse::Ok().json(body)
+            }
+            Err(e) => reject(&data, 400, "RESOLUTION_FAILED", &e),
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+// --- Opportunity attack (reaction-stack resolution) ----------------------------
+//
+// The other half of the reaction stack's OA story: `/move` DISCLOSES pending
+// opportunity attacks (see `move_entity`'s response), and THIS endpoint is how
+// the provoked enemy actually takes the swing. Same ids-only attack contract
+// as `/action/attack` — but it buys the swing with the REACTION, never the
+// Action, and ONLY against a mover whose leaving-reach movement armed the
+// trigger this round (`GameSession::pending_opportunity_attacks`).
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpportunityAttackReq {
+    pub attacker_id: Uuid,
+    pub target_id: Uuid,
+    #[serde(default)]
+    pub action_index: usize,
+    /// Optional deterministic seed pinning the roll (any value is equally
+    /// valid — see `refuse_client_seed`).
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+async fn resolve_opportunity_attack(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<OpportunityAttackReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    // Seed policy: refused BEFORE any validation side effect (Reaction spend,
+    // ledger append) can occur.
+    if let Some(resp) = refuse_client_seed(&data, &identity, req.seed) {
+        return resp;
+    }
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        let attacker = match session.entities.get(&req.attacker_id) {
+            Some(a) => a.clone(),
+            None => {
+                return reject(
+                    &data,
+                    404,
+                    "ATTACKER_NOT_FOUND",
+                    "attacker_id does not exist in this session",
+                )
+            }
+        };
+        if !may_control_entity(attacker.owner_player_id.as_ref(), role, &identity.user_id) {
+            return reject(
+                &data,
+                403,
+                "ENTITY_NOT_OWNED",
+                "you do not control the attacking entity",
+            );
+        }
+        let target = match session.entities.get(&req.target_id) {
+            Some(t) => t.clone(),
+            None => {
+                return reject(&data, 404, "TARGET_NOT_FOUND", "target_id does not exist in this session")
+            }
+        };
+        if target.is_dead {
+            return reject(&data, 409, "TARGET_ALREADY_DEAD", "target has expired");
+        }
+        if attacker.id == target.id {
+            return reject(&data, 422, "SELF_ATTACK_INVALID", "attacker and target coincide");
+        }
+        // Spend-and-resolve atomically through the engine primitive: only the
+        // exact attacker/mover pairing whose movement armed the trigger this
+        // round passes; anything else is `OA_NOT_PENDING`, an exhausted
+        // reaction is `REACTION_UNAVAILABLE`. A rejection spends nothing and
+        // ledgers nothing. NOTE: the trigger is cleared BEFORE the roll so a
+        // failed resolution cannot leave the pairing re-takeable within the
+        // same round. Reach is NOT re-checked here: the trigger was armed by
+        // the mover LEAVING reach, so the swing happens on that departure step
+        // regardless of where the mover ended up (SRD: "when a creature you
+        // can see moves out of your reach" — the exit, not the destination).
+        if let Err(e) = session.take_opportunity_attack(req.attacker_id, req.target_id) {
+            return reject(&data, 409, &e, "no live opportunity attack for this pairing");
+        }
+
+        let seed = req.seed.unwrap_or_else(|| {
+            (session_id.as_u128() as u64) ^ (session.ledger.current_sequence << 32)
+        });
+        let mut dice = DiceEngine::with_seed(seed);
+
+        let weapon = attacker.attack_for_index(req.action_index);
+        let res = RulesEvaluator::resolve_attack(
+            &mut dice,
+            req.attacker_id,
+            req.target_id,
+            weapon.attack_bonus,
+            target.ac,
+            &weapon.damage_expression,
+            weapon.damage_type,
+            target.current_hp,
+            target.max_hp,
+            target.temp_hp,
+            &target.resistances,
+            &target.vulnerabilities,
+            &target.immunities,
+            false,
+            false,
+        );
+
+        match res {
+            Ok(result) => {
+                data.count_valid();
+                let campaign_id = session.campaign_id;
+                if let Some(t) = session.entities.get_mut(&req.target_id) {
+                    t.current_hp = result.target_hp_remaining;
+                    t.is_conscious = result.target_is_conscious;
+                    t.is_dead = result.target_is_dead || result.target_hp_remaining <= -t.max_hp;
+                }
+                let event = session.ledger.append_event(
+                    session_id,
+                    campaign_id,
+                    req.attacker_id,
+                    "OPPORTUNITY_ATTACK_RESOLVED",
+                    serde_json::json!({
+                        "attacker_id": req.attacker_id.to_string(),
+                        "mover_id": req.target_id.to_string(),
+                        "resolution": serde_json::to_value(&result).unwrap_or_default(),
+                        "weapon": weapon.name,
+                    }),
+                );
+                let mut body = serde_json::to_value(&result).unwrap_or_default();
+                body["action_name"] = serde_json::json!(weapon.name);
+                body["is_opportunity"] = serde_json::json!(true);
+                body["economy_spent"] = serde_json::json!("reaction");
+                body["event_sequence"] = serde_json::json!(event.sequence_id);
                 HttpResponse::Ok().json(body)
             }
             Err(e) => reject(&data, 400, "RESOLUTION_FAILED", &e),
@@ -2772,8 +2922,18 @@ fn perform_standard_action(
             StandardAction::Disengage => entity.take_disengage(),
         },
     };
+    #[allow(unused_assignments)] // read only on the Disengage arm of the payload match below
+    let mut cancelled_opportunity_attacks = 0usize;
     let entity = match result {
-        Ok(()) => &session.entities[&entity_id],
+        Ok(()) => {
+            // SRD Disengage also withdraws any OA already provoked by this
+            // mover's movement this round: the pending trigger is dropped and
+            // the provoking enemies keep their readied reactions (nothing
+            // fired, so nothing is consumed). A mover who walked away and THEN
+            // disengages is protected too.
+            cancelled_opportunity_attacks = session.cancel_opportunity_attacks_against(entity_id);
+            &session.entities[&entity_id]
+        }
         Err(e) => {
             return Err(StandardActionRejection {
                 status: 409,
@@ -2782,7 +2942,6 @@ fn perform_standard_action(
             })
         }
     };
-
     Ok(match action {
         StandardAction::Dodge => serde_json::json!({
             "entity_id": entity_id.to_string(),
@@ -2796,6 +2955,7 @@ fn perform_standard_action(
         StandardAction::Disengage => serde_json::json!({
             "entity_id": entity_id.to_string(),
             "disengaged_until_next_turn": entity.disengaged_until_next_turn,
+            "cancelled_opportunity_attacks": cancelled_opportunity_attacks,
         }),
     })
 }
@@ -2874,9 +3034,11 @@ pub struct ReadyActionReq {
     /// What the entity is holding ("I attack the goblin").
     pub description: String,
     /// Optional declared trigger ("when it moves"), folded into the stored
-    /// description for display.
+    /// description for display. Mechanical shorthands: "enemy_enters_reach",
+    /// "enemy_attacks", "turn_start"; anything else is kept as a freeform
+    /// string for GM adjudication.
     #[serde(default)]
-    pub trigger_hint: Option<String>,
+    pub trigger: Option<String>,
 }
 
 async fn resolve_ready_action(
@@ -2923,7 +3085,13 @@ async fn resolve_ready_action(
         let readied = match session.ready_action(
             req.entity_id,
             &req.description,
-            req.trigger_hint.as_deref(),
+            match req.trigger.as_deref() {
+                Some("enemy_enters_reach") => ReadiedTrigger::EnemyEntersReach,
+                Some("enemy_attacks") => ReadiedTrigger::EnemyAttacks,
+                Some("turn_start") => ReadiedTrigger::TurnStart,
+                Some(other) => ReadiedTrigger::Freeform(other.to_string()),
+                None => ReadiedTrigger::Freeform(String::new()),
+            },
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -2936,6 +3104,79 @@ async fn resolve_ready_action(
             "status": "READY_ACTION_SET",
             "entity_id": req.entity_id.to_string(),
             "readied_action": readied,
+            "event_sequence": event_sequence,
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+// --- Release readied action ----------------------------------------------------
+//
+// SRD: resolving a readied action takes the actor's Reaction. Same contract as
+// the other action routes — ids-only payload with `deny_unknown_fields`,
+// attack-identical RBAC, engine-side spend. Rejections surface as 409 with the
+// engine's stable error string: NO_READIED_ACTION (nothing held),
+// REACTION_SPENT (reaction budget already gone), ENTITY_CANNOT_ACT
+// (incapacitated). The engine clears the declaration and ledgers
+// READY_ACTION_RELEASED itself; a rejection changes nothing.
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseReadyReq {
+    pub entity_id: Uuid,
+}
+
+async fn release_ready_action(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<ReleaseReadyReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+    }
+    let req = req.into_inner();
+
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+
+        // Attack-identical RBAC, mirroring the Ready route.
+        let owner = session
+            .entities
+            .get(&req.entity_id)
+            .and_then(|e| e.owner_player_id.clone());
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in this session");
+        }
+        if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+            return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+        }
+
+        // Core spends the Reaction, clears the declaration and ledgers
+        // READY_ACTION_RELEASED itself; every rejection changes nothing.
+        let released = match session.release_readied_action(req.entity_id) {
+            Ok(r) => r,
+            Err(e)
+                if matches!(
+                    e.as_str(),
+                    "NO_READIED_ACTION" | "REACTION_SPENT" | "ENTITY_CANNOT_ACT"
+                ) =>
+            {
+                return reject(&data, 409, &e, "release rejected by the action economy")
+            }
+            Err(e) => return reject(&data, 409, &e, "action rejected by the action economy"),
+        };
+        data.count_valid();
+        let event_sequence = session.ledger.current_sequence;
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": "READY_ACTION_RELEASED",
+            "entity_id": req.entity_id.to_string(),
+            "released_action": released,
+            "reaction_spent": true,
             "event_sequence": event_sequence,
         }))
     } else {
@@ -6463,6 +6704,7 @@ pub fn configure_app_with(
                         .route("/entities/{eid}", web::delete().to(remove_entity))
                         .route("/map", web::put().to(set_session_map))
                         .route("/action/attack", web::post().to(resolve_attack))
+                        .route("/action/opportunity-attack", web::post().to(resolve_opportunity_attack))
                         .route("/action/grapple", web::post().to(resolve_grapple_action))
                         .route("/action/escape-grapple", web::post().to(resolve_escape_grapple_action))
                         .route("/action/shove", web::post().to(resolve_shove_action))
@@ -6471,6 +6713,10 @@ pub fn configure_app_with(
                         .route("/action/dash", web::post().to(resolve_dash))
                         .route("/action/disengage", web::post().to(resolve_disengage))
                         .route("/action/ready", web::post().to(resolve_ready_action))
+                        .route(
+                            "/action/ready/release",
+                            web::post().to(release_ready_action),
+                        )
                         .route("/action/stabilize", web::post().to(resolve_stabilize))
                         .route("/action/offhand", web::post().to(resolve_offhand_action))
                         .route("/action/help", web::post().to(resolve_help_action))

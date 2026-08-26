@@ -36,7 +36,8 @@ pub use rules::{
 };
 pub use state::{
     ArmedReaction, AttackAction, ConditionTimer, ConcentrationState, EndOfTurnSave, EntityState,
-    GameSession, InitiativeCombatState, InitiativeEntry, MoveOutcome, ReactionType, RewindReport,
-    RoundAdvanceReport, SessionMap,
+    GameSession, InitiativeCombatState, InitiativeEntry, MoveOutcome,
+    OpportunityAttackTrigger, PendingOpportunityAttack, ReadiedAction, ReadiedTrigger, ReactionType,
+    RewindReport, RoundAdvanceReport, SessionMap,
 };
 pub use types::*;

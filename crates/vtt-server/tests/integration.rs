@@ -2968,8 +2968,10 @@ async fn move_provoke_reports_opportunity_attack() {
     assert_eq!(triggers[0]["attacker_id"], orc_id.to_string());
     assert_eq!(triggers[0]["mover_id"], hero_id.to_string());
 
-    // The reaction was CONSUMED by detection: step back in and away again —
-    // this second provocation cannot fire, so the field must be omitted.
+    // The reaction is PENDED by detection (iteration 72): the swing itself is
+    // still available through /action/opportunity-attack. Step back in and
+    // away again — the mover's SECOND departure re-arms nothing new, and the
+    // pending entry from the first provocation remains the single live one.
     let req = test::TestRequest::post()
         .uri(&format!("/api/v1/sessions/{}/move", session_id))
         .insert_header((auth.0.clone(), auth.1.clone()))
@@ -2985,6 +2987,23 @@ async fn move_provoke_reports_opportunity_attack() {
         String::from_utf8_lossy(&raw)
     );
 
+    // Take the swing: it spends the orc's REACTION (not its Action).
+    let seed = oa_hit_seed(3, 12);
+    let (status, oa_body) = post_opportunity_attack(&app, &token, session_id, orc_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", oa_body);
+    assert_eq!(oa_body["economy_spent"], serde_json::json!("reaction"));
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        !snap["entities"][orc_id.to_string()]["action_budget"]["reaction"].as_bool().unwrap(),
+        "the taken OA spends the orc's reaction"
+    );
+    assert!(
+        snap["entities"][orc_id.to_string()]["action_budget"]["action"].as_bool().unwrap(),
+        "the OA never touches the Action"
+    );
+
+    // Now that the swing is TAKEN, a further leave-adjacency move reports NO
+    // new opportunity attack: no armed reaction remains to provoke.
     let req = test::TestRequest::post()
         .uri(&format!("/api/v1/sessions/{}/move", session_id))
         .insert_header((auth.0.clone(), auth.1.clone()))
@@ -3390,6 +3409,324 @@ async fn move_provoke_reports_all_attackers_in_opportunity_attacks_detail() {
     );
     assert_eq!(singular["reaction_type"], "opportunity_attack");
     assert_eq!(singular["available"], true);
+}
+
+// --- Opportunity attack RESOLUTION (iteration 72) -----------------------------
+//
+// The move response only DISCLOSES the pending OA; this is the half where the
+// provoked enemy actually takes the swing through the wire — against its
+// REACTION budget, never the Action, and only for a mover whose movement
+// armed the trigger this round.
+
+/// Posts /action/opportunity-attack and returns (status, body).
+async fn post_opportunity_attack(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    attacker_id: Uuid,
+    target_id: Uuid,
+    seed: u64,
+) -> (StatusCode, serde_json::Value) {
+    let req = test::TestRequest::post()
+        .uri(&format!(
+            "/api/v1/sessions/{}/action/opportunity-attack",
+            session_id
+        ))
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({
+            "attacker_id": attacker_id,
+            "target_id": target_id,
+            "seed": seed
+        }))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let raw = test::read_body(res).await;
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    (status, value)
+}
+
+/// Finds a seed whose first d20 roll with `attack_bonus` beats AC exactly.
+fn oa_hit_seed(attack_bonus: i32, ac: i32) -> u64 {
+    let mut dice = DiceEngine::with_seed(1);
+    let _ = dice.roll_d20(); // warm up identically to the real call path
+    for s in 1..=100_000u64 {
+        let mut dice = DiceEngine::with_seed(s);
+        if dice.roll_d20() + attack_bonus >= ac {
+            return s;
+        }
+    }
+    panic!("no seed hits");
+}
+
+#[actix_web::test]
+async fn opportunity_attack_resolves_spend_reaction_not_action_and_refuse_second() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-oa", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    let hero_id = Uuid::new_v4();
+    // Orc: AC 11, one attack entry with +3 to hit (entity_json defaults).
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": orc_id, "reaction_type": "opportunity_attack"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // The hero leaves reach: the move response must DISCLOSE the pending OA.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 25.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["opportunity_attack"]["provoked_by"], orc_id.to_string());
+    assert_eq!(
+        body["opportunity_attack"]["pending_opportunity"],
+        serde_json::json!("/action/opportunity-attack"),
+        "the disclosure must name the endpoint that takes the swing"
+    );
+    assert_eq!(body["outcome"]["opportunity_attacks"].as_array().unwrap().len(), 1);
+
+    // The orc takes it. A guaranteed-hit seed pins the resolution.
+    let seed = oa_hit_seed(8, 11);
+    let (status, body) = post_opportunity_attack(&app, &token, session_id, orc_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["is_opportunity"], serde_json::json!(true));
+    assert_eq!(body["economy_spent"], serde_json::json!("reaction"));
+    assert_eq!(body["is_hit"], serde_json::json!(true), "seeded swing must land");
+
+    // REACTION spent, Action untouched.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let orc = &snap["entities"][orc_id.to_string()];
+    assert!(
+        !orc["action_budget"]["reaction"].as_bool().unwrap(),
+        "the OA spends the REACTION"
+    );
+    assert!(
+        orc["action_budget"]["action"].as_bool().unwrap(),
+        "an OA must NEVER spend the Action"
+    );
+
+    // Ledger: OPPORTUNITY_ATTACK_RESOLVED landed.
+    assert!(
+        snap["ledger"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("OPPORTUNITY_ATTACK_RESOLVED")),
+        "OPPORTUNITY_ATTACK_RESOLVED expected in ledger"
+    );
+
+    // Second OA the same round: no trigger left AND no reaction → 409.
+    let (status, err_body) =
+        post_opportunity_attack(&app, &token, session_id, orc_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err_body["error"], serde_json::json!("OA_NOT_PENDING"));
+}
+
+/// An entity with NO pending trigger cannot invent an OA: wrong target, wrong
+/// attacker, or nothing armed at all are all refused without spending anything.
+#[actix_web::test]
+async fn opportunity_attack_only_legal_for_the_armed_attacker_mover_pairing() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-oa-pair", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    let goblin_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, goblin_id, "Goblin", false, [10.0, 7.5, 0.0]).await;
+
+    // Arm ONLY the orc; the hero leaves BOTH creatures' reach.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": orc_id, "reaction_type": "opportunity_attack"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 30.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Wrong attacker (goblin has no trigger): refused, nothing spent.
+    let seed = oa_hit_seed(8, 11);
+    let (status, err_body) =
+        post_opportunity_attack(&app, &token, session_id, goblin_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err_body["error"], serde_json::json!("OA_NOT_PENDING"));
+
+    // Right attacker, wrong pairing direction (hero "attacking" itself out of
+    // turn is nonsense anyway): refused.
+    let (status, _) =
+        post_opportunity_attack(&app, &token, session_id, hero_id, goblin_id, seed).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // The genuine pairing resolves.
+    let (status, body) =
+        post_opportunity_attack(&app, &token, session_id, orc_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["is_opportunity"], serde_json::json!(true));
+}
+
+/// Disengage AFTER walking away withdraws the already-provoked OA: the pending
+/// trigger is dropped, the enemy's readied reaction survives, and a later
+/// attempt at the swing finds nothing.
+#[actix_web::test]
+async fn disengage_after_leaving_reach_cancels_the_pending_opportunity_attack() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-oa-disengage", "gm", TEST_SECRET);
+    let auth = bearer(&token);
+    let session_id = create_opportunity_session(&app, &auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let orc_id = Uuid::new_v4();
+    spawn_at(&app, &auth, session_id, hero_id, "Hero", true, [5.0, 5.0, 0.0]).await;
+    spawn_at(&app, &auth, session_id, orc_id, "Orc", false, [10.0, 5.0, 0.0]).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(auth.clone())
+        .set_json(serde_json::json!({"entity_id": orc_id, "reaction_type": "opportunity_attack"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Walk away: provocation disclosed (must exit the 5.5 ft slack band).
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["opportunity_attack"]["provoked_by"], orc_id.to_string());
+
+    // Disengage (still has its Action): the pending OA is cancelled and the
+    // response says how many.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "disengage",
+        serde_json::json!({"entity_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(
+        body["cancelled_opportunity_attacks"],
+        serde_json::json!(1),
+        "Disengage must report the withdrawn OA"
+    );
+
+    // The orc's readied reaction was NOT consumed by the cancellation.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][orc_id.to_string()]["action_budget"]["reaction"]
+            .as_bool()
+            .unwrap(),
+        "cancelling must hand the readied reaction back untouched"
+    );
+
+    // The swing can no longer be taken.
+    let seed = oa_hit_seed(8, 11);
+    let (status, err_body) =
+        post_opportunity_attack(&app, &token, session_id, orc_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err_body["error"], serde_json::json!("OA_NOT_PENDING"));
+}
+
+/// Forced displacement NEVER arms an OA: a shove push moves the defender
+/// engine-side WITHOUT a MOVE_ENTITY, so leaving reach through a push leaves
+/// every adjacent armed enemy unprovoked.
+#[actix_web::test]
+async fn shove_push_displacement_does_not_arm_opportunity_attacks() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-shove-oa", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    // Defender starts adjacent (2.5 ft) to an ARMED watcher.
+    let defender_id = Uuid::new_v4();
+    let watcher_id = Uuid::new_v4();
+    // Defender at [2.5, 2.5] (entity_json default), watcher adjacent at
+    // [7.5, 2.5] — exactly one cell apart so the shover standing BEHIND the
+    // defender pushes them straight out of the watcher's reach.
+    spawn(&app, &token, session_id, entity_with_abilities(entity_json(defender_id, "Victim", 30, 14, 0, "1d4"), 8, 8)).await;
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(watcher_id, "Watcher", 20, 11, 0, "1d4"), 8, 8), 7.5, 2.5)).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({"entity_id": watcher_id, "reaction_type": "opportunity_attack"}))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // The shover stands on the far side so the push drives the victim OUT of
+    // the watcher's reach along their connecting line.
+    let shover_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_at(entity_with_abilities(entity_json(shover_id, "Shover", 30, 14, 0, "1d4"), 20, 10), 2.5, 2.5)).await;
+
+    let seed = contest_seed(5, -1, true);
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "shove",
+        serde_json::json!({
+            "attacker_id": shover_id,
+            "defender_id": defender_id,
+            "shove_effect": "push_5ft",
+            "seed": seed
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["success"], serde_json::json!(true));
+    let pushed_to = body["pushed_to"].clone();
+    assert!(pushed_to.is_array(), "push must land: {}", body);
+
+    // The defender left the watcher's adjacency FORCED. The watcher's armed
+    // reaction must be intact and NO pending OA may exist anywhere in state.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert!(
+        snap["entities"][watcher_id.to_string()]["action_budget"]["reaction"]
+            .as_bool()
+            .unwrap(),
+        "forced displacement must not consume the watcher's readied reaction"
+    );
+    let pendings = snap["pending_opportunity_attacks"].as_array().cloned().unwrap_or_default();
+    assert!(
+        pendings.is_empty(),
+        "forced displacement must never arm an OA: {:?}",
+        pendings
+    );
+
+    // Belt and braces: the swing endpoint refuses outright.
+    let seed = oa_hit_seed(8, 11);
+    let (status, err_body) =
+        post_opportunity_attack(&app, &token, session_id, watcher_id, defender_id, seed).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err_body["error"], serde_json::json!("OA_NOT_PENDING"));
 }
 
 // --- Initiative combat lifecycle (/combat/begin, /combat/end) ----------------
@@ -4711,7 +5048,7 @@ async fn ready_action_stores_description_spends_action_and_clears_on_refresh() {
         &token,
         session_id,
         "ready",
-        serde_json::json!({"entity_id": hero_id, "description": "I attack the goblin", "trigger_hint": "when it moves"}),
+        serde_json::json!({"entity_id": hero_id, "description": "I attack the goblin", "trigger": "enemy_moves"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {}", body);
@@ -4839,6 +5176,121 @@ async fn ready_action_rejects_wrong_role_owner_and_payload_shape() {
         "unknown fields must be structurally rejected, got {}",
         status
     );
+}
+
+// --- Release readied action (SRD: resolving it takes the Reaction) ------------
+
+#[actix_web::test]
+async fn release_ready_action_spends_the_reaction_and_409s_without_one() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-ready-release", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &token, session_id, entity_json(hero_id, "Hero", 30, 14, 0, "1d4")).await;
+
+    // Ready with a structured mechanical trigger.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "ready",
+        serde_json::json!({"entity_id": hero_id, "description": "I attack the goblin", "trigger": "enemy_enters_reach"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(
+        body["readied_action"]["trigger"], serde_json::json!("enemy_enters_reach"),
+        "the structured trigger is echoed back: {}",
+        body
+    );
+
+    // Release: 200, spends the Reaction, clears the declaration.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "ready/release",
+        serde_json::json!({"entity_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("READY_ACTION_RELEASED"));
+    assert_eq!(body["reaction_spent"], serde_json::json!(true));
+    assert!(body["event_sequence"].is_u64(), "ledger sequence surfaced");
+
+    let snap = snapshot_as(&app, &token, session_id).await;
+    let hero = &snap["entities"][hero_id.to_string()];
+    assert!(hero["readied_action"].is_null(), "release clears the declaration");
+    assert!(
+        !hero["action_budget"]["reaction"].as_bool().unwrap(),
+        "release spent the entity's Reaction"
+    );
+    assert!(
+        snap["ledger"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event_type"] == serde_json::json!("READY_ACTION_RELEASED")
+                && e["payload"]["reaction_spent"] == serde_json::json!(true)),
+        "READY_ACTION_RELEASED lands in the ledger with the spend marker"
+    );
+
+    // Releasing again with nothing held → 409 NO_READIED_ACTION.
+    let (status, body) = post_contest(
+        &app,
+        &token,
+        session_id,
+        "ready/release",
+        serde_json::json!({"entity_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], serde_json::json!("NO_READIED_ACTION"));
+}
+
+#[actix_web::test]
+async fn release_ready_action_enforces_rbac_and_unknown_entities() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-ready-rel-rbac", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let hero_id = Uuid::new_v4();
+    spawn(&app, &gm, session_id, entity_owned_by(entity_json(hero_id, "Claimed Hero", 30, 14, 0, "1d4"), "player-rel")).await;
+
+    // Spectators cannot release.
+    let spectator = sign_token_with_role("spec-rel", "spectator", TEST_SECRET);
+    let (status, _) = post_contest(
+        &app,
+        &spectator,
+        session_id,
+        "ready/release",
+        serde_json::json!({"entity_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Players cannot release someone else's readied action.
+    let player = sign_token("player-other", TEST_SECRET);
+    let (status, body) = post_contest(
+        &app,
+        &player,
+        session_id,
+        "ready/release",
+        serde_json::json!({"entity_id": hero_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], serde_json::json!("ENTITY_NOT_OWNED"));
+
+    // Unknown entity → 404.
+    let (status, _) = post_contest(
+        &app,
+        &gm,
+        session_id,
+        "ready/release",
+        serde_json::json!({"entity_id": Uuid::new_v4()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // --- Two-Weapon Fighting (off-hand bonus strike) -------------------------------
