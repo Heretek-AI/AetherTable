@@ -410,3 +410,5 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 76 — 7038174 — feat(client): OA disclosures on moves + resolve contract (P3) — vitest 375
 ### Iteration 77 — this wave — feat(gateway): opt-in periodic campaign autosave (P1/P2) — pytest 960
 ### Iteration 78 — (prior commit) — feat(gateway): opportunity-attack proxy closes wire gap
+### Iteration 79 — cf6a428 — feat(client): Help-check + structured Ready/Release controls (P3) — vitest 397
+### Iteration 80 — 759594d — feat(wfc): seeded loot containers on generated maps (P8) — cargo 440/20
