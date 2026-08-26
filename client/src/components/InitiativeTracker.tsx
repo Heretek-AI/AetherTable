@@ -13,6 +13,14 @@ import {
   Zap,
 } from 'lucide-react';
 import { Token } from './TacticalCanvas';
+import { ConcentrationBadge } from './ConcentrationBadge';
+import {
+  combatantRowStatus,
+  hasRowStatus,
+  type CombatantRowStatus,
+} from '../api/row_status_glyphs';
+import type { EntityCombatStatus } from '../api/entity_status_state';
+import type { ConcentrationInfo } from '../api/concentration_state';
 
 /**
  * One rolled initiative slot as reported by the authoritative engine
@@ -164,6 +172,9 @@ export function parseTurnAdvancement(raw: unknown): TurnAdvancementNotice | null
   return { round, opportunityAttacks, concentrationChecks };
 }
 
+const EMPTY_STATUS_MAP: Record<string, EntityCombatStatus> = {};
+const EMPTY_CONCENTRATION_MAP: Record<string, ConcentrationInfo> = {};
+
 interface InitiativeTrackerProps {
   tokens: Token[];
   onNextTurn: () => void;
@@ -190,6 +201,20 @@ interface InitiativeTrackerProps {
    * fields it actually contains are displayed. Null/undefined renders nothing.
    */
   lastTurnResponse?: unknown;
+  /**
+   * Iteration 84 — per-entity combat facts (conditions incl. exhaustion)
+   * parsed by the caller from the session-state projection. Absent entries
+   * mean "the projection did not expose this entity" — those rows simply show
+   * no status strip. Never fabricated here.
+   */
+  entityStatusByEntity?: Record<string, EntityCombatStatus>;
+  /** Per-entity active concentration from the same session-state projection. */
+  concentrationByEntity?: Record<string, ConcentrationInfo>;
+  /**
+   * RAW session-state body, consulted ONLY for the numeric exhaustion level
+   * inside `entities[id].conditions` (`Exhaustion(u8)` → `{"exhaustion": N}`).
+   */
+  sessionStateRaw?: unknown;
 }
 
 export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
@@ -208,6 +233,9 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   onBeginCombat,
   onEndCombat,
   lastTurnResponse,
+  entityStatusByEntity = EMPTY_STATUS_MAP,
+  concentrationByEntity = EMPTY_CONCENTRATION_MAP,
+  sessionStateRaw,
 }) => {
   // Additive turn report: whatever the engine's last advance actually
   // disclosed (OA provocations, concentration saves). Nothing here is derived
@@ -243,6 +271,28 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   // Entries without a matching local token still render (engine name + roll).
   const tokenFor = (entityId: string): Token | undefined =>
     tokens.find((t) => t.id === entityId);
+
+  /**
+   * Iteration 84 — shape this row's status glyphs from the session-state
+   * projection the caller handed us. A combatant the projection said nothing
+   * about gets no strip at all; nothing here is derived from HP, role, or any
+   * other proxy for conditions.
+   */
+  const rowStatus = useMemo(
+    () =>
+      new Map<string, CombatantRowStatus>(
+        combatOrder.map((entry) => [
+          entry.entity_id,
+          combatantRowStatus(
+            entry.entity_id,
+            entityStatusByEntity[entry.entity_id],
+            concentrationByEntity[entry.entity_id],
+            sessionStateRaw,
+          ),
+        ]),
+      ),
+    [combatOrder, entityStatusByEntity, concentrationByEntity, sessionStateRaw],
+  );
 
   const renderAvatar = (entityId: string, name: string) => {
     const token = tokenFor(entityId);
@@ -366,6 +416,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
               const isActiveTurn = entry.entity_id === activeEntityId;
               const isSelected = selectedTokenId === entry.entity_id;
               const isDead = token ? token.hp <= 0 : false;
+              const status = rowStatus.get(entry.entity_id);
 
               return (
                 <div
@@ -438,6 +489,43 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                           style={{ width: `${Math.max(0, (token.hp / token.maxHp) * 100)}%` }}
                         />
                       </div>
+                    </div>
+                  )}
+
+                  {/* Iteration 84 — compact status glyphs, straight from the
+                      session-state projection: numbered exhaustion level,
+                      active-concentration badge (iteration 58), and condition
+                      tags in engine snake_case. A combatant the projection
+                      exposed nothing about renders no strip at all — absence
+                      stays silent instead of becoming an invention. Kept to
+                      one wrapping flex line so 8 combatants cannot break the
+                      column layout. */}
+                  {status && hasRowStatus(status) && (
+                    <div
+                      data-testid={`row-status-${entry.entity_id}`}
+                      className="mt-1.5 flex flex-wrap items-center gap-1"
+                    >
+                      {status.exhaustion && (
+                        <span
+                          title={`Exhaustion level ${status.exhaustion.level}`}
+                          aria-label={`Exhaustion level ${status.exhaustion.level}`}
+                          className="inline-flex items-center gap-0.5 px-1.5 py-px rounded bg-orange-950/60 border border-orange-400/40 text-orange-200 text-[9px] font-mono font-bold"
+                        >
+                          EXH {status.exhaustion.level}
+                        </span>
+                      )}
+                      {status.concentration && (
+                        <ConcentrationBadge info={status.concentration} variant="token" />
+                      )}
+                      {status.conditions.map((cond) => (
+                        <span
+                          key={cond.name}
+                          title={`Condition: ${cond.name}`}
+                          className="px-1.5 py-px rounded bg-rose-950/50 border border-rose-300/30 text-rose-100 text-[9px] font-semibold uppercase tracking-wide"
+                        >
+                          {cond.name}
+                        </span>
+                      ))}
                     </div>
                   )}
                 </div>

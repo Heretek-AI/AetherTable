@@ -677,6 +677,11 @@ export function App() {
   const [entityStatusByEntity, setEntityStatusByEntity] =
     useState<Record<string, EntityCombatStatus>>({});
   const [grappleHolders, setGrappleHolders] = useState<Record<string, string>>({});
+  // Iteration 84: the RAW body of the most recent session-state snapshot.
+  // The parsed maps above deliberately flatten Exhaustion(u8) to the bare
+  // variant name; the tracker's exhaustion glyph needs the numeric level,
+  // which only this verbatim body preserves. Null until a snapshot arrives.
+  const [sessionStateRaw, setSessionStateRaw] = useState<unknown>(null);
   /** Status for one token id, or null when the projection exposed nothing. */
   const combatStatusFor = (tokenId: string | undefined): EntityCombatStatus | null =>
     (tokenId ? entityStatusByEntity[tokenId] : undefined) ?? null;
@@ -1110,6 +1115,9 @@ export function App() {
       const status = parseEntityStatusFromSessionState(snap);
       setEntityStatusByEntity(status.byEntity);
       setGrappleHolders(status.grappleHolders);
+      // Iteration 84: keep the verbatim body for the tracker's exhaustion
+      // glyph (level number lives only in the raw conditions array).
+      setSessionStateRaw(snap);
     } catch {
       /* engine unreachable — keep showing last known state */
     }
@@ -2247,6 +2255,9 @@ export function App() {
                 onBeginCombat={() => void handleBeginCombat()}
                 onEndCombat={() => void handleEndCombat()}
                 lastTurnResponse={lastTurnResponse}
+                entityStatusByEntity={entityStatusByEntity}
+                concentrationByEntity={concentrationByEntity}
+                sessionStateRaw={sessionStateRaw}
               />
 
               {/* Center Tactical Canvas */}
