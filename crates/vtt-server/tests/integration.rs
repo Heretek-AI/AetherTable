@@ -1738,6 +1738,8 @@ async fn short_rest_does_not_touch_exhaustion_or_hp() {
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
 
+    // A dice-less short rest: no healing (no hit dice spent), no exhaustion
+    // recovery. Still ledgered for auditability.
     let req = test::TestRequest::post()
         .uri(&format!("/api/v1/sessions/{}/rest", session_id))
         .insert_header(bearer(&gm))
@@ -1755,12 +1757,418 @@ async fn short_rest_does_not_touch_exhaustion_or_hp() {
     assert!(
         !snap["ledger"]["events"].as_array().unwrap().iter()
             .any(|e| e["event_type"] == "LONG_REST_APPLIED"),
-        "a mechanical no-op short rest must not emit per-entity rest events"
+        "a dice-less short rest must not emit per-entity rest events"
     );
     assert!(
         snap["ledger"]["events"].as_array().unwrap().iter()
             .any(|e| e["event_type"] == "SHORT_REST_APPLIED"),
-        "the no-op rest itself stays ledgered for auditability"
+        "the rest itself stays ledgered for auditability"
+    );
+}
+
+// --- Iteration 86: funded short rests (hit-dice spending) --------------------
+//
+// Pins the closed gap on the wire:
+//   - spending N hit dice heals sum(rolls) + CON mod per die and draws down
+//     the entity's `hit_dice_remaining` pool
+//   - every funded spend journals a SHORT_REST_APPLIED event carrying the
+//     rolls and post-heal HP so safety_rewind replays it
+//   - over-spends, unmodelled die sizes and foreign entities are refused with
+//     distinct codes; the dead cannot short-rest
+
+async fn spawn_short_rest_hero(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    token: &str,
+    session_id: Uuid,
+    id: Uuid,
+) {
+    let mut hero = entity_json(id, "Bruised Veteran", 30, 16, 5, "1d10");
+    hero["current_hp"] = serde_json::json!(6);
+    hero["hit_dice_size"] = serde_json::json!(10);
+    hero["hit_dice_remaining"] = serde_json::json!(3);
+    hero["owner_player_id"] = serde_json::json!("gm-1");
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(token))
+        .set_json(hero)
+        .to_request();
+    assert_eq!(test::call_service(app, req).await.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn short_rest_spends_hit_dice_heals_and_ledgers_the_spend() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    spawn_short_rest_hero(&app, &gm, session_id, hero_id).await;
+
+    // Spend ALL remaining dice by omitting `dice` — the default spend.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": hero_id}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], "SHORT_REST_APPLIED");
+    assert_eq!(body["restored_entities"], 1);
+
+    let entry = &body["entities"][0];
+    assert_eq!(entry["dice_spent"], 3);
+    let rolls: Vec<i64> = entry["rolls"].as_array().unwrap()
+        .iter().map(|r| r.as_i64().unwrap()).collect();
+    assert_eq!(rolls.len(), 3, "one face per die");
+    for face in &rolls {
+        assert!((1..=10).contains(face), "d10 faces only, got {face}");
+    }
+    // CON 14 -> +2 per die.
+    assert_eq!(entry["con_modifier"], 2);
+    // Healing = sum of faces + 2/die; the reported figure is PRE-clamp, so it
+    // can exceed the 24 points actually needed to top off from 6.
+    let raw_healing: i64 = rolls.iter().sum::<i64>() + 2 * 3;
+    assert_eq!(
+        entry["healing"],
+        raw_healing.max(0),
+        "reported healing is the pre-clamp total"
+    );
+    // Healing is RANDOM (3d10 + 6, floored at 0): a full pool heals into
+    // [6+9 .. 30] — it does not deterministically top off. Pin the band and
+    // the max-HP clamp instead of a face-dependent total.
+    assert_eq!(
+        entry["hp_remaining"].as_i64().unwrap(),
+        (6 + raw_healing).min(30),
+        "post-heal HP is pre-rest HP + healing clamped at max"
+    );
+    assert!((15..=30).contains(&entry["hp_remaining"].as_i64().unwrap()));
+    assert_eq!(entry["hit_dice_remaining"], 0, "the pool is drained");
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["current_hp"],
+        body["entities"][0]["hp_remaining"],
+        "live state reflects the funded heal"
+    );
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["hit_dice_remaining"], 0,
+        "pool draw-down persists on the entity"
+    );
+
+    let events = snap["ledger"]["events"].as_array().unwrap();
+    let spend_events: Vec<&serde_json::Value> = events.iter()
+        .filter(|e| e["event_type"] == "SHORT_REST_APPLIED")
+        .collect();
+    assert_eq!(spend_events.len(), 1, "exactly one journal for one funded spend");
+    let payload = &spend_events[0]["payload"];
+    assert_eq!(payload["target_id"], json_str(&hero_id));
+    assert_eq!(payload["dice_spent"], 3);
+    assert_eq!(
+        payload["hp_remaining"],
+        snap["entities"][&hero_id.to_string()]["current_hp"],
+        "event carries absolute post-heal HP for rewind replay"
+    );
+    assert!(payload["rolls"].is_array());
+}
+
+#[actix_web::test]
+async fn short_rest_refuses_overspend_unmodelled_dice_foreign_entities_and_dead() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-2", "player", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    spawn_short_rest_hero(&app, &gm, session_id, hero_id).await;
+
+    // Over-spend: 99 dice vs a pool of 3.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": hero_id, "dice": 99}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "INSUFFICIENT_HIT_DICE");
+
+    // Unmodelled die size: an ordinary entity without hit-dice fields.
+    let plain_id = Uuid::new_v4();
+    let mut plain = entity_json(plain_id, "Diceless Hireling", 20, 12, 3, "1d6");
+    plain["current_hp"] = serde_json::json!(5);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(plain)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": plain_id}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "NO_HIT_DICE_MODELLED");
+
+    // A player may not fund someone else's entity.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": hero_id}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // The dead do not short-rest.
+    let corpse_id = Uuid::new_v4();
+    let mut corpse = entity_json(corpse_id, "Fallen Scout", 20, 13, 3, "1d8");
+    corpse["is_dead"] = serde_json::json!(true);
+    corpse["current_hp"] = serde_json::json!(0);
+    corpse["hit_dice_size"] = serde_json::json!(8);
+    corpse["hit_dice_remaining"] = serde_json::json!(2);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(corpse)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": corpse_id}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["error"], "ENTITY_DEAD");
+
+    // Every refusal above must have left both pools untouched.
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(snap["entities"][&hero_id.to_string()]["hit_dice_remaining"], 3);
+    assert_eq!(snap["entities"][&hero_id.to_string()]["current_hp"], 6);
+    assert!(
+        !snap["ledger"]["events"].as_array().unwrap().iter()
+            .any(|e| e["event_type"] == "SHORT_REST_APPLIED"
+                && e["payload"]["target_id"].is_string()),
+        "refused spends journal nothing target-bearing"
+    );
+}
+
+#[actix_web::test]
+async fn short_rest_rewind_restores_pre_rest_hit_points() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    spawn_short_rest_hero(&app, &gm, session_id, hero_id).await;
+
+    // Anchor the pre-rest HP in the LEDGER: a rewind replays surviving
+    // events, so without a baseline event the replay has nothing to restore
+    // from and would strand live-drifted HP. One provenance-checked damage
+    // commit puts the veteran at a known wounded total first.
+    let foe_id = Uuid::new_v4();
+    let mut foe = entity_json(foe_id, "Baseline Striker", 30, 14, 8, "1d4");
+    foe["owner_player_id"] = serde_json::json!("gm-1");
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(foe)
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let mut baseline_seq: Option<u64> = None;
+    for seed in 1u64..=50 {
+        // Refresh the striker's turn first: each attempt burns the Action, and
+        // a miss must not strand the loop budgetless.
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/turn/next", session_id))
+            .insert_header(bearer(&gm))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(serde_json::json!({
+                "attacker_id": foe_id,
+                "target_id": hero_id,
+                "action_index": 0,
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "seed {seed} must resolve");
+        let attempt: serde_json::Value = test::read_body_json(res).await;
+        if attempt["is_hit"] == serde_json::Value::Bool(true) {
+            let seq = attempt["event_sequence"].as_u64().unwrap();
+            let req = test::TestRequest::post()
+                .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+                .insert_header(bearer(&gm))
+                .set_json(serde_json::json!({
+                    "target_id": hero_id,
+                    "source_event_sequence": seq
+                }))
+                .to_request();
+            let res = test::call_service(&app, req).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            baseline_seq = Some(seq);
+            break;
+        }
+    }
+    let _baseline_seq =
+        baseline_seq.expect("at least one of the first fifty seeds must connect");
+
+    // Funded spend next (one die heals into a known band from the wound).
+    // Capture the wounded pre-rest total FIRST: the rewind target below sits
+    // AFTER the baseline wound, so the surviving ATTACK_RESOLVED replays that
+    // wounded total back — the pre-rest world is the wounded one, not spawn HP.
+    let pre_rest_hp: i64 = snapshot_as(&app, &gm, session_id).await
+        ["entities"][&hero_id.to_string()]["current_hp"]
+        .as_i64()
+        .unwrap();
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/rest", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "kind": "short",
+            "spend": [{"entity_id": hero_id, "dice": 1}]
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    let post_rest_hp = body["entities"][0]["hp_remaining"].as_i64().unwrap();
+    // The live HP right now IS the healed total (the rest endpoint just ran);
+    // it must sit inside the entity's HP band and agree with the response.
+    let healed_live: i64 = snapshot_as(&app, &gm, session_id).await
+        ["entities"][&hero_id.to_string()]["current_hp"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        post_rest_hp, healed_live,
+        "response and live state agree on the healed total"
+    );
+    assert!(
+        (pre_rest_hp + 1..=30).contains(&post_rest_hp),
+        "one die (+CON) strictly heals above the wounded {pre_rest_hp} without exceeding max, got {post_rest_hp}"
+    );
+
+    let seq_after_rest: u64 = {
+        let snap = snapshot_as(&app, &gm, session_id).await;
+        let last = snap["ledger"]["events"].as_array().unwrap().last().unwrap();
+        last["sequence_id"].as_u64().unwrap()
+    };
+
+    // The same striker wounds the veteran AGAIN after the rest — this is the
+    // damage a rewind discards. A fresh turn refresh re-arms the striker's
+    // Action budget first.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/turn/next", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Scan a few seeds for a guaranteed hit so the test never flakes on RNG;
+    // each attempt burns the Action, so re-arm the budget per attempt.
+    let mut attack_seq: Option<u64> = None;
+    for seed in 1u64..=50 {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/turn/next", session_id))
+            .insert_header(bearer(&gm))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+            .insert_header(bearer(&gm))
+            .set_json(serde_json::json!({
+                "attacker_id": foe_id,
+                "target_id": hero_id,
+                "action_index": 0,
+                "seed": seed
+            }))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK, "seed {seed} must resolve");
+        let attempt: serde_json::Value = test::read_body_json(res).await;
+        if attempt["is_hit"] == serde_json::Value::Bool(true) {
+            attack_seq = attempt["event_sequence"].as_u64();
+            break;
+        }
+    }
+    let attack_seq =
+        attack_seq.expect("at least one of the first fifty seeds must connect");
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/damage", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "target_id": hero_id,
+            "source_event_sequence": attack_seq
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "wounding after the rest anchors the rewind"
+    );
+    let wounded: i64 = snapshot_as(&app, &gm, session_id).await
+        ["entities"][&hero_id.to_string()]["current_hp"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(wounded, post_rest_hp, "the wound must change HP");
+
+    // Rewind past BOTH the wound and the funded spend: the X-card target
+    // reverts everything ABOVE the sequence, so targeting the event BEFORE
+    // the rest undoes both and replays the pre-rest world.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "player_id": "gm-1",
+            "topic": "rewind the funded short rest",
+            "target_sequence_id": seq_after_rest - 1
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "X-card rewind must accept");
+
+    let snap = snapshot_as(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["current_hp"], pre_rest_hp,
+        "rewind past the spend restores the wounded pre-rest HP exactly"
+    );
+    assert_eq!(
+        snap["entities"][&hero_id.to_string()]["hit_dice_remaining"], 3,
+        "rewind past the spend refunds the drawn die (pool back to spawn)"
+    );
+    assert!(
+        !snap["ledger"]["events"].as_array().unwrap().iter()
+            .any(|e| e["event_type"] == "SHORT_REST_APPLIED"
+                && e["payload"]["target_id"] == json_str(&hero_id)
+                && e["is_reverted"] != serde_json::Value::Bool(true)),
+        "the reverted spend event must be flagged, not replayed"
     );
 }
 
@@ -10933,4 +11341,272 @@ async fn rewind_after_attributed_escape_keeps_the_release_not_a_hold() {
         serde_json::json!([]),
         "rewind keeps the escaper free"
     );
+}
+
+// --- Iteration 88 (audit F3): the /move wire must not name hidden attackers ---
+//
+// The move response annotated `opportunity_attacks_detail` (and the singular
+// back-compat `opportunity_attack`) with EVERY armed adjacent enemy that the
+// departing mover provoked — including enemies a non-GM caller cannot see.
+// A player moving out of a hidden lurker's reach learned an invisible
+// creature exists and where it stands. Fix: project per caller role. GM sees
+// every provocation verbatim; players/spectators see only VISIBLE attackers;
+// hidden provocations are omitted from the wire entirely while the pending OA
+// still exists server-side.
+
+/// Spawns an entity with explicit visibility, position and side.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_at_visible(
+    app: &impl Service<
+        actix_http::Request,
+        Response = ServiceResponse<EitherBody<BoxBody>>,
+        Error = actix_web::Error,
+    >,
+    auth: &(actix_web::http::header::HeaderName, String),
+    session_id: Uuid,
+    id: Uuid,
+    name: &str,
+    is_player: bool,
+    is_visible: bool,
+    pos: [f64; 3],
+) {
+    let mut payload = entity_json(id, name, 20, 12, 3, "1d6+1");
+    payload["is_player"] = serde_json::json!(is_player);
+    payload["is_visible"] = serde_json::json!(is_visible);
+    payload["position"] = serde_json::json!(pos);
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+        .insert_header((auth.0.clone(), auth.1.clone()))
+        .set_json(payload)
+        .to_request();
+    let res = test::call_service(app, req).await;
+    assert_eq!(res.status(), StatusCode::OK, "spawn of {} failed", name);
+}
+
+#[actix_web::test]
+async fn move_response_for_non_gm_omits_hidden_attacker_disclosures() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-88", "gm", TEST_SECRET);
+    // player-2 will own the mover so the player may move it at all.
+    let player = sign_token_with_role("player-two", "player", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let player_auth = bearer(&player);
+    let session_id = create_opportunity_session(&app, &gm_auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let hidden_lurker_id = Uuid::new_v4();
+
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["owner_player_id"] = serde_json::json!("player-two");
+    hero["position"] = serde_json::json!([5.0, 5.0, 0.0]);
+    for payload in [hero] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+    spawn_at_visible(
+        &app, &gm_auth, session_id, hidden_lurker_id, "Hidden Lurker",
+        false, false, [10.0, 5.0, 0.0],
+    )
+    .await;
+
+    // Arm ONLY the hidden lurker's opportunity reaction.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": hidden_lurker_id,
+            "reaction_type": "opportunity_attack"
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // THE PLAYER walks away: provocation happens server-side...
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(player_auth.clone())
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+
+    // ...but the WIRE must not name the hidden attacker to the player.
+    assert!(
+        body.get("opportunity_attack").is_none() || body["opportunity_attack"].is_null(),
+        "singular disclosure must be withheld for a hidden attacker: {}",
+        body
+    );
+    assert!(
+        body.get("opportunity_attacks_detail").is_none()
+            || body["opportunity_attacks_detail"].is_null(),
+        "detail array must not carry hidden attackers to a player: {}",
+        body
+    );
+
+    // The mechanic SURVIVES: the pending OA exists server-side and the GM can
+    // still resolve the hidden enemy's swing against its reaction budget.
+    let seed = oa_hit_seed(3, 14);
+    let (status, oa_body) = post_opportunity_attack(
+        &app, &gm, session_id, hidden_lurker_id, hero_id, seed,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the pending OA from the HIDDEN enemy must still resolve: {}",
+        oa_body
+    );
+    assert_eq!(oa_body["is_opportunity"], serde_json::json!(true));
+}
+
+#[actix_web::test]
+async fn move_response_for_non_gm_keeps_visible_attacker_disclosures() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-88v", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-twov", "player", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let player_auth = bearer(&player);
+    let session_id = create_opportunity_session(&app, &gm_auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let visible_orc_id = Uuid::new_v4();
+
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["owner_player_id"] = serde_json::json!("player-twov");
+    hero["position"] = serde_json::json!([5.0, 5.0, 0.0]);
+    for payload in [hero] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+    spawn_at_visible(
+        &app, &gm_auth, session_id, visible_orc_id, "Board Orc",
+        false, true, [10.0, 5.0, 0.0],
+    )
+    .await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+        .insert_header(gm_auth.clone())
+        .set_json(serde_json::json!({
+            "entity_id": visible_orc_id,
+            "reaction_type": "opportunity_attack"
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(player_auth.clone())
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 5.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+
+    // A VISIBLE attacker's provocation stays on the wire for players.
+    assert_eq!(
+        body["opportunity_attack"]["provoked_by"],
+        visible_orc_id.to_string(),
+        "{}",
+        body
+    );
+    let detail = body["opportunity_attacks_detail"]
+        .as_array()
+        .expect("visible provocation keeps the detail array");
+    assert_eq!(detail.len(), 1);
+    assert_eq!(detail[0]["provoked_by"], visible_orc_id.to_string());
+}
+
+#[actix_web::test]
+async fn move_response_for_non_gm_splits_hidden_and_visible_mixed_provocateurs() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-88m", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-threem", "player", TEST_SECRET);
+    let gm_auth = bearer(&gm);
+    let player_auth = bearer(&player);
+    let session_id = create_opportunity_session(&app, &gm_auth).await;
+
+    let hero_id = Uuid::new_v4();
+    let visible_orc_id = Uuid::new_v4();
+    let hidden_lurker_id = Uuid::new_v4();
+
+    let mut hero = entity_json(hero_id, "Hero", 30, 14, 8, "1d8+3");
+    hero["owner_player_id"] = serde_json::json!("player-threem");
+    hero["position"] = serde_json::json!([5.0, 5.0, 0.0]);
+    for payload in [hero] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/entities", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(payload)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+    spawn_at_visible(
+        &app, &gm_auth, session_id, visible_orc_id, "Board Orc",
+        false, true, [10.0, 5.0, 0.0],
+    )
+    .await;
+    spawn_at_visible(
+        &app, &gm_auth, session_id, hidden_lurker_id, "Hidden Lurker",
+        false, false, [5.0, 10.0, 0.0],
+    )
+    .await;
+
+    // Arm BOTH.
+    for enemy in [visible_orc_id, hidden_lurker_id] {
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/sessions/{}/reactions/arm", session_id))
+            .insert_header(gm_auth.clone())
+            .set_json(serde_json::json!({
+                "entity_id": enemy,
+                "reaction_type": "opportunity_attack"
+            }))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    }
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/move", session_id))
+        .insert_header(player_auth.clone())
+        .set_json(serde_json::json!({"entity_id": hero_id, "x": 20.0, "y": 20.0}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+
+    // The PLAYER-facing projection names ONLY the VISIBLE provocateur — in the
+    // detail array, the singular back-compat field AND the echoed outcome.
+    let raw = serde_json::to_string(&body).unwrap();
+    assert_eq!(detail_len(&body), 1, "{}", body);
+    assert_eq!(body["opportunity_attack"]["provoked_by"], visible_orc_id.to_string());
+    assert_eq!(
+        body["outcome"]["opportunity_attacks"].as_array().unwrap().len(),
+        1,
+        "echoed outcome must also project to visible attackers only"
+    );
+    assert!(
+        !raw.contains(&hidden_lurker_id.to_string()),
+        "hidden attacker id must not appear anywhere in a player's move response"
+    );
+
+    // The mechanic SURVIVES the redaction: the HIDDEN lurker's OA still pends
+    // and resolves against its reaction budget.
+    let seed = oa_hit_seed(3, 14);
+    let (status, oa_body) =
+        post_opportunity_attack(&app, &gm, session_id, hidden_lurker_id, hero_id, seed).await;
+    assert_eq!(status, StatusCode::OK, "hidden enemy's pending OA must survive: {}", oa_body);
+}
+
+/// Number of entries in the projected opportunity_attacks_detail array (0 when
+/// the field was withheld entirely).
+fn detail_len(body: &serde_json::Value) -> usize {
+    body["opportunity_attacks_detail"].as_array().map(|a| a.len()).unwrap_or(0)
 }

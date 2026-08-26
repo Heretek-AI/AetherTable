@@ -1327,13 +1327,39 @@ async fn move_entity(
                 // through /action/opportunity-attack against its REACTION
                 // budget. The fields are omitted entirely when nothing could be
                 // provoked (mover disengaged / no adjacent armed enemy).
+                //
+                // AUDIT F3 (iteration 88): the disclosure is PROJECTED per
+                // caller role. Naming an attacker tells the caller that an
+                // entity exists and where it stands — for a HIDDEN adjacent
+                // enemy that is exactly the information the role projection of
+                // GET /sessions/{id} withholds. Non-GM callers receive only
+                // VISIBLE attackers' disclosures; hidden provocations are
+                // omitted from the wire entirely while the pending OA still
+                // exists server-side (the reacting side can still take the
+                // swing). GM/admin keep every provocation verbatim.
                 let mut body = serde_json::json!({ "status": "MOVED", "outcome": outcome.clone() });
-                if !outcome.opportunity_attacks.is_empty() {
-                    // Full report: EVERY pending OA, not just the first. Each
-                    // entry carries `pending_opportunity` naming the endpoint
-                    // that actually takes the swing.
+                let disclosures: Vec<&vtt_core::state::OpportunityAttackTrigger> =
+                    if role.is_gm() {
+                        outcome.opportunity_attacks.iter().collect()
+                    } else {
+                        outcome
+                            .opportunity_attacks
+                            .iter()
+                            .filter(|trigger| {
+                                session
+                                    .entities
+                                    .get(&trigger.attacker_id)
+                                    .map(|attacker| attacker.is_visible)
+                                    .unwrap_or(true)
+                            })
+                            .collect()
+                    };
+                if !disclosures.is_empty() {
+                    // Full report: EVERY disclosed pending OA, not just the
+                    // first. Each entry carries `pending_opportunity` naming
+                    // the endpoint that actually takes the swing.
                     body["opportunity_attacks_detail"] = serde_json::json!(
-                        outcome.opportunity_attacks.iter().map(|trigger| serde_json::json!({
+                        disclosures.iter().map(|trigger| serde_json::json!({
                             "provoked_by": trigger.attacker_id,
                             "reaction_type": "opportunity_attack",
                             "pending_opportunity": "/action/opportunity-attack",
@@ -1342,13 +1368,35 @@ async fn move_entity(
                     );
                     // Back-compat: old clients read the singular field, which
                     // mirrors the first detail entry.
-                    let trigger = &outcome.opportunity_attacks[0];
+                    let trigger = disclosures[0];
                     body["opportunity_attack"] = serde_json::json!({
                         "provoked_by": trigger.attacker_id,
                         "reaction_type": "opportunity_attack",
                         "pending_opportunity": "/action/opportunity-attack",
                         "available": true,
                     });
+                }
+
+                // AUDIT F3 residual leak: `outcome.opportunity_attacks` itself
+                // names every provoking attacker id — including hidden ones —
+                // inside the echoed engine outcome. Strip it for non-GM
+                // callers; they keep the count only via the projected
+                // disclosures above (or nothing at all when every provocateur
+                // is hidden).
+                if !role.is_gm() {
+                    if let Some(body_obj) = body.as_object_mut() {
+                        if let Some(outcome_val) = body_obj.get_mut("outcome") {
+                            if let Some(outcome_obj) = outcome_val.as_object_mut() {
+                                outcome_obj.insert(
+                                    "opportunity_attacks".to_string(),
+                                    serde_json::json!(disclosures.iter().map(|t| serde_json::json!({
+                                        "attacker_id": t.attacker_id,
+                                        "mover_id": t.mover_id,
+                                    })).collect::<Vec<_>>()),
+                                );
+                            }
+                        }
+                    }
                 }
                 HttpResponse::Ok().json(body)
             }
@@ -4314,9 +4362,24 @@ pub enum RestKind {
     Long,
 }
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RestReq {
     pub kind: RestKind,
+    /// Funded hit-dice spends for a short rest. `None` = a dice-less rest
+    /// (legal: an hour of light activity buys nothing but the convention).
+    #[serde(default)]
+    pub spend: Option<Vec<ShortRestEntityReq>>,
+}
+
+/// Per-entity hit-dice request for a short rest (iteration 86). Absent or
+/// zero = the caller rests without spending dice (still legal: a short rest
+/// is an hour of light activity even when no healing is bought).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShortRestEntityReq {
+    pub entity_id: Uuid,
+    /// Hit dice to spend. Defaults to ALL remaining — the common "patch me up"
+    /// short rest. Clamped by the pool server-side; over-spends are refused.
+    #[serde(default)]
+    pub dice: Option<u32>,
 }
 
 async fn take_rest(
@@ -4338,23 +4401,121 @@ async fn take_rest(
         let campaign_id = session.campaign_id;
 
         match req.kind {
-            // Short rest: no mechanical effect, and deliberately so for
-            // exhaustion — SRD 5e grants NO exhaustion recovery on a short
-            // rest (only hit dice / class features do). HP restoration via
-            // hit-dice spending is a future hook. Ledgered so the intent is
-            // auditable and rewirable.
+            // Short rest (SRD 5e): one hour of light activity, convention
+            // pinned by this endpoint — the engine does not model in-game time
+            // so the hour is an adjudication promise, not a tracked clock.
+            // Mechanics: NO exhaustion recovery (only a long rest sheds
+            // levels), and each caller-controlled entity may spend hit dice:
+            // per die spent it rolls its hit-die size and heals that many HP
+            // plus its Constitution modifier, drawing down the entity's
+            // serde-defaulted `hit_dice_remaining` pool. Every funded spend
+            // emits ONE SHORT_REST_APPLIED event carrying the rolls and
+            // post-heal HP so safety_rewind replays it exactly like any other
+            // mutation; a dice-less rest still journals the intent once with
+            // no target payload (a replay no-op).
             RestKind::Short => {
-                session.ledger.append_event(
-                    session_id,
-                    campaign_id,
-                    Uuid::nil(),
-                    "SHORT_REST_APPLIED",
-                    serde_json::json!({"triggered_by": identity.user_id}),
-                );
+                let requests: Vec<ShortRestEntityReq> = req.spend.clone().unwrap_or_default();
+                if !requests.is_empty() {
+                    // RBAC mirrors long rest: players fund only their own
+                    // entities; GM/service principals fund anything alive.
+                    for r in &requests {
+                        let Some(entity) = session.entities.get(&r.entity_id) else {
+                            return reject(&data, 404, "ENTITY_NOT_FOUND", "short-rest target does not exist");
+                        };
+                        if entity.is_dead {
+                            return reject(&data, 409, "ENTITY_DEAD", "the dead do not short-rest");
+                        }
+                        if !may_control_entity(entity.owner_player_id.as_ref(), role, &identity.user_id) {
+                            return reject(&data, 403, "FORBIDDEN_ENTITY", "you do not control that entity");
+                        }
+                    }
+                }
+
+                // Server-derived seed: session-scoped and ledger-position
+                // derived like every other combat roll, so replays of the same
+                // ledger prefix reproduce identical faces. The engine is shared
+                // across the request's entities (later spends continue the same
+                // stream) and the seed is journaled per spend event.
+                let dice_seed =
+                    session_id.as_u128() as u64 ^ (session.ledger.current_sequence << 32);
+                let mut dice = DiceEngine::with_seed(dice_seed);
+
+                let mut spent: Vec<serde_json::Value> = Vec::new();
+                for r in requests {
+                    let report = {
+                        let entity = session.entities.get_mut(&r.entity_id).expect("checked above");
+                        let count = r.dice.unwrap_or(entity.hit_dice_remaining);
+                        if entity.hit_dice_size == 0 {
+                            return reject(
+                                &data,
+                                422,
+                                "NO_HIT_DICE_MODELLED",
+                                "entity has no modelled hit-die size; set hit_dice_size/hit_dice_remaining on the entity first",
+                            );
+                        }
+                        if count > entity.hit_dice_remaining {
+                            return reject(
+                                &data,
+                                422,
+                                "INSUFFICIENT_HIT_DICE",
+                                &format!(
+                                    "requested {} dice but only {} remain",
+                                    count, entity.hit_dice_remaining
+                                ),
+                            );
+                        }
+                        entity.spend_hit_dice(&mut dice, count)
+                    };
+                    let report = match report {
+                        Ok(r) => r,
+                        Err(detail) => {
+                            return reject(&data, 422, "SHORT_REST_REFUSED", &detail);
+                        }
+                    };
+                    session.ledger.append_event(
+                        session_id,
+                        campaign_id,
+                        r.entity_id,
+                        "SHORT_REST_APPLIED",
+                        serde_json::json!({
+                            "triggered_by": identity.user_id,
+                            "target_id": r.entity_id.to_string(),
+                            "dice_spent": report.dice_spent,
+                            "die_size": report.die_size,
+                            "rolls": report.rolls,
+                            "con_modifier": report.con_modifier,
+                            "healing": report.healing,
+                            "hp_remaining": report.hp_after,
+                            "hit_dice_before": report.hit_dice_before,
+                            "hit_dice_remaining": report.hit_dice_remaining,
+                            "seed": dice_seed,
+                        }),
+                    );
+                    spent.push(serde_json::json!({
+                        "entity_id": r.entity_id,
+                        "dice_spent": report.dice_spent,
+                        "rolls": report.rolls,
+                        "con_modifier": report.con_modifier,
+                        "healing": report.healing,
+                        "hp_remaining": report.hp_after,
+                        "hit_dice_remaining": report.hit_dice_remaining,
+                    }));
+                }
+
+                if spent.is_empty() {
+                    session.ledger.append_event(
+                        session_id,
+                        campaign_id,
+                        Uuid::nil(),
+                        "SHORT_REST_APPLIED",
+                        serde_json::json!({"triggered_by": identity.user_id}),
+                    );
+                }
                 HttpResponse::Ok().json(serde_json::json!({
                     "status": "SHORT_REST_APPLIED",
-                    "restored_entities": 0,
-                    "hook": "short-rest mechanics (hit dice) not yet implemented",
+                    "restored_entities": spent.len(),
+                    "entities": spent,
+                    "note": "one hour of light activity (untracked convention); no exhaustion recovery; healing = rolled hit dice + CON mod per die spent",
                 }))
             }
             // Long rest: SRD restores hit points and sheds ONE exhaustion

@@ -289,6 +289,17 @@ pub struct EntityState {
     /// default keeps legacy serialized entities deserializing.
     #[serde(default)]
     pub hands_occupied: u8,
+    /// Remaining unspent hit dice (SRD short-rest healing pool). The die SIZE
+    /// lives in [`Self::hit_dice_size`] (0 = unknown / no class modelled), so a
+    /// fighter's d10 and a wizard's d6 can coexist on one board. Both fields
+    /// serde-default to keep legacy payloads deserializing; an empty pool just
+    /// means a short rest cannot fund any healing for this creature.
+    #[serde(default)]
+    pub hit_dice_remaining: u32,
+    /// Hit-die size of this creature's class (d6/d8/d10/d12). 0 = not
+    /// modelled — spending is refused until a value exists.
+    #[serde(default)]
+    pub hit_dice_size: u32,
 }
 
 impl EntityState {
@@ -621,6 +632,93 @@ impl EntityState {
         self.set_exhaustion(level - 1);
         true
     }
+
+    /// Short-rest hit-dice spend (SRD 5e): roll one class hit die per die
+    /// spent and heal that many hit points plus the Constitution modifier PER
+    /// DIE, drawing down [`Self::hit_dice_remaining`]. Healing clamps at max
+    /// HP (the pool is spent even when the clamp wastes rolled faces — SRD
+    /// leaves no change back). The spend is refused whole (no partial
+    /// draw-down) unless `dice` is at least 1, fully funded by the pool AND
+    /// the die size is modelled.
+    ///
+    /// All randomness is drawn through the caller's [`DiceEngine`] so a seeded
+    /// engine reproduces the exact same faces (same contract as every other
+    /// combat roll). The caller owns the ledger: a spend is only
+    /// auditable/rewindable once its `SHORT_REST_APPLIED` event (carrying the
+    /// returned rolls and `hp_remaining`) reaches the ledger — see the
+    /// gateway's rest endpoint.
+    pub fn spend_hit_dice(
+        &mut self,
+        dice_engine: &mut DiceEngine,
+        dice: u32,
+    ) -> Result<HitDiceSpendReport, String> {
+        if dice == 0 {
+            return Err("a short rest must spend at least one hit die".to_string());
+        }
+        if self.hit_dice_size == 0 {
+            return Err("entity has no modelled hit-die size; cannot spend hit dice".to_string());
+        }
+        if dice > self.hit_dice_remaining {
+            return Err(format!(
+                "not enough hit dice: requested {dice}, only {} remain",
+                self.hit_dice_remaining
+            ));
+        }
+        // Roll first, then commit — an early return above must not touch state.
+        let con_modifier = self.abilities.modifier(Ability::Constitution);
+        let mut rolls = Vec::with_capacity(dice as usize);
+        for _ in 0..dice {
+            rolls.push(dice_engine.roll_die(self.hit_dice_size));
+        }
+        let hit_dice_before = self.hit_dice_remaining;
+        self.hit_dice_remaining -= dice;
+
+        let hp_before = self.current_hp;
+        let healing = (rolls.iter().sum::<i32>() + con_modifier * dice as i32).max(0);
+        self.current_hp = (self.current_hp + healing).min(self.effective_max_hp());
+        // Regaining hit points ends the dying state (SRD) and wipes any
+        // accumulated death-save tally, mirroring reset_death_saves_if_healed.
+        if self.current_hp > 0 {
+            self.is_conscious = true;
+            self.reset_death_saves_if_healed();
+        }
+        Ok(HitDiceSpendReport {
+            dice_spent: dice,
+            die_size: self.hit_dice_size,
+            rolls,
+            con_modifier,
+            healing,
+            hp_before,
+            hp_after: self.current_hp,
+            hit_dice_remaining: self.hit_dice_remaining,
+            hit_dice_before,
+        })
+    }
+}
+
+/// Outcome of one short-rest hit-dice spend ([`EntityState::spend_hit_dice`]).
+/// Everything the caller needs to journal a rewindable `SHORT_REST_APPLIED`
+/// ledger event in one pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HitDiceSpendReport {
+    pub dice_spent: u32,
+    pub die_size: u32,
+    /// Kept faces in roll order.
+    pub rolls: Vec<i32>,
+    /// Per-die CON modifier applied to each die's contribution.
+    pub con_modifier: i32,
+    /// Total healed BEFORE the max-HP clamp (`sum(rolls) + con_modifier *
+    /// dice`, floored at zero).
+    pub healing: i32,
+    pub hp_before: i32,
+    /// Post-heal HP after the max-HP clamp — this is what a surviving
+    /// `SHORT_REST_APPLIED` replay restores.
+    pub hp_after: i32,
+    pub hit_dice_remaining: u32,
+    /// Pool size BEFORE this spend — journaled as `hit_dice_before` so a
+    /// safety rewind past the spend can restore the pre-spend pool even when
+    /// no earlier short-rest event survives.
+    pub hit_dice_before: u32,
 }
 
 impl EntityState {
@@ -682,6 +780,8 @@ impl EntityState {
             vision_mode: None,
             sense_range_feet: None,
             hands_occupied: 0,
+            hit_dice_remaining: 0,
+            hit_dice_size: 0,
         }
     }
 }
@@ -1935,11 +2035,12 @@ impl GameSession {
                 // exhaustion lives in `conditions` and no other event type
                 // records it, so last surviving rest event wins. Legacy
                 // payloads without the field replay HP only.
-                // SHORT_REST_APPLIED is intentionally NOT handled: it is a
-                // mechanical no-op today (hit-dice spending is a future hook),
-                // so a surviving short-rest event must change nothing during
-                // replay; it falls through to the catch-all arm.
-                "LONG_REST_APPLIED" => {
+                // SHORT_REST_APPLIED (iteration 86+) now carries a funded
+                // hit-dice spend and replays exactly like HEALED: absolute
+                // hp_remaining restores the post-rest total so a later wound's
+                // replay does not strand the entity at its wounded value.
+                // Legacy payloads without a target/hp stay a no-op.
+                "LONG_REST_APPLIED" | "SHORT_REST_APPLIED" => {
                     if let Some(tid) = ev
                         .payload
                         .get("target_id")
@@ -2329,6 +2430,52 @@ impl GameSession {
             Some(true) => {
                 self.combat.in_combat = true;
                 self.combat.order.retain(|id| self.entities.contains_key(id));
+            }
+        }
+
+        // Hit-dice pool replay (short-rest rewind, iteration 86+): the pool
+        // draw-down of a reverted SHORT_REST_APPLIED is otherwise invisible to
+        // the HP replay above — a rewind past the spend would leave the dice
+        // consumed while the healed HP vanished. Rebuild each entity's pool
+        // from the last surviving spend (absolute `hit_dice_remaining`),
+        // seeded first from REVERTED spends' own payloads so a rewind with no
+        // earlier spend history still restores the pre-spend pool.
+        let mut hit_dice_state: HashMap<Uuid, u32> = HashMap::new();
+        for ev in reverted.iter().filter(|e| e.event_type == "SHORT_REST_APPLIED") {
+            let Some(id) = ev
+                .payload
+                .get("target_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            if let Some(remaining) = ev.payload.get("hit_dice_before").and_then(|v| v.as_u64()) {
+                hit_dice_state.entry(id).or_insert(remaining as u32);
+            }
+        }
+        for ev in self
+            .ledger
+            .events
+            .iter()
+            .filter(|e| !e.is_reverted && e.event_type == "SHORT_REST_APPLIED")
+        {
+            let Some(id) = ev
+                .payload
+                .get("target_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            if let Some(remaining) = ev.payload.get("hit_dice_remaining").and_then(|v| v.as_u64()) {
+                hit_dice_state.insert(id, remaining as u32);
+            }
+        }
+        for (id, remaining) in hit_dice_state {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.hit_dice_remaining = remaining;
+                restored += 1;
             }
         }
 
