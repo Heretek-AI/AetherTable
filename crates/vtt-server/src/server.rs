@@ -1004,21 +1004,14 @@ async fn next_turn(
     }
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
-        let campaign_id = session.campaign_id;
         let seed = session_id.as_u128() as u64 ^ (session.ledger.current_sequence << 32);
         let mut dice = DiceEngine::with_seed(seed);
         let report = session.advance_round(&mut dice);
         let round = report.round;
-        session.ledger.append_event(
-            session_id,
-            campaign_id,
-            Uuid::nil(),
-            "TURN_ADVANCED",
-            serde_json::json!({
-                "round": round,
-                "condition_ticks": serde_json::to_value(&report.ticks).unwrap_or_default(),
-            }),
-        );
+        // Iteration 21, F4: `advance_round` now journals the TURN_ADVANCED
+        // event itself (cursor position + condition_clocks snapshot for F6
+        // rewind consistency). The route used to append a duplicate; it
+        // no longer does.
         HttpResponse::Ok().json(serde_json::json!({
             "status": "TURN_ADVANCED",
             "round": round,
@@ -3137,13 +3130,18 @@ macro_rules! delay_action_route {
                     Err(response) => return response,
                 };
                 data.count_valid();
+                // F2 (iteration 21): only the caller's own id is permitted
+                // in this body. The full combat projection (`delayed`,
+                // `order`, `round`, `turn_index`) leaks every other
+                // combatant's id — including hidden NPCs — because there is
+                // no projection pass in this macro. Clients are expected
+                // to re-pull the projected snapshot via GET /sessions/{id}
+                // on success anyway (the snapshot endpoint projects per
+                // role), so dropping the redundant fields costs nothing and
+                // closes the disclosure surface.
                 HttpResponse::Ok().json(serde_json::json!({
                     "status": $mode.status(),
                     "entity_id": req.entity_id.to_string(),
-                    "delayed": session.combat.delayed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                    "round": session.combat.round,
-                    "turn_index": session.combat.turn_index,
-                    "order": session.combat.order.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
                     "event_sequence": sequence_id,
                 }))
             } else {
@@ -4063,11 +4061,37 @@ async fn resolve_apply_condition(
             .entities
             .get(&req.entity_id)
             .and_then(|e| e.owner_player_id.clone());
-        if !may_control_entity(target_owner.as_ref(), role, &identity.user_id) {
+        // F3 (iteration 21): apply-condition targets an entity's sheet,
+        // so ownership rules are TIGHTER than `may_control_entity` for the
+        // action routes. The shared helper permits any non-spectator when
+        // the target is unowned (so a player can move an unowned NPC into
+        // position); the same lenience here would let a player slap
+        // Paralyzed/Stunned onto every monster on the board with no roll
+        // at all. Unowned entities are GM-controlled for this mutation.
+        let apply_condition_ok = match role {
+            Role::Gm => true,
+            Role::Player => target_owner
+                .as_deref()
+                .map(|o| o == identity.user_id.as_str())
+                .unwrap_or(false),
+            Role::Spectator => false,
+        };
+        if !apply_condition_ok {
             return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
         }
         if let Some(src) = req.source_entity_id {
-            if !session.entities.contains_key(&src) {
+            // F9 (iteration 21): collapse the unknown-source and
+            // hidden-source branches into one identical rejection so the
+            // route is not an existence oracle for caller-hidden ids.
+            // Both branches return the SAME body; a player can no longer
+            // probe session.entities membership by checking whether a
+            // random source id is accepted.
+            let source_ok = session
+                .entities
+                .get(&src)
+                .map(|e| role.is_gm() || e.is_visible)
+                .unwrap_or(false);
+            if !source_ok {
                 return reject(
                     &data,
                     404,

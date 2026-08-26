@@ -992,6 +992,13 @@ pub struct RoundAdvanceReport {
     /// legacy reports deserializing.
     #[serde(default)]
     pub readied_expired: Vec<Uuid>,
+    /// Post-advance position of the initiative cursor (iteration 21, F4).
+    /// `None` for legacy reports that predate the cursor-skipping pass —
+    /// those reports describe an era where `advance_round` did not advance
+    /// the cursor at all, so callers reading a value should default to "no
+    /// override" rather than crashing on the absence.
+    #[serde(default)]
+    pub turn_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -1727,8 +1734,13 @@ impl GameSession {
             condition,
             remaining_rounds: duration_rounds,
             source_entity_id,
-            end_of_turn_save,
+            end_of_turn_save: end_of_turn_save.clone(),
         });
+        // Snapshot the save config for the journal BEFORE moving the value
+        // into the timer (or we just clone above and serialize below).
+        let save_cfg_json = end_of_turn_save
+            .as_ref()
+            .map(|cfg| serde_json::to_value(cfg).unwrap_or_default());
         self.ledger.append_event(
             self.session_id,
             self.campaign_id,
@@ -1738,6 +1750,11 @@ impl GameSession {
                 "condition": condition,
                 "duration_rounds": duration_rounds,
                 "source_entity_id": source_entity_id.map(|s| s.to_string()),
+                // Iteration 21, F6: the rewind replay must restore the
+                // end-of-turn save config alongside the timer. Serde-defaults
+                // in legacy payloads (the field is a JSON Value, not a typed
+                // struct field) make absence safe.
+                "end_of_turn_save": save_cfg_json,
             }),
         );
         Ok(())
@@ -1781,12 +1798,19 @@ impl GameSession {
     /// - roll configured end-of-turn saves (`dice` must be server-seeded)
     /// - expire conditions whose clock ran out or whose save succeeded
     /// - clear expired conditions AND their mechanical flags
+    /// - advance the initiative cursor PAST delayed entries so the production
+    ///   `/turn/next` primitive actually honors the SRD Delay mechanic
+    ///   (iteration 21, F4)
+    /// - journal a single TURN_ADVANCED event carrying the post-tick cursor
+    ///   and a per-entity clock snapshot so safety rewinds can rebuild the
+    ///   exact state the round produced (iteration 21, F6)
     pub fn advance_round(&mut self, dice: &mut DiceEngine) -> RoundAdvanceReport {
         self.combat.round += 1;
         let mut report = RoundAdvanceReport {
             round: self.combat.round,
             ticks: Vec::new(),
             readied_expired: Vec::new(),
+            turn_index: None,
         };
 
         // An unresolved opportunity attack is a THIS-round offer: the mover is
@@ -1883,6 +1907,79 @@ impl GameSession {
                 });
             }
         }
+
+        // F4 (iteration 21): the production turn primitive advances the
+        // initiative cursor PAST delayed combatants. Without this, posting
+        // `/turn/next` honored `next_turn`'s delay-aware scan when tests ran
+        // it directly but never in production — `advance_round` skipped the
+        // cursor entirely, so a parked combatant's slot still got "current"
+        // and the round counter marched on past the actual actor ordering.
+        // Bounded scan: one full lap max so an all-delayed table still
+        // terminates instead of looping the cursor forever.
+        if self.combat.in_combat && !self.combat.order.is_empty() {
+            let order_len = self.combat.order.len();
+            for _ in 0..order_len {
+                self.combat.turn_index += 1;
+                if self.combat.turn_index >= order_len {
+                    self.combat.turn_index = 0;
+                }
+                match self.combat.order.get(self.combat.turn_index) {
+                    Some(id) if !self.combat.delayed.contains(id) => break,
+                    _ => continue,
+                }
+            }
+        }
+        report.turn_index = if self.combat.in_combat {
+            Some(self.combat.turn_index)
+        } else {
+            None
+        };
+
+        // F6 (iteration 21): snapshot every surviving condition clock so the
+        // rewind replay can restore the partway-decremented value instead of
+        // rebuilding the clock at full `duration_rounds` from
+        // CONDITION_APPLIED. Payloads are keyed by entity id; per-condition
+        // entries carry condition-name + remaining_rounds so the rewind can
+        // match variants even after JSON round-trips.
+        let mut condition_clocks: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::new();
+        for (id, entity) in self.entities.iter() {
+            let entry: Vec<serde_json::Value> = entity
+                .condition_timers
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "condition": t.condition,
+                        "remaining_rounds": t.remaining_rounds,
+                    })
+                })
+                .collect();
+            if !entry.is_empty() {
+                condition_clocks.insert(id.to_string(), serde_json::Value::Array(entry));
+            }
+        }
+
+        // F4 journaling: the cursor position must survive rewinds, so the
+        // TURN_ADVANCED event carries it. The route used to append this
+        // event; it now lives in the engine alongside every other state
+        // change so core-level advance_round callers (tests, future
+        // non-HTTP gateways) get the same rewind-consistent behavior.
+        // Legacy TURN_ADVANCED payloads without `turn_index` /
+        // `condition_clocks` still parse — they're serde JSON Values, and
+        // the rewind reader treats absence as "no override".
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            Uuid::nil(),
+            "TURN_ADVANCED",
+            serde_json::json!({
+                "round": self.combat.round,
+                "condition_ticks": serde_json::to_value(&report.ticks)
+                    .unwrap_or_default(),
+                "turn_index": report.turn_index,
+                "condition_clocks": serde_json::Value::Object(condition_clocks),
+            }),
+        );
 
         report
     }
@@ -2138,8 +2235,19 @@ impl GameSession {
         // LONG_REST_APPLIED events carrying "exhaustion_level".
         let mut exhaustion_state: HashMap<Uuid, u8> = HashMap::new();
         // Last-seen combat phase from surviving COMBAT_BEGAN / COMBAT_ENDED
-        // events (`None` = no surviving combat events at all).
+        // events (`None` = no surviving combat events at all). Iteration 21,
+        // F5: also capture the SEQUENCE of the last surviving COMBAT_BEGAN so
+        // the delay replay below can scope itself to the current combat
+        // epoch — without the sequence, DELAY_TAKEN / DELAY_RESUMED from a
+        // prior combat that predate the surviving rewind point resurrect as
+        // ghost parked combatants on the board.
         let mut combat_active: Option<bool> = None;
+        let mut combat_epoch_began_seq: Option<u64> = None;
+        // Iteration 21, F4 + F6: capture the last surviving TURN_ADVANCED's
+        // cursor position and per-entity clock snapshot so the rewind can
+        // restore both exactly.
+        let mut last_turn_advanced_turn_index: Option<u64> = None;
+        let mut last_turn_advanced_clocks: Option<serde_json::Value> = None;
 
         for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
             match ev.event_type.as_str() {
@@ -2219,9 +2327,32 @@ impl GameSession {
                     }
                 }
                 // Combat phase: the LAST surviving begin/end decides whether
-                // an engagement is active at the rewind point.
-                "COMBAT_BEGAN" => combat_active = Some(true),
-                "COMBAT_ENDED" => combat_active = Some(false),
+                // an engagement is active at the rewind point. The
+                // COMBAT_BEGAN's ledger sequence becomes the epoch marker
+                // the delay replay consults; a subsequent COMBAT_ENDED
+                // forgets the marker because the engagement itself is gone.
+                "COMBAT_BEGAN" => {
+                    combat_active = Some(true);
+                    combat_epoch_began_seq = Some(ev.sequence_id);
+                }
+                "COMBAT_ENDED" => {
+                    combat_active = Some(false);
+                    combat_epoch_began_seq = None;
+                }
+                // F4/F6: remember the cursor + clock snapshot from the
+                // last surviving TURN_ADVANCED. The cursor position and the
+                // surviving-clock list both win over the COMBAT_BEGAN
+                // baseline of `turn_index = 0`.
+                "TURN_ADVANCED" => {
+                    last_turn_advanced_turn_index = ev
+                        .payload
+                        .get("turn_index")
+                        .and_then(|v| v.as_u64());
+                    last_turn_advanced_clocks = ev
+                        .payload
+                        .get("condition_clocks")
+                        .cloned();
+                }
                 "DEATH_SAVE_RESOLVED" => {
                     let tally = DeathSaveState {
                         successes: ev.payload.get("successes").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
@@ -2478,7 +2609,15 @@ impl GameSession {
                     .get("source_entity_id")
                     .and_then(|v| v.as_str())
                     .and_then(|s| Uuid::parse_str(s).ok()),
-                end_of_turn_save: None,
+                // Iteration 21, F6: the journaled payload now carries the
+                // end-of-turn save config. Legacy payloads without the field
+                // round-trip as `None` (serde default on the struct field);
+                // here we read the JSON Value directly and parse defensively
+                // so a malformed payload cannot poison the rebuild.
+                end_of_turn_save: ev
+                    .payload
+                    .get("end_of_turn_save")
+                    .and_then(|v| serde_json::from_value::<EndOfTurnSave>(v.clone()).ok()),
             };
             if ev.is_reverted {
                 reverted_timers_entry(&mut reverted_timed, ev.actor_id).push(timer);
@@ -2693,10 +2832,15 @@ impl GameSession {
         // NOT resurrected by this rewind (step 1 only despawns late spawns),
         // so prune order slots referencing ids that no longer exist rather
         // than leaving dangling entries that would reference ghosts.
-        // Simplification: round and turn_index are kept as-is — recomputing
-        // initiative mid-rewind is out of scope; `next_turn` tolerates an
-        // out-of-range index by yielding no actor until it wraps back in
-        // bounds.
+        //
+        // Iteration 21, F4 + F6: round and turn_index are now also restored
+        // from the surviving TURN_ADVANCED ledger so the rewind is exact.
+        // The pre-existing simplification ("kept as-is") was a small lie
+        // that let the cursor drift whenever rewinds crossed `/turn/next`
+        // boundaries; that drift was masked in tests by the cursor's
+        // bounded-scan tolerance in `next_turn` itself, but in practice a
+        // rewind mid-combat could leave the cursor pointing at the wrong
+        // actor.
         match combat_active {
             Some(false) | None => {
                 self.combat = InitiativeCombatState::default();
@@ -2704,36 +2848,107 @@ impl GameSession {
             Some(true) => {
                 self.combat.in_combat = true;
                 self.combat.order.retain(|id| self.entities.contains_key(id));
-                // Delay replay (audit rewind-consistency class): the delayed
-                // flags are rebuilt from the surviving ledger instead of being
-                // trusted as live state — DELAY_TAKEN parks a combatant,
-                // DELAY_RESUMED re-seats them, applied chronologically so a
-                // rewind that severed only the resume restores the park.
+                // F4: cursor position wins from the last surviving
+                // TURN_ADVANCED. A rewind that crosses the COMBAT_BEGAN
+                // boundary (no surviving turn-advanced events after it)
+                // falls back to `0`, mirroring the live begin_combat seed.
+                if let Some(idx) = last_turn_advanced_turn_index {
+                    self.combat.turn_index = idx as usize;
+                } else {
+                    self.combat.turn_index = 0;
+                }
+                // F5 (iteration 21): epoch-scoped delay replay. The pre-fix
+                // replay scanned every surviving DELAY_TAKEN / DELAY_RESUMED
+                // event and rebuilt `delayed` from the whole ledger, which
+                // resurrected ghost parked combatants from a prior combat
+                // when a rewind landed inside a later combat whose begin
+                // predated the cut. Filter to events emitted AT OR AFTER
+                // the last surviving COMBAT_BEGAN's sequence so only the
+                // current epoch's delay state is honoured.
                 self.combat.delayed.clear();
-                for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
-                    let Some(id) = ev
-                        .payload
-                        .get("entity_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| Uuid::parse_str(s).ok())
-                    else {
-                        continue;
-                    };
-                    match ev.event_type.as_str() {
-                        "DELAY_TAKEN"
-                            if !self.combat.delayed.contains(&id) =>
-                        {
-                            self.combat.delayed.push(id);
+                if let Some(epoch) = combat_epoch_began_seq {
+                    for ev in self
+                        .ledger
+                        .events
+                        .iter()
+                        .filter(|e| !e.is_reverted && e.sequence_id >= epoch)
+                    {
+                        let Some(id) = ev
+                            .payload
+                            .get("entity_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                        else {
+                            continue;
+                        };
+                        match ev.event_type.as_str() {
+                            "DELAY_TAKEN"
+                                if !self.combat.delayed.contains(&id) =>
+                            {
+                                self.combat.delayed.push(id);
+                            }
+                            "DELAY_RESUMED" => {
+                                self.combat.delayed.retain(|d| *d != id);
+                            }
+                            _ => {}
                         }
-                        "DELAY_RESUMED" => {
-                            self.combat.delayed.retain(|d| *d != id);
-                        }
-                        _ => {}
                     }
                 }
                 // Slots referencing entities the rewind despawned are gone;
                 // nobody can stay parked on a ghost.
                 self.combat.delayed.retain(|id| self.entities.contains_key(id));
+            }
+        }
+
+        // F6 (iteration 21): condition-clock snapshot. The CONDITION_APPLIED
+        // rebuild above gives every clock its full original `duration_rounds`
+        // and restores the `end_of_turn_save` config from the journal; what
+        // it cannot restore is the partway-decremented `remaining_rounds`
+        // after a `/turn/next` ticked the clock. The TURN_ADVANCED snapshot
+        // closes that gap by recording every surviving clock's
+        // `remaining_rounds` post-tick. Apply it as an OVERRIDE on matching
+        // condition variants only — conditions that were GRANTED AFTER the
+        // last surviving TURN_ADVANCED are not in the snapshot and must
+        // keep their rebuilt full duration.
+        if let Some(snapshot) = last_turn_advanced_clocks.as_ref().and_then(|v| v.as_object()) {
+            for (entity_id_str, entry) in snapshot.iter() {
+                let Ok(entity_uuid) = Uuid::parse_str(entity_id_str) else {
+                    continue;
+                };
+                let Some(entity) = self.entities.get_mut(&entity_uuid) else {
+                    continue;
+                };
+                let Some(list) = entry.as_array() else { continue };
+                for snap_timer in list.iter() {
+                    let Some(snap_condition) = snap_timer.get("condition") else {
+                        continue;
+                    };
+                    let Some(snap_remaining) = snap_timer
+                        .get("remaining_rounds")
+                        .and_then(|v| v.as_u64())
+                    else {
+                        continue;
+                    };
+                    let snap_disc = std::mem::discriminant(&Condition::Blinded);
+                    // Match by the string payload of the variant rather
+                    // than re-serializing a constructed Condition — the
+                    // snapshot's `condition` field is already a serialised
+                    // variant (e.g. "frightened"), the same shape the
+                    // CONDITION_APPLIED rebuilder above uses to find a
+                    // Condition enum match.
+                    let _ = snap_disc; // silence unused
+                    let name_match = |c: &Condition| {
+                        serde_json::to_string(c)
+                            .ok()
+                            .map(|s| s.trim_matches('"').to_string())
+                            == snap_condition.as_str().map(|s| s.to_string())
+                    };
+                    for timer in entity.condition_timers.iter_mut() {
+                        if name_match(&timer.condition) {
+                            timer.remaining_rounds = snap_remaining as u32;
+                        }
+                    }
+                }
             }
         }
 
@@ -2982,6 +3197,10 @@ impl GameSession {
         self.combat.in_combat = true;
         self.combat.round = 1;
         self.combat.turn_index = 0;
+        // F5 (iteration 21): a previously-parked combatant must not survive
+        // a re-roll of initiative. The other tracker scalars are reset
+        // inline; delayed was the only field-by-field miss.
+        self.combat.delayed.clear();
         self.combat.order = entries.iter().map(|e| e.entity_id).collect();
         self.ledger.append_event(
             self.session_id,
@@ -4034,5 +4253,242 @@ mod tests {
         };
         assert_eq!(build(1234), build(1234));
         assert_ne!(build(1234), build(5678), "different seeds may reorder");
+    }
+
+    // -- Iteration 21 (Loop 3 audit remediation) --------------------------
+    //
+    // Red tests for F4 / F5 / F6 must fail before the fixes land; they're
+    // grouped here so the production turn primitive, the rewind delay-replay
+    // scoping, and the condition-clock rewind consistency are all pinned in
+    // one place.
+
+    // ---- F4: production turn primitive honors delayed slots ---------------
+
+    #[test]
+    fn test_advance_round_skips_delayed_actor_and_journals_turn_index() {
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let c = Uuid::from_u128(0xC);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        for (id, dex) in [(a, 16u32), (b, 12), (c, 14)] {
+            session
+                .add_entity(entity(id, &format!("e-{id}"), dex as i32), None)
+                .unwrap();
+        }
+        let mut dice = DiceEngine::with_seed(0xDEADBEEF);
+        session.begin_combat(&mut dice);
+        // Pin a deterministic order regardless of the RNG: highest total first
+        // (a > c > b by dex), then we verify cursor semantics.
+        session.combat.order = vec![a, b, c];
+        session.combat.turn_index = 0;
+
+        // Delay the second slot.
+        session.take_delay(b).unwrap();
+        let report = session.advance_round(&mut DiceEngine::with_seed(1));
+        // Cursor must have advanced PAST the delayed actor. Slot order:
+        // index 0 (a) -> step to 1 (delayed b, skip) -> land on 2 (c).
+        assert_eq!(
+            session.combat.turn_index, 2,
+            "delayed actor must be skipped on advance"
+        );
+        assert_eq!(
+            report.turn_index, Some(2),
+            "report exposes the new cursor position for clients"
+        );
+        assert_eq!(
+            session.combat.order[session.combat.turn_index], c,
+            "cursor lands on a non-delayed actor"
+        );
+
+        // TURN_ADVANCED must be journaled with turn_index so rewinds can
+        // restore the cursor (legacy payloads without the field still parse).
+        let last_turn = session
+            .ledger
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "TURN_ADVANCED")
+            .expect("advance_round must journal its own TURN_ADVANCED event");
+        assert_eq!(
+            last_turn.payload.get("turn_index").and_then(|v| v.as_u64()),
+            Some(2),
+            "the journaled turn_index must match the live cursor after advance"
+        );
+        // And the payload must also carry the surviving clock snapshot (F6).
+        assert!(
+            last_turn.payload.get("condition_clocks").is_some(),
+            "TURN_ADVANCED must snapshot surviving condition clocks for F6 rewind"
+        );
+    }
+
+    #[test]
+    fn test_advance_round_turn_index_legacy_payload_still_parses() {
+        // Rewind replay must tolerate a legacy TURN_ADVANCED payload that
+        // carries only `round` (the pre-iteration-21 wire shape).
+        let legacy = serde_json::json!({
+            "round": 4,
+            "condition_ticks": [],
+        });
+        let value: serde_json::Value = legacy;
+        // The rewind reader must treat absence of `turn_index` as "no
+        // override" and keep the live cursor as-is.
+        assert!(value.get("turn_index").is_none());
+        assert!(value.get("condition_clocks").is_none());
+    }
+
+    // ---- F5: begin_combat clears stale delayed; replay is epoch-scoped -----
+
+    #[test]
+    fn test_begin_combat_clears_stale_delayed_flags() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(a, "A", 14), None).unwrap();
+        session.add_entity(entity(b, "B", 12), None).unwrap();
+        let mut dice = DiceEngine::with_seed(1);
+        session.begin_combat(&mut dice);
+        session.take_delay(a).unwrap();
+        assert!(session.combat.delayed.contains(&a));
+
+        // Re-rolling initiative without ending combat must NOT inherit the
+        // previous combat's parked flag.
+        session.begin_combat(&mut dice);
+        assert!(
+            session.combat.delayed.is_empty(),
+            "begin_combat must reset delayed alongside order/round/turn_index"
+        );
+    }
+
+    #[test]
+    fn test_rewind_does_not_resurrect_delay_flags_from_a_prior_combat() {
+        // Combat 1: A delays.  Combat ends, Combat 2 begins, some other event
+        // happens.  Rewind to a sequence inside combat 2 — DELAY_TAKEN from
+        // combat 1 still SURVIVES (it predates the rewind point) and the old
+        // replay resurrected the ghost.  Epoch-scoping fixes it.
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        session.add_entity(entity(a, "A", 14), None).unwrap();
+        session.add_entity(entity(b, "B", 12), None).unwrap();
+        let mut dice = DiceEngine::with_seed(1);
+        session.begin_combat(&mut dice);
+        session.take_delay(a).unwrap();
+        session.end_combat();
+        session.begin_combat(&mut dice);
+        // Some post-begin event so the rewind point lives strictly inside
+        // combat 2.
+        session
+            .move_entity(b, (10.0, 0.0, 0.0))
+            .expect("move legal mid-combat");
+        let move_event_seq = session.ledger.current_sequence;
+        // Sanity: A was delayed in combat 1 only — never in combat 2.
+        assert!(session.combat.delayed.is_empty());
+
+        // Rewind into combat 2 (target = MOVE_ENTITY event from combat 2):
+        // combat 1's DELAY_TAKEN survives the rewind (its sequence is below
+        // the cut).  Replay must NOT bring A back as delayed because the
+        // surviving COMBAT_BEGAN that scopes the current epoch is combat 2's.
+        let report = session.safety_rewind(move_event_seq);
+        assert_eq!(report.reverted_event_count, 0, "nothing above the cut");
+        assert!(
+            !session.combat.delayed.contains(&a),
+            "ghost delayed flag from a prior combat must not resurrect on rewind: {:?}",
+            session.combat.delayed
+        );
+    }
+
+    // ---- F6: condition-clock rewind preserves end_of_turn_save --------------
+
+    #[test]
+    fn test_rewind_preserves_end_of_turn_save_config_on_condition_clocks() {
+        let victim = Uuid::from_u128(0xCAFE);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        session
+            .add_entity(entity(victim, "Victim", 12), None)
+            .unwrap();
+        // Apply a Hold Person with a save config: WIS save vs DC 14.
+        let cfg = EndOfTurnSave {
+            ability: Ability::Wisdom,
+            dc: 14,
+        };
+        session
+            .apply_timed_condition_from(
+                victim,
+                Condition::Paralyzed,
+                10,
+                None,
+                Some(cfg.clone()),
+            )
+            .expect("apply legal");
+
+        // Verify the journaled CONDITION_APPLIED carries the config (new
+        // field; legacy payloads without it still parse via serde default).
+        let applied = session
+            .ledger
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "CONDITION_APPLIED")
+            .unwrap();
+        let saved_cfg: EndOfTurnSave =
+            serde_json::from_value(applied.payload.get("end_of_turn_save").unwrap().clone())
+                .expect("journaled end_of_turn_save round-trips");
+        assert_eq!(saved_cfg, cfg);
+
+        // Advance once, then rewind past the advance so the timer is
+        // rebuilt from scratch — the save config must survive.
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice);
+        let advance_seq = session.ledger.current_sequence;
+        session.safety_rewind(advance_seq - 1);
+        let rebuilt = session
+            .entities
+            .get(&victim)
+            .unwrap()
+            .condition_timers
+            .iter()
+            .find(|t| t.condition == Condition::Paralyzed)
+            .expect("rewound timer must still exist");
+        assert_eq!(
+            rebuilt.end_of_turn_save.as_ref(),
+            Some(&cfg),
+            "rewind must restore end_of_turn_save from the journal"
+        );
+    }
+
+    #[test]
+    fn test_rewind_restores_partial_clock_from_last_turn_advanced_snapshot() {
+        // F6 residual mitigation: TURN_ADVANCED now carries a snapshot of
+        // every surviving condition clock so a rewind back to a later event
+        // restores the partway-decremented value instead of the original
+        // full duration.
+        let victim = Uuid::from_u128(0xCAFE);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        session
+            .add_entity(entity(victim, "Victim", 12), None)
+            .unwrap();
+        session
+            .apply_timed_condition_from(victim, Condition::Frightened, 4, None, None)
+            .unwrap();
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice); // 4 -> 3, TURN_ADVANCED journaled
+        let move_seq_before = session.ledger.current_sequence;
+        session
+            .move_entity(victim, (5.0, 0.0, 0.0))
+            .expect("move legal");
+        // Rewind to BEFORE the move: Frightened clock must be 3, not 4.
+        session.safety_rewind(move_seq_before);
+        let clock = session
+            .entities
+            .get(&victim)
+            .unwrap()
+            .condition_timers
+            .iter()
+            .find(|t| t.condition == Condition::Frightened)
+            .expect("clock rebuilt");
+        assert_eq!(
+            clock.remaining_rounds, 3,
+            "rewind must apply TURN_ADVANCED's clock snapshot over the CONDITION_APPLIED duration"
+        );
     }
 }

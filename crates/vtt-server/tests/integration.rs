@@ -11784,12 +11784,14 @@ async fn delay_take_resume_roundtrip_is_free_and_ledgers_state() {
     let (status, body) = post_delay(&app, &gm, session_id, a, false).await;
     assert_eq!(status, StatusCode::OK, "{}", body);
     assert_eq!(body["status"], "DELAY_TAKEN");
-    assert_eq!(
-        body["delayed"].as_array().unwrap().len(),
-        1,
-        "exactly one combatant parked"
-    );
     assert!(body["event_sequence"].as_u64().is_some());
+    // F2 (iteration 21): the action response carries ONLY the caller's own
+    // entity id; the full initiative projection lives in the snapshot
+    // endpoint, not here.
+    assert!(body.get("delayed").is_none(), "response must not leak the full delayed list");
+    assert!(body.get("order").is_none(), "response must not leak the full initiative order");
+    assert!(body.get("turn_index").is_none(), "response must not leak the cursor");
+    assert!(body.get("round").is_none(), "response must not leak the round counter");
 
     let snap = session_snapshot(&app, &gm, session_id).await;
     assert_eq!(
@@ -11811,7 +11813,6 @@ async fn delay_take_resume_roundtrip_is_free_and_ledgers_state() {
     let (status, body) = post_delay(&app, &gm, session_id, a, true).await;
     assert_eq!(status, StatusCode::OK, "{}", body);
     assert_eq!(body["status"], "DELAY_RESUMED");
-    assert_eq!(body["delayed"].as_array().unwrap().len(), 0);
     let snap = session_snapshot(&app, &gm, session_id).await;
     assert_eq!(snap["combat"]["delayed"].as_array().unwrap().len(), 0);
 
@@ -12286,4 +12287,292 @@ async fn hidden_entities_do_not_leak_through_apply_condition_responses_or_snapsh
     // ids that were visible (or owned).
     let entities = snap["entities"].as_object().unwrap();
     assert_eq!(entities.len(), 1, "only the owner's sheet survives");
+}
+
+// -- Iteration 21 (Loop 3 audit remediation) --------------------------
+//
+// F2 / F3 / F4 / F9 integration tests pin the HTTP-surface remediation
+// onto the running server (the core-only tests in vtt-core handle the
+// engine internals).
+
+// --- F2: delay response never leaks unprojected initiative order -----------
+
+#[actix_web::test]
+async fn delay_response_for_non_gm_leaks_no_other_entity_ids() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-f2", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-f2", "player", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 20, 14, 5, "1d8");
+    hero["owner_player_id"] = serde_json::json!("player-f2");
+    spawn_entity(&app, &gm, session_id, hero).await;
+
+    // A HIDDEN GM-owned NPC rides the same combat. Its id must NEVER appear
+    // anywhere in the player's delay response.
+    let lurker_id = Uuid::new_v4();
+    let mut lurker = entity_json(lurker_id, "Lurker", 20, 14, 5, "1d8");
+    lurker["is_visible"] = serde_json::json!(false);
+    spawn_entity(&app, &gm, session_id, lurker).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Player delays their own hero. Inspect the raw response body.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/delay", session_id))
+        .insert_header(bearer(&player))
+        .set_json(serde_json::json!({"entity_id": hero_id}))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let raw = test::read_body(res).await;
+    let body: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+    // Only the caller's own id is permitted to appear, period.
+    let body_str = serde_json::to_string(&body).unwrap();
+    assert!(
+        !body_str.contains(&lurker_id.to_string()),
+        "hidden NPC id must not appear in a non-GM delay response: {}",
+        body_str
+    );
+    // And the action-level disclosure surface is fully gone.
+    assert!(body.get("delayed").is_none(), "no delayed array: {}", body_str);
+    assert!(body.get("order").is_none(), "no order array: {}", body_str);
+    assert!(body.get("turn_index").is_none(), "no turn_index: {}", body_str);
+    assert!(body.get("round").is_none(), "no round: {}", body_str);
+    // The caller's own id is still surfaced so they know what they parked.
+    assert_eq!(body["entity_id"], serde_json::json!(hero_id.to_string()));
+}
+
+// --- F3: apply-condition rejects unowned (GM-run) targets from players -----
+
+#[actix_web::test]
+async fn apply_condition_rbac_unowned_entities_are_gm_only() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-f3", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-f3", "player", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // A player-owned token — the player may afflict it.
+    let mine_id = Uuid::new_v4();
+    let mut mine = entity_json(mine_id, "Mine", 20, 14, 5, "1d8");
+    mine["owner_player_id"] = serde_json::json!("player-f3");
+    spawn_entity(&app, &gm, session_id, mine).await;
+
+    // A GM-spawned monster with no owner — players must NOT be able to
+    // slap conditions on it (audit F3: the prior `may_control_entity`
+    // lenience permitted this).
+    let monster_id = Uuid::new_v4();
+    spawn_entity(&app, &gm, session_id, entity_json(monster_id, "Monster", 30, 14, 5, "1d8")).await;
+
+    // Player → unowned monster = 403 ENTITY_NOT_OWNED.
+    let (status, body) = apply_condition(
+        &app,
+        &player,
+        session_id,
+        serde_json::json!({
+            "entity_id": monster_id,
+            "condition": "paralyzed",
+            "duration_rounds": 3,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {}", body);
+    assert_eq!(body["error"], "ENTITY_NOT_OWNED");
+
+    // Player → own token = ok.
+    let (status, body) = apply_condition(
+        &app,
+        &player,
+        session_id,
+        serde_json::json!({
+            "entity_id": mine_id,
+            "condition": "frightened",
+            "duration_rounds": 3,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("CONDITION_APPLIED"));
+
+    // GM → anyone = ok (control over unowned monsters preserved).
+    let (status, body) = apply_condition(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": monster_id,
+            "condition": "stunned",
+            "duration_rounds": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["status"], serde_json::json!("CONDITION_APPLIED"));
+}
+
+// --- F9: source_entity_id existence oracle collapsed -----------------------
+
+#[actix_web::test]
+async fn apply_condition_source_rejection_is_identical_for_unknown_and_hidden() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-f9", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-f9", "player", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    // The player owns a victim; a HIDDEN GM-only source lurks on the board.
+    let victim_id = Uuid::new_v4();
+    let mut victim = entity_json(victim_id, "Victim", 20, 14, 5, "1d8");
+    victim["owner_player_id"] = serde_json::json!("player-f9");
+    spawn_entity(&app, &gm, session_id, victim).await;
+
+    let hidden_source_id = Uuid::new_v4();
+    let mut hidden = entity_json(hidden_source_id, "Lurker", 20, 14, 5, "1d8");
+    hidden["is_visible"] = serde_json::json!(false);
+    spawn_entity(&app, &gm, session_id, hidden).await;
+
+    // Branch A: completely unknown source id.
+    let unknown_id = Uuid::new_v4();
+    let (status_a, body_a) = apply_condition(
+        &app,
+        &player,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 3,
+            "source_entity_id": unknown_id,
+        }),
+    )
+    .await;
+    assert_eq!(status_a, StatusCode::NOT_FOUND);
+    assert_eq!(body_a["error"], "SOURCE_ENTITY_NOT_FOUND");
+
+    // Branch B: real, in-session source id that is hidden from the caller.
+    let (status_b, body_b) = apply_condition(
+        &app,
+        &player,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 3,
+            "source_entity_id": hidden_source_id,
+        }),
+    )
+    .await;
+    assert_eq!(status_b, StatusCode::NOT_FOUND);
+    assert_eq!(body_b["error"], "SOURCE_ENTITY_NOT_FOUND");
+
+    // Identical body — no oracle: the caller cannot distinguish "id does
+    // not exist" from "id exists but is hidden from you".
+    assert_eq!(
+        serde_json::to_string(&body_a).unwrap(),
+        serde_json::to_string(&body_b).unwrap(),
+        "unknown and hidden-source branches must produce byte-identical bodies"
+    );
+    assert_eq!(status_a, status_b);
+
+    // Sanity: the GM CAN name the hidden source — they're the GM, the
+    // visibility check is bypassed for them.
+    let (status_c, body_c) = apply_condition(
+        &app,
+        &gm,
+        session_id,
+        serde_json::json!({
+            "entity_id": victim_id,
+            "condition": "frightened",
+            "duration_rounds": 3,
+            "source_entity_id": hidden_source_id,
+        }),
+    )
+    .await;
+    assert_eq!(status_c, StatusCode::OK, "gm body: {}", body_c);
+    assert_eq!(body_c["source_entity_id"], serde_json::json!(hidden_source_id.to_string()));
+}
+
+// --- F4: production /turn/next skips the delayed actor ----------------------
+
+#[actix_web::test]
+async fn turn_next_over_http_skips_delayed_actor_in_projected_snapshot() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-f4", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+    let b = Uuid::new_v4();
+    for id in [Uuid::new_v4(), b, Uuid::new_v4()] {
+        spawn_entity(
+            &app,
+            &gm,
+            session_id,
+            entity_json(id, "Combatant", 20, 14, 5, "1d8"),
+        )
+        .await;
+    }
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Read the post-begin initiative order (RNG-seeded, so the slot of the
+    // delayed combatant is data-driven; the test asserts the cursor lands
+    // on a non-delayed slot regardless of where it sat).
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    let order: Vec<Uuid> = snap["combat"]["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Uuid::parse_str(v.as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(order.len(), 3);
+    let delayed_id = b;
+    let (status, _) = post_delay(&app, &gm, session_id, delayed_id, false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Hit the production turn primitive.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/turn/next", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = test::read_body_json(res).await;
+    assert_eq!(body["status"], serde_json::json!("TURN_ADVANCED"));
+    // Expected post-advance cursor: mirror the engine's bounded scan — step
+    // forward from slot 0, wrapping once, landing on the first non-delayed
+    // slot (with exactly one delayed combatant this terminates immediately).
+    let mut expected_cursor = None;
+    let mut probe = 0usize;
+    for _ in 0..order.len() {
+        probe = (probe + 1) % order.len();
+        if order[probe] != delayed_id {
+            expected_cursor = Some(probe);
+            break;
+        }
+    }
+    assert_eq!(
+        body["report"]["turn_index"].as_u64(),
+        expected_cursor.map(|v| v as u64),
+        "report.turn_index must reflect the post-skip cursor position"
+    );
+
+    // Snapshot must show the cursor landed on a non-delayed slot.
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    let cursor = snap["combat"]["turn_index"].as_u64().unwrap() as usize;
+    let order_now: Vec<Uuid> = snap["combat"]["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Uuid::parse_str(v.as_str().unwrap()).unwrap())
+        .collect();
+    assert_ne!(
+        order_now[cursor], delayed_id,
+        "the delayed actor must be skipped: cursor={} order={:?} delayed={}",
+        cursor, order_now, delayed_id
+    );
 }
