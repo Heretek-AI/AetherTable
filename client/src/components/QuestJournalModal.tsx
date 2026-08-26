@@ -27,10 +27,14 @@ interface QuestJournalModalProps {
    * Live session role from the App shell (same convention as StreamerHUDModal:
    * passed IN rather than mirrored). Defaults to the App shell's own default
    * seat. Quest generation and GM notes are gated on this in the UI; the
-   * gateway also enforces GM on POST /api/v1/quest/generate via its auth
-   * dependency, so this is a UX gate layered on real server enforcement.
+   * gateway also enforces gm-or-admin on POST /api/v1/quest/generate via its
+   * auth dependency, so this is a UX gate layered on real server enforcement.
+   *
+   * Iteration 29 (F3 sweep): 'admin' is now part of the accepted role set so
+   * an admin seat can drive the GM Notes / quest graph UX the server already
+   * authorises.
    */
-  userRole?: 'gm' | 'player' | 'spectator';
+  userRole?: 'gm' | 'admin' | 'player' | 'spectator';
 }
 
 const NODE_BADGE: Record<string, string> = {
@@ -56,7 +60,13 @@ export const QuestJournalModal: React.FC<QuestJournalModalProps> = ({
   onShareToChat,
   userRole = 'gm',
 }) => {
-  const isGM = userRole === 'gm';
+  // Iteration 29 (F3 sweep): admin == gm for staff authority — mirrors the
+  // server-side `actor.get("role","") not in ("gm","admin")` gate on
+  // POST /api/v1/quest/generate (python/vtt_orchestrator/server.py). Pre-fix,
+  // an admin seat defaulted the prop to 'gm' via App's wiring gap and silently
+  // worked — but the moment App starts plumbing userRole through, admin would
+  // have lost GM Notes editing and quest generation.
+  const isGM = userRole === 'gm' || userRole === 'admin';
   const [activeTab, setActiveTab] = useState<'quests' | 'notes'>('quests');
   const [selectedQuestId, setSelectedQuestId] = useState<string | null>(null);
   const [shareAlert, setShareAlert] = useState<string | null>(null);

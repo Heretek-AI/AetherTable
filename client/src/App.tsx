@@ -105,6 +105,7 @@ import {
 import { fetchSessionState, triggerXCard } from './api/safety_xcard';
 
 import { canMoveTokensOnTransport, type BoundTransport } from './sync/transport_gate';
+import { computeControlledEntityIds } from './api/seat_authority';
 import {
   REPROBE_INTERVAL_MS,
   shouldAttemptReprobe,
@@ -855,18 +856,15 @@ export function App() {
 
   /**
    * Iteration 16 — entity ids THIS seat may act for, feeding the tracker's
-   * Delay/Resume gating. Mirrors the engine's own `may_control_entity` RBAC:
-   * GM/admin act on anyone; players only the tokens bound to their seat
-   * (assignedTokenIds, '*' = authority without a body); spectators nothing.
-   * The engine re-verifies every call — this list only shapes the UI.
+   * Delay/Resume gating. Iteration 29 (F3 remediation): the role→ids decision
+   * lives in a pure helper so the audit invariant (admin == gm for staff
+   * authority, see api/seat_authority.ts) can be pinned by a unit test without
+   * mounting App. Mirrors the engine's own `may_control_entity` RBAC.
    */
-  const controlledEntityIds = useMemo(() => {
-    if (userRole === 'gm') return visibleTokens.map((t) => t.id);
-    if (userRole !== 'player') return [];
-    return visibleTokens
-      .filter((t) => t.isPlayer && currentUser.assignedTokenIds.includes(t.id))
-      .map((t) => t.id);
-  }, [userRole, visibleTokens, currentUser.assignedTokenIds]);
+  const controlledEntityIds = useMemo(
+    () => computeControlledEntityIds(userRole, visibleTokens, currentUser.assignedTokenIds),
+    [userRole, visibleTokens, currentUser.assignedTokenIds],
+  );
 
   // Private-channel chat is excluded from what NarrativeChat receives. The
   // channel tab UI stays (NarrativeChat owns it) — it just renders nothing
@@ -2243,7 +2241,12 @@ export function App() {
         onOpenJukebox={() => setIsJukeboxOpen(true)}
         activeAtmosphereId={atmosphereId}
         onSelectAtmosphere={handleSelectAtmosphere}
-        canManageAtmosphere={userRole === 'gm'}
+        // Iteration 29 (F3 sweep): admin == gm for staff authority — mirrors
+        // AmbiencePanel/SfxPanel which already gate on isStaff =
+        // `userRole === 'gm' || userRole === 'admin'`. An admin seat was
+        // previously handed a read-only atmosphere picker for the same reason
+        // controlledEntityIds silently returned [] for admin.
+        canManageAtmosphere={userRole === 'gm' || userRole === 'admin'}
                 onOpenCampaignSaves={() => setIsCampaignSavesOpen(true)}
         onOpenCampaignWizard={guardGmSurface('the New Campaign wizard', () => setIsCampaignWizardOpen(true))}
         onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
@@ -2253,7 +2256,10 @@ export function App() {
         onToggleVideoMesh={() => setIsVideoMeshVisible(!isVideoMeshVisible)}
         onOpenStreamerHUD={() => setIsStreamerHUDOpen(true)}
         // Pillar 9: only the GM seat gets the Go Live control (see
-        // canEnterStreamerView in api/streamer_view_state.ts).
+        // canEnterStreamerView in api/streamer_view_state.ts — POLICY GM-ONLY:
+        // the dedicated broadcast surface is an authority decision about what
+        // leaves the room, intentionally narrower than the F3 sweep's
+        // gm||admin widening for staff surfaces).
         onEnterStreamerView={
           canEnterStreamerView(userRole)
             ? () => {
@@ -2323,7 +2329,11 @@ export function App() {
                 inCombat={combat.in_combat}
                 combatOrder={combat.order}
                 activeEntityId={combat.order[combat.turn_index]?.entity_id ?? null}
-                isGm={userRole === 'gm'}
+                // Iteration 29 (F3 sweep): admin == gm for staff authority —
+                // the handlers below already pass admin through (only spectator
+                // is blocked), so the Begin/End Combat toggle must also surface
+                // for admin or the wiring is silently one-handed.
+                isGm={userRole === 'gm' || userRole === 'admin'}
                 isCombatBusy={isCombatBusy}
                 onBeginCombat={() => void handleBeginCombat()}
                 onEndCombat={() => void handleEndCombat()}

@@ -89,8 +89,10 @@ interface NarrativeChatProps {
    * expanded by default; others start collapsed.
    */
   narrationSessionId?: string | null;
-  /** Seat role, used only to pick the NarrationPanel default collapse state. */
-  userRole?: 'gm' | 'player' | 'spectator';
+  /** Seat role, used only to pick the NarrationPanel default collapse state.
+   *  Iteration 29 (F3): 'admin' added so admin seats inherit the staff
+   *  default-open behaviour that gm already gets. */
+  userRole?: 'gm' | 'admin' | 'player' | 'spectator';
 }
 
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
@@ -576,7 +578,11 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
         <div className="px-2 pt-1.5">
           <NarrationPanel
             sessionId={narrationSessionId}
-            defaultOpen={userRole === 'gm' || userRole === undefined}
+            // Iteration 29 (F3): admin == gm for staff authority — match the
+            // server's accepted role set on POST /api/v1/narrate/* (gm/admin).
+            // Pre-fix, admin seats inherited the collapsed default and never
+            // opened the TTS composer without a click.
+            defaultOpen={userRole === 'gm' || userRole === 'admin' || userRole === undefined}
           />
         </div>
       )}
