@@ -45,10 +45,13 @@ export type { CampaignRuleVersion, CampaignWizardConfig };
  *    lobby_store.createLobby; the invite code shown on the final step is the
  *    one the backend generated, never a local placeholder. The wizard only
  *    reports success after that call returns a lobby.
- *  - Rule version, party size and starting level are DATA ONLY. Today's lobby
- *    API accepts just `{ name }` — there is no server field for them yet — so
- *    they are carried to App via onComplete and kept client-side until a
- *    campaign-settings endpoint exists.
+ *  - Rule version, party size and starting level are REAL since iteration 71:
+ *    POST /api/v1/lobbies accepts them (validated: rule_version literal,
+ *    level 1..20, party 2..8) and wizardCreateRequestBody puts all three on
+ *    the wire alongside the name.
+ *  - Atmosphere selection reuses theme/atmospheres.ts presets; applying it is
+ *    the same LOCAL-ONLY mechanism as the Navbar picker (no sync channel), and
+ *    it is the one wizard selection that never rides the create call.
  *  - Atmosphere selection reuses theme/atmospheres.ts presets; applying it is
  *    the same LOCAL-ONLY mechanism as the Navbar picker (no sync channel).
  *  - "Load starter adventure" performs the only real action available: it
@@ -186,9 +189,11 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
   const handleCreate = async () => {
     setCreating(true);
     setCreateError(null);
-    // The wire body is exactly { name } — see campaign_wizard_state.ts for the
-    // audited boundary between what is sent and what stays client-side.
-    const lobby = await createLobby(wizardCreateRequestBody(name).name);
+    // The wire body is the name plus the three gateway-accepted selections —
+    // see campaign_wizard_state.ts for the audited boundary between what is
+    // sent and what stays client-side (only atmosphere, by design).
+    const body = wizardCreateRequestBody(name, { ruleVersion, partySize, startingLevel });
+    const lobby = await createLobby(body);
     if (!lobby || !lobby.invite_code) {
       setCreating(false);
       setCreateError(
@@ -510,16 +515,25 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
           </div>
 
           <p className="text-[10px] text-[var(--rp-parchment-300)] leading-relaxed">
-            Note: the lobby API persists this campaign's name only. Recorded with your campaign
-            config but not yet sent to the server:
-            {deferredFields.map((f, i) => (
-              <span key={f.field}>
-                {i > 0 && '; '}
-                {' '}
-                <span className="font-bold">{f.field}</span> ({f.value}) — {f.reason}
-              </span>
-            ))}
-            .
+            {deferredFields.length === 0 ? (
+              <>
+                Every table selection above — name, rule version, starting level and party size —
+                was sent to the server with the POST /api/v1/lobbies create call. Only the
+                atmosphere preset stays local to this browser (it has no sync channel yet).
+              </>
+            ) : (
+              <>
+                Note: recorded with your campaign config but not yet sent to the server:
+                {deferredFields.map((f, i) => (
+                  <span key={f.field}>
+                    {i > 0 && '; '}
+                    {' '}
+                    <span className="font-bold">{f.field}</span> ({f.value}) — {f.reason}
+                  </span>
+                ))}
+                .
+              </>
+            )}
           </p>
         </div>
       ) : (
@@ -672,8 +686,8 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
                   ))}
                 </div>
                 <p className="text-[10px] text-[var(--rp-parchment-300)] mt-2">
-                  Stored with the campaign config; characters keep their own persisted levels in
-                  the character builder.
+                  Sent to the server with the lobby on creation; characters keep their own
+                  persisted levels in the character builder.
                 </p>
               </div>
             </div>

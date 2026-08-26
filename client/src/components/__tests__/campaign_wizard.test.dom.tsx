@@ -5,9 +5,11 @@
  *  1. STEP TRANSITIONS: Identity → Ruleset → Party → Review, gated on a
  *     non-blank name at Identity, Back never skips past Identity, and the
  *     Review step reflects every selection made along the way.
- *  2. WIRE HONESTY: Create fires POST /api/v1/lobbies with EXACTLY
- *     `{ name }` — no invented rule-version/party-size/level fields — and the
- *     success panel shows the SERVER-generated invite code, not a local one.
+ *  2. WIRE HONESTY: Create fires POST /api/v1/lobbies with exactly what the
+ *     gateway models — `{ name, rule_version, starting_level, party_size }`
+ *     reflecting the choices made in the wizard, and nothing invented on top
+ *     (atmosphere stays local) — and the success panel shows the
+ *     SERVER-generated invite code, not a local one.
  *  3. FAILURE HONESTY: a gateway refusal keeps the wizard open, surfaces the
  *     error, and never calls onComplete.
  *
@@ -135,7 +137,12 @@ describe('wizard step transitions', () => {
 });
 
 describe('create payload & completion', () => {
-  it('posts EXACTLY { name } and completes with the server invite code', async () => {
+  /** Slider input on the Party step (the only range input in the wizard). */
+  function partySizeSlider() {
+    return document.querySelector('input[type="range"]') as HTMLInputElement;
+  }
+
+  it('posts the full create body — selections included — and completes with the server invite code', async () => {
     let capturedBody: string | undefined;
     const fetchMock = installFetch((url, init) => {
       if (url === '/api/v1/adventures/starter') return jsonRes({ adventures: [] });
@@ -161,8 +168,16 @@ describe('create payload & completion', () => {
 
     typeCampaignName('  The Fall of Baron Vane  ');
     fireEvent.click(screen.getByRole('button', { name: /^Next:/ }));
+
+    // Ruleset step: pick SRD 5.1 so the wire body must say rule_version.
+    fireEvent.click(ruleVersionRadios()[1]);
     fireEvent.click(screen.getByRole('button', { name: /^Next:/ }));
+
+    // Party step: six seats at level 3.
+    fireEvent.change(partySizeSlider(), { target: { value: '6' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Level 3' }));
     fireEvent.click(screen.getByRole('button', { name: /^Next:/ }));
+
     fireEvent.click(screen.getByRole('button', { name: 'Create Lobby' }));
 
     await waitFor(() =>
@@ -170,14 +185,46 @@ describe('create payload & completion', () => {
     );
     // The displayed code IS the server's, never a locally generated stand-in.
     expect(screen.getByText('DRAGON7')).toBeTruthy();
-    expect(capturedBody).toBe(JSON.stringify({ name: 'The Fall of Baron Vane' }));
+    // Every wizard selection reached the gateway, snake_case as modeled there;
+    // atmosphere is deliberately absent (local-only by design).
+    expect(capturedBody).toBe(
+      JSON.stringify({
+        name: 'The Fall of Baron Vane',
+        rule_version: 'srd_5_1',
+        starting_level: 3,
+        party_size: 6,
+      })
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'Enter Lobby' }));
     await waitFor(() => expect(configs.length).toBe(1));
     expect(lobbies[0].invite_code).toBe('DRAGON7');
-    expect(configs[0].name).toBe('The Fall of Baron Vane');
+    expect(configs[0]).toEqual({
+      name: 'The Fall of Baron Vane',
+      atmosphereId: 'default',
+      ruleVersion: 'srd_5_1',
+      partySize: 6,
+      startingLevel: 3,
+    });
     // Name was trimmed before it reached the wire AND the carried config.
     expect(fetchMock.mock.calls.some(([u]) => u === '/api/v1/lobbies')).toBe(true);
+  });
+
+  it('reports full wire coverage in the success note (no client-only leftovers)', async () => {
+    installHappyPath();
+    render(<CampaignWizardModal isOpen onClose={() => {}} onComplete={vi.fn()} />);
+
+    typeCampaignName('Doomvault');
+    for (const label of ['Ruleset', 'Party', 'Review']) {
+      fireEvent.click(screen.getByRole('button', { name: `Next: ${label}` }));
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Create Lobby' }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/sent to the server with the POST \/api\/v1\/lobbies/)).toBeTruthy()
+    );
+    // The old "persists this campaign's name only" apology is gone.
+    expect(screen.queryByText(/persists this campaign's name only/)).toBeNull();
   });
 
   it('keeps the wizard open with an honest error when creation fails', async () => {

@@ -18,6 +18,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  createLobby,
   launchLobby,
   listCharacters,
   ownedCharacters,
@@ -68,6 +69,54 @@ beforeEach(() => {
       return store.size;
     },
   } as Storage;
+});
+
+describe('createLobby (iteration 73 — optional table selections on the wire)', () => {
+  it('accepts a bare name and posts the legacy {name} body', async () => {
+    store.set('aethertable_token', TOKEN);
+    const calls = stubFetch(() => ({ ok: true, json: async () => ROSTER }));
+
+    const lobby = await createLobby('Doomvault');
+    expect(calls[0].url).toBe('/api/v1/lobbies');
+    expect(calls[0].init.method).toBe('POST');
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ name: 'Doomvault' });
+    expect(lobby?.invite_code).toBe('VANE42');
+  });
+
+  it('forwards the optional rule_version / starting_level / party_size selections verbatim', async () => {
+    store.set('aethertable_token', TOKEN);
+    const calls = stubFetch(() => ({ ok: true, json: async () => ROSTER }));
+
+    await createLobby({
+      name: 'The Fall of Baron Vane',
+      rule_version: 'srd_5_1',
+      starting_level: 3,
+      party_size: 6,
+    });
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({
+      name: 'The Fall of Baron Vane',
+      rule_version: 'srd_5_1',
+      starting_level: 3,
+      party_size: 6,
+    });
+  });
+
+  it('omits selections a caller never chose instead of sending placeholder values', async () => {
+    store.set('aethertable_token', TOKEN);
+    const calls = stubFetch(() => ({ ok: true, json: async () => ROSTER }));
+
+    await createLobby({ name: 'Doomvault' });
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body).toEqual({ name: 'Doomvault' });
+    expect(body.rule_version).toBeUndefined();
+  });
+
+  it('refuses the call entirely when signed out', async () => {
+    const calls = stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    expect(await createLobby('Doomvault')).toBeNull();
+    expect(await createLobby({ name: 'Doomvault', party_size: 6 })).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('setMemberReady', () => {

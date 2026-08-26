@@ -3,12 +3,14 @@
  * contracts:
  *
  *  1. STEP GATING: the Identity step is the only gated one (a non-blank name
- *     is the single field the lobby API accepts); later steps always advance.
- *  2. PAYLOAD SHAPING: `wizardCreateRequestBody` emits EXACTLY `{ name }` —
- *     no invented server fields for rule version / party size / level.
- *  3. HONESTY LEDGER: `clientOnlyWizardFields` names every client-only
- *     selection so the UI's "server support pending" note cannot drift from
- *     what the code actually sends.
+ *     is required); later steps always advance.
+ *  2. PAYLOAD SHAPING: `wizardCreateRequestBody` emits exactly what the
+ *     gateway models since iteration 71 — `{ name, rule_version,
+ *     starting_level, party_size }` — clamped into the validated bands and
+ *     with no invented fields (atmosphere never rides the wire).
+ *  3. HONESTY LEDGER: `clientOnlyWizardFields` names every selection that is
+ *     still DATA ONLY; it is empty now that all three table selections are
+ *     real, so the UI's post-create note reports full wire coverage.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -89,33 +91,53 @@ describe('input clamping', () => {
 });
 
 describe('payload shaping — the honest wire contract', () => {
-  it('sends EXACTLY { name }, trimmed, with no invented fields', () => {
-    const body = wizardCreateRequestBody('  The Fall of Baron Vane  ');
-    expect(body).toEqual({ name: 'The Fall of Baron Vane' });
-    expect(Object.keys(body)).toEqual(['name']);
+  it('sends the trimmed name plus the three gateway-accepted selections in snake_case', () => {
+    const body = wizardCreateRequestBody('  The Fall of Baron Vane  ', {
+      ruleVersion: 'srd_5_1',
+      partySize: 6,
+      startingLevel: 3,
+    });
+    expect(body).toEqual({
+      name: 'The Fall of Baron Vane',
+      rule_version: 'srd_5_1',
+      starting_level: 3,
+      party_size: 6,
+    });
+    // Exactly the four fields the gateway models — nothing invented.
+    expect(Object.keys(body).sort()).toEqual(
+      ['name', 'party_size', 'rule_version', 'starting_level'].sort()
+    );
   });
 
-  it('never leaks rule version, party size or level onto the wire', () => {
-    const body = wizardCreateRequestBody(CONFIG.name) as Record<string, unknown>;
-    expect(body.rule_version).toBeUndefined();
-    expect(body.party_size).toBeUndefined();
-    expect(body.starting_level).toBeUndefined();
+  it('re-clamps selections into the legal bands the gateway validates', () => {
+    // The create endpoint answers 422 outside rule_version's literal union,
+    // level 1..20 or party size 2..8; garbage state must never reach that
+    // refusal from client code.
+    const body = wizardCreateRequestBody('Doomvault', {
+      ruleVersion: 'srd_5_2',
+      partySize: 99,
+      startingLevel: -7,
+    });
+    expect(body.party_size).toBe(8); // PARTY_SIZE_MAX
+    expect(body.starting_level).toBe(1); // nearest offered level
+  });
+
+  it('never leaks the atmosphere preset or any other client-side field', () => {
+    const body = wizardCreateRequestBody(CONFIG.name, CONFIG) as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(body.atmosphere_id).toBeUndefined();
+    expect(body.atmosphereId).toBeUndefined();
+    expect(body.ruleVersion).toBeUndefined();
+    expect(body.partySize).toBeUndefined();
+    expect(body.startingLevel).toBeUndefined();
   });
 });
 
 describe('client-only field ledger', () => {
-  it('accounts for every selection that has no server field yet', () => {
-    const ledger = clientOnlyWizardFields(CONFIG);
-    expect(ledger.map((f) => f.field)).toEqual(['Rule version', 'Party size', 'Starting level']);
-    expect(ledger[0].value).toBe('SRD 5.1');
-    expect(ledger[1].value).toBe('6 seats');
-    expect(ledger[2].value).toBe('3');
-  });
-
-  it('gives each entry a concrete reason, never a bare apology', () => {
-    for (const entry of clientOnlyWizardFields(CONFIG)) {
-      expect(entry.reason.length).toBeGreaterThan(8);
-    }
+  it('is empty now that rule version, party size and level ride the wire', () => {
+    expect(clientOnlyWizardFields(CONFIG)).toEqual([]);
   });
 });
 

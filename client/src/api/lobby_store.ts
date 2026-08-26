@@ -55,12 +55,32 @@ async function req<T>(path: string, init?: RequestInit): Promise<T | null> {
   }
 }
 
-export async function createLobby(name: string): Promise<Lobby | null> {
+/**
+ * Optional table selections the gateway accepts on lobby create (iteration
+ * 71+). All three are validated server-side — rule_version must be one of the
+ * SRD literals, starting_level 1..20, party_size 2..8 (422 otherwise) — so
+ * callers must only send values they mean.
+ */
+export interface LobbyCreateOptions {
+  rule_version?: 'srd_5_1' | 'srd_5_2';
+  starting_level?: number;
+  party_size?: number;
+}
+
+/**
+ * Create payload: either a bare table name (the legacy `{ name }` contract,
+ * still accepted by every gateway that serves this endpoint) or a full object
+ * carrying the optional selections alongside it.
+ */
+export type LobbyCreateInput = string | ({ name: string } & LobbyCreateOptions);
+
+export async function createLobby(input: LobbyCreateInput): Promise<Lobby | null> {
   if (!getToken()) return null;
+  const body = typeof input === 'string' ? { name: input } : input;
   return req<Lobby>('/api/v1/lobbies', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(body),
   });
 }
 

@@ -6,11 +6,13 @@
  * rules and the honest "what actually goes on the wire" contract are
  * unit-testable without a DOM.
  *
- * HONEST API BOUNDARY: POST /api/v1/lobbies accepts exactly `{ name }`.
- * Rule version, party size and starting level are collected by the wizard and
- * recorded client-side only — see `clientOnlyWizardFields()` for the machine-
- * readable list the UI renders as its "server support pending" note. Nothing
- * in this module fabricates a server field that does not exist.
+ * HONEST API BOUNDARY (iteration 73): POST /api/v1/lobbies accepts the table
+ * name plus three OPTIONAL, validated selections — `rule_version`
+ * ('srd_5_1' | 'srd_5_2'), `starting_level` (1..20) and `party_size` (2..8).
+ * `wizardCreateRequestBody()` shapes exactly those four fields (clamped into
+ * the legal bands so the wire body can never carry an out-of-range value) and
+ * `clientOnlyWizardFields()` reports whatever still has no server home —
+ * currently nothing. Nothing here fabricates a field the gateway rejects.
  */
 
 /** Rule versions the wizard can record as a preference. */
@@ -31,8 +33,9 @@ export const WIZARD_STEPS = ['Identity', 'Ruleset', 'Party', 'Review'] as const;
 
 /**
  * Forward gate for `step`: the Identity step requires a non-blank campaign
- * name (it is the ONLY field POST /api/v1/lobbies accepts), every later step
- * always has a valid default. The Review step reuses this gate for Create.
+ * name (it is the one field the create call cannot do without), every later
+ * step always has a valid default. The Review step reuses this gate for
+ * Create.
  */
 export function canAdvanceStep(step: number, campaignName: string): boolean {
   if (!Number.isInteger(step) || step < 0 || step >= WIZARD_STEPS.length) return false;
@@ -93,13 +96,37 @@ export function clampStartingLevel(value: unknown): number {
   return best;
 }
 
+/** The table-shaping selections that ride the create call (name excluded). */
+export interface WizardTableSelections {
+  ruleVersion: CampaignRuleVersion;
+  partySize: number;
+  startingLevel: number;
+}
+
 /**
  * The exact request body sent to POST /api/v1/lobbies. This is the whole
- * contract: the name, trimmed. Every other wizard selection travels through
- * `CampaignWizardConfig` on the client only.
+ * contract: the trimmed name plus the gateway's three optional, validated
+ * selections in snake_case. Values are re-clamped here so a caller holding
+ * garbage state still cannot put an out-of-band number on the wire — the
+ * gateway answers 422 to anything outside rule_version's literal union,
+ * level 1..20 or party size 2..8, and a refused create must stay a user
+ * mistake, never a client bug.
  */
-export function wizardCreateRequestBody(campaignName: string): { name: string } {
-  return { name: campaignName.trim() };
+export function wizardCreateRequestBody(
+  campaignName: string,
+  selections: WizardTableSelections
+): {
+  name: string;
+  rule_version: CampaignRuleVersion;
+  starting_level: number;
+  party_size: number;
+} {
+  return {
+    name: campaignName.trim(),
+    rule_version: selections.ruleVersion,
+    starting_level: clampStartingLevel(selections.startingLevel),
+    party_size: clampPartySize(selections.partySize),
+  };
 }
 
 /** One wizard selection that has no server-side home yet. */
@@ -114,32 +141,27 @@ export interface ClientOnlyField {
 /**
  * Enumerate the wizard selections that are DATA ONLY. Rendered verbatim by the
  * modal so the honesty note cannot drift from what the code actually sends.
+ *
+ * Since iteration 71 the gateway accepts rule_version / starting_level /
+ * party_size and this module sends all of them, so the ledger is empty; it
+ * stays as the single source of truth for any future selection that regresses
+ * to client-only status (atmosphere is local-only by design but is applied via
+ * theme/atmospheres.ts, not carried on this call, so it is not listed).
  */
 export function clientOnlyWizardFields(config: CampaignWizardConfig): ClientOnlyField[] {
-  return [
-    {
-      field: 'Rule version',
-      value: ruleVersionLabel(config.ruleVersion),
-      reason: 'the lobby API persists the table name only',
-    },
-    {
-      field: 'Party size',
-      value: `${config.partySize} seats`,
-      reason: 'no server-side seat cap exists yet',
-    },
-    {
-      field: 'Starting level',
-      value: `${config.startingLevel}`,
-      reason: 'characters keep their own persisted levels',
-    },
-  ];
+  // Every table selection now rides the wire (see wizardCreateRequestBody);
+  // the parameter is kept so the call sites and the honesty contract stay
+  // stable if a future selection regresses to client-only status.
+  void config;
+  return [];
 }
 
 /**
  * Review-step rows: `[label, displayValue]` pairs summarizing every selection.
  * Which selections stay client-side is reported separately by
  * `clientOnlyWizardFields`, so the review stays scannable and the honesty note
- * lives in exactly one place.
+ * lives in exactly one place. Atmosphere is listed here for completeness but
+ * never leaves the browser (see `clientOnlyWizardFields`).
  */
 export function reviewRows(config: CampaignWizardConfig): Array<[string, string]> {
   return [
