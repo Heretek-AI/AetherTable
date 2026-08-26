@@ -48,6 +48,12 @@ from .agents.tool_agent import EngineToolAgent
 from .simulation.faction_simulation import FactionSimulationGOAP
 from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
+from .safety import (
+    BOUNDARY_TOPIC_MAX_LEN,
+    REDACTED_TOPIC,
+    BoundaryError,
+    SafetyBoundaryRegistry,
+)
 from .simulation.dynasty_engine import global_dynasty_engine, DynastyEngine
 from .simulation.empirical_playtester import EmpiricalPlaytester
 from .compendium.bundle_packager import global_bundle_packager
@@ -173,6 +179,10 @@ dm_agent = EncounterDMAgent()
 retry_controller = DiagnosticRetryController(auditor=auditor, max_retries=2)
 spotlight_tracker = VoiceSpotlightTracker(["Thorin", "Lyra", "Player3"])
 safety_gateway = SafetyGateway()
+# Lines & Veils declarations (Pillar 11). PROCESS-MEMORY-ONLY, like the X-card
+# intervention list above — see vtt_orchestrator/safety.py for the honest
+# trade-off discussion of why this state is deliberately not persisted.
+safety_boundaries = SafetyBoundaryRegistry()
 # PROCESS-MEMORY-ONLY shared campaign state. Iteration 47 made this durable by
 # riding it inside campaign autosave snapshots (_faction_slot) and restoring it
 # via POST /api/v1/campaign/restore — but between autosaves it still lives only
@@ -1660,6 +1670,207 @@ async def delete_handout(handout_id: str, token: str = Depends(_require_auth)):
     if not deleted:
         raise HTTPException(status_code=404, detail="Handout not found")
     return {"status": "deleted"}
+
+
+# --- Lines & Veils (Pillar 11: pre-play content boundaries) -------------------
+#
+# The X-Card (POST /api/v1/safety/x-card) is the MID-PLAY veto; these routes
+# are the BEFORE-PLAY declaration surface: "lines" are hard limits (this
+# content never enters the game), "veils" are fade-to-black topics (it may
+# exist in the fiction but is never depicted).
+#
+# Trust decisions (mirrored by tests in tests/test_safety_boundaries.py):
+#
+# * Every route requires an authenticated HMAC token — boundaries are
+#   per-person safety data, not public metadata (401 otherwise).
+# * Session existence comes from the gateway's OWN membership data: at least
+#   one lobby bound to the engine session id (host launch writes that
+#   binding). An id no lobby binds cannot be distinguished from a typo, so it
+#   is 404 SESSION_NOT_FOUND for everyone — including staff. This differs
+#   from the X-card route, which lets GMs act on out-of-band sessions,
+#   because X-cards rewind LIVE state while boundaries configure a table the
+#   gateway must know about.
+# * Access is participant-or-staff via ``_caller_is_session_participant``
+#   (the lobby-roster derivation; role-blind, so spectator seats — which ARE
+#   roster members — count). Authenticated outsiders on a REAL session get
+#   403 SAFETY_NOT_A_PARTICIPANT with explicit detail, never silent success.
+# * Adding: any participant may declare under their OWN actor id; gm/admin
+#   may additionally manage (delete) anyone's entries. Players delete only
+#   their own -> 403 BOUNDARY_DELETE_FORBIDDEN.
+# * REDACTION RULE (the load-bearing design point): veils are shared openly
+#   at most tables, so every participant sees veil topics verbatim. LINES can
+#   be sensitive, so a non-staff viewer sees OTHER participants' line topics
+#   as "[redacted]" (metadata intact) while their own stay verbatim;
+#   gm/admin see everything verbatim because they adjudicate against the
+#   full list.
+# * Topics normalize to trimmed short labels: blank -> 422
+#   BOUNDARY_TOPIC_REQUIRED, > BOUNDARY_TOPIC_MAX_LEN chars -> 422
+#   BOUNDARY_TOPIC_TOO_LONG, case-insensitive repeat within the same list ->
+#   422 BOUNDARY_DUPLICATE. Validation failures raise BoundaryError from the
+#   registry and map to machine-readable detail codes here.
+
+
+class BoundaryTopicRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    topic: str
+
+
+async def _boundary_gate(session_id: str, token: str) -> Dict[str, str]:
+    """Shared auth gate for every lines & veils route: resolves the verified
+    caller and enforces unknown-session/404 vs outsider/403 ordering."""
+    actor = _caller_actor(token)  # 401 on missing/expired tokens
+    bound_lobby = await storage_backend.get_lobby_by_engine_session(session_id)
+    if bound_lobby is None:
+        # No launch binding anywhere -> the gateway has never heard of this
+        # session. Uniform answer regardless of role so the route cannot be
+        # probed as an existence oracle for other deployments' tables.
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "SESSION_NOT_FOUND",
+                "message": (
+                    f"No table is bound to engine session {session_id}; "
+                    "boundaries attach to launched sessions."
+                ),
+            },
+        )
+    is_staff = actor.get("role", "") in ("gm", "admin")
+    if not is_staff and not await _caller_is_session_participant(
+        actor["user_id"], session_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "SAFETY_NOT_A_PARTICIPANT",
+                "message": (
+                    "Lines & veils are visible only to this session's "
+                    "participants (lobby members) and GM/admin."
+                ),
+            },
+        )
+    return actor
+
+
+def _boundary_http_error(exc: BoundaryError) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": exc.code, "message": exc.message},
+    )
+
+
+@app.get("/api/v1/sessions/{session_id}/safety/boundaries")
+async def get_safety_boundaries(
+    session_id: str, token: str = Depends(_require_auth)
+):
+    """Reads one session's declared lines & veils, redacted per viewer.
+
+    gm/admin get verbatim topics everywhere. Participants keep their OWN line
+    topics verbatim and see everyone else's lines as "[redacted]" (entry ids,
+    authors, and timestamps stay so clients can show that a boundary exists);
+    veils are always open. See the block comment above for the rationale."""
+    actor = await _boundary_gate(session_id, token)
+    privileged = actor.get("role", "") in ("gm", "admin")
+    return {
+        "session_id": session_id,
+        **safety_boundaries.view(
+            session_id, viewer_id=actor["user_id"], privileged=privileged
+        ),
+    }
+
+
+@app.post("/api/v1/sessions/{session_id}/safety/lines")
+async def add_safety_line(
+    session_id: str,
+    req: BoundaryTopicRequest,
+    token: str = Depends(_require_auth),
+):
+    """Declares a hard-limit LINE under the CALLER's actor id. Any session
+    participant may add their own; validation errors are 422s carrying
+    BOUNDARY_TOPIC_REQUIRED / BOUNDARY_TOPIC_TOO_LONG / BOUNDARY_DUPLICATE."""
+    actor = await _boundary_gate(session_id, token)
+    try:
+        entry = safety_boundaries.add(
+            session_id, "line", req.topic, added_by=actor["user_id"]
+        )
+    except BoundaryError as exc:
+        raise _boundary_http_error(exc)
+    return {"status": "declared", "entry": entry}
+
+
+@app.post("/api/v1/sessions/{session_id}/safety/veils")
+async def add_safety_veil(
+    session_id: str,
+    req: BoundaryTopicRequest,
+    token: str = Depends(_require_auth),
+):
+    """Declares a fade-to-black VEIL under the CALLER's actor id. Veils are
+    shared openly with the whole table once declared."""
+    actor = await _boundary_gate(session_id, token)
+    try:
+        entry = safety_boundaries.add(
+            session_id, "veil", req.topic, added_by=actor["user_id"]
+        )
+    except BoundaryError as exc:
+        raise _boundary_http_error(exc)
+    return {"status": "declared", "entry": entry}
+
+
+@app.delete("/api/v1/sessions/{session_id}/safety/lines/{entry_id}")
+async def delete_safety_line(
+    session_id: str, entry_id: str, token: str = Depends(_require_auth)
+):
+    """Withdraws a line: gm/admin may withdraw anyone's; a participant may
+    withdraw only their OWN (403 BOUNDARY_DELETE_FORBIDDEN otherwise)."""
+    return await _delete_boundary_entry(session_id, "line", entry_id, token)
+
+
+@app.delete("/api/v1/sessions/{session_id}/safety/veils/{entry_id}")
+async def delete_safety_veil(
+    session_id: str, entry_id: str, token: str = Depends(_require_auth)
+):
+    """Withdraws a veil, under the same ownership rule as lines."""
+    return await _delete_boundary_entry(session_id, "veil", entry_id, token)
+
+
+async def _delete_boundary_entry(
+    session_id: str, kind: str, entry_id: str, token: str
+) -> dict:
+    """Shared delete path: ownership check happens against the stored entry's
+    added_by, so a player can never retract another participant's boundary —
+    withdrawing someone else's line would effectively lift their limit."""
+    actor = await _boundary_gate(session_id, token)
+    listing = safety_boundaries.view(session_id, privileged=True)
+    entry = next((e for e in listing[f"{kind}s"] if e["entry_id"] == entry_id), None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "BOUNDARY_ENTRY_NOT_FOUND",
+                "message": f"No {kind} {entry_id} exists for this session.",
+            },
+        )
+    is_staff = actor.get("role", "") in ("gm", "admin")
+    if entry["added_by"] != actor["user_id"] and not is_staff:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "BOUNDARY_DELETE_FORBIDDEN",
+                "message": (
+                    "You may only withdraw your own declarations; ask the "
+                    "participant who filed it, or a GM."
+                ),
+            },
+        )
+    removed = safety_boundaries.remove(session_id, kind, entry_id)
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "BOUNDARY_ENTRY_NOT_FOUND",
+                "message": f"No {kind} {entry_id} exists for this session.",
+            },
+        )
+    return {"status": "withdrawn", "entry_id": entry_id}
 
 
 @app.get("/api/v1/compendium/spells")

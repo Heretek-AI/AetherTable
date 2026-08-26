@@ -420,6 +420,21 @@ class MemoryStore:
         if record is not None:
             record["engine_session_id"] = engine_session_id
 
+    async def get_lobby_by_engine_session(
+        self, engine_session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolves the lobby bound to one engine session, if any.
+
+        The gateway's authoritative session-existence data IS the launch
+        binding (host launch writes it via set_lobby_session), so routes that
+        must distinguish "unknown session" from "not yours" resolve the
+        binding here instead of trusting the caller's claim.
+        """
+        for record in self.lobbies.values():
+            if record.get("engine_session_id") == engine_session_id:
+                return self._lobby_public(record)
+        return None
+
     async def set_member_ready(self, lobby_id: str, user_id: str,
                                ready: bool) -> Optional[Dict[str, Any]]:
         """Flags one member's readiness; returns the refreshed public lobby,
@@ -933,6 +948,24 @@ class PostgresStore:
             "UPDATE narrative_state.lobbies SET engine_session_id = $2 WHERE lobby_id = $1",
             lobby_id, engine_session_id,
         )
+
+    async def get_lobby_by_engine_session(
+        self, engine_session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Postgres twin of MemoryStore.get_lobby_by_engine_session: resolves
+        the launch binding for one engine session, or None when no lobby is
+        bound (the gateway's definition of an unknown session)."""
+        try:
+            row = await self.pool.fetchrow(
+                """SELECT lobby_id FROM narrative_state.lobbies
+                   WHERE engine_session_id::text = $1""",
+                engine_session_id,
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return await self.get_lobby(str(row["lobby_id"]))
 
     async def create_character(self, owner_user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         row = await self.pool.fetchrow(
