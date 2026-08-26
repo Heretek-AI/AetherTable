@@ -3260,6 +3260,45 @@ async def engine_combat_end(req: EngineCombatActionRequest, token: str = Depends
     )
 
 
+class EngineSurpriseAdjudicationRequest(BaseModel):
+    """Body for the SRD Surprise adjudication proxy: the session reference
+    plus ONE combatant's surprised flag. First-round-only and GM-admin-only —
+    the engine re-verifies both from the caller identity it resolves."""
+
+    session_id: str
+    entity_id: str
+    surprised: bool
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/combat/surprise")
+async def engine_combat_surprise(
+    req: EngineSurpriseAdjudicationRequest, token: str = Depends(_require_auth)
+):
+    """GM-only: grant or revoke one combatant's SRD Surprise flag.
+
+    Iteration 35 (cross-stack gap): the browser's GM Surprised toggle
+    (client/src/api/combat_surprise.ts) targets ``/api/v1/engine/combat/
+    surprise`` and the engine defines the adjudication route, but the
+    gateway never registered the proxied form — so the button 404'd at
+    this layer. Same contract as /combat/begin and /combat/end: forwards
+    ONLY the session reference plus the caller's real identity; the
+    engine's RBAC re-verifies the GM seat and the first-round window."""
+    return await _engine_call(
+        engine_client.engine_request(
+            "POST",
+            f"/api/v1/sessions/{engine_client._coerce_uuid(req.session_id)}/combat/surprise",
+            {
+                "entity_id": engine_client._coerce_uuid(req.entity_id),
+                "surprised": req.surprised,
+            },
+            actor=_caller_actor(token),
+        )
+    )
+
+
 @app.post("/api/v1/engine/damage")
 async def engine_damage(req: EngineDamageRequest, token: str = Depends(_require_auth)):
     return await _engine_call(

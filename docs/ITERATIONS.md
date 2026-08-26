@@ -539,3 +539,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.33 — 4c1196b — feat(gateway): session spotlight aggregation — pytest 1347
 ### L3.32 — 3aaecc4 — feat(engine): SRD 5.1 Surprise round, rewind-consistent — cargo 518
 ### L3.34 — 0e799e7 — feat(client): Surprise badge + mark/clear controls — vitest 781
+### L3.35 — [working tree, uncommitted] — fix(gateway): SRD Surprise adjudication proxy wire gap + live cross-stack surprise/delay/spotlight/timeline e2e — pytest 1350/34 standalone, 1366/18 w/ engine, benchmark ALL PASSED

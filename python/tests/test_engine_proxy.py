@@ -91,6 +91,10 @@ class TestProxyAuthRequired:
         "turn-next": ("/api/v1/engine/turn-next", {"session_id": "s"}),
         "combat-begin": ("/api/v1/engine/combat/begin", {"session_id": "s"}),
         "combat-end": ("/api/v1/engine/combat/end", {"session_id": "s"}),
+        "combat-surprise": (
+            "/api/v1/engine/combat/surprise",
+            {"session_id": "s", "entity_id": "e", "surprised": True},
+        ),
         "damage": (
             "/api/v1/engine/damage",
             {"session_id": "s", "target_id": "t", "source_event_sequence": 1},
@@ -2039,6 +2043,74 @@ class TestCombatProxy:
         assert captured["payload"] == {}
         assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
 
+    def test_surprise_without_a_token_is_unauthorized(self):
+        resp = client.post(
+            "/api/v1/engine/combat/surprise",
+            json={"session_id": "s", "entity_id": "e", "surprised": True},
+        )
+        assert resp.status_code == 401, "missing credential is an honest 401"
+
+    def test_surprise_forwards_gm_role_and_engine_path(self, monkeypatch):
+        """Iteration 35 wire-gap regression: the browser's GM Surprised toggle
+        posts /api/v1/engine/combat/surprise, but the gateway never registered
+        the proxied form before this iteration — the button 404'd at this
+        layer while the engine's adjudication route went untested
+        cross-stack. The proxy must forward ONLY the single-combatant triple
+        plus the caller's real identity to the engine's canonical path."""
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return {
+                "status": "SURPRISE_GRANTED",
+                "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin")),
+                "surprised": [str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin"))],
+                "changed": True,
+            }
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/surprise",
+            params={"token": token},
+            json={
+                "session_id": self.SESSION_ID,
+                "entity_id": "thorin",
+                "surprised": True,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "SURPRISE_GRANTED"
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/combat/surprise"
+        )
+        # Only the entity + flag travel; the session rides the path; the REAL
+        # caller identity (GM seat) reaches the engine RBAC.
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin")),
+            "surprised": True,
+        }
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_surprise_rejects_extra_body_fields(self):
+        """Trust-inversion regression: no surprise-list or order overrides may
+        be smuggled through — adjudication is one combatant at a time."""
+        token = self._token("gm-1", "gm")
+        resp = client.post(
+            "/api/v1/engine/combat/surprise",
+            params={"token": token},
+            json={
+                "session_id": self.SESSION_ID,
+                "entity_id": "thorin",
+                "surprised": True,
+                "surprised_list": ["orc-1", "orc-2"],
+            },
+        )
+        assert resp.status_code == 422
+
     def test_begin_rejects_extra_body_fields(self):
         """Trust-inversion regression: no initiative overrides smuggled past
         the proxy — clients reference the session, never supply combat math."""
@@ -2055,11 +2127,23 @@ class TestCombatProxy:
 
     def test_combat_unreachable_engine_maps_to_502(self, monkeypatch):
         monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
-        for route in ("combat/begin", "combat/end"):
+        cases = (
+            ("combat/begin", {"session_id": self.SESSION_ID}),
+            ("combat/end", {"session_id": self.SESSION_ID}),
+            (
+                "combat/surprise",
+                {
+                    "session_id": self.SESSION_ID,
+                    "entity_id": "thorin",
+                    "surprised": True,
+                },
+            ),
+        )
+        for route, body in cases:
             resp = client.post(
                 f"/api/v1/engine/{route}",
                 params={"token": self._token("gm-1", "gm")},
-                json={"session_id": self.SESSION_ID},
+                json=body,
             )
             assert resp.status_code == 502, route
             assert "unreachable" in resp.json()["detail"].lower()
