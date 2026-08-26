@@ -412,3 +412,5 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 78 — (prior commit) — feat(gateway): opportunity-attack proxy closes wire gap
 ### Iteration 79 — cf6a428 — feat(client): Help-check + structured Ready/Release controls (P3) — vitest 397
 ### Iteration 80 — 759594d — feat(wfc): seeded loot containers on generated maps (P8) — cargo 440/20
+### Iteration 81 — this wave — feat(gateway): campaign sim OA + ready/release reactions (P5) — pytest 989
+### Iteration 82 — 70533c5 — fix(gateway): ready trigger field rename + release proxy
