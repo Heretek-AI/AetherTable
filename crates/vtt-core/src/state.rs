@@ -826,6 +826,19 @@ pub struct InitiativeCombatState {
     /// tracker by [`GameSession::end_combat`].
     #[serde(default)]
     pub delayed: Vec<Uuid>,
+    /// Combatants under the SRD 5.1 Surprise penalty whose FIRST turn has not
+    /// yet concluded: they cannot move, act, use a bonus action, or take a
+    /// reaction. The set is granted at [`GameSession::begin_combat_with_surprise`]
+    /// (folded into the COMBAT_BEGAN journal) or adjudicated live through
+    /// [`GameSession::grant_surprise`] / [`GameSession::revoke_surprise`]
+    /// (round 1 only). Each member releases the moment its first turn ends —
+    /// the cursor scan in [`GameSession::advance_round`] spends its skip-turn
+    /// budget, drops it from this set and restores its reaction. Serde default
+    /// keeps legacy payloads (written before surprise existed) parsing as no
+    /// surprise; cleared with the rest of the tracker by
+    /// [`GameSession::end_combat`].
+    #[serde(default)]
+    pub surprised: Vec<Uuid>,
 }
 
 /// One rolled initiative slot, as reported by [`GameSession::begin_combat`].
@@ -839,6 +852,13 @@ pub struct InitiativeEntry {
 }
 
 impl InitiativeCombatState {
+    /// Advances the initiative cursor to the next combatant who can act,
+    /// passing over delayed AND surprised first-turn slots. Surprised slots
+    /// are passed over cursor-wise exactly like delayed ones, so both primitives
+    /// keep the same scan geometry; the withhold-and-release of a surprised
+    /// combatant is owned by [`GameSession::advance_round`] (which has entity
+    /// access), so a cursor-only walker that never calls it will keep the slot
+    /// passing over.
     pub fn next_turn(&mut self) -> (usize, u32, Option<Uuid>) {
         if self.order.is_empty() {
             return (0, self.round, None);
@@ -847,7 +867,8 @@ impl InitiativeCombatState {
         // A delayed combatant's slot still exists in `order` (so resuming can
         // re-seat them), but their turn arriving passes them over. The scan is
         // bounded by the order length so an all-delayed order terminates
-        // parked on some slot instead of spinning forever.
+        // parked on some slot instead of spinning forever. A surprised
+        // combatant's first-turn slot skips the same way.
         let mut current_actor = None;
         for _ in 0..self.order.len() {
             self.turn_index += 1;
@@ -858,7 +879,11 @@ impl InitiativeCombatState {
 
             current_actor = self.order.get(self.turn_index).cloned();
             match current_actor {
-                Some(id) if !self.delayed.contains(&id) => break,
+                Some(id)
+                    if !self.delayed.contains(&id) && !self.surprised.contains(&id) =>
+                {
+                    break
+                }
                 _ => continue,
             }
         }
@@ -1793,6 +1818,37 @@ impl GameSession {
             })
     }
 
+    /// Withholds a surprised combatant's skip-turn and releases the SRD
+    /// Surprise penalty: the whole action/movement/bonus-action budget is
+    /// spent (the creature can do nothing on its first turn), the entity is
+    /// dropped from [`InitiativeCombatState::surprised`], and its reaction
+    /// returns because the first turn has now ENDED. Journals SURPRISE_RELEASED
+    /// so a safety rewind replays exactly who was still surprised when: a
+    /// rewind that crosses the release point must not re-surprise a combatant
+    /// whose turns have already returned to normal, and a rewind that lands
+    /// BEFORE the release must keep the penalty intact.
+    fn release_surprised_combatant(&mut self, entity_id: Uuid) {
+        if let Some(entity) = self.entities.get_mut(&entity_id) {
+            entity.action_budget.action = false;
+            entity.action_budget.bonus_action = false;
+            entity.action_budget.movement_remaining_feet = 0.0;
+            entity.action_budget.free_object_interaction = false;
+            entity.action_budget.reaction = true; // reactions return when the turn ends
+        }
+        self.combat.surprised.retain(|s| *s != entity_id);
+        self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "SURPRISE_RELEASED",
+            serde_json::json!({
+                "entity_id": entity_id,
+                "round": self.combat.round,
+                "turn_index": self.combat.turn_index,
+            }),
+        );
+    }
+
     /// End-of-round lifecycle pass over every entity:
     /// - decrement each condition clock by one round
     /// - roll configured end-of-turn saves (`dice` must be server-seeded)
@@ -1801,6 +1857,7 @@ impl GameSession {
     /// - advance the initiative cursor PAST delayed entries so the production
     ///   `/turn/next` primitive actually honors the SRD Delay mechanic
     ///   (iteration 21, F4)
+    /// - skip-and-release surprised combatants' first turns (iteration 32)
     /// - journal a single TURN_ADVANCED event carrying the post-tick cursor
     ///   and a per-entity clock snapshot so safety rewinds can rebuild the
     ///   exact state the round produced (iteration 21, F6)
@@ -1855,6 +1912,12 @@ impl GameSession {
             // Re-clamp HP to the halved maximum at exhaustion 4+ so healing
             // past the reduced cap between rounds cannot stick.
             entity.enforce_exhaustion_hp_cap();
+            // Iteration 32: a surprised combatant's reaction stays disabled
+            // until its first turn concludes — the wholesale refresh above
+            // would otherwise hand it back on every turn step.
+            if self.combat.surprised.contains(id) {
+                entity.action_budget.reaction = false;
+            }
             if entity.condition_timers.is_empty() {
                 continue;
             }
@@ -1916,17 +1979,44 @@ impl GameSession {
         // and the round counter marched on past the actual actor ordering.
         // Bounded scan: one full lap max so an all-delayed table still
         // terminates instead of looping the cursor forever.
+        //
+        // Iteration 32: the same pass-over now owns SRD Surprise. Landing on a
+        // surprised combatant's slot IS its first turn arriving; the engine
+        // skips the turn, withholds the whole action/movement/bonus-action
+        // budget, and releases the penalty at the end of that turn — the slot
+        // then returns to normal on the next rotation at the SAME initiative
+        // position. The current actor (the cursor's starting position) whose
+        // turn this advance concludes releases first, covering a surprised
+        // order[0]; the pass-over releases mid-order surprised combatants.
+        // Each release journals SURPRISE_RELEASED so a rewind replays exactly
+        // who was still surprised when.
         if self.combat.in_combat && !self.combat.order.is_empty() {
             let order_len = self.combat.order.len();
+            // Start position: the combatant this advance ends. If they were
+            // surprised, their first turn just concluded — release now.
+            if let Some(&current) = self.combat.order.get(self.combat.turn_index) {
+                if !self.combat.delayed.contains(&current)
+                    && self.combat.surprised.contains(&current)
+                {
+                    self.release_surprised_combatant(current);
+                }
+            }
             for _ in 0..order_len {
                 self.combat.turn_index += 1;
                 if self.combat.turn_index >= order_len {
                     self.combat.turn_index = 0;
                 }
-                match self.combat.order.get(self.combat.turn_index) {
-                    Some(id) if !self.combat.delayed.contains(id) => break,
-                    _ => continue,
+                let Some(&id) = self.combat.order.get(self.combat.turn_index) else {
+                    continue;
+                };
+                if self.combat.delayed.contains(&id) {
+                    continue;
                 }
+                if self.combat.surprised.contains(&id) {
+                    self.release_surprised_combatant(id);
+                    continue;
+                }
+                break; // settled on a combatant who can act
             }
         }
         report.turn_index = if self.combat.in_combat {
@@ -2872,6 +2962,70 @@ impl GameSession {
                 // Slots referencing entities the rewind despawned are gone;
                 // nobody can stay parked on a ghost.
                 self.combat.delayed.retain(|id| self.entities.contains_key(id));
+                // Iteration 32: epoch-scoped surprise replay, mirroring the
+                // delay rebuild above. Seed from the last surviving
+                // COMBAT_BEGAN's `surprised` payload, then apply SURPRISE_GRANTED
+                // (add) / SURPRISE_REVOKED + SURPRISE_RELEASED (remove). The
+                // RELEASED variant is part of the set — a rewind that crosses a
+                // surprise release point must not re-surprise a combatant whose
+                // turns have already returned to normal. Grant/begin payloads
+                // are ignored for a combatant who is also delayed, keeping the
+                // two flags disjoint.
+                self.combat.surprised.clear();
+                if let Some(epoch) = combat_epoch_began_seq {
+                    for ev in self
+                        .ledger
+                        .events
+                        .iter()
+                        .filter(|e| !e.is_reverted && e.sequence_id >= epoch)
+                    {
+                        let entity_id = ev
+                            .payload
+                            .get("entity_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Uuid::parse_str(s).ok());
+                        match ev.event_type.as_str() {
+                            "COMBAT_BEGAN" => {
+                                if let Some(list) =
+                                    ev.payload.get("surprised").and_then(|v| v.as_array())
+                                {
+                                    for idv in list {
+                                        let Some(id) = idv
+                                            .as_str()
+                                            .and_then(|s| Uuid::parse_str(s).ok())
+                                        else {
+                                            continue;
+                                        };
+                                        // The only COMBAT_BEGAN at >= epoch is the
+                                        // epoch event itself, so this seeds once.
+                                        if !self.combat.delayed.contains(&id)
+                                            && !self.combat.surprised.contains(&id)
+                                        {
+                                            self.combat.surprised.push(id);
+                                        }
+                                    }
+                                }
+                            }
+                            "SURPRISE_GRANTED" => {
+                                if let Some(id) = entity_id {
+                                    if !self.combat.delayed.contains(&id)
+                                        && !self.combat.surprised.contains(&id)
+                                    {
+                                        self.combat.surprised.push(id);
+                                    }
+                                }
+                            }
+                            "SURPRISE_REVOKED" | "SURPRISE_RELEASED" => {
+                                if let Some(id) = entity_id {
+                                    self.combat.surprised.retain(|s| *s != id);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Nobody can stay surprised on a ghost.
+                self.combat.surprised.retain(|id| self.entities.contains_key(id));
             }
         }
 
@@ -3036,6 +3190,13 @@ impl GameSession {
             entity.readied_action = None;
             entity.action_budget.reset(entity.effective_speed_feet());
         }
+        // Iteration 32: a rewind that lands WITH a surprise penalty active
+        // must restore the disabled Reaction the wholesale reset just granted.
+        for id in &self.combat.surprised {
+            if let Some(entity) = self.entities.get_mut(id) {
+                entity.action_budget.reaction = false;
+            }
+        }
 
         RewindReport {
             reverted_event_count: reverted_count,
@@ -3185,6 +3346,22 @@ impl GameSession {
     }
 
     pub fn begin_combat(&mut self, dice: &mut DiceEngine) -> Vec<InitiativeEntry> {
+        self.begin_combat_with_surprise(dice, &[])
+    }
+
+    /// [`GameSession::begin_combat`] plus an optional SRD Surprise adjudication:
+    /// the ids listed start the fight surprised (GM sets the ambiguous
+    /// hostiles before any turn resolves). Surprised ids that do not name a
+    /// board entity are silently dropped; duplicates collapse. Each surprised
+    /// combatant has its Reaction disabled immediately (SRD: "can't take a
+    /// reaction until that turn ends") and is released at the end of its first
+    /// turn by the cursor scan in [`GameSession::advance_round`]. The granted
+    /// set rides the COMBAT_BEGAN journal payload so rewinds replay it exactly.
+    pub fn begin_combat_with_surprise(
+        &mut self,
+        dice: &mut DiceEngine,
+        surprised: &[Uuid],
+    ) -> Vec<InitiativeEntry> {
         // Deterministic visit order — HashMap iteration order must never leak
         // into which die lands on which entity.
         let mut ids: Vec<Uuid> = self.entities.keys().copied().collect();
@@ -3214,6 +3391,22 @@ impl GameSession {
         // a re-roll of initiative. The other tracker scalars are reset
         // inline; delayed was the only field-by-field miss.
         self.combat.delayed.clear();
+        // Iteration 32: the same field-by-field miss must not happen for a
+        // half-finished surprise flag from a prior engagement.
+        self.combat.surprised.clear();
+        // Apply the initial surprise set: only ids that actually name a board
+        // entity, deduplicated. The Reaction is disabled immediately.
+        let mut applied_surprised: Vec<Uuid> = surprised.to_vec();
+        applied_surprised.sort();
+        applied_surprised.dedup();
+        for id in &applied_surprised {
+            if self.entities.contains_key(id) {
+                self.combat.surprised.push(*id);
+                if let Some(entity) = self.entities.get_mut(id) {
+                    entity.action_budget.reaction = false;
+                }
+            }
+        }
         self.combat.order = entries.iter().map(|e| e.entity_id).collect();
         self.ledger.append_event(
             self.session_id,
@@ -3226,6 +3419,11 @@ impl GameSession {
                     "entity_id": e.entity_id,
                     "initiative_total": e.initiative_total,
                 })).collect::<Vec<_>>(),
+                "surprised": applied_surprised
+                    .iter()
+                    .filter(|id| self.entities.contains_key(id))
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
                 "cleared_pending_opportunity_attacks": cleared_oas,
                 "cleared_readied_actions": cleared_readied,
             }),
@@ -3281,6 +3479,11 @@ impl GameSession {
         if self.combat.delayed.contains(&entity_id) {
             return Err("ALREADY_DELAYED".to_string());
         }
+        // Iteration 32: a surprised combatant cannot take actions at all, so
+        // it cannot volunteer to delay. Keeps surprise and delay disjoint.
+        if self.combat.surprised.contains(&entity_id) {
+            return Err("ENTITY_SURPRISED".to_string());
+        }
 
         self.combat.delayed.push(entity_id);
         let round = self.combat.round;
@@ -3321,6 +3524,85 @@ impl GameSession {
             }),
         );
         Ok(event.sequence_id)
+    }
+
+    // -------------------------------------------------------- surprise (SRD)
+
+    /// SRD Surprise adjudication for a combatant, live: grants the surprised
+    /// flag while combat is still in the first round so the GM can declare (or
+    /// correct) hostiles after `begin_combat` but BEFORE any turn resolves. The
+    /// Reaction is disabled immediately ("can't take a reaction until that turn
+    /// ends") and stays disabled until the creature's first turn concludes.
+    /// Re-granting an already-surprised combatant is an idempotent no-op.
+    /// Rejections: `NOT_IN_COMBAT`, `ENTITY_NOT_FOUND`,
+    /// `SURPRISE_WINDOW_CLOSED` (round > 1), `ENTITY_DELAYED`.
+    /// Returns `Ok(Some(sequence_id))` when the flag changed (journaled as
+    /// SURPRISE_GRANTED), `Ok(None)` for the idempotent no-op.
+    pub fn grant_surprise(&mut self, entity_id: Uuid) -> Result<Option<u64>, String> {
+        if !self.combat.in_combat {
+            return Err("NOT_IN_COMBAT".to_string());
+        }
+        if !self.entities.contains_key(&entity_id) {
+            return Err("ENTITY_NOT_FOUND".to_string());
+        }
+        if self.combat.round > 1 {
+            return Err("SURPRISE_WINDOW_CLOSED".to_string());
+        }
+        if self.combat.delayed.contains(&entity_id) {
+            return Err("ENTITY_DELAYED".to_string());
+        }
+        if self.combat.surprised.contains(&entity_id) {
+            return Ok(None); // already surprised — idempotent re-grant
+        }
+
+        self.combat.surprised.push(entity_id);
+        if let Some(entity) = self.entities.get_mut(&entity_id) {
+            entity.action_budget.reaction = false;
+        }
+        let round = self.combat.round;
+        let event = self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "SURPRISE_GRANTED",
+            serde_json::json!({ "entity_id": entity_id, "round": round }),
+        );
+        Ok(Some(event.sequence_id))
+    }
+
+    /// Ends a surprised flag by GM fiat (round 1 only): drops the combatant
+    /// from the surprised set and restores its Reaction. Revoking an entity
+    /// that is not currently surprised is an idempotent no-op. Rejections:
+    /// `NOT_IN_COMBAT`, `ENTITY_NOT_FOUND`, `SURPRISE_WINDOW_CLOSED`.
+    /// Returns `Ok(Some(sequence_id))` when the flag changed (journaled as
+    /// SURPRISE_REVOKED), `Ok(None)` for the idempotent no-op.
+    pub fn revoke_surprise(&mut self, entity_id: Uuid) -> Result<Option<u64>, String> {
+        if !self.combat.in_combat {
+            return Err("NOT_IN_COMBAT".to_string());
+        }
+        if !self.entities.contains_key(&entity_id) {
+            return Err("ENTITY_NOT_FOUND".to_string());
+        }
+        if self.combat.round > 1 {
+            return Err("SURPRISE_WINDOW_CLOSED".to_string());
+        }
+        if !self.combat.surprised.contains(&entity_id) {
+            return Ok(None); // not surprised — idempotent revoke
+        }
+
+        self.combat.surprised.retain(|s| *s != entity_id);
+        if let Some(entity) = self.entities.get_mut(&entity_id) {
+            entity.action_budget.reaction = true;
+        }
+        let round = self.combat.round;
+        let event = self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "SURPRISE_REVOKED",
+            serde_json::json!({ "entity_id": entity_id, "round": round }),
+        );
+        Ok(Some(event.sequence_id))
     }
 }
 
@@ -4630,6 +4912,349 @@ mod tests {
         assert_eq!(
             clock.remaining_rounds, 4,
             "rewind past the decrement must restore the full journaled Exhaustion duration"
+        );
+    }
+
+    // ------------------------------------------------------- surprise (SRD 5.1)
+
+    fn session_with_three_combatants() -> (GameSession, Uuid, Uuid, Uuid) {
+        let a = Uuid::from_u128(0xA1);
+        let b = Uuid::from_u128(0xB2);
+        let c = Uuid::from_u128(0xC3);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        for e in [a, b, c] {
+            session.add_entity(entity(e, &format!("E{:x}", e.as_u128() % 16), 10), None).unwrap();
+        }
+        (session, a, b, c)
+    }
+
+    #[test]
+    fn test_surprised_skips_first_turn_but_acts_round_two() {
+        let (mut session, a, b, c) = session_with_three_combatants();
+        let entries = session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a]);
+        // Pin a deterministic order: a first, then b, then c.
+        session.combat.order = entries.iter().map(|e| e.entity_id).collect::<Vec<_>>();
+        session.combat.order = vec![a, b, c];
+        session.combat.turn_index = 0;
+
+        assert_eq!(session.combat.surprised, vec![a], "only a starts surprised");
+        assert!(
+            !session.entities[&a].action_budget.reaction,
+            "surprise disables the reaction immediately"
+        );
+        assert!(session.entities[&b].action_budget.reaction, "b is not surprised");
+
+        // a is the current actor and surprised: the first /turn/next concludes
+        // its (skipped) turn, spends its budget, releases it, then reveals b.
+        let report = session.advance_round(&mut DiceEngine::with_seed(2));
+        assert_eq!(session.combat.turn_index, 1);
+        assert_eq!(session.combat.order[session.combat.turn_index], b);
+        assert!(
+            !session.combat.surprised.contains(&a),
+            "the skip-turn concluded a's first turn and released the penalty"
+        );
+        assert!(session.entities[&a].action_budget.reaction, "reaction returns at turn end");
+        assert!(!session.entities[&a].action_budget.action, "the skip spent the Action");
+        assert_eq!(
+            session.entities[&a].action_budget.movement_remaining_feet, 0.0,
+            "the skip spent all movement"
+        );
+        assert_eq!(session.combat.round, report.round);
+
+        // b concludes, then c concludes and the cursor wraps back to a.
+        session.advance_round(&mut DiceEngine::with_seed(3));
+        assert_eq!(session.combat.order[session.combat.turn_index], c);
+        session.advance_round(&mut DiceEngine::with_seed(4));
+        assert_eq!(session.combat.order[session.combat.turn_index], a);
+        // Round two: a is no longer surprised and holds a FULL budget — it
+        // acts normally despite spending its skipped first turn.
+        assert!(!session.combat.surprised.contains(&a));
+        assert!(session.entities[&a].action_budget.action, "a can act in round two");
+        assert!(session.entities[&a].action_budget.reaction, "reaction is back for round two");
+        assert_eq!(
+            session.entities[&a].action_budget.movement_remaining_feet, 30.0,
+            "round-two budget refreshes to full speed"
+        );
+    }
+
+    #[test]
+    fn test_surprised_mid_order_is_passed_over_and_released_in_one_advance() {
+        let (mut session, a, s, b) = session_with_three_combatants();
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        session.combat.order = vec![a, s, b];
+        session.combat.turn_index = 0;
+        session.grant_surprise(s).expect("round 1 grant is legal");
+
+        // a acts normally; the advance passes over the surprised second slot.
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert_eq!(session.combat.turn_index, 2, "s's slot is passed over");
+        assert_eq!(session.combat.order[session.combat.turn_index], b);
+        assert!(!session.combat.surprised.contains(&s), "the passer-over released s");
+        assert!(!session.entities[&s].action_budget.action, "s's skipped turn spent the Action");
+        assert!(session.entities[&s].action_budget.reaction, "s's reaction returned");
+
+        // b concludes, cursor wraps; s is back at the same initiative slot.
+        session.advance_round(&mut DiceEngine::with_seed(3));
+        assert_eq!(session.combat.order[session.combat.turn_index], a);
+        session.advance_round(&mut DiceEngine::with_seed(4));
+        assert_eq!(session.combat.order[session.combat.turn_index], s);
+        assert!(
+            session.entities[&s].action_budget.action,
+            "s returns to normal on the next rotation"
+        );
+    }
+
+    #[test]
+    fn test_surprised_cannot_use_a_reaction_until_the_turn_ends() {
+        let (mut session, a, _, _) = session_with_three_combatants();
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        session.combat.order = vec![a, Uuid::from_u128(0xB2), Uuid::from_u128(0xC3)];
+        session.combat.turn_index = 0;
+        session.grant_surprise(a).unwrap();
+        assert!(!session.entities[&a].action_budget.reaction);
+
+        // While surprised, arming a reaction is refused even though the
+        // creature is conscious and otherwise capable.
+        assert_eq!(
+            session.arm_reaction(a, ReactionType::OpportunityAttack).unwrap_err(),
+            "REACTION_SPENT",
+            "a surprised creature cannot arm a reaction before its turn ends"
+        );
+
+        // Release at the end of its first turn restores the reaction economy.
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert!(!session.combat.surprised.contains(&a));
+        session
+            .arm_reaction(a, ReactionType::OpportunityAttack)
+            .expect("reaction arms again once the first turn ended");
+    }
+
+    #[test]
+    fn test_grant_and_revoke_surprise_rejections_and_idempotence() {
+        let (mut session, a, b, _) = session_with_three_combatants();
+
+        assert_eq!(
+            session.grant_surprise(a).unwrap_err(),
+            "NOT_IN_COMBAT".to_string(),
+            "no combat, no surprise adjudication"
+        );
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+
+        assert_eq!(
+            session.grant_surprise(Uuid::new_v4()).unwrap_err(),
+            "ENTITY_NOT_FOUND".to_string()
+        );
+
+        // Grant is a real change then idempotent.
+        let seq = session.grant_surprise(a).unwrap();
+        assert!(seq.is_some(), "fresh grant journals SURPRISE_GRANTED");
+        let no_op = session.grant_surprise(a).unwrap();
+        assert!(no_op.is_none(), "re-granting an already-surprised combatant is a no-op");
+
+        // A surprised combatant cannot take the (free) Delay action.
+        assert_eq!(
+            session.take_delay(a).unwrap_err(),
+            "ENTITY_SURPRISED".to_string()
+        );
+        // And a delayed combatant cannot be granted surprise.
+        session.take_delay(b).unwrap();
+        assert_eq!(
+            session.grant_surprise(b).unwrap_err(),
+            "ENTITY_DELAYED".to_string()
+        );
+
+        // Revoke is a real change then idempotent; reaction comes back.
+        let revoked = session.revoke_surprise(a).unwrap();
+        assert!(revoked.is_some());
+        assert!(!session.combat.surprised.contains(&a));
+        assert!(session.entities[&a].action_budget.reaction);
+        assert!(session.revoke_surprise(a).unwrap().is_none());
+        assert_eq!(
+            session.revoke_surprise(Uuid::new_v4()).unwrap_err(),
+            "ENTITY_NOT_FOUND".to_string()
+        );
+    }
+
+    #[test]
+    fn test_surprise_window_closes_once_combat_leaves_round_one() {
+        let (mut session, a, b, _) = session_with_three_combatants();
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        session.combat.order = vec![a, b, Uuid::from_u128(0xC3)];
+        session.combat.turn_index = 0;
+        session.grant_surprise(a).unwrap();
+
+        // One /turn/next leaves the first round (the coarse engine round
+        // counter marches per turn step).
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert!(session.combat.round >= 2);
+
+        assert_eq!(
+            session.grant_surprise(b).unwrap_err(),
+            "SURPRISE_WINDOW_CLOSED".to_string()
+        );
+        assert_eq!(
+            session.revoke_surprise(b).unwrap_err(),
+            "SURPRISE_WINDOW_CLOSED".to_string()
+        );
+    }
+
+    #[test]
+    fn test_begin_combat_with_surprise_drops_unknowns_and_dedups() {
+        let (mut session, a, b, _) = session_with_three_combatants();
+        let ghost = Uuid::from_u128(0xDEAD);
+        // a twice (dedup) plus b and a non-existent id (dropped).
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a, a, b, ghost]);
+        assert_eq!(
+            session.combat.surprised, vec![a, b],
+            "unknown ids dropped and duplicates collapsed"
+        );
+        let began = session
+            .ledger
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "COMBAT_BEGAN")
+            .expect("begin_combat journals COMBAT_BEGAN");
+        let payload_ids: Vec<&str> = began
+            .payload
+            .get("surprised")
+            .and_then(|v| v.as_array())
+            .expect("COMBAT_BEGAN carries the surprised list")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(payload_ids, vec![a.to_string().as_str(), b.to_string().as_str()]);
+    }
+
+    #[test]
+    fn test_rewind_past_combat_began_restores_surprise_and_reaction_disable() {
+        let (mut session, a, _, _) = session_with_three_combatants();
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a]);
+        let begin_seq = session.ledger.current_sequence; // the COMBAT_BEGAN event
+        assert!(session.combat.surprised.contains(&a));
+
+        // Skip a's first turn; the penalty releases.
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert!(!session.combat.surprised.contains(&a));
+
+        // X-card back ACROSS the begin: the COMBAT_BEGAN payload seeds the
+        // surprise set again, the cursor resets, and the disabled Reaction is
+        // restored after the wholesale budget reset.
+        session.safety_rewind(begin_seq);
+        assert!(
+            session.combat.surprised.contains(&a),
+            "rewind past COMBAT_BEGAN must restore a's surprise"
+        );
+        assert_eq!(session.combat.turn_index, 0, "no surviving TURN_ADVANCED -> cursor 0");
+        assert!(
+            !session.entities[&a].action_budget.reaction,
+            "a restored surprised creature must have its reaction disabled again"
+        );
+    }
+
+    #[test]
+    fn test_rewind_after_release_keeps_the_combatant_released() {
+        let (mut session, a, b, _) = session_with_three_combatants();
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a]);
+        session.combat.order = vec![a, b, Uuid::from_u128(0xC3)];
+        session.combat.turn_index = 0;
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert!(!session.combat.surprised.contains(&a));
+        let release_seq = session.ledger.current_sequence; // the TURN_ADVANCED that closed the skip
+
+        // X-card AFTER the release point (the SURPRISE_RELEASED event survives)
+        // must NOT re-surprise a, whose turn is already back to normal.
+        session.safety_rewind(release_seq);
+        assert!(
+            !session.combat.surprised.contains(&a),
+            "a rewind that keeps the release must not resurrect the penalty"
+        );
+        assert!(session.entities[&a].action_budget.reaction);
+        assert_eq!(session.combat.turn_index, 1, "the surviving TURN_ADVANCED restores the cursor");
+    }
+
+    #[test]
+    fn test_rewind_prunes_surprised_flag_for_despawned_ghosts() {
+        let (mut session, a, b, _) = session_with_three_combatants();
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a, b]);
+        let begin_seq = session.ledger.current_sequence;
+        session.remove_entity(&b, "DESPAWN");
+        assert!(session.entities.contains_key(&a) && !session.entities.contains_key(&b));
+
+        session.safety_rewind(begin_seq);
+        assert!(
+            session.combat.surprised.contains(&a),
+            "a survives and keeps its surprised flag"
+        );
+        assert!(
+            !session.combat.surprised.contains(&b),
+            "b is a despawned ghost; its surprised flag must be pruned like delayed"
+        );
+        assert!(
+            !session.combat.order.contains(&b),
+            "the order slot for the ghost is pruned too"
+        );
+    }
+
+    #[test]
+    fn test_legacy_combat_state_without_surprised_parses_empty() {
+        let legacy = serde_json::json!({
+            "in_combat": true,
+            "round": 2,
+            "turn_index": 1,
+            "order": [],
+            "delayed": [],
+        });
+        let state: InitiativeCombatState = serde_json::from_value(legacy).unwrap();
+        assert!(
+            state.surprised.is_empty(),
+            "a pre-surprise payload deserializes as no surprise"
+        );
+    }
+
+    #[test]
+    fn test_rewind_tolerates_legacy_combat_began_without_surprised_payload() {
+        let (mut session, a, _, _) = session_with_three_combatants();
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[a]);
+        let begin_seq = session.ledger.current_sequence;
+        // Simulate a legacy COMBAT_BEGAN journal that predates the surprised
+        // payload key.
+        let began = session
+            .ledger
+            .events
+            .iter_mut()
+            .find(|e| e.event_type == "COMBAT_BEGAN")
+            .expect("COMBAT_BEGAN present");
+        began.payload.as_object_mut().unwrap().remove("surprised");
+
+        session.advance_round(&mut DiceEngine::with_seed(2));
+        assert!(!session.combat.surprised.contains(&a));
+        session.safety_rewind(begin_seq);
+        assert!(
+            session.combat.surprised.is_empty(),
+            "a legacy begin with no surprised payload rebuilds as no surprise"
+        );
+    }
+
+    #[test]
+    fn test_rewind_applies_epoch_scoped_surprise_grant_and_revoke() {
+        let (mut session, a, b, c) = session_with_three_combatants();
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        session.combat.order = vec![a, b, c];
+        session.combat.turn_index = 0;
+        session.grant_surprise(b).unwrap();
+        session.revoke_surprise(b).unwrap();
+        session.grant_surprise(c).unwrap();
+        let grant_c_seq = session.ledger.current_sequence;
+        // a untouched, b granted then revoked (ends clean), c granted.
+        assert_eq!(session.combat.surprised, vec![c]);
+
+        // Rewind to just after c's grant: b's revoke and c's grant survive;
+        // b's earlier grant/relic pair must not resurrect.
+        session.safety_rewind(grant_c_seq);
+        assert_eq!(
+            session.combat.surprised, vec![c],
+            "epoch-scoped replay must honour grant->revoke ordering per entity"
         );
     }
 

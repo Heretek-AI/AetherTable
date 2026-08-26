@@ -1017,12 +1017,24 @@ async fn next_turn(
     }
 }
 
+/// Optional body for the combat-begin route: `{"surprised": [<entity_id>, ...]}`
+/// names the SRD 5.1 hostiles that start the fight surprised. The engine drops
+/// unknown ids and dedups; absence of the field (or of the whole body) means
+/// nobody starts surprised, keeping every legacy caller working.
+#[derive(Debug, Deserialize)]
+pub struct BeginCombatReq {
+    #[serde(default)]
+    pub surprised: Vec<Uuid>,
+}
+
 /// Rolls initiative for every entity on the board and opens combat. RBAC
 /// matches every other session mutation (`may_mutate_session`): GMs and
-/// players may start the fight, spectators may not.
+/// players may start the fight, spectators may not. An optional JSON body may
+/// carry the initial SRD Surprise adjudication (see [`BeginCombatReq`]).
 async fn begin_combat(
     data: web::Data<AppState>,
     path: web::Path<Uuid>,
+    body: web::Bytes,
     identity: AuthIdentity,
 ) -> impl Responder {
     data.count_request();
@@ -1030,6 +1042,22 @@ async fn begin_combat(
     let role = Role::from_identity(&identity);
     if !may_mutate_session(&data, session_id, role, &identity.user_id) {
         return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot start combat");
+    }
+    // The body is OPTIONAL (legacy clients POST with no payload). Read the raw
+    // bytes so an absent body means "no surprise" instead of a 400.
+    let mut surprised = Vec::new();
+    if !body.is_empty() {
+        match serde_json::from_slice::<BeginCombatReq>(&body) {
+            Ok(req) => surprised = req.surprised,
+            Err(_) => {
+                return reject(
+                    &data,
+                    422,
+                    "INVALID_COMBAT_BODY",
+                    "begin_combat body must be {\"surprised\": [uuid, ...]}",
+                )
+            }
+        }
     }
     if let Some(session_lock) = data.sessions.get(&session_id) {
         let mut session = session_lock.write();
@@ -1045,13 +1073,14 @@ async fn begin_combat(
         // session id and ledger position, never client-supplied.
         let seed = session_id.as_u128() as u64 ^ (session.ledger.current_sequence << 32);
         let mut dice = DiceEngine::with_seed(seed);
-        let order = session.begin_combat(&mut dice);
+        let order = session.begin_combat_with_surprise(&mut dice, &surprised);
         HttpResponse::Ok().json(serde_json::json!({
             "status": "COMBAT_BEGAN",
             "in_combat": true,
             "round": session.combat.round,
             "turn_index": session.combat.turn_index,
             "order": order,
+            "surprised": session.combat.surprised,
         }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
@@ -1085,6 +1114,78 @@ async fn end_combat(
             "round": 0,
             "turn_index": 0,
             "order": [],
+        }))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+    }
+}
+
+/// True when the caller may adjudicate SRD Surprise (grant/revoke a
+/// combatant's surprised flag). GM-admin only — declaring who is ambushed is
+/// a GM call, unlike ordinary table mutations which players may make.
+fn can_adjudicate_surprise(role: Role) -> bool {
+    role.is_gm()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SurpriseAdjudicationReq {
+    pub entity_id: Uuid,
+    #[serde(default)]
+    pub surprised: bool,
+}
+
+/// GM grants or revokes a combatant's SRD Surprise flag while combat is in
+/// the first round (before any turn has resolved). 403 for non-GM callers;
+/// the engine rejects with NOT_IN_COMBAT / ENTITY_NOT_FOUND /
+/// SURPRISE_WINDOW_CLOSED (round > 1, mapped to 422) / ENTITY_DELAYED
+/// (409). Re-granting or re-revoking an already-set flag is an idempotent
+/// no-op reported with `changed: false`.
+async fn set_surprise_flag(
+    data: web::Data<AppState>,
+    path: web::Path<Uuid>,
+    req: web::Json<SurpriseAdjudicationReq>,
+    identity: AuthIdentity,
+) -> impl Responder {
+    data.count_request();
+    let session_id = path.into_inner();
+    let role = Role::from_identity(&identity);
+    if !can_adjudicate_surprise(role) {
+        return reject(&data, 403, "FORBIDDEN_ROLE", "only GMs may grant or revoke surprise");
+    }
+    let req = req.into_inner();
+    if let Some(session_lock) = data.sessions.get(&session_id) {
+        let mut session = session_lock.write();
+        if !session.entities.contains_key(&req.entity_id) {
+            return reject(&data, 404, "ENTITY_NOT_FOUND", "entity does not exist in session");
+        }
+        let outcome = if req.surprised {
+            session.grant_surprise(req.entity_id)
+        } else {
+            session.revoke_surprise(req.entity_id)
+        };
+        let (sequence_id, changed) = match outcome {
+            Ok(opt) => match opt {
+                Some(seq) => (seq, true),
+                None => (0, false),
+            },
+            Err(code) => {
+                let status = if code == "SURPRISE_WINDOW_CLOSED" { 422 } else { 409 };
+                return reject(
+                    &data,
+                    status,
+                    &code,
+                    "surprise adjudication rejected by the engine",
+                );
+            }
+        };
+        data.count_valid();
+        HttpResponse::Ok().json(serde_json::json!({
+            "status": if req.surprised { "SURPRISE_GRANTED" } else { "SURPRISE_REVOKED" },
+            "sequence_id": sequence_id,
+            "changed": changed,
+            "entity_id": req.entity_id,
+            "round": session.combat.round,
+            "surprised": session.combat.surprised,
         }))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
@@ -6137,6 +6238,20 @@ fn project_snapshot_for_role(
                         .unwrap_or(true)
                 });
             }
+            // Iteration 32: the SRD Surprise set leaks the same relative
+            // information — a player seeing a hidden NPC named "surprised"
+            // both exposes that it is IN the fight and telegraphs the ambush
+            // that would otherwise be the GM's reveal. Filter it by the same
+            // visibility projection: GMs keep the full list (this function
+            // returns early for them); non-GMs keep only the ids of entities
+            // they can already see.
+            if let Some(surprised) = combat.get_mut("surprised").and_then(|s| s.as_array_mut()) {
+                surprised.retain(|id| {
+                    id.as_str()
+                        .map(|s| !hidden_ids.contains(s))
+                        .unwrap_or(true)
+                });
+            }
             let in_combat = combat
                 .get("in_combat")
                 .and_then(|v| v.as_bool())
@@ -7126,6 +7241,7 @@ pub fn configure_app_with(
                         .route("/reactions/arm", web::post().to(arm_reaction))
                         .route("/turn/next", web::post().to(next_turn))
                         .route("/combat/begin", web::post().to(begin_combat))
+                        .route("/combat/surprise", web::post().to(set_surprise_flag))
                         .route("/combat/end", web::post().to(end_combat))
                         .route("/action/death-save", web::post().to(resolve_death_save))
                         .route("/damage", web::post().to(apply_damage))
@@ -7438,5 +7554,92 @@ mod exhaustion_token_move_tests {
             validate_token_move(&data, &room_id.to_string(), key, "Orc", 49.05, 49.05).is_ok(),
             "a healthy token keeps its full drag radius"
         );
+    }
+}
+
+// --- SRD Surprise: projection + RBAC (iteration 32) ---------------------------
+
+#[cfg(test)]
+mod surprise_projection_tests {
+    use super::*;
+    use vtt_core::{AbilityScores, DiceEngine, EntityState, GameSession};
+
+    fn board_with_visible_and_hidden() -> (GameSession, Uuid, Uuid) {
+        let session_id = Uuid::from_u128(9);
+        let visible_id = Uuid::from_u128(0x51);
+        let hidden_id = Uuid::from_u128(0x52);
+        let mut session =
+            GameSession::new(session_id, Uuid::from_u128(8), "surprise table".to_string());
+        let mut visible = EntityState::new(
+            visible_id,
+            "vis".to_string(),
+            "Orc A".to_string(),
+            false,
+            12,
+            13,
+            30.0,
+            AbilityScores::default(),
+        );
+        visible.is_visible = true;
+        let mut hidden = EntityState::new(
+            hidden_id,
+            "hid".to_string(),
+            "Orc B".to_string(),
+            false,
+            12,
+            13,
+            30.0,
+            AbilityScores::default(),
+        );
+        hidden.is_visible = false;
+        session.entities.insert(visible_id, visible);
+        session.entities.insert(hidden_id, hidden);
+        session.begin_combat_with_surprise(&mut DiceEngine::with_seed(1), &[visible_id, hidden_id]);
+        (session, visible_id, hidden_id)
+    }
+
+    #[test]
+    fn hidden_surprised_npc_is_dropped_for_non_gm_but_kept_for_gm() {
+        let (session, visible_id, hidden_id) = board_with_visible_and_hidden();
+        let snapshot = serde_json::to_value(&session).expect("session serializes");
+
+        // GM sees the UNPROJECTED snapshot: both surprised ids verbatim.
+        let gm_view = project_snapshot_for_role(snapshot.clone(), Role::Gm, "gm-1");
+        let gm_surprised = gm_view["combat"]["surprised"].as_array().expect("combat.surprised");
+        assert!(
+            gm_surprised
+                .iter()
+                .any(|id| id.as_str() == Some(visible_id.to_string().as_str())),
+            "GM sees the visible surprised entity"
+        );
+        assert!(
+            gm_surprised
+                .iter()
+                .any(|id| id.as_str() == Some(hidden_id.to_string().as_str())),
+            "GM sees the hidden surprised entity verbatim"
+        );
+
+        // Non-GM: the hidden id is dropped, the visible one survives.
+        let player_view = project_snapshot_for_role(snapshot, Role::Player, "p-1");
+        let player_surprised = player_view["combat"]["surprised"].as_array().expect("combat.surprised");
+        assert!(
+            player_surprised
+                .iter()
+                .any(|id| id.as_str() == Some(visible_id.to_string().as_str())),
+            "player still sees the visible surprised entity"
+        );
+        assert!(
+            !player_surprised
+                .iter()
+                .any(|id| id.as_str() == Some(hidden_id.to_string().as_str())),
+            "a hidden surprised npc must not leak to the player view"
+        );
+    }
+
+    #[test]
+    fn surprise_adjudication_is_gm_admin_only() {
+        assert!(can_adjudicate_surprise(Role::Gm), "GM may grant/revoke surprise");
+        assert!(!can_adjudicate_surprise(Role::Player), "players may not adjudicate surprise");
+        assert!(!can_adjudicate_surprise(Role::Spectator), "spectators never may");
     }
 }
