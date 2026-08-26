@@ -1843,7 +1843,20 @@ async def hydrate_engine_session(req: EngineHydrateRequest, token: str = Depends
 # --- Lobbies -------------------------------------------------------------------
 
 class LobbyCreateRequest(BaseModel):
+    """Table creation body.
+
+    Iteration 71: GOALS.md P2's wizard picks the table's edition, starting
+    level and intended party size; those choices must persist server-side so
+    host launch can hand the engine the same session it promised the party.
+    ``rule_version`` mirrors the engine's RuleVersion parse (iteration 34) —
+    unknown editions are a 422, not a silent fallback — while level/party
+    bounds keep obviously-wrong wizard input out of storage.
+    """
+
     name: str = "Untitled Table"
+    rule_version: Optional[Literal["srd_5_1", "srd_5_2"]] = None
+    starting_level: int = Field(default=1, ge=1, le=20)
+    party_size: int = Field(default=4, ge=2, le=8)
 
 
 class LobbyJoinRequest(BaseModel):
@@ -1877,6 +1890,9 @@ async def create_lobby(req: LobbyCreateRequest, token: str = Depends(_require_au
     return await storage_backend.create_lobby(
         user_id, profile.get("displayName", user_id), req.name.strip() or "Untitled Table",
         _invite_code(),
+        rule_version=req.rule_version,
+        starting_level=req.starting_level,
+        party_size=req.party_size,
     )
 
 
@@ -1978,6 +1994,25 @@ class LobbyLaunchRequest(BaseModel):
     force: bool = False
 
 
+def _launch_session_payload(lobby: Dict[str, Any]) -> Dict[str, Any]:
+    """Engine session-creation body for a lobby launch.
+
+    The lobby's edition choice rides along so the created session inherits
+    it (iteration 34 persists ``rule_version`` per engine session). When the
+    host never recorded a preference the key is OMITTED entirely, leaving the
+    engine's own VTT_DEFAULT_RULE_VERSION in charge — the exact payload shape
+    legacy callers have always produced.
+    """
+    payload: Dict[str, Any] = {
+        "campaign_id": "00000000-0000-0000-0000-00000000000a",
+        "session_name": f"Lobby {lobby['name']}",
+    }
+    rule_version = lobby.get("rule_version")
+    if rule_version:
+        payload["rule_version"] = rule_version
+    return payload
+
+
 @app.post("/api/v1/lobbies/{lobby_id}/launch")
 async def launch_lobby(lobby_id: str,
                        req: Optional[LobbyLaunchRequest] = None,
@@ -2016,8 +2051,7 @@ async def launch_lobby(lobby_id: str,
         engine_client.engine_request(
             "POST",
             "/api/v1/sessions",
-            {"campaign_id": "00000000-0000-0000-0000-00000000000a",
-             "session_name": f"Lobby {lobby['name']}"},
+            _launch_session_payload(lobby),
         )
     )
     session_id = created["session_id"]

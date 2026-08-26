@@ -120,6 +120,16 @@ ALTER TABLE narrative_state.lobby_members
     ADD COLUMN IF NOT EXISTS ready BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE narrative_state.lobby_members
     ADD COLUMN IF NOT EXISTS selected_character_id TEXT;
+-- Lobby launch configuration (iteration 71). Same idempotent migration so
+-- lobbies created before the wizard shipped keep loading; rule_version stays
+-- NULLable (NULL = deployment default) while the numeric columns carry the
+-- API defaults so legacy rows read back unchanged.
+ALTER TABLE narrative_state.lobbies
+    ADD COLUMN IF NOT EXISTS rule_version VARCHAR(16);
+ALTER TABLE narrative_state.lobbies
+    ADD COLUMN IF NOT EXISTS starting_level INT NOT NULL DEFAULT 1;
+ALTER TABLE narrative_state.lobbies
+    ADD COLUMN IF NOT EXISTS party_size INT NOT NULL DEFAULT 4;
 """
 
 
@@ -254,13 +264,23 @@ class MemoryStore:
         return record["snapshot"] if record else None
 
     async def create_lobby(self, host_user_id: str, host_display_name: str,
-                           name: str, invite_code: str) -> Dict[str, Any]:
+                           name: str, invite_code: str,
+                           rule_version: Optional[str] = None,
+                           starting_level: int = 1,
+                           party_size: int = 4) -> Dict[str, Any]:
         lobby_id = f"lob_{secrets.token_hex(6)}"
         record = {
             "lobby_id": lobby_id,
             "invite_code": invite_code,
             "name": name,
             "host_user_id": host_user_id,
+            # Launch configuration (iteration 71): the wizard's edition/level/
+            # party choices persist so launch can pass them to the engine.
+            # ``rule_version=None`` means "deployment default" (the engine's
+            # VTT_DEFAULT_RULE_VERSION stays in charge at launch).
+            "rule_version": rule_version,
+            "starting_level": int(starting_level),
+            "party_size": int(party_size),
             "engine_session_id": None,
             "created_at": time.time(),
             # Lobby depth: every member carries a ready flag and an optional
@@ -349,6 +369,9 @@ class MemoryStore:
             "invite_code": record["invite_code"],
             "name": record["name"],
             "host_user_id": record["host_user_id"],
+            "rule_version": record.get("rule_version"),
+            "starting_level": int(record.get("starting_level", 1)),
+            "party_size": int(record.get("party_size", 4)),
             "engine_session_id": record["engine_session_id"],
             "created_at": record["created_at"],
             "members": [
@@ -590,13 +613,20 @@ class PostgresStore:
         return snap
 
     async def create_lobby(self, host_user_id: str, host_display_name: str,
-                           name: str, invite_code: str) -> Dict[str, Any]:
+                           name: str, invite_code: str,
+                           rule_version: Optional[str] = None,
+                           starting_level: int = 1,
+                           party_size: int = 4) -> Dict[str, Any]:
         row = await self.pool.fetchrow(
-            """INSERT INTO narrative_state.lobbies (invite_code, name, host_user_id)
-               VALUES ($1, $2, $3)
+            """INSERT INTO narrative_state.lobbies
+                   (invite_code, name, host_user_id,
+                    rule_version, starting_level, party_size)
+               VALUES ($1, $2, $3, $4, $5, $6)
                RETURNING lobby_id, invite_code, name, host_user_id,
+                         rule_version, starting_level, party_size,
                          engine_session_id, created_at""",
             invite_code, name, host_user_id,
+            rule_version, int(starting_level), int(party_size),
         )
         await self.pool.execute(
             """INSERT INTO narrative_state.lobby_members (lobby_id, user_id, display_name, role)
@@ -613,6 +643,9 @@ class PostgresStore:
             "invite_code": row["invite_code"],
             "name": row["name"],
             "host_user_id": row["host_user_id"],
+            "rule_version": row["rule_version"],
+            "starting_level": int(row["starting_level"]),
+            "party_size": int(row["party_size"]),
             "engine_session_id": None,
             "created_at": str(row["created_at"]),
             "members": self._member_rows(members),
@@ -631,6 +664,7 @@ class PostgresStore:
         try:
             row = await self.pool.fetchrow(
                 """SELECT lobby_id, invite_code, name, host_user_id,
+                          rule_version, starting_level, party_size,
                           engine_session_id, created_at
                    FROM narrative_state.lobbies WHERE lobby_id = $1""",
                 lobby_id,
@@ -649,6 +683,9 @@ class PostgresStore:
             "invite_code": row["invite_code"],
             "name": row["name"],
             "host_user_id": row["host_user_id"],
+            "rule_version": row["rule_version"],
+            "starting_level": int(row["starting_level"]),
+            "party_size": int(row["party_size"]),
             "engine_session_id": str(row["engine_session_id"]) if row["engine_session_id"] else None,
             "created_at": str(row["created_at"]),
             "members": self._member_rows(members),
