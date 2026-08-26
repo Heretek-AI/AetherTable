@@ -2569,32 +2569,7 @@ impl GameSession {
             if ev.event_type != "CONDITION_APPLIED" {
                 continue;
             }
-            let Some(condition) = ev
-                .payload
-                .get("condition")
-                .and_then(|c| c.as_str())
-                .and_then(|name| {
-                    [
-                        Condition::Blinded,
-                        Condition::Charmed,
-                        Condition::Deafened,
-                        Condition::Frightened,
-                        Condition::Incapacitated,
-                        Condition::Invisible,
-                        Condition::Paralyzed,
-                        Condition::Petrified,
-                        Condition::Poisoned,
-                        Condition::Prone,
-                        Condition::Restrained,
-                        Condition::Stunned,
-                        Condition::Unconscious,
-                    ]
-                    .into_iter()
-                    .find(|rep| {
-                        serde_json::to_string(rep).unwrap_or_default().trim_matches('"') == name
-                    })
-                })
-            else {
+            let Some(condition) = parse_timed_condition(ev.payload.get("condition")) else {
                 continue;
             };
             let timer = ConditionTimer {
@@ -2910,6 +2885,28 @@ impl GameSession {
         // condition variants only — conditions that were GRANTED AFTER the
         // last surviving TURN_ADVANCED are not in the snapshot and must
         // keep their rebuilt full duration.
+        //
+        // Hardening-pass survey (iteration 30, F4 lane) — deliberately NOT an
+        // alive-set prune: the CONDITION_APPLIED-only rebuild above can
+        // resurrect a condition whose CONDITION_EXPIRED event predates the
+        // rewind point (rewinding to a point after the expiry reapplies the
+        // expired clock at full duration). Treating the last surviving
+        // TURN_ADVANCED snapshot as authoritative for "what's alive" would fix
+        // that, but the snapshot cannot express the alive-set:
+        //   * the writer omits any entity with zero surviving clocks
+        //     (`if !entry.is_empty()`), so "entity absent" is ambiguous between
+        //     "no timers" and "entity not in `self.entities` at snapshot time"
+        //     (spawned later, or the snapshot predates it). A prune cannot
+        //     know a fully-expired entity's alive-set is empty.
+        //   * within a present entity, an absent condition is ambiguous between
+        //     "expired before the snapshot" (prune) and "granted after the
+        //     snapshot" (must keep full duration — the documented post-TA-grant
+        //     caveat above).
+        // So the residual is left documented rather than fixed with a lossy
+        // prune; closing it needs the snapshot to carry a per-entity alive-set
+        // (e.g. always emit an entry, including an explicit empty list, and
+        // distinguish grant-after- from expired-before), which is a writer
+        // change and out of scope for this reader lane.
         if let Some(snapshot) = last_turn_advanced_clocks.as_ref().and_then(|v| v.as_object()) {
             for (entity_id_str, entry) in snapshot.iter() {
                 let Ok(entity_uuid) = Uuid::parse_str(entity_id_str) else {
@@ -2929,19 +2926,40 @@ impl GameSession {
                     else {
                         continue;
                     };
-                    let snap_disc = std::mem::discriminant(&Condition::Blinded);
-                    // Match by the string payload of the variant rather
-                    // than re-serializing a constructed Condition — the
-                    // snapshot's `condition` field is already a serialised
-                    // variant (e.g. "frightened"), the same shape the
-                    // CONDITION_APPLIED rebuilder above uses to find a
-                    // Condition enum match.
-                    let _ = snap_disc; // silence unused
-                    let name_match = |c: &Condition| {
-                        serde_json::to_string(c)
-                            .ok()
-                            .map(|s| s.trim_matches('"').to_string())
-                            == snap_condition.as_str().map(|s| s.to_string())
+                    // Match the snapshot's `condition` field back to a timer's
+                    // condition by comparing the timer against the serialised
+                    // variant shape, without re-serializing a constructed
+                    // Condition. Unit variants serialise as a bare snake-case
+                    // string ("frightened") and match by name; the sole tuple
+                    // variant, Condition::Exhaustion(u8), serialises as an
+                    // object {"exhaustion": <level>} whose `.as_str()` is None,
+                    // so it is matched by its numeric payload instead.
+                    // Iteration 30 (F4): without the Exhaustion branch the
+                    // recorded remaining_rounds was never restored and an
+                    // exhausted creature rewound to its full pre-decrement
+                    // duration.
+                    let name_match = |c: &Condition| match c {
+                        // Tuple variant: match Exhaustion(level) against the
+                        // snapshot's `exhaustion` value. A snapshot whose level
+                        // differs from the timer's level does NOT match (no
+                        // cross-level override), and a legacy snapshot entry
+                        // with no `exhaustion` field matches nothing — both
+                        // keep the whole override from applying, exactly as the
+                        // missing-string case does for unit variants.
+                        Condition::Exhaustion(level) => snap_condition
+                            .get("exhaustion")
+                            .and_then(|v| v.as_u64())
+                            .map(|lvl| lvl as u8)
+                            == Some(*level),
+                        // Unit variants: externally-tagged serialise as a bare
+                        // quoted string ("frightened"); compare names after
+                        // trimming the quotes.
+                        _ => {
+                            serde_json::to_string(c)
+                                .ok()
+                                .map(|s| s.trim_matches('"').to_string())
+                                == snap_condition.as_str().map(|s| s.to_string())
+                        }
                     };
                     for timer in entity.condition_timers.iter_mut() {
                         if name_match(&timer.condition) {
@@ -3125,11 +3143,6 @@ impl GameSession {
         } else {
             None
         }
-    }
-
-    pub fn verify_entity_conservation(&self, previous_count: usize, ingress_count: usize, egress_count: usize) -> bool {
-        let expected = previous_count + ingress_count - egress_count;
-        self.entities.len() == expected
     }
 
     // ------------------------------------------------------------- combat flow
@@ -3337,6 +3350,54 @@ fn parse_contest_condition(value: Option<&serde_json::Value>) -> Option<Conditio
         Some("grappled") => Some(Condition::Grappled),
         Some("prone") => Some(Condition::Prone),
         _ => None,
+    }
+}
+
+/// Resolves the `condition` field of a CONDITION_APPLIED ledger payload back
+/// into a [`Condition`], recognising both serde serialisation shapes:
+/// - unit variants serialise externally-tagged as a bare snake-case string
+///   ("frightened") — matched against each representative's serialised name;
+/// - the sole tuple variant, [`Condition::Exhaustion(u8)`], serialises as an
+///   object {"exhaustion": <level>} — matched on its numeric payload so the
+///   exact level survives the JSON round-trip.
+///
+/// Grappled is deliberately absent from the unit-variant probes: it is the
+/// contest pipeline's condition, replayed from its own events rather than from
+/// CONDITION_APPLIED, matching the pre-existing rebuild behaviour. Iteration 30
+/// (F4): this is the first path that arms Exhaustion clocks — before it, the
+/// object shape made `.as_str()` return None and an Exhaustion timer was
+/// invisible to the timed-condition replay, so a rewind neither re-armed it
+/// from the journal nor correctly decremented it.
+fn parse_timed_condition(value: Option<&serde_json::Value>) -> Option<Condition> {
+    let value = value?;
+    if let Some(name) = value.as_str() {
+        [
+            Condition::Blinded,
+            Condition::Charmed,
+            Condition::Deafened,
+            Condition::Frightened,
+            Condition::Incapacitated,
+            Condition::Invisible,
+            Condition::Paralyzed,
+            Condition::Petrified,
+            Condition::Poisoned,
+            Condition::Prone,
+            Condition::Restrained,
+            Condition::Stunned,
+            Condition::Unconscious,
+        ]
+        .into_iter()
+        .find(|rep| {
+            serde_json::to_string(rep).unwrap_or_default().trim_matches('"') == name
+        })
+    } else {
+        // Tuple variant: Exhaustion(level). Legacy payloads without the level
+        // object (or a non-numeric level) resolve to no condition, and the
+        // event is skipped exactly as the string path skips unknown names.
+        value
+            .get("exhaustion")
+            .and_then(|lvl| lvl.as_u64())
+            .map(|lvl| Condition::Exhaustion(lvl as u8))
     }
 }
 
@@ -4488,7 +4549,93 @@ mod tests {
             .expect("clock rebuilt");
         assert_eq!(
             clock.remaining_rounds, 3,
-            "rewind must apply TURN_ADVANCED's clock snapshot over the CONDITION_APPLIED duration"
+            "rewind must apply TURN_ADVANCED's snapshot over the CONDITION_APPLIED duration"
         );
     }
+
+    // F4 (iteration 30): Condition::Exhaustion(u8) is the only tuple variant.
+    // Externally-tagged serde serialises it as {"exhaustion": <level>} (an
+    // object), not as a bare "exhaustion" string like the unit variants. The
+    // F6 TURN_ADVANCED snapshot override restores the partway-decremented
+    // `remaining_rounds` by comparing the snapshot's `condition` field; for a
+    // unit variant that field is a plain string and matches by name, but for
+    // Exhaustion it is an object whose `.as_str()` is None, so the recorded
+    // remaining_rounds was silently dropped and an exhausted creature rewound
+    // to its full pre-decrement clock.
+    #[test]
+    fn test_rewind_restores_partial_exhaustion_clock_from_last_turn_advanced_snapshot() {
+        let victim = Uuid::from_u128(0xCAFE);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        session
+            .add_entity(entity(victim, "Victim", 12), None)
+            .unwrap();
+        session
+            .apply_timed_condition_from(victim, Condition::Exhaustion(2), 4, None, None)
+            .unwrap();
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice); // exhaustion timer 4 -> 3, TURN_ADVANCED journaled
+        let move_seq_before = session.ledger.current_sequence;
+        session
+            .move_entity(victim, (5.0, 0.0, 0.0))
+            .expect("move legal");
+        // Rewind to BEFORE the move: the exhaustion clock must be 3, not 4.
+        session.safety_rewind(move_seq_before);
+        let clock = session
+            .entities
+            .get(&victim)
+            .unwrap()
+            .condition_timers
+            .iter()
+            .find(|t| t.condition == Condition::Exhaustion(2))
+            .expect("exhaustion clock rebuilt");
+        assert_eq!(
+            clock.remaining_rounds, 3,
+            "rewind must restore the decremented Exhaustion clock (never the full duration)"
+        );
+    }
+
+    // F4 (iteration 30) companion, journal-authority half: before the
+    // timed-condition rebuild recognised the Exhaustion tuple variant, an
+    // Exhaustion clock was invisible to the journal — a rewind simply leaked
+    // whatever value the live in-memory timer happened to hold. Rewinding past
+    // the advance_round (so no TURN_ADVANCED snapshot survives to apply an
+    // override) therefore returned the leaked 3 instead of the journal's full
+    // 4. The rebuild must re-arm the clock from the CONDITION_APPLIED payload
+    // so the rewind is journal-authoritative.
+    #[test]
+    fn test_rewind_derives_exhaustion_clock_from_journal_at_full_duration() {
+        let victim = Uuid::from_u128(0xCAFE);
+        let mut session = GameSession::new(Uuid::from_u128(1), Uuid::from_u128(2), "t".into());
+        session
+            .add_entity(entity(victim, "Victim", 12), None)
+            .unwrap();
+        session
+            .apply_timed_condition_from(victim, Condition::Exhaustion(2), 4, None, None)
+            .unwrap();
+        let apply_seq = session.ledger.current_sequence;
+        let mut dice = DiceEngine::with_seed(1);
+        session.advance_round(&mut dice); // 4 -> 3, TURN_ADVANCED journaled
+        // Rewind past the advance entirely: no TURN_ADVANCED snapshot
+        // survives, so the clock must be rebuilt at its full journaled
+        // duration (not left at the leaked live value).
+        session.safety_rewind(apply_seq);
+        let clock = session
+            .entities
+            .get(&victim)
+            .unwrap()
+            .condition_timers
+            .iter()
+            .find(|t| t.condition == Condition::Exhaustion(2))
+            .expect("exhaustion clock rebuilt from journal");
+        assert_eq!(
+            clock.remaining_rounds, 4,
+            "rewind past the decrement must restore the full journaled Exhaustion duration"
+        );
+    }
+
+
+
+
+
+
 }
