@@ -407,3 +407,6 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 73 — 8709f48 — feat(client): wizard sends real wire fields, ledger empty (P2) — vitest 366
 ### Iteration 69 — baa2503 — fix(gateway): bundle tokens spawn in world-feet (milestone-gate find) 
 ### Iteration 70 — d8d0e35 — test(client): campaign wizard coverage (P2) — vitest 361
+### Iteration 76 — 7038174 — feat(client): OA disclosures on moves + resolve contract (P3) — vitest 375
+### Iteration 77 — this wave — feat(gateway): opt-in periodic campaign autosave (P1/P2) — pytest 960
+### Iteration 78 — (prior commit) — feat(gateway): opportunity-attack proxy closes wire gap
