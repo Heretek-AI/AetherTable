@@ -57,6 +57,22 @@ The resulting ``director`` block of the report carries the curve and the
 director's recommendations verbatim; it is pure accounting over counted
 events, never invented.
 
+Reaction-layer play (iteration 81): the tactical players now exercise the NEW
+mechanics through the SAME authenticated proxies. When a move response
+discloses a pending opportunity attack against the mover (the engine's
+``opportunity_attacks_detail`` wire disclosure), the OPPONENT seat takes the
+swing on its next available action via ``/api/v1/engine/opportunity-attack``
+— ownerless NPC attackers are driven by the host seat, which the engine's own
+RBAC authorizes for ownerless entities. Seats also occasionally spend their
+Action on a READY (structured trigger ``enemy_attacks`` or
+``enemy_enters_reach``) and RELEASE it once the declared trigger observably
+fires, via ``/api/v1/engine/ready`` + ``/api/v1/engine/ready/release``. A
+``decision_seed`` makes every such choice deterministic per seed (same seed,
+identical replay); without one the legacy behavior is preserved exactly.
+Every reaction attempt is accounted honestly — an engine refusal counts as an
+attempted action with its rejection reason recorded, never dropped from the
+totals and never reclassified as a compliance failure.
+
 Importable API only — no HTTP routes are added this iteration. To run live:
 
     # 1. authoritative engine:      cargo run -p vtt-server
@@ -69,7 +85,9 @@ Importable API only — no HTTP routes are added this iteration. To run live:
 
 import asyncio
 import json
+import math
 import os
+import random
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -88,6 +106,30 @@ ORCHESTRATOR_URL = os.environ.get(
 DEFAULT_PASSWORD = "dice-dice-dice"
 
 VALID_ACTIONS = ("attack", "move", "check")
+
+# Reaction-layer decision knobs (iteration 81). The sim's tactical players now
+# exercise the NEW reaction mechanics through the SAME authenticated proxy
+# surface as every other action:
+#
+# - opportunity attacks: when a move response discloses a pending OA against
+#   the mover (the engine's ``opportunity_attacks`` wire disclosure), the
+#   OPPONENT seat takes it on its next available action via
+#   /api/v1/engine/opportunity-attack (iteration 78's proxy);
+# - readied actions: occasionally a seat spends its Action to READY one and
+#   RELEASES it when the structured trigger fires (enemy_attacks /
+#   enemy_enters_reach) via /api/v1/engine/ready + .../ready/release.
+REACTION_OPPORTUNITY_ATTACK = "opportunity_attack"
+REACTION_READY = "readied_ready"
+REACTION_RELEASE = "readied_release"
+
+#: Chance per scripted combat turn that a seat READIES instead of acting.
+READY_PROBABILITY = 0.15
+
+#: Structured triggers the sim declares (engine shorthand strings; anything
+#: else is kept freeform for GM adjudication).
+READY_TRIGGERS = ("enemy_attacks", "enemy_enters_reach")
+
+MELEE_REACH_FEET = 5.0
 
 
 class CampaignSimError(Exception):
@@ -181,6 +223,12 @@ class CampaignSimPlayer:
         self.character_id: Optional[str] = None
         self.entity_id: Optional[str] = None
         self.is_host = False
+        # Reaction-layer state (iteration 81): ``readied`` holds this seat's
+        # declared Ready (description + structured trigger) between the Ready
+        # and its Release. Pending opportunity attacks AGAINST a mover are
+        # tracked at the simulation level — they belong to the OPPONENT, who
+        # takes them on ITS next available action.
+        self.readied: Optional[Dict[str, Any]] = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -365,7 +413,7 @@ class CampaignSimPlayer:
         else:  # defensive: decisions are validated upstream, never trust them twice
             return {"attempted": False, "accepted": False, "rejected": True,
                     "rejection_reason": "INVALID_ACTION", "response_status": None,
-                    "degraded": False}
+                    "degraded": False, "outcome": None}
 
         accepted = record["status"] < 400
         body = record["body"]
@@ -380,7 +428,58 @@ class CampaignSimPlayer:
             "degraded": _degraded_flag(body),
         }
 
-    # -- plumbing -------------------------------------------------------------
+    async def execute_reaction(self, reaction: Dict[str, Any]) -> Dict[str, Any]:
+        """One reaction-layer action (OA take / ready / release) through the
+        SAME authenticated proxy endpoints. These are EXTRA attempts beyond
+        the seat's regular turn action — counted honestly wherever they land."""
+        kind = reaction["reaction_kind"]
+        session_id = self._session_id
+        if kind == REACTION_OPPORTUNITY_ATTACK:
+            path, payload = "/api/v1/engine/opportunity-attack", {
+                "session_id": session_id,
+                "attacker_id": reaction["attacker_id"],
+                "target_id": reaction["target_id"],
+            }
+        elif kind == REACTION_READY:
+            payload = {
+                "session_id": session_id,
+                "entity_id": self.entity_id,
+                "description": reaction["description"],
+            }
+            trigger = reaction.get("trigger")
+            if trigger:
+                payload["trigger"] = trigger
+            path = "/api/v1/engine/ready"
+        elif kind == REACTION_RELEASE:
+            path, payload = "/api/v1/engine/ready/release", {
+                "session_id": session_id,
+                "entity_id": self.entity_id,
+            }
+        else:
+            return {"attempted": False, "accepted": False, "rejected": True,
+                    "rejection_reason": "INVALID_REACTION",
+                    "response_status": None, "outcome": None, "degraded": False}
+
+        record = await self.authed("POST", path, payload)
+        accepted = record["status"] < 400
+        body = record["body"]
+        rejected = not accepted or (isinstance(body, dict) and body.get("ok") is False)
+        if kind == REACTION_READY and accepted:
+            self.readied = {
+                "description": reaction.get("description", ""),
+                "trigger": reaction.get("trigger") or "enemy_attacks",
+            }
+        elif kind == REACTION_RELEASE:
+            self.readied = None
+        return {
+            "attempted": True,
+            "accepted": accepted and not rejected,
+            "rejected": rejected,
+            "rejection_reason": None if not rejected else _rejection_reason(body),
+            "response_status": record["status"],
+            "outcome": body if accepted else None,
+            "degraded": _degraded_flag(body),
+        }
 
     async def authed(self, method: str, path: str, json_body: Optional[Dict[str, Any]] = None):
         """One ?token=-authenticated call, exactly like the browser client."""
@@ -436,12 +535,25 @@ def scripted_decision(
     snapshot: Dict[str, Any],
     round_no: int,
     stances: Optional[Dict[str, str]] = None,
+    *,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Deterministic fallback policy — no RNG anywhere:
+    """Deterministic fallback policy — no RNG anywhere UNLESS a decision seed
+    is supplied, and even then a per-(seed, player-index, round) draw so any
+    two runs sharing a seed replay identically (iteration 81's determinism
+    contract):
 
     round % 3 == 0 -> Perception-style check; badly hurt -> retreat move;
     even rounds -> reposition move; otherwise attack the lowest-id living
     hostile; with no legal target left, fall back to a check.
+
+    Reaction layer: with a seed, each combat turn has a small fixed chance of
+    being spent on READY instead ("I attack when an enemy attacks" /
+    "...enters my reach"); without one the legacy behavior is preserved
+    exactly (``ready_this_turn`` False). The same seeded draw also picks the
+    even-round reposition DIRECTION (toward or away from the nearest hostile)
+    — stepping away from an armed adjacent enemy is exactly what provokes an
+    opportunity attack, so the sim genuinely exercises the reaction path.
 
     ``stances`` maps target display name/id -> current disposition stance of
     that target toward this player (socially grounded input). The current
@@ -451,28 +563,77 @@ def scripted_decision(
     """
     del stances  # documented input for socially-aware policy variants
     own = next((e for e in snapshot["entities"] if e["id"] == player.entity_id), None)
+    ready_this_turn = _seeded_ready_roll(
+        seed, getattr(player, "index", 0), round_no)
+    step_away = _seeded_step_away_roll(seed, getattr(player, "index", 0), round_no)
     if round_no % 3 == 0 or own is None:
-        return {"action": "check"}
-    hostiles = sorted(
-        (
-            e for e in snapshot["entities"]
-            if e["id"] != player.entity_id and not e["is_dead"] and not e["is_player"]
-        ),
-        key=lambda e: str(e["id"]),
-    )
-    if not hostiles:
-        return {"action": "check"}
-    if own["hp"] is not None and own["max_hp"] and own["hp"] <= own["max_hp"] * 0.25:
-        pos = own["position"] or [5.0, 5.0]
-        return {"action": "move", "x": float(pos[0]) - 5.0, "y": float(pos[1]) - 5.0}
-    if round_no % 2 == 0:
-        target_pos = hostiles[0]["position"] or [8.0, 8.0]
-        own_pos = own["position"] or [4.0, 4.0]
-        step_x = 2.0 if float(target_pos[0]) >= float(own_pos[0]) else -2.0
-        return {"action": "move",
-                "x": float(own_pos[0]) + step_x,
-                "y": float(own_pos[1])}
-    return {"action": "attack", "target_id": hostiles[0]["id"]}
+        decision = {"action": "check"}
+    else:
+        hostiles = sorted(
+            (
+                e for e in snapshot["entities"]
+                if e["id"] != player.entity_id and not e["is_dead"] and not e["is_player"]
+            ),
+            key=lambda e: str(e["id"]),
+        )
+        if not hostiles:
+            decision = {"action": "check"}
+        elif own["hp"] is not None and own["max_hp"] and \
+                own["hp"] <= own["max_hp"] * 0.25:
+            pos = own["position"] or [5.0, 5.0]
+            decision = {"action": "move", "x": float(pos[0]) - 5.0,
+                        "y": float(pos[1]) - 5.0}
+        elif round_no % 2 == 0:
+            target_pos = hostiles[0]["position"] or [8.0, 8.0]
+            own_pos = own["position"] or [4.0, 4.0]
+            direction = -1.0 if step_away else 1.0
+            step_x = direction * (2.0 if float(target_pos[0]) >= float(own_pos[0])
+                                  else -2.0)
+            decision = {"action": "move",
+                        "x": float(own_pos[0]) + step_x,
+                        "y": float(own_pos[1])}
+        else:
+            decision = {"action": "attack", "target_id": hostiles[0]["id"]}
+    decision["ready_this_turn"] = bool(ready_this_turn)
+    return decision
+
+
+def _seeded_ready_roll(seed: Optional[int], player_index: int, round_no: int) -> bool:
+    """One deterministic pseudo-random draw per (seed, seat, round). Returns
+    True with READY_PROBABILITY. A None seed always reads False — callers
+    that never pass a seed see byte-identical legacy behavior."""
+    if seed is None:
+        return False
+    rng = random.Random(f"{int(seed)}:{int(player_index)}:{int(round_no)}")
+    return rng.random() < READY_PROBABILITY
+
+
+def _seeded_step_away_roll(seed: Optional[int], player_index: int,
+                           round_no: int) -> bool:
+    """Second deterministic draw: True steers the even-round reposition AWAY
+    from the nearest hostile (with ~50% chance under a seed; always toward
+    without one, preserving legacy behavior exactly)."""
+    if seed is None:
+        return False
+    rng = random.Random(f"away:{int(seed)}:{int(player_index)}:{int(round_no)}")
+    return rng.random() < 0.5
+
+
+def _closed_to_reach(turn: Dict[str, Any], anchor: Optional[List[float]]) -> bool:
+    """True when a move turn's requested destination sits within melee reach
+    of ``anchor`` — the readying seat's own position when it readied. The sim
+    judges only from coordinates it actually sent and observed, never from
+    engine-internal state it cannot see."""
+    if not anchor:
+        return False
+    x, y = turn.get("requested", {}).get("x"), turn.get("requested", {}).get("y")
+    if x is None or y is None:
+        return False
+    try:
+        return math.hypot(float(x) - float(anchor[0]),
+                          float(y) - float(anchor[1])) <= MELEE_REACH_FEET
+    except (TypeError, ValueError):
+        return False
 
 
 SYSTEM_PROMPT = (
@@ -651,6 +812,7 @@ class CampaignSimulation:
         npc_registry: Optional[Dict[str, Any]] = None,
         social_npc_id: Optional[str] = None,
         director: Optional[DirectorAgent] = None,
+        decision_seed: Optional[int] = None,
     ):
         if players < 1:
             raise ValueError("players must be >= 1")
@@ -692,6 +854,29 @@ class CampaignSimulation:
         # Stance at the end of round N, per (npc_id, player_id), to diff
         # against round N+1 -> stance TRANSITIONS observed.
         self._stance_cache: Dict[tuple, str] = {}
+        # Reaction-layer state (iteration 81). ``decision_seed`` drives the
+        # occasional Ready choice deterministically (None = legacy behavior,
+        # never ready). ``pending_opportunity_attacks`` holds offers exactly
+        # as the engine's /move responses disclosed them: each entry names the
+        # REACTING attacker, the mover who provoked it, and which seat
+        # controls that attacker (so the OPPONENT takes the swing on its own
+        # authenticated identity).
+        self.decision_seed = decision_seed
+        self.pending_opportunity_attacks: List[Dict[str, Any]] = []
+        # Per-round count of reaction-kind attempts, for honest totals.
+        self._reaction_actions: Dict[str, int] = {}
+        # Chronological record of every turn this run produced (regular AND
+        # reaction), so trigger evaluation reads only what was observed.
+        self._observed_turns: List[Dict[str, Any]] = []
+        # player name -> (round, seq) when its Ready was accepted.
+        self._readied_since: Dict[str, tuple] = {}
+        # player name -> the seat's own position when it readied, so an
+        # ``enemy_enters_reach`` release can be judged against where the
+        # readying entity actually stood.
+        self._readied_position: Dict[str, Optional[List[float]]] = {}
+        # Set by run() so disclosure handling can map attacker entity ids
+        # back to the seat that controls them.
+        self._players_ref: List[CampaignSimPlayer] = []
 
     @property
     def _end_ts(self) -> float:
@@ -790,6 +975,7 @@ class CampaignSimulation:
                 "accepted": 0,
                 "rejected": 0,
                 "rejection_reasons": {},
+                "reaction_actions": {},
                 "llm_calls_made": 0,
                 "llm_decisions_accepted": 0,
                 "llm_fallbacks": 0,
@@ -811,6 +997,7 @@ class CampaignSimulation:
             )
             for i in range(self.players_n)
         ]
+        self._players_ref = players
 
         try:
             await self._setup(players, report)
@@ -844,6 +1031,16 @@ class CampaignSimulation:
                 report["rounds"].append(round_entry)
         except CampaignSimError as exc:
             report["errors"].append(f"aborted mid-run: {exc}")
+        finally:
+            # Reaction-layer accounting (iteration 81): every reaction-kind
+            # attempt is counted under its kind — accepted OR honestly
+            # rejected, never dropped and never reclassified.
+            for turn in self._observed_turns:
+                kind = turn.get("reaction_kind")
+                if kind:
+                    self._reaction_actions[kind] = \
+                        self._reaction_actions.get(kind, 0) + 1
+            report["totals"]["reaction_actions"] = dict(self._reaction_actions)
 
         report["per_player"] = [self._player_summary(p, report) for p in players]
         # Campaign Director summary: the full curve + final recommendations,
@@ -926,15 +1123,201 @@ class CampaignSimulation:
         await host.spawn_encounter_target(session_id)
 
     async def _take_turn(self, player: CampaignSimPlayer, round_no: int) -> Dict[str, Any]:
+        # 1) Reaction layer FIRST: an opportunity attack this seat's entity
+        #    provoked earlier (disclosed by the engine's /move response) is
+        #    taken NOW — the opponent's next available action. A held Ready
+        #    whose structured trigger has fired releases instead.
+        reaction = self._next_reaction_for(player)
+        if reaction is not None:
+            return await self._execute_reaction_turn(player, round_no, reaction)
+
         snapshot = await player.observe_session()
         stances = self._stance_view(player, snapshot)
         decision, source, fallback_reason, llm_used = await self._decide(
             player, snapshot, round_no, stances)
+
+        # Occasionally spend the Action on a Ready (seeded, deterministic).
+        if decision.pop("ready_this_turn", False) and \
+                decision["action"] != "check":
+            trigger = READY_TRIGGERS[0] if decision.get("action") == "attack" \
+                else READY_TRIGGERS[1]
+            return await self._ready_instead(player, round_no, decision, trigger)
+
         result = await player.execute(decision)
         # Social-state telemetry AFTER the proxy verdict: only ACCEPTED
         # attacks touch disposition state (checks/moves record nothing).
         self._record_social(player, decision, result, round_no)
-        return {
+        turn = self._turn_record(
+            player, round_no, decision, result, source, fallback_reason, llm_used)
+        turn["reaction_kind"] = None
+        return turn
+
+    def _next_reaction_for(self, player: CampaignSimPlayer) -> Optional[Dict[str, Any]]:
+        """The next reaction action THIS seat can take right now.
+
+        Priority: take a pending opportunity attack whose attacker this seat's
+        entity controls; otherwise release its own readied declaration when
+        the structured trigger has fired since it was set.
+        """
+        for offer in self.pending_opportunity_attacks:
+            if offer.get("taken"):
+                continue
+            if offer.get("controller_entity_id") == player.entity_id and \
+                    offer["attacker_id"] != offer["mover_id"]:
+                offer["taken"] = True   # claimed; one attempt per disclosure
+                return {
+                    "reaction_kind": REACTION_OPPORTUNITY_ATTACK,
+                    "attacker_id": offer["attacker_id"],
+                    "target_id": offer["mover_id"],
+                    "round_provenance": offer.get("round"),
+                }
+        if player.readied is not None and self._readied_trigger_fired(player):
+            return {"reaction_kind": REACTION_RELEASE}
+        return None
+
+    def _readied_trigger_fired(self, player: CampaignSimPlayer) -> bool:
+        """Whether the seat's declared structured trigger has observably fired
+        since the Ready was made. ``enemy_attacks`` fires when ANY attack was
+        accepted after the ready; ``enemy_enters_reach`` fires when an
+        ACCEPTED move by another entity ended within melee reach of this
+        seat's own position as of the ready. The sim judges only from the
+        coordinates it actually sent and observed — never guesses."""
+        readied_at = (self._readied_since.get(player.name))
+        if readied_at is None:
+            return False
+        anchor = self._readied_position.get(player.name)
+
+        def _later(t) -> bool:
+            return (t["round"], t.get("_seq", 0)) > readied_at
+
+        for turn in self._observed_turns:
+            if not _later(turn):
+                continue
+            trigger = player.readied.get("trigger")
+            if trigger == "enemy_attacks" and \
+                    turn.get("action") == "attack" and turn.get("accepted"):
+                return True
+            if trigger == "enemy_enters_reach" and \
+                    turn.get("action") == "move" and turn.get("accepted") and \
+                    _closed_to_reach(turn, anchor):
+                return True
+        return False
+
+    async def _execute_reaction_turn(self, player, round_no, reaction) -> Dict[str, Any]:
+        """Run one reaction action as the seat's whole observable activity."""
+        kind = reaction["reaction_kind"]
+        result = await player.execute_reaction(reaction)
+        record = {
+            "round": round_no,
+            "player": player.name,
+            "entity_id": player.entity_id,
+            "decision_source": "scripted",
+            "fallback_reason": None,
+            "reason": f"reaction: {kind}",
+            "action": kind,
+            "requested": {k: v for k, v in reaction.items()},
+            "attempted": result["attempted"],
+            "accepted": result["accepted"],
+            "rejected": result["rejected"],
+            "rejection_reason": result["rejection_reason"],
+            "response_status": result["response_status"],
+            "degraded": result["degraded"],
+            "llm_called": False,
+            "reaction_kind": kind,
+        }
+        if kind == REACTION_OPPORTUNITY_ATTACK:
+            # Disposition: the OA swing hit a PLAYER mover — social telemetry
+            # tracks NPC targets only, so nothing records here by design.
+            pass
+        self._observed_turns.append(record)
+        return record
+
+    async def _ready_instead(self, player, round_no, base_decision, trigger) -> Dict[str, Any]:
+        """Spend this turn's Action declaring a Ready through the proxy."""
+        description = {
+            "attack": "I strike when my trigger fires",
+            "move": "I shift when my trigger fires",
+        }.get(base_decision["action"], "I hold my action")
+        reaction = {
+            "reaction_kind": REACTION_READY,
+            "description": description,
+            "trigger": trigger,
+        }
+        result = await player.execute_reaction(reaction)
+        record = {
+            "round": round_no,
+            "player": player.name,
+            "entity_id": player.entity_id,
+            "decision_source": "scripted",
+            "fallback_reason": None,
+            "reason": f"ready ({trigger})",
+            "action": "ready",
+            "requested": dict(reaction),
+            "attempted": result["attempted"],
+            "accepted": result["accepted"],
+            "rejected": result["rejected"],
+            "rejection_reason": result["rejection_reason"],
+            "response_status": result["response_status"],
+            "degraded": result["degraded"],
+            "llm_called": False,
+            "reaction_kind": REACTION_READY,
+        }
+        if result["accepted"]:
+            self._readied_since[player.name] = (round_no, len(self._observed_turns))
+            try:
+                snapshot = await player.observe_session()
+                own = next(
+                    (e for e in snapshot.get("entities", [])
+                     if e["id"] == player.entity_id), None)
+                pos = own.get("position") if isinstance(own, dict) else None
+                self._readied_position[player.name] = \
+                    [float(pos[0]), float(pos[1])] if pos else None
+            except CampaignSimError:
+                self._readied_position[player.name] = None
+        self._observed_turns.append(record)
+        return record
+
+    def _note_disclosed_opportunity_attacks(self, player, decision, result) -> None:
+        """After a move, fold the engine's OWN pending-OA disclosure into the
+        sim-level queue so the OPPONENT seat takes each offer later. Only what
+        the response actually disclosed is recorded.
+
+        The reacting attacker is usually an NPC nobody owns; the engine's RBAC
+        lets any non-spectator control ownerless entities, so the HOST seat
+        (players[0]) drives those swings on its own authenticated identity.
+        """
+        if decision.get("action") != "move" or not result.get("accepted"):
+            return
+        outcome = result.get("outcome") or {}
+        detail = outcome.get("opportunity_attacks_detail")
+        if not isinstance(detail, list):
+            return
+        for entry in detail:
+            if not isinstance(entry, dict):
+                continue
+            attacker = entry.get("provoked_by")
+            if not attacker or entry.get("available") is False:
+                continue
+            attacker_id = str(attacker)
+            controller = next(
+                (p for p in self._players_ref or [] if p.entity_id == attacker_id),
+                None,
+            ) or (self._players_ref[0] if self._players_ref else None)
+            self.pending_opportunity_attacks.append({
+                "attacker_id": attacker_id,
+                "mover_id": str(player.entity_id),
+                "controller_entity_id": (
+                    controller.entity_id if controller is not None else None),
+                "controller_player_name": (
+                    controller.name if controller is not None else None),
+                "available": True,
+                "taken": False,
+                "round": None,
+            })
+
+    def _turn_record(self, player, round_no, decision, result, source,
+                     fallback_reason, llm_used) -> Dict[str, Any]:
+        record = {
             "round": round_no,
             "player": player.name,
             "entity_id": player.entity_id,
@@ -951,6 +1334,9 @@ class CampaignSimulation:
             "degraded": result["degraded"],
             "llm_called": llm_used,
         }
+        self._observed_turns.append(record)
+        self._note_disclosed_opportunity_attacks(player, decision, result)
+        return record
 
     async def _decide(self, player, snapshot, round_no, stances=None):
         """LLM decision with per-turn deterministic fallback, or scripted mode.
@@ -961,7 +1347,8 @@ class CampaignSimulation:
         Returns (decision, source, fallback_reason|None, llm_was_called).
         """
         if self.mode != "llm":
-            return scripted_decision(player, snapshot, round_no, stances), \
+            return scripted_decision(player, snapshot, round_no, stances,
+                                     seed=self.decision_seed), \
                 "scripted", None, False
 
         system_prompt, user_prompt = build_decision_prompts(snapshot, player, stances)
@@ -969,7 +1356,8 @@ class CampaignSimulation:
         decision, problem = validate_decision(parsed)
         if decision is None:
             reason = problem if parsed is not None else "llm_unavailable_or_unparseable"
-            fallback = scripted_decision(player, snapshot, round_no, stances)
+            fallback = scripted_decision(player, snapshot, round_no, stances,
+                                         seed=self.decision_seed)
             fallback["reason"] = f"scripted fallback ({reason})"
             return fallback, "llm_fallback", reason, True
         return decision, "llm", None, True

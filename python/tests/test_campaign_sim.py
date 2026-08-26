@@ -54,6 +54,16 @@ DUMMY_ID = engine_client._coerce_uuid("sim-training-dummy")
 SOCIAL_NPC_ID = str(DUMMY_ID)
 
 
+def _dist(a, b) -> float:
+    """Euclidean distance between two [x, y, z] positions; inf when either is
+    missing so an unpositioned entity is never treated as adjacent."""
+    try:
+        return ((float(a[0]) - float(b[0])) ** 2 +
+                (float(a[1]) - float(b[1])) ** 2) ** 0.5
+    except (TypeError, ValueError, IndexError):
+        return float("inf")
+
+
 class FakeEngine:
     """In-memory stand-in for vtt-server's HTTP surface.
 
@@ -67,6 +77,14 @@ class FakeEngine:
         self.entities = {}          # session_id -> {entity_id: entity dict}
         self.reject_rules = []      # list of (path_substring, status, reason)
         self.attack_damage = 3
+        # Iteration 81: entities with an ARMED opportunity-attack reaction.
+        # When one of these loses adjacency to a mover via /move, the fake
+        # mirrors vtt-core's move_entity disclosure: it PENDS the swing
+        # (available: true, pending_opportunity naming the endpoint that
+        # takes it) instead of resolving silently.
+        self.armed_reactions = set()
+        self.pending_oa: list = []  # (attacker_id, mover_id) pairs
+        self._last_session = None
 
     # -- configuration ------------------------------------------------------
 
@@ -77,8 +95,16 @@ class FakeEngine:
 
     async def engine_request(self, method, path, payload=None, *, actor=None):
         self.calls.append(
-            {"method": method, "path": path, "payload": payload, "actor": actor}
+            {"method": method, "path": path, "payload": payload, "actor": actor,
+             "_seq": len(self.calls)}
         )
+        m0 = re.fullmatch(r"/api/v1/sessions/([^/]+)", path)
+        if method == "GET" and m0:
+            self._last_session = m0.group(1)
+        elif "/api/v1/sessions/" in path:
+            parts = path.split("/")
+            if len(parts) > 4:
+                self._last_session = parts[4]
         for pattern, status, reason in self.reject_rules:
             if pattern in path:
                 raise EngineRejectedError(status, json.dumps({"reason": reason}))
@@ -133,11 +159,80 @@ class FakeEngine:
             entity = bucket.get(payload["entity_id"])
             if entity is None:
                 raise EngineRejectedError(409, json.dumps({"reason": "MOVE_REJECTED"}))
+            mover_id = str(entity.get("id"))
+            was_adjacent_to = [
+                other_id for other_id, other in bucket.items()
+                if other_id != mover_id
+                and not other.get("is_dead")
+                and bool(other.get("is_player")) != bool(entity.get("is_player"))
+                and _dist(entity.get("position"), other.get("position")) <= 5.0
+            ]
             entity["position"] = [payload["x"], payload["y"], 0.0]
-            return {"status": "MOVED", "outcome": {"to": {"x": payload["x"], "y": payload["y"]}}}
+            provoked = [
+                attacker for attacker in was_adjacent_to
+                if attacker in self.armed_reactions
+                and _dist(bucket[attacker].get("position"), entity.get("position")) > 5.5
+            ]
+            outcome = {"to": {"x": payload["x"], "y": payload["y"]}}
+            body: dict = {"status": "MOVED", "outcome": outcome}
+            if provoked:
+                detail = []
+                for attacker in provoked:
+                    self.pending_oa.append((attacker, mover_id))
+                    detail.append({
+                        "provoked_by": attacker,
+                        "reaction_type": "opportunity_attack",
+                        "pending_opportunity": "/action/opportunity-attack",
+                        "available": True,
+                    })
+                body["opportunity_attacks_detail"] = detail
+            return body
 
         if path == "/api/v1/actions/check":
-            return {"total": 15, "d20": 13, "modifier": 2, "dc": payload.get("dc"), "success": True}
+            return {"total": 15, "d20": 13, "modifier": 2,
+                    "dc": payload.get("dc"), "success": True}
+
+        if path.endswith("/action/opportunity-attack"):
+            pair = (payload["attacker_id"], payload["target_id"])
+            if pair not in self.pending_oa:
+                return {
+                    "ok": False,
+                    "error": "OA_NOT_PENDING",
+                    "message": "no pending opportunity attack against this mover",
+                }
+            self.pending_oa.remove(pair)
+            attacker = self.entities[self._last_session][pair[0]]
+            attacker["action_budget"]["reaction"] = False
+            target = self.entities[self._last_session][pair[1]]
+            target["current_hp"] = max(0, int(target.get("current_hp", 0)) - 2)
+            return {"status": "OPPORTUNITY_ATTACK_TAKEN", "is_hit": True,
+                    "total_damage": 2, "reaction_spent": True}
+
+        if path.endswith("/action/ready"):
+            entity = self.entities[self._last_session][payload["entity_id"]]
+            entity["readied_action"] = {
+                "description": payload["description"],
+                "trigger": payload.get("trigger") or "",
+            }
+            entity["action_budget"]["action"] = False
+            return {"status": "READY_ACTION_SET",
+                    "entity_id": payload["entity_id"],
+                    "readied_action": entity["readied_action"]}
+
+        if path.endswith("/action/ready/release"):
+            entity = self.entities[self._last_session].get(payload["entity_id"])
+            readied = (entity or {}).pop("readied_action", None)
+            if readied is None:
+                return {"ok": False, "error": "NO_READIED_ACTION",
+                        "message": "nothing is readied"}
+            entity["action_budget"]["reaction"] = False
+            return {"status": "READY_ACTION_RELEASED",
+                    "entity_id": payload["entity_id"],
+                    "released_action": readied, "reaction_spent": True}
+
+        if path == "/api/v1/actions/check":
+            return {"total": 15, "d20": 13, "modifier": 2,
+                    "dc": payload.get("dc"), "success": True}
 
         raise AssertionError(f"FakeEngine has no route for {method} {path}")
 
