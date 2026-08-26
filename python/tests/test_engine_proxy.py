@@ -140,6 +140,11 @@ class TestProxyAuthRequired:
             "/api/v1/engine/ready/release",
             {"session_id": "s", "entity_id": "e"},
         ),
+        "delay": ("/api/v1/engine/delay", {"session_id": "s", "entity_id": "e"}),
+        "delay-resume": (
+            "/api/v1/engine/delay/resume",
+            {"session_id": "s", "entity_id": "e"},
+        ),
     }
 
     def test_missing_token_is_401_on_every_narrative_route(self):
@@ -684,6 +689,11 @@ class TestManeuverProxyIdentity:
         "dodge": {"session_id": SESSION_ID, "entity_id": "thorin"},
         "dash": {"session_id": SESSION_ID, "entity_id": "thorin"},
         "disengage": {"session_id": SESSION_ID, "entity_id": "thorin"},
+        # SRD-optional Delay (iteration 22): the client's Delay/Resume UI posts
+        # to /api/v1/engine/delay[/resume] with exactly the engine's
+        # SimpleActionReq ({entity_id} plus the session id for the path).
+        "delay": {"session_id": SESSION_ID, "entity_id": "thorin"},
+        "delay/resume": {"session_id": SESSION_ID, "entity_id": "thorin"},
         "stabilize": {
             "session_id": SESSION_ID,
             "healer_id": "cleric",
@@ -783,6 +793,10 @@ class TestManeuverProxyIdentity:
             "grapple-seed": {**self.ROUTES["grapple"], "seed": 42},
             "shove": {**self.ROUTES["shove"], "target_ac": -5},
             "dodge": {**self.ROUTES["dodge"], "ac_override": 30},
+            # Delay is SimpleActionReq ({entity_id}) upstream: no round, turn
+            # index, or order may be smuggled into the wire body.
+            "delay": {**self.ROUTES["delay"], "round": 3},
+            "delay-resume": {**self.ROUTES["delay/resume"], "turn_index": 2},
             "stabilize": {**self.ROUTES["stabilize"], "auto_success": True},
             "offhand": {
                 **self.ROUTES["offhand"],
@@ -792,7 +806,14 @@ class TestManeuverProxyIdentity:
             "help": {**self.ROUTES["help"], "auto_grant": True},
         }
         for case, body in smuggles.items():
-            name = "grapple" if case.startswith("grapple") else case.split("-")[0]
+            if case.startswith("grapple"):
+                name = "grapple"
+            elif case.startswith("offhand"):
+                name = "offhand"
+            elif case == "delay-resume":
+                name = "delay/resume"
+            else:
+                name = case.split("-")[0]
             resp = client.post(
                 f"/api/v1/engine/{name}", params={"token": token}, json=body
             )
@@ -843,6 +864,104 @@ class TestManeuverProxyIdentity:
             )
             assert resp.status_code == 502, name
             assert "unreachable" in resp.json()["detail"].lower()
+
+
+class TestDelayProxy:
+    """SRD-optional Delay (iteration 22): the client's Delay/Resume UI posts
+    to POST /api/v1/engine/delay and /api/v1/engine/delay/resume; these must
+    proxy onto the engine's
+    POST /api/v1/sessions/{id}/action/delay[/resume] exactly like the other
+    self-targeting entity actions (dodge/dash/disengage) do.
+
+    Delay is FREE (no Action spent); everything mechanical — turn-order
+    re-seating, ALREADY_DELAYED / NOT_DELAYED conflicts, entity ownership,
+    spectator refusal — is engine-owned. The gateway forwards ids plus the
+    caller's verified identity only."""
+
+    SESSION_ID = "7c6d5e4f-3a2b-4918-8796-a5b4c3d2e1f0"
+    BODY = {"session_id": SESSION_ID, "entity_id": "thorin"}
+
+    @staticmethod
+    def _token(user_id: str, role: str) -> str:
+        from vtt_orchestrator.server import _sign_token
+
+        import time as _time
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    @staticmethod
+    def _capture(monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    @pytest.mark.parametrize("suffix", ["delay", "delay/resume"])
+    def test_engine_verdict_is_surfaced_verbatim(self, monkeypatch, suffix):
+        """The full engine payload ({status, entity_id, delayed, round,
+        turn_index, order, event_sequence}) passes through untouched."""
+        engine_body = {
+            "status": "DELAY_TAKEN" if suffix == "delay" else "DELAY_RESUMED",
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin")),
+            "delayed": [str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin"))],
+            "round": 3,
+            "turn_index": 1,
+            "order": [{"entity_id": "x"}],
+            "event_sequence": 42,
+        }
+        captured = self._capture(monkeypatch, engine_body)
+        resp = client.post(
+            f"/api/v1/engine/{suffix}",
+            params={"token": self._token("player-7", "player")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == engine_body
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/action/{suffix}"
+        )
+        # SimpleActionReq is {entity_id} ONLY — nothing else crosses the wire.
+        assert captured["payload"] == {
+            "entity_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "thorin"))
+        }
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+
+    @pytest.mark.parametrize("suffix", ["delay", "delay/resume"])
+    def test_engine_conflict_is_surfaced_verbatim(self, monkeypatch, suffix):
+        code = "ALREADY_DELAYED" if suffix == "delay" else "NOT_DELAYED"
+
+        async def rejected(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(
+                409, f'{{"error": "{code}", "message": "combat state"}}'
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        resp = client.post(
+            f"/api/v1/engine/{suffix}",
+            params={"token": self._token("player-7", "player")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {"error": code, "message": "combat state"}
+
+    @pytest.mark.parametrize("suffix", ["delay", "delay/resume"])
+    def test_missing_entity_id_is_422_not_an_upstream_dial(self, monkeypatch, suffix):
+        async def refuse(method, path, payload=None, *, actor=None):
+            raise AssertionError("engine must not be dialed for an invalid body")
+
+        monkeypatch.setattr(engine_client, "engine_request", refuse)
+        resp = client.post(
+            f"/api/v1/engine/{suffix}",
+            params={"token": self._token("gm-1", "gm")},
+            json={"session_id": self.SESSION_ID},
+        )
+        assert resp.status_code == 422
 
 
 class TestOffhandAndHelpProxies:

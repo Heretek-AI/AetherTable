@@ -11,7 +11,7 @@ difficulty tier before spawning. This pins POST
 * difficulty tiers at known DMG thresholds and party-size scaling,
 * boundary party sizes / levels / quantities,
 * gm/admin-only auth (401 anonymous, 403 player),
-* default rate-limit bucket.
+* tight `media` rate-limit bucket (F7: no longer the loose 600/min default).
 """
 
 import json
@@ -100,6 +100,28 @@ class TestAuth:
         )
         assert resp.status_code == 403
         assert resp.json()["detail"] == "ENCOUNTER_BALANCE_GM_ONLY"
+
+    def test_player_is_403_regardless_of_body_size(self, player_token):
+        """F7 remediation: authorization must precede body parsing. A player
+        submitting an oversized roster gets the role verdict (403), never a
+        body-validation verdict — and the giant array is never parsed."""
+        roster = [{"monster_id": "monster_goblin_warrior", "quantity": 50} for _ in range(200)]
+        resp = client.post(
+            ROUTE, params={"token": player_token},
+            json={"party_level": 1, "party_size": 4, "monsters": roster},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "ENCOUNTER_BALANCE_GM_ONLY"
+
+    def test_anonymous_is_401_even_with_oversized_body(self):
+        """F7 remediation: no credential means the request is refused before
+        any roster parsing, whatever the body contains."""
+        roster = [{"monster_id": "monster_goblin_warrior", "quantity": 50} for _ in range(200)]
+        resp = client.post(
+            ROUTE,
+            json={"party_level": 1, "party_size": 4, "monsters": roster},
+        )
+        assert resp.status_code == 401
 
     def test_gm_gets_200(self, gm_token):
         resp = client.post(
@@ -290,6 +312,26 @@ class TestValidation:
         )
         assert resp.status_code == 422
 
+    def test_oversized_roster_is_422_before_any_math(self, gm_token):
+        """F7 remediation: the roster is capped at 64 lines so an unbounded
+        array can never be parsed and threshold-computed per request."""
+        roster = [{"monster_id": "monster_goblin_warrior", "quantity": 1} for _ in range(65)]
+        resp = client.post(
+            ROUTE, params={"token": gm_token},
+            json={"party_level": 1, "party_size": 4, "monsters": roster},
+        )
+        assert resp.status_code == 422
+        assert "monsters" in str(resp.json()["detail"])
+
+    def test_roster_at_the_cap_is_accepted(self, gm_token):
+        roster = [{"monster_id": "monster_shrieker_fungus", "quantity": 1} for _ in range(64)]
+        resp = client.post(
+            ROUTE, params={"token": gm_token},
+            json={"party_level": 1, "party_size": 4, "monsters": roster},
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["per_monster"]) == 64
+
     def test_missing_monsters_field_is_422(self, gm_token):
         resp = client.post(
             ROUTE, params={"token": gm_token}, json={"party_level": 1, "party_size": 4}
@@ -361,10 +403,17 @@ class TestValidation:
 # --- Rate-limit bucket ----------------------------------------------------------
 
 class TestRateBucket:
-    def test_route_meters_in_default_bucket(self):
-        # Bucket assignment happens by path before routing; the balance route
-        # is pure math (no model spend) so it must NOT inherit the expensive
-        # llm bucket via any prefix match.
-        assert server_module._bucket_for_path("/api/v1/engine/encounter/balance") == "default"
-        # Trailing-slash alias normalizes to the same bucket decision.
-        assert server_module._bucket_for_path("/api/v1/engine/encounter/balance/") == "default"
+    def test_route_meters_in_tight_media_bucket(self):
+        """F7 remediation: the balance route is no longer in the loose default
+        bucket. Each accepted call parses a roster and runs threshold math over
+        up to 64 compendium lines, so it meters in the tight 10/min `media`
+        bucket — the gateway's established expensive-per-call cap — instead of
+        the default 600/min allowance."""
+        for path in (
+            "/api/v1/engine/encounter/balance",
+            "/api/v1/engine/encounter/balance/",
+        ):
+            bucket = server_module._bucket_for_path(path)
+            limit, window = server_module._RATE_LIMITS[bucket]
+            assert bucket == "media", path
+            assert limit <= 10 and window <= 60, (path, bucket, limit, window)

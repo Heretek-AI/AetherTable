@@ -764,6 +764,23 @@ async def _require_auth(token: str = Depends(_token_from)) -> str:
     return token
 
 
+async def _require_staff_role(token: str = Depends(_require_auth)) -> str:
+    """GM/admin gate usable as a FastAPI sub-dependency (F7 remediation).
+
+    Declaring this on a route — instead of checking the role inside the
+    handler body — moves the authorization verdict AHEAD of request-body
+    parsing: FastAPI resolves sub-dependencies before validating the endpoint's
+    own body schema, so an oversized or malformed payload from a non-staff
+    caller is refused with the role verdict (403) without ever being parsed,
+    rather than leaking a body-validation error first. Routes that use this
+    still keep their inline role check as defence in depth.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="ENCOUNTER_BALANCE_GM_ONLY")
+    return token
+
+
 async def _engine_ground_truth(session_id: str) -> Dict[str, Any]:
     """Fetches LIVE session state from the authoritative engine.
 
@@ -3017,11 +3034,14 @@ class EncounterBalanceRequest(BaseModel):
     party_level 1..=20 and party_size 1..=8 are enforced by the schema so an
     out-of-range table never reaches the threshold math; an empty roster is
     rejected here too (422) — there is no such thing as a zero-monster fight.
+    The roster is also capped at 64 lines (F7 remediation): the threshold math
+    iterates every line per accepted call, so an unbounded array would let one
+    seat burn arbitrary CPU. Anything over 64 is 422 before the handler runs.
     """
 
     party_level: int = Field(1, ge=1, le=20)
     party_size: int = Field(4, ge=1, le=8)
-    monsters: List[EncounterBalanceMonsterLine] = Field(min_length=1)
+    monsters: List[EncounterBalanceMonsterLine] = Field(min_length=1, max_length=64)
 
 
 def _balance_compendium():
@@ -3033,7 +3053,7 @@ def _balance_compendium():
 
 @app.post("/api/v1/engine/encounter/balance")
 async def engine_encounter_balance(
-    req: EncounterBalanceRequest, token: str = Depends(_require_auth)
+    req: EncounterBalanceRequest, token: str = Depends(_require_staff_role)
 ):
     """Server-side ENCOUNTER BALANCE preview for encounter composition.
 
@@ -3044,15 +3064,23 @@ async def engine_encounter_balance(
     (vtt_orchestrator.compendium.encounter_balance) — one source of truth, so
     the pre-spawn number and the shipped-adventure number can never drift.
 
-    Pure math over the compendium: no engine call, no model spend — hence the
-    default rate bucket (see _bucket_for_path). GM/admin only: balance data is
-    the DM's information; revealing it to players leaks encounter design.
+    Pure math over the compendium: no engine call, no model spend — but each
+    accepted call parses a roster and runs threshold math over up to 64
+    compendium lines, so it meters in the tight 10/min `media` bucket (F7:
+    promoted out of the 600/min default to cap repeat CPU spend per IP).
+    GM/admin only: balance data is the DM's information; revealing it to
+    players leaks encounter design. The role check lives in a sub-dependency
+    so it runs BEFORE body parsing — a player submitting an oversized roster
+    gets the honest 403 verdict, never a 422 from the body cap.
 
     Honest failures: an unknown monster_id 404s NAMING it (no invented stats,
-    matching the compendium's "monsters are references" rule); an empty roster
-    or out-of-range party bounds are 422 from the schema itself.
+    matching the compendium's "monsters are references" rule); an empty /
+    oversized roster or out-of-range party bounds are 422 from the schema
+    itself.
     """
     actor = _caller_actor(token)
+    # Defence in depth: the sub-dependency already enforced the role gate;
+    # the inline check guards against future route-decorator drift.
     if actor.get("role", "") not in ("gm", "admin"):
         raise HTTPException(status_code=403, detail="ENCOUNTER_BALANCE_GM_ONLY")
 
@@ -3361,6 +3389,42 @@ async def engine_dash(req: EngineEntityActionRequest, token: str = Depends(_requ
 async def engine_disengage(req: EngineEntityActionRequest, token: str = Depends(_require_auth)):
     return await _maneuver_proxy(
         "disengage",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+# SRD-optional Delay (iteration 22): the client's Delay/Resume UI posts to
+# /api/v1/engine/delay[/resume]; these proxies meet that existing contract.
+# The engine's SimpleActionReq is {entity_id} ONLY (deny_unknown_fields), so
+# EngineEntityActionRequest is reused verbatim — no round / turn_index / order
+# ever crosses the wire, and Delay stays FREE because the action economy is
+# engine-owned. RBAC is identical to every other maneuver proxy: a signed
+# gateway identity is mandatory and the engine authorizes the real actor
+# (entity ownership, spectator refusal) itself; verdicts surface verbatim.
+
+
+@app.post("/api/v1/engine/delay")
+async def engine_delay(req: EngineEntityActionRequest, token: str = Depends(_require_auth)):
+    return await _maneuver_proxy(
+        "delay",
+        {
+            "session_id": req.session_id,
+            "entity_id": engine_client._coerce_uuid(req.entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+@app.post("/api/v1/engine/delay/resume")
+async def engine_delay_resume(
+    req: EngineEntityActionRequest, token: str = Depends(_require_auth)
+):
+    return await _maneuver_proxy(
+        "delay/resume",
         {
             "session_id": req.session_id,
             "entity_id": engine_client._coerce_uuid(req.entity_id),
@@ -4446,6 +4510,13 @@ def _bucket_for_path(path: str) -> str:
     # bucket. Must be matched before the generic media prefix below.
     if normalized == "/api/v1/media/image":
         return "media"
+    # Encounter-balance preview (F7): no model spend, but every accepted call
+    # parses a roster and runs DMG threshold math over up to 64 compendium
+    # lines — repeat hammering is a CPU-spend surface, not free reads. Meters
+    # in the same tight 10/min `media` bucket (the gateway's established
+    # expensive-per-call cap) instead of the 600/min default.
+    if normalized == "/api/v1/engine/encounter/balance":
+        return "media"
     # Spoken narration (POST /api/v1/media/narrate): same model spend as
     # speech but with a far longer per-call allowance — its own 20/min bucket,
     # also matched before the generic media prefix below.
@@ -5110,6 +5181,29 @@ def reset_ambience_cache() -> None:
     _ambience_inflight.clear()
 
 
+def _store_ambience(key: "tuple[str, str]", wav_bytes: bytes) -> bytes:
+    """Cap-check + bounded-LRU insert for one finished generation (F8 helper).
+
+    Raises the shared 413 HTTPException for an over-cap payload without
+    touching the cache; otherwise inserts at MRU position, evicting past
+    ``_AMBIENCE_CACHE_MAX_ENTRIES``, and returns the payload.
+    """
+    if len(wav_bytes) > _MEDIA_MAX_SFX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Generated ambience exceeds the {_MEDIA_MAX_SFX_BYTES} "
+                f"byte response cap ({len(wav_bytes)} bytes returned "
+                f"upstream)."
+            ),
+        )
+    _ambience_cache[key] = wav_bytes
+    _ambience_cache.move_to_end(key)
+    while len(_ambience_cache) > _AMBIENCE_CACHE_MAX_ENTRIES:
+        _ambience_cache.popitem(last=False)
+    return wav_bytes
+
+
 async def _load_ambience(slug: str, model: Optional[str] = None) -> bytes:
     """Returns preset ``slug``'s wav bytes, generating through SFX at most once.
 
@@ -5117,6 +5211,15 @@ async def _load_ambience(slug: str, model: Optional[str] = None) -> bytes:
     with LRU eviction of the least-recently-used entry past
     ``_AMBIENCE_CACHE_MAX_ENTRIES``. Failures propagate to every waiter and
     leave no cache trace; oversized payloads raise before touching the cache.
+
+    Leader cancellation is NOT a failure (F8): a client disconnect cancels the
+    leader's handler mid-generation, but coalesced waiters never caused that
+    cancellation and must never receive its CancelledError. Instead the still-
+    running upstream call is adopted by a detached done-callback that resolves
+    the shared future and fills the cache when it lands — so waiters get a
+    normal outcome and later callers hit the cache. The in-flight slot stays
+    occupied until adoption completes, so new joiners keep coalescing onto the
+    same generation instead of racing it.
     """
     from .compendium.ambience_presets import get_preset
 
@@ -5136,39 +5239,76 @@ async def _load_ambience(slug: str, model: Optional[str] = None) -> bytes:
     existing = _ambience_inflight.get(key)
     if existing is not None:
         # Join an identical in-flight generation rather than doubling the
-        # spend on the self-hosted box.
+        # spend on the self-hosted box. shield() keeps OUR cancellation from
+        # unravelling the shared future if this waiter itself is cancelled.
         return await asyncio.shield(existing)
 
     loop = asyncio.get_running_loop()
     future: "asyncio.Future[bytes]" = loop.create_future()
     _ambience_inflight[key] = future
+
+    def _adopt(task: "asyncio.Task[bytes]") -> None:
+        """Detached resolution of the shared future once the adopted upstream
+        call finishes. Never poisons waiters with the LEADER's cancellation:
+        a cancelled task resolves the future with an honest gateway error
+        instead (which only happens at interpreter/loop shutdown)."""
+        try:
+            if not future.done():
+                if task.cancelled():
+                    future.set_exception(
+                        MediaGatewayUnavailableError(
+                            "ambience generation was abandoned before completion"
+                        )
+                    )
+                elif task.exception() is not None:
+                    future.set_exception(task.exception())
+                else:
+                    try:
+                        result = _store_ambience(key, task.result())
+                    except Exception as store_exc:  # noqa: BLE001 - 413 cap etc.
+                        future.set_exception(store_exc)
+                    else:
+                        future.set_result(result)
+        finally:
+            if _ambience_inflight.get(key) is future:
+                _ambience_inflight.pop(key, None)
+
+    # Run the upstream call as its own task so a leader cancellation cannot
+    # take it down; shield() surfaces only THIS coroutine's cancellation.
+    gen_task = loop.create_task(media_client.generate_sfx(preset.prompt))
     try:
-        # No ``model=`` passthrough: the gateway's configured MEDIA_SFX_MODEL
-        # is the single source of truth for ambience generation.
-        wav_bytes = await media_client.generate_sfx(preset.prompt)
-        if len(wav_bytes) > _MEDIA_MAX_SFX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Generated ambience exceeds the {_MEDIA_MAX_SFX_BYTES} "
-                    f"byte response cap ({len(wav_bytes)} bytes returned "
-                    f"upstream)."
-                ),
-            )
-        future.set_result(wav_bytes)
+        wav_bytes = await asyncio.shield(gen_task)
+    except asyncio.CancelledError:
+        # F8: detach instead of poisoning — hand the in-flight generation to
+        # the adopter and re-raise our own cancellation.
+        gen_task.add_done_callback(_adopt)
+        raise
     except BaseException as exc:
-        # Never cache failures: wake every coalesced waiter with the error
-        # and drop the in-flight slot so a retry actually retries.
+        # A real failure (gateway down / rejected): wake every waiter with
+        # the same error, drop the join lane. Cancel nothing — the shield
+        # already let the inner task complete (or the task was already done).
+        if _ambience_inflight.get(key) is future:
+            _ambience_inflight.pop(key, None)
         if not future.done():
             future.set_exception(exc)
         raise
-    finally:
-        _ambience_inflight.pop(key, None)
 
-    _ambience_cache[key] = wav_bytes
-    _ambience_cache.move_to_end(key)
-    while len(_ambience_cache) > _AMBIENCE_CACHE_MAX_ENTRIES:
-        _ambience_cache.popitem(last=False)
+    # Generation succeeded; cap-check + LRU insert, then wake waiters. A cap
+    # violation (413) must also wake waiters with the same verdict so they
+    # never hang waiting on a result that will never land.
+    try:
+        _store_ambience(key, wav_bytes)
+    except BaseException as store_exc:
+        if _ambience_inflight.get(key) is future:
+            _ambience_inflight.pop(key, None)
+        if not future.done():
+            future.set_exception(store_exc)
+        raise
+
+    if not future.done():
+        future.set_result(wav_bytes)
+    if _ambience_inflight.get(key) is future:
+        _ambience_inflight.pop(key, None)
     return wav_bytes
 
 

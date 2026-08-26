@@ -800,3 +800,155 @@ class TestAmbienceRoutes:
         assert all(isinstance(r, MediaGatewayUnavailableError) for r in results)
         assert len(calls) == 1
         assert server_module._ambience_cache == {}
+
+    # -- leader cancellation must not poison coalesced waiters (F8) ----------
+
+    async def _cancelled_leader_scenario(self, monkeypatch, wav):
+        """Shared harness: a leader whose upstream generation hangs until
+        ``release`` is set; returns (leader task, waiter task, calls)."""
+        import asyncio
+
+        calls = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_sfx(prompt):
+            calls.append(prompt)
+            started.set()
+            await release.wait()
+            return wav
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", slow_sfx)
+
+        leader = asyncio.create_task(server_module._load_ambience(self.SLUG))
+        await started.wait()
+        waiter = asyncio.create_task(server_module._load_ambience(self.SLUG))
+        # Yield until the waiter has run up to its first suspension point,
+        # i.e. it is parked on the shared in-flight future.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not waiter.done()
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        return leader, waiter, release, calls
+
+    async def test_leader_cancellation_gives_waiter_a_normal_outcome(
+        self, monkeypatch
+    ):
+        """F8: the leader's CancelledError (client disconnect cancels its
+        handler) must never surface as the WAITER's failure. The adopted
+        generation completes and the waiter gets real bytes."""
+        import asyncio
+
+        payload = make_wav(b"adopted tavern bed")
+        _leader, waiter, release, calls = await self._cancelled_leader_scenario(
+            monkeypatch, payload
+        )
+        release.set()
+        result = await asyncio.wait_for(waiter, timeout=2)
+        assert result == payload, (
+            "coalesced waiter must receive the generated audio, "
+            "never the leader's CancelledError"
+        )
+        assert len(calls) == 1, "the upstream call must be adopted, not restarted"
+        assert server_module._ambience_inflight == {}
+        assert list(server_module._ambience_cache.values()) == [payload]
+
+    async def test_cancelled_leader_still_populates_the_cache_for_later_callers(
+        self, monkeypatch
+    ):
+        """F8: after adoption completes, a brand-new caller is served from the
+        cache — no duplicate upstream spend."""
+        import asyncio
+
+        payload = make_wav(b"cached after disconnect")
+        _leader, waiter, release, calls = await self._cancelled_leader_scenario(
+            monkeypatch, payload
+        )
+        release.set()
+        await asyncio.wait_for(waiter, timeout=2)
+
+        fresh_calls: list = []
+
+        async def cached_sfx(prompt):
+            fresh_calls.append(prompt)
+            return b"should never run"
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", cached_sfx)
+        resp = client.post(self.GEN_PATH, headers=_auth("usr_gm_k", "gm"))
+        assert resp.status_code == 200, resp.text
+        assert resp.content == payload
+        assert fresh_calls == [], "post-disconnect request must be a cache hit"
+
+    async def test_cancelled_leader_leaves_join_lane_open_until_adoption_lands(
+        self, monkeypatch
+    ):
+        """F8: while an adopted generation is still running, a NEW caller must
+        coalesce onto it rather than racing a duplicate upstream call."""
+        import asyncio
+
+        payload = make_wav(b"shared adopt")
+        _leader, waiter, release, calls = await self._cancelled_leader_scenario(
+            monkeypatch, payload
+        )
+        late = asyncio.create_task(server_module._load_ambience(self.SLUG))
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.wait_for(late, timeout=2) == payload
+        assert await asyncio.wait_for(waiter, timeout=2) == payload
+        assert len(calls) == 1, "late joiner must ride the adopted generation"
+
+    async def test_adopted_generation_failure_is_not_a_cancellation_for_waiters(
+        self, monkeypatch
+    ):
+        """F8: if the adopted upstream call fails on its own merits, waiters
+        see that honest error — still never a stray CancelledError."""
+        import asyncio
+
+        started = asyncio.Event()
+        fail_now = asyncio.Event()
+
+        async def failing_late(prompt):
+            started.set()
+            await fail_now.wait()
+            raise MediaGatewayRejectedError(422, "model refused late")
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", failing_late)
+        leader = asyncio.create_task(server_module._load_ambience(self.SLUG))
+        await started.wait()
+        waiter = asyncio.create_task(server_module._load_ambience(self.SLUG))
+        await asyncio.sleep(0)
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        fail_now.set()
+        with pytest.raises(MediaGatewayRejectedError) as excinfo:
+            await asyncio.wait_for(waiter, timeout=2)
+        assert excinfo.value.status_code == 422
+        assert server_module._ambience_inflight == {}
+        assert server_module._ambience_cache == {}
+
+    async def test_no_pending_task_leaks_after_adoption(self, monkeypatch):
+        """F8: the detached adopter must finish, leaving no lingering tasks
+        beyond the ones this test created."""
+        import asyncio
+
+        before = set(map(id, filter(_is_pending, asyncio.all_tasks())))
+        payload = make_wav(b"leak check")
+        _leader, waiter, release, _calls = await self._cancelled_leader_scenario(
+            monkeypatch, payload
+        )
+        release.set()
+        await asyncio.wait_for(waiter, timeout=2)
+        # Let done-callbacks and any stragglers settle.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        pending_after = {
+            t for t in map(id, filter(_is_pending, asyncio.all_tasks()))
+        } - before - {id(asyncio.current_task())}
+        assert not pending_after, "adoption must not leak pending tasks"
+
+
+def _is_pending(task: "asyncio.Task") -> bool:
+    return not task.done()
