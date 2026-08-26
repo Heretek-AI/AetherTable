@@ -505,3 +505,9 @@ TDD red-first → gates → commit → push → row below.
 
 ## Iteration log
 
+### L3.1 — 8e9d213 — feat(gateway): LemonadeClient multimedia service — pytest 1030
+### L3.2 — d1d2b1a — feat(gateway): authenticated media proxy routes — pytest 1068
+### L3.5 — 2532120 — refactor(gateway): generic MediaGatewayClient + capability discovery — pytest 1082
+### L3.6 — 29ea23a — feat(gateway): narration TTS + session narration log — pytest 1110
+### L3.4 — 9286063 — feat(client): GM-gated SFX ambience panel — vitest 438
+### L3.3 — this wave — feat(client): AI token art on the CRDT board — vitest 438
