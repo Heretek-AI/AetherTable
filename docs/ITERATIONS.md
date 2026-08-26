@@ -529,3 +529,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.22 — 1e70288 — fix(gateway): audit-sweep F1/F7/F8 — pytest 1232
 ### L3.24 — d95fd67 — feat(gateway): safety boundaries summary endpoint — pytest 1248
 ### L3.23 — 0dab7eb — fix(client): audit-sweep F10/F11/F12 + EncounterBuilderView latch — vitest 666
+### L3.25 — cf8745e — feat(client): condition-themed token rings + lucide badge stack — vitest 710
