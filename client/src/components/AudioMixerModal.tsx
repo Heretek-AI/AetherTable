@@ -12,6 +12,7 @@ import { globalWebRTCMesh, PeerAudioState } from '../render/webrtc_mesh';
 import { Token } from './TacticalCanvas';
 import { ModalShell } from './ui/ModalShell';
 import { SfxPanel } from './SfxPanel';
+import { AmbiencePanel } from './AmbiencePanel';
 
 interface AudioMixerModalProps {
   isOpen: boolean;
@@ -281,6 +282,10 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
               />
             </div>
           </div>
+
+          {/* Ambience presets (iteration 17): curated looping soundscapes.
+              Same GM-gating convention as the SFX panel below. */}
+          <AmbiencePanel />
 
           {/* Generated SFX (GM-gated server-side; panel renders an honest
               lock notice / 403 copy for non-staff seats). */}
