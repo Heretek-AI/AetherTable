@@ -129,6 +129,7 @@ import {
   type EntityCombatStatus,
 } from './api/entity_status_state';
 import { delayedIdsFromSnapshot } from './api/combat_delay';
+import { surprisedIdsFromSnapshot } from './api/combat_surprise';
 import {
   canEnterStreamerView,
   exitStreamerView,
@@ -153,6 +154,13 @@ interface EngineCombatSnapshot {
    * projection said nothing; never derived client-side.
    */
   delayed: string[];
+  /**
+   * Iteration 34 — ids the engine currently holds surprised (verbatim
+   * `combat.surprised` from the projected snapshot, same hidden-id projection
+   * as `delayed`). Empty when the projection said nothing; never derived
+   * client-side.
+   */
+  surprised: string[];
 }
 
 const IDLE_COMBAT_SNAPSHOT: EngineCombatSnapshot = {
@@ -161,6 +169,7 @@ const IDLE_COMBAT_SNAPSHOT: EngineCombatSnapshot = {
   turn_index: 0,
   order: [],
   delayed: [],
+  surprised: [],
 };
 
 // --- Roll history persistence ---------------------------------------------
@@ -1203,6 +1212,9 @@ export function App() {
         // Iteration 16: the engine's parked-out-of-turn-order list, read
         // verbatim from this same snapshot (role-projected server-side).
         delayed: delayedIdsFromSnapshot(snap),
+        // Iteration 34: the engine's SRD Surprise set, read verbatim from this
+        // same snapshot with the same hidden-id projection as `delayed`.
+        surprised: surprisedIdsFromSnapshot(snap),
       });
       // Iteration 58: same snapshot also mirrors per-entity concentration
       // (`entities[id].concentration = {spell_id, started_round}`). Parsed
@@ -1268,6 +1280,9 @@ export function App() {
         turn_index: Number(data.turn_index ?? 0),
         order,
         delayed: delayedIdsFromSnapshot(data),
+        // Iteration 34: combat-begin may also open with a `surprised` list
+        // (Begin combat with surprise). Read verbatim from the response.
+        surprised: surprisedIdsFromSnapshot(data),
       });
       setRoundNumber(round || 1);
       setCurrentTurnIndex(Number(data.turn_index ?? 0));
@@ -2375,6 +2390,7 @@ export function App() {
                 concentrationByEntity={concentrationByEntity}
                 sessionStateRaw={sessionStateRaw}
                 delayedIds={combat.delayed}
+                surprisedIds={combat.surprised}
                 combatSessionIdForActions={combatSessionId}
                 controlledEntityIds={controlledEntityIds}
                 onRefreshCombatState={() => void refreshCombatState()}

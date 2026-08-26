@@ -14,6 +14,17 @@
  *    asks the CALLER to refresh the authoritative snapshot: no local mutation
  *    of order/turn_index ever happens here (optimistic-state discipline).
  *
+ * Iteration 34 adds the mirrored SRD Surprise surface:
+ *  - A visible "Surprised" badge renders for every id the engine's
+ *    `combat.surprised` array carries, and for nothing else — trusted verbatim.
+ *  - Mark/Clear buttons render under the SAME controlledEntityIds gating as
+ *    Delay/Resume (spectators none); the ENGINE re-verifies GM authority and the
+ *    first-round window, so a non-GM attempt surfaces FORBIDDEN_ROLE and a
+ *    round>1 attempt SURPRISE_WINDOW_CLOSED — verbatim, never rewritten.
+ *  - Firing either posts SurpriseAdjudicationReq through /api/v1/engine/combat/
+ *    surprise and then asks the CALLER to refresh the authoritative snapshot
+ *    (no local mutation of the surprised set).
+ *
  * @vitest-environment happy-dom
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -81,6 +92,8 @@ const ORDER = [
 
 interface Opts {
   delayed?: string[];
+  /** Iteration 34 — the engine's projected `combat.surprised` list. */
+  surprised?: string[];
   isGm?: boolean;
   /** Defaults to "everyone" (GM semantics); pass [] explicitly for nobody. */
   controlledIds?: string[] | 'everyone';
@@ -105,6 +118,7 @@ function renderTracker(opts: Opts = {}, onNextTurn = () => undefined) {
     onBeginCombat: () => undefined,
     onEndCombat: () => undefined,
     delayedIds: opts.delayed ?? [],
+    surprisedIds: opts.surprised ?? [],
     combatSessionIdForActions: 'sess-1',
     controlledEntityIds:
       opts.controlledIds === undefined || opts.controlledIds === 'everyone'
@@ -312,5 +326,205 @@ describe('Delay / Resume control gating', () => {
     };
     render(<InitiativeTracker {...props} />);
     expect(screen.queryByTestId(/delay-action-/)).toBeNull();
+  });
+});
+
+describe('Surprised marker rendering (iteration 34)', () => {
+  it('renders a Surprised badge for each id in the engine surprised list — verbatim', () => {
+    renderTracker({ surprised: ['goblin_1'] });
+    expect(screen.getByTestId('surprised-marker-goblin_1')).toBeTruthy();
+    expect(screen.queryByTestId('surprised-marker-thorin_1')).toBeNull();
+  });
+
+  it('renders badges for multiple surprised combatants and none when nobody is surprised', () => {
+    const { unmount } = renderTracker({ surprised: ['thorin_1', 'goblin_1'] });
+    expect(screen.getByTestId('surprised-marker-thorin_1')).toBeTruthy();
+    expect(screen.getByTestId('surprised-marker-goblin_1')).toBeTruthy();
+    unmount();
+    renderTracker({ surprised: [] });
+    expect(screen.queryByTestId(/surprised-marker-/)).toBeNull();
+  });
+
+  it('never invents badges for entities the projection did not mark', () => {
+    renderTracker({ surprised: ['someone-else-entirely'] });
+    expect(screen.queryByTestId(/surprised-marker-/)).toBeNull();
+  });
+
+  it('shows the badge in collapsed rail mode too', () => {
+    const props = {
+      tokens: [THORIN, GOBLIN],
+      onNextTurn: () => undefined,
+      onSelectToken: () => undefined,
+      selectedTokenId: null as string | null,
+      roundNumber: 1,
+      isCollapsed: true,
+      onToggleCollapse: () => undefined,
+      inCombat: true,
+      combatOrder: ORDER,
+      activeEntityId: 'thorin_1',
+      isGm: false,
+      isCombatBusy: false,
+      onBeginCombat: () => undefined,
+      onEndCombat: () => undefined,
+      delayedIds: [],
+      surprisedIds: ['goblin_1'],
+      controlledEntityIds: [],
+      onRefreshCombatState: () => undefined,
+    };
+    render(<InitiativeTracker {...props} />);
+    expect(screen.getByTestId('surprised-marker-goblin_1')).toBeTruthy();
+  });
+});
+
+describe('Surprised mark / clear wire + gating (iteration 34)', () => {
+  it('marks a controlled combatant through the engine proxy with the Bearer header', async () => {
+    const calls = stubFetch(() => ({
+      ok: true,
+      json: async () => ({
+        status: 'SURPRISE_GRANTED',
+        sequence_id: 9,
+        changed: true,
+        entity_id: 'thorin_1',
+        round: 1,
+        surprised: ['thorin_1'],
+      }),
+    }));
+    let refreshed = 0;
+    render(
+      <InitiativeTracker
+        tokens={[THORIN, GOBLIN]}
+        onNextTurn={() => undefined}
+        onSelectToken={() => undefined}
+        selectedTokenId={null}
+        roundNumber={1}
+        isCollapsed={false}
+        onToggleCollapse={() => undefined}
+        inCombat
+        combatOrder={ORDER}
+        activeEntityId="thorin_1"
+        isGm={false}
+        isCombatBusy={false}
+        onBeginCombat={() => undefined}
+        onEndCombat={() => undefined}
+        delayedIds={[]}
+        surprisedIds={[]}
+        combatSessionIdForActions="sess-1"
+        controlledEntityIds={['thorin_1']}
+        onRefreshCombatState={() => {
+          refreshed += 1;
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('surprised-mark-thorin_1'));
+    await waitFor(() =>
+      expect(calls.find((c) => c.url === '/api/v1/engine/combat/surprise')).toBeTruthy(),
+    );
+    const call = calls.find((c) => c.url === '/api/v1/engine/combat/surprise')!;
+    expect(call.body).toEqual({ session_id: 'sess-1', entity_id: 'thorin_1', surprised: true });
+    expect((call.init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
+    // Optimistic-state discipline: the tracker never mutates the surprised set
+    // itself — it asks the caller to re-pull the authoritative snapshot.
+    await waitFor(() => expect(refreshed).toBeGreaterThan(0));
+  });
+
+  it('clears surprise for a marked combatant through the same engine proxy', async () => {
+    const calls = stubFetch(() => ({
+      ok: true,
+      json: async () => ({
+        status: 'SURPRISE_REVOKED',
+        sequence_id: 10,
+        changed: true,
+        entity_id: 'goblin_1',
+        round: 1,
+        surprised: [],
+      }),
+    }));
+    renderTracker({ surprised: ['goblin_1'], controlledIds: ['goblin_1'] });
+    expect(screen.queryByTestId('surprised-mark-goblin_1')).toBeNull();
+    fireEvent.click(screen.getByTestId('surprised-clear-goblin_1'));
+    await waitFor(() =>
+      expect(calls.find((c) => c.url === '/api/v1/engine/combat/surprise')).toBeTruthy(),
+    );
+    expect(calls.find((c) => c.url === '/api/v1/engine/combat/surprise')!.body).toEqual({
+      session_id: 'sess-1',
+      entity_id: 'goblin_1',
+      surprised: false,
+    });
+  });
+
+  it('swaps the Mark button for Clear while the entity is surprised', () => {
+    stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    renderTracker({ surprised: ['thorin_1'], controlledIds: ['thorin_1'] });
+    expect(screen.queryByTestId('surprised-mark-thorin_1')).toBeNull();
+    expect(screen.getByTestId('surprised-clear-thorin_1')).toBeTruthy();
+  });
+
+  it('gives the GM mark buttons for every combatant (GMs adjudicate anyone)', () => {
+    stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    renderTracker({ isGm: true });
+    expect(screen.getByTestId('surprised-mark-thorin_1')).toBeTruthy();
+    expect(screen.getByTestId('surprised-mark-goblin_1')).toBeTruthy();
+  });
+
+  it('gives a player a mark button only on their own token — not others — the engine re-verifies GM authority', () => {
+    stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    renderTracker({ controlledIds: ['thorin_1'] });
+    expect(screen.getByTestId('surprised-mark-thorin_1')).toBeTruthy();
+    expect(screen.queryByTestId('surprised-mark-goblin_1')).toBeNull();
+    expect(screen.queryByTestId('surprised-clear-goblin_1')).toBeNull();
+  });
+
+  it('gives spectators no surprise mark or clear buttons at all', () => {
+    stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    renderTracker({ controlledIds: [], isGm: false });
+    expect(screen.queryByTestId(/surprised-mark-/)).toBeNull();
+    expect(screen.queryByTestId(/surprised-clear-/)).toBeNull();
+  });
+
+  it('surfaces an engine rejection code verbatim instead of faking success', async () => {
+    const calls = stubFetch(() => ({
+      ok: false,
+      status: 422,
+      json: async () => ({
+        detail: { error: 'SURPRISE_WINDOW_CLOSED', message: 'surprise adjudication rejected by the engine' },
+      }),
+    }));
+    renderTracker({ controlledIds: ['thorin_1'] });
+    fireEvent.click(screen.getByTestId('surprised-mark-thorin_1'));
+    await waitFor(() => expect(calls.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(screen.getByTestId('surprise-error').textContent).toContain('SURPRISE_WINDOW_CLOSED'),
+    );
+  });
+
+  it('renders no surprise error line before anything has been attempted', () => {
+    stubFetch(() => ({ ok: true, json: async () => ({}) }));
+    renderTracker({ controlledIds: ['thorin_1'] });
+    expect(screen.queryByTestId('surprise-error')).toBeNull();
+  });
+
+  it('hides all surprise affordances outside of combat', () => {
+    const props = {
+      tokens: [THORIN],
+      onNextTurn: () => undefined,
+      onSelectToken: () => undefined,
+      selectedTokenId: null as string | null,
+      roundNumber: 0,
+      isCollapsed: false,
+      onToggleCollapse: () => undefined,
+      inCombat: false,
+      combatOrder: [],
+      activeEntityId: null as string | null,
+      isGm: true,
+      isCombatBusy: false,
+      onBeginCombat: () => undefined,
+      onEndCombat: () => undefined,
+      delayedIds: [],
+      surprisedIds: [],
+      controlledEntityIds: ['thorin_1'],
+      onRefreshCombatState: () => undefined,
+    };
+    render(<InitiativeTracker {...props} />);
+    expect(screen.queryByTestId(/surprised-mark-/)).toBeNull();
   });
 });

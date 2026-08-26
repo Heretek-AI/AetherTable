@@ -14,6 +14,7 @@ import {
   Hourglass,
 } from 'lucide-react';
 import { delayEntity, resumeEntity } from '../api/combat_delay';
+import { setSurprised, clearSurprised } from '../api/combat_surprise';
 import { Token } from './TacticalCanvas';
 import { ConcentrationBadge } from './ConcentrationBadge';
 import {
@@ -177,6 +178,7 @@ export function parseTurnAdvancement(raw: unknown): TurnAdvancementNotice | null
 const EMPTY_STATUS_MAP: Record<string, EntityCombatStatus> = {};
 const EMPTY_CONCENTRATION_MAP: Record<string, ConcentrationInfo> = {};
 const EMPTY_DELAYED: string[] = [];
+const EMPTY_SURPRISED: string[] = [];
 
 /**
  * Iteration 16 — the visible "Delayed" badge. Rendered ONLY for ids present in
@@ -199,6 +201,31 @@ const DelayedMarker: React.FC<{ variant?: 'row' | 'rail'; entityId?: string }> =
   >
     <Hourglass className={variant === 'rail' ? 'w-2 h-2' : 'w-2.5 h-2.5'} />
     {variant !== 'rail' && 'Delayed'}
+  </span>
+);
+
+/**
+ * Iteration 34 — the visible "Surprised" badge. Rendered ONLY for ids present
+ * in the engine-projected `combat.surprised` list; presence in that array is
+ * the whole truth, so there is nothing here to derive or guess. Amber/red zap
+ * so it reads distinctly from the sky-toned Delayed marker, both row and rail.
+ */
+const SurprisedMarker: React.FC<{ variant?: 'row' | 'rail'; entityId?: string }> = ({
+  variant = 'row',
+  entityId,
+}) => (
+  <span
+    data-testid={`surprised-marker-${entityId ?? (variant === 'rail' ? 'slot' : '')}`.replace(/-$/, '')}
+    title="Surprised — cannot act or react until this round's ambush resolves"
+    aria-label="Surprised"
+    className={`inline-flex items-center gap-0.5 rounded bg-amber-950/70 border border-amber-400/50 text-amber-200 font-mono font-bold ${
+      variant === 'rail'
+        ? 'absolute -top-1 -right-1 w-3 h-3 justify-center text-[7px]'
+        : 'px-1.5 py-px text-[9px] uppercase tracking-wide'
+    }`}
+  >
+    <Zap className={variant === 'rail' ? 'w-2 h-2' : 'w-2.5 h-2.5'} />
+    {variant !== 'rail' && 'Surprised'}
   </span>
 );
 
@@ -250,6 +277,14 @@ interface InitiativeTrackerProps {
    * delaying".
    */
   delayedIds?: string[];
+  /**
+   * Iteration 34 — ids the authoritative engine currently holds surprised
+   * (`combat.surprised` from the projected snapshot, verbatim — the server
+   * projection already filtered hidden ids per role, exactly like `delayed`).
+   * It is trusted as given and NEVER re-filtered client-side. Absent entries
+   * simply mean "not surprised".
+   */
+  surprisedIds?: string[];
   /** Engine session id these delay/resume calls act through (null = no engine). */
   combatSessionIdForActions?: string | null;
   /**
@@ -285,6 +320,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   concentrationByEntity = EMPTY_CONCENTRATION_MAP,
   sessionStateRaw,
   delayedIds = EMPTY_DELAYED,
+  surprisedIds = EMPTY_SURPRISED,
   combatSessionIdForActions = null,
   controlledEntityIds = EMPTY_DELAYED,
   onRefreshCombatState,
@@ -301,6 +337,13 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
   // Transient verbatim engine rejection from the most recent delay/resume try.
   // Cleared on the next attempt; display-only, it never gates anything.
   const [delayError, setDelayError] = useState<string | null>(null);
+
+  // Iteration 34 — who is under the SRD ambush flag, again straight from the
+  // projection. Set membership only; never re-filtered client-side.
+  const surprisedSet = useMemo(() => new Set(surprisedIds), [surprisedIds]);
+  // Transient verbatim engine rejection from the most recent mark/clear try.
+  // Display-only, it never gates anything — the engine re-verifies role.
+  const [surpriseError, setSurpriseError] = useState<string | null>(null);
 
   const runDelayAction = useCallback(
     async (entityId: string, mode: 'take' | 'resume') => {
@@ -328,6 +371,42 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
         return;
       }
       setDelayError('Rules engine unreachable — nothing was changed.');
+    },
+    [combatSessionIdForActions, onRefreshCombatState],
+  );
+
+  /**
+   * Iteration 34 — GM mark/clear for the SRD Surprise flag (first-round-only
+   * on the engine). Buttons render where the caller's ownership projection
+   * allows (GMs pass everyone; players only their own tokens; spectators an
+   * empty list), but ONLY the engine decides who may actually adjudicate —
+   * a non-GM posting here comes back FORBIDDEN_ROLE (403) verbatim. Success
+   * never mutates the surprised set locally — onRefreshCombatState re-pulls
+   * the authoritative snapshot whose combat.surprised drives the badge.
+   */
+  const runSurpriseAction = useCallback(
+    async (entityId: string, surprised: boolean) => {
+      if (!combatSessionIdForActions) {
+        setSurpriseError('Rules engine unavailable — surprise needs a live session.');
+        return;
+      }
+      setSurpriseError(null);
+      const outcome = surprised
+        ? await setSurprised({ sessionId: combatSessionIdForActions, entityId })
+        : await clearSurprised({ sessionId: combatSessionIdForActions, entityId });
+      if (outcome.kind === 'applied') {
+        onRefreshCombatState?.();
+        return;
+      }
+      if (outcome.kind === 'rejected') {
+        setSurpriseError(
+          outcome.code
+            ? `${outcome.code}${outcome.message ? ` — ${outcome.message}` : ''}`
+            : (outcome.message ?? `HTTP ${outcome.status}`),
+        );
+        return;
+      }
+      setSurpriseError('Rules engine unreachable — nothing was changed.');
     },
     [combatSessionIdForActions, onRefreshCombatState],
   );
@@ -416,6 +495,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
             {combatOrder.map((entry) => {
               const isActiveTurn = entry.entity_id === activeEntityId;
               const isDelayed = delayedSet.has(entry.entity_id);
+              const isSurprised = surprisedSet.has(entry.entity_id);
               return (
                 <div
                   key={entry.entity_id}
@@ -426,6 +506,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                 >
                   {renderAvatar(entry.entity_id, entry.name)}
                   {isDelayed && <DelayedMarker variant="rail" entityId={entry.entity_id} />}
+                  {isSurprised && <SurprisedMarker variant="rail" entityId={entry.entity_id} />}
                 </div>
               );
             })}
@@ -516,6 +597,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
               // marker renders from the projection for all seats to see.
               const canControl = controlledSet.has(entry.entity_id);
               const isDelayed = delayedSet.has(entry.entity_id);
+              const isSurprised = surprisedSet.has(entry.entity_id);
 
               return (
                 <div
@@ -537,6 +619,7 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                           {entry.name}
                           {isDead && <Skull className="w-3 h-3 text-rose-500 shrink-0" />}
                           {isDelayed && <DelayedMarker entityId={entry.entity_id} />}
+                          {isSurprised && <SurprisedMarker entityId={entry.entity_id} />}
                         </div>
                         <div className="text-[10px] text-[var(--rp-parchment-300)] font-mono">
                           DEX {entry.dexterity >= 0 ? `+${entry.dexterity}` : entry.dexterity}
@@ -636,8 +719,14 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                       authoritative snapshot instead. Engine rejections
                       surface verbatim (ALREADY_DELAYED, NOT_DELAYED,
                       NOT_IN_COMBAT, ENTITY_CANNOT_ACT, …). */}
+                  {/* Iteration 34 — SRD Surprise mark/clear sits on the SAME
+                      row, gated the same way (this seat controls → visible;
+                      spectators none). The engine re-verifies GM authority —
+                      a non-GM attempt comes back FORBIDDEN_ROLE verbatim —
+                      and the first-round window (SURPRISE_WINDOW_CLOSED).
+                      Success never mutates the surprised set locally. */}
                   {inCombat && canControl && (
-                    <div className="mt-1.5 flex items-center gap-1.5">
+                    <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
                       {isDelayed ? (
                         <button
                           data-testid={`delay-resume-${entry.entity_id}`}
@@ -665,6 +754,35 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
                         >
                           <Hourglass className="w-2.5 h-2.5" />
                           <span>Delay</span>
+                        </button>
+                      )}
+                      {isSurprised ? (
+                        <button
+                          data-testid={`surprised-clear-${entry.entity_id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void runSurpriseAction(entry.entity_id, false);
+                          }}
+                          disabled={!combatSessionIdForActions}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/70 hover:bg-amber-900/70 disabled:opacity-40 disabled:cursor-not-allowed border border-amber-400/50 text-amber-200 text-[9px] font-mono font-bold uppercase tracking-wide transition"
+                          title="Reveal the ambush — drop this combatant from the surprised set and restore their Reaction (round 1 only)"
+                        >
+                          <Zap className="w-2.5 h-2.5" />
+                          <span>Clear</span>
+                        </button>
+                      ) : (
+                        <button
+                          data-testid={`surprised-mark-${entry.entity_id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void runSurpriseAction(entry.entity_id, true);
+                          }}
+                          disabled={!combatSessionIdForActions}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950/60 hover:bg-amber-900/60 disabled:opacity-40 disabled:cursor-not-allowed border border-amber-400/40 text-amber-200 text-[9px] font-mono font-bold uppercase tracking-wide transition"
+                          title="Mark this combatant surprised — they skip their Reaction this round (GM call, round 1 only)"
+                        >
+                          <Zap className="w-2.5 h-2.5" />
+                          <span>Mark</span>
                         </button>
                       )}
                     </div>
@@ -729,6 +847,20 @@ export const InitiativeTracker: React.FC<InitiativeTrackerProps> = ({
           className="mx-3 mb-2 px-2.5 py-1.5 rounded-lg border border-rose-400/40 bg-rose-950/40 text-[10px] font-mono text-rose-200"
         >
           ⏳ {delayError}
+        </div>
+      )}
+
+      {/* Iteration 34 — verbatim engine rejection from the last surprise
+          mark/clear attempt (SURPRISE_WINDOW_CLOSED, FORBIDDEN_ROLE,
+          ENTITY_DELAYED, NOT_IN_COMBAT, …). Display-only honesty: the engine's
+          machine code is quoted, never rewritten into friendlier fiction. */}
+      {inCombat && surpriseError && (
+        <div
+          data-testid="surprise-error"
+          role="alert"
+          className="mx-3 mb-2 px-2.5 py-1.5 rounded-lg border border-rose-400/40 bg-rose-950/40 text-[10px] font-mono text-rose-200"
+        >
+          ⚡ {surpriseError}
         </div>
       )}
 
