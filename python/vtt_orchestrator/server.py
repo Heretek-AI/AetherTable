@@ -20,7 +20,7 @@ from pathlib import PurePosixPath
 import uvicorn
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Annotated, Dict, Any, List, Literal, Optional, Tuple, Union
 
@@ -4128,29 +4128,36 @@ def _get_rate_backend() -> Any:
 
 
 def _bucket_for_path(path: str) -> str:
-    if path.startswith("/api/v1/auth"):
+    # The middleware runs BEFORE routing, so bucket matching sees the raw
+    # request path. A trailing-slash alias ("/api/v1/media/image/") would
+    # otherwise miss the exact-match expensive buckets and fall through to the
+    # looser llm/default metering even though routing itself tolerates the
+    # slash (redirect_slashes). Normalize it away so metering is decided by
+    # the route, not by how the client spelled the URL.
+    normalized = path[:-1] if len(path) > 1 and path.endswith("/") else path
+    if normalized.startswith("/api/v1/auth"):
         return "auth"
-    if path.startswith("/api/v1/agent"):
+    if normalized.startswith("/api/v1/agent"):
         return "agent"
     # Empirical benchmark: 10-1000 in-process simulations per accepted call —
     # matched before the generic simulation prefix so it gets its own tight cap.
-    if path.startswith("/api/v1/simulation/empirical-benchmark"):
+    if normalized.startswith("/api/v1/simulation/empirical-benchmark"):
         return "benchmark"
     # Diffusion images: expensive GPU work per call, tighter than the llm
     # bucket. Must be matched before the generic media prefix below.
-    if path == "/api/v1/media/image":
+    if normalized == "/api/v1/media/image":
         return "media"
     # Spoken narration (POST /api/v1/media/narrate): same model spend as
     # speech but with a far longer per-call allowance — its own 20/min bucket,
     # also matched before the generic media prefix below.
-    if path == "/api/v1/media/narrate":
+    if normalized == "/api/v1/media/narrate":
         return "narration"
     # Other media surfaces (TTS / STT): model spend, llm bucket.
-    if path.startswith("/api/v1/media/"):
+    if normalized.startswith("/api/v1/media/"):
         return "llm"
     # LLM-spend surfaces: intent classification and every orchestrator
     # narrative path (including the legacy /narrative/* aliases).
-    if path.startswith(
+    if normalized.startswith(
         (
             "/api/v1/intent/",
             "/api/v1/orchestrator/",
@@ -4433,12 +4440,29 @@ async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(
 #     MEDIA_GATEWAY_UNAVAILABLE and an upstream rejection forwards its status +
 #     detail verbatim; no route ever fabricates placeholder media or masks a
 #     generation failure with canned content;
-#   * rate limiting is bucket-assigned by _bucket_for_path: diffusion images
-#     meter in their own tight `media` bucket (10/min), spoken narration in
-#     its own `narration` bucket (20/min), TTS/STT/SFX share the `llm` bucket
-#     because they all spend model time per call.
+#   * rate limiting is bucket-assigned by _bucket_for_path (trailing-slash
+#     aliases normalize to the canonical metering): diffusion images meter in
+#     their own tight `media` bucket (10/min), spoken narration in its own
+#     `narration` bucket (20/min), TTS/STT/SFX share the `llm` bucket because
+#     they all spend model time per call;
+#   * every response carries Cache-Control: no-store — session-scoped media
+#     and narration logs must never land in a shared cache or browser store;
+#   * every binary-returning route caps what it relays from upstream
+#     (_MEDIA_MAX_{IMAGE,TTS,SFX}_BYTES) so a runaway generation cannot stream
+#     unbounded bytes through the gateway.
 _MEDIA_MAX_TTS_BYTES = 20 * 1024 * 1024          # 20 MB speech response cap
 _MEDIA_MAX_UPLOAD_BYTES = 25 * 1024 * 1024       # 25 MB transcription upload cap
+# Self-audit (iteration 10): every binary-returning media route caps what it
+# will relay. A misbehaving or compromised upstream must not be able to stream
+# gigabytes through the gateway (image bytes are base64-inflated ~4/3 again in
+# the JSON envelope, so its cap is tighter than the audio ones).
+_MEDIA_MAX_IMAGE_BYTES = 10 * 1024 * 1024        # 10 MB decoded PNG cap
+_MEDIA_MAX_SFX_BYTES = 20 * 1024 * 1024          # 20 MB generated-SFX wav cap
+
+#: Session-scoped generated media and per-session narration logs are never
+#: cacheable: no shared cache, no browser back-button replay of another seat's
+#: audio. Applied to EVERY /api/v1/media/* response.
+_MEDIA_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 
 #: Default narration voice; operators retune the table's storyteller voice via
 #: ``MEDIA_TTS_VOICE`` without a redeploy. Read per-request (not at import) so
@@ -4594,7 +4618,20 @@ async def media_image(req: MediaImageRequest, token: str = Depends(_require_auth
         )
     except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
         raise _media_error_to_http(exc)
-    return MediaImageResponse(image_b64=base64.b64encode(png_bytes).decode())
+    if len(png_bytes) > _MEDIA_MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Generated image exceeds the {_MEDIA_MAX_IMAGE_BYTES} byte "
+                f"response cap ({len(png_bytes)} bytes returned upstream)."
+            ),
+        )
+    return JSONResponse(
+        content=MediaImageResponse(
+            image_b64=base64.b64encode(png_bytes).decode()
+        ).model_dump(),
+        headers=_MEDIA_NO_STORE_HEADERS,
+    )
 
 
 @app.post("/api/v1/media/speech")
@@ -4621,7 +4658,9 @@ async def media_speech(req: MediaSpeechRequest, token: str = Depends(_require_au
             ),
         )
     content_type = "audio/mpeg" if req.fmt == "mp3" else "audio/wav"
-    return Response(content=audio, media_type=content_type)
+    return Response(
+        content=audio, media_type=content_type, headers=_MEDIA_NO_STORE_HEADERS
+    )
 
 
 @app.post("/api/v1/media/transcribe")
@@ -4641,7 +4680,9 @@ async def media_transcribe(
         text = await media_client.transcribe(payload, filename=file.filename or "input.wav")
     except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
         raise _media_error_to_http(exc)
-    return {"text": text}
+    return JSONResponse(
+        content={"text": text}, headers=_MEDIA_NO_STORE_HEADERS
+    )
 
 
 @app.post("/api/v1/media/sfx")
@@ -4665,7 +4706,17 @@ async def media_sfx(req: MediaSfxRequest, token: str = Depends(_require_auth)):
         wav_bytes = await media_client.generate_sfx(req.prompt)
     except (MediaGatewayUnavailableError, MediaGatewayRejectedError) as exc:
         raise _media_error_to_http(exc)
-    return Response(content=wav_bytes, media_type="audio/wav")
+    if len(wav_bytes) > _MEDIA_MAX_SFX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Generated sound effect exceeds the {_MEDIA_MAX_SFX_BYTES} "
+                f"byte response cap ({len(wav_bytes)} bytes returned upstream)."
+            ),
+        )
+    return Response(
+        content=wav_bytes, media_type="audio/wav", headers=_MEDIA_NO_STORE_HEADERS
+    )
 
 
 @app.post("/api/v1/media/narrate")
@@ -4724,7 +4775,9 @@ async def media_narrate(
         voice=voice,
         text=req.text,
     )
-    return Response(content=audio, media_type="audio/wav")
+    return Response(
+        content=audio, media_type="audio/wav", headers=_MEDIA_NO_STORE_HEADERS
+    )
 
 
 @app.get("/api/v1/media/narrations")
@@ -4755,7 +4808,14 @@ async def list_media_narrations(
                 ),
             )
     rows = await storage_backend.list_narrations(session_id, limit=50)
-    return {"session_id": session_id, "count": len(rows), "narrations": rows}
+    return JSONResponse(
+        content={
+            "session_id": session_id,
+            "count": len(rows),
+            "narrations": rows,
+        },
+        headers=_MEDIA_NO_STORE_HEADERS,
+    )
 
 
 def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:

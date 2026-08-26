@@ -438,3 +438,84 @@ class TestMediaBuckets:
             assert resp.status_code == 429
         finally:
             _rate_windows.pop(key, None)
+
+    def test_trailing_slash_alias_cannot_reach_image_at_llm_rates(self):
+        # A client hitting the canonical route with one extra slash must not
+        # slip diffusion spend into the looser llm bucket: the middleware runs
+        # before routing, so bucket matching has to tolerate the alias form.
+        assert _bucket_for_path("/api/v1/media/image/") == "media"
+
+    def test_trailing_slash_alias_cannot_reach_narrate_at_llm_rates(self):
+        assert _bucket_for_path("/api/v1/media/narrate/") == "narration"
+
+    def test_non_media_paths_do_not_inherit_media_buckets(self):
+        assert _bucket_for_path("/api/v1/media") == "default"
+        assert _bucket_for_path("/api/v1/other") == "default"
+
+
+# ---------------------------------------------------------------------------
+# Self-audit (iteration 10): response hardening on every media surface
+# ---------------------------------------------------------------------------
+
+
+class TestMediaResponseHardening:
+    """Session-scoped generated media must not be cacheable or unbounded."""
+
+    def test_image_bytes_over_cap_is_413(self, monkeypatch):
+        async def fake_image(prompt, size="512x512", steps=4):
+            return b"\x89PNG" + b"\x00" * (10 * 1024 * 1024)
+
+        monkeypatch.setattr(server_module.media_client, "generate_image", fake_image)
+        resp = client.post(
+            "/api/v1/media/image", headers=_auth(), json={"prompt": "a keep"}
+        )
+        assert resp.status_code == 413, resp.text
+
+    def test_sfx_wav_over_cap_is_413(self, monkeypatch):
+        async def fake_sfx(prompt):
+            return b"RIFF" + b"\x00" * (20 * 1024 * 1024 + 1)
+
+        monkeypatch.setattr(server_module.media_client, "generate_sfx", fake_sfx)
+        resp = client.post(
+            "/api/v1/media/sfx",
+            headers=_auth("usr_gm4", "gm"),
+            json={"prompt": "rain"},
+        )
+        assert resp.status_code == 413, resp.text
+
+    @pytest.mark.parametrize("path,body,files", [
+        ("/api/v1/media/image", {"prompt": "a torchlit tavern"}, None),
+        ("/api/v1/media/speech", {"text": "Roll initiative"}, None),
+        ("/api/v1/media/transcribe", None, "wav"),
+        ("/api/v1/media/narrate", {"text": "The door groans open."}, None),
+    ])
+    def test_generated_media_responses_are_no_store(self, path, body, files, monkeypatch):
+        async def fake_bytes(*args, **kwargs):
+            if "image" in path:
+                return PNG_BYTES
+            if "transcribe" in path:
+                return "I attack the darkness"
+            return WAV_BYTES
+
+        for attr in ("generate_image", "text_to_speech", "transcribe"):
+            monkeypatch.setattr(server_module.media_client, attr, fake_bytes)
+        kwargs = {"headers": _auth()}
+        if files == "wav":
+            kwargs["files"] = {"file": ("clip.wav", make_wav(), "audio/wav")}
+        else:
+            kwargs["json"] = body
+        resp = client.post(path, **kwargs)
+        assert resp.status_code == 200, f"{path} -> {resp.text}"
+        assert resp.headers.get("cache-control") == "no-store", (
+            f"{path} must not be cacheable"
+        )
+
+    def test_narrations_listing_is_no_store(self):
+        # GM tokens may list any session without lobby standing.
+        resp = client.get(
+            "/api/v1/media/narrations",
+            params={"session_id": "44444444-4444-4444-4444-444444444444"},
+            headers=_auth("usr_gm5", "gm"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers.get("cache-control") == "no-store"
