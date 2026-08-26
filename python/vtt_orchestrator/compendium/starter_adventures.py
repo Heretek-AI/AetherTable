@@ -46,6 +46,7 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 from ..routing import engine_client
+from . import encounter_balance as _balance
 from .bundle_packager import global_bundle_packager
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(
@@ -119,22 +120,17 @@ MAGIC_ITEM_IDS = {
     "bat_cloak": "item_cloak_of_the_bat",
 }
 
-# Encounter-balance model: standard DMG XP thresholds for a 4-PC level-1
-# party, plus the official encounter multipliers by hostile count. Shipped
-# balance numbers are recomputed from these tables at build time, so a stale
-# hand-written difficulty label can never ship.
+# Encounter-balance model lives in the shared module
+# :mod:`vtt_orchestrator.compendium.encounter_balance` so the build-time
+# adventure audit and the runtime gateway route
+# (/api/v1/engine/encounter/balance) compute difficulty from ONE table. The
+# names are re-exported here unchanged for backward compatibility.
 PARTY_LEVEL = 1
 PARTY_SIZE = 4
-XP_THRESHOLDS = {
-    1: {"easy": 50, "medium": 100, "hard": 200, "deadly": 400},
-}
-DAILY_XP_BUDGET_PER_PC = {1: 300}
-_ENCOUNTER_MULTIPLIERS = (
-    (1, 0.5), (2, 1.0), (6, 1.5), (10, 2.0), (15, 2.5),
-)
-CR_CEILING_FOR_PARTY_LEVEL = {1: 3}  # nothing above CR 3 vs level-1 PCs
-
-_MONSTER_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+XP_THRESHOLDS = _balance.XP_THRESHOLDS
+DAILY_XP_BUDGET_PER_PC = _balance.DAILY_XP_BUDGET_PER_PC
+CR_CEILING_FOR_PARTY_LEVEL = _balance.CR_CEILING_FOR_PARTY_LEVEL
+_MONSTER_CACHE: Optional[Dict[str, Dict[str, Any]]] = {}
 
 ITEMS_FILE = os.path.join(COMPENDIUM_DIR, "srd_5_2_magic_items.json")
 _ITEM_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
@@ -142,11 +138,9 @@ _ITEM_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
 def _load_monster_compendium() -> Dict[str, Dict[str, Any]]:
     """Load srd_5_2_monsters.json keyed by compendium id (cached)."""
-    global _MONSTER_CACHE
-    if _MONSTER_CACHE is None:
-        with open(MONSTERS_FILE, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        _MONSTER_CACHE = {m["id"]: m for m in entries}
+    if not _MONSTER_CACHE:
+        # Delegate to the shared loader so both modules share one cache.
+        _MONSTER_CACHE.update(_balance.load_monster_compendium())
     return _MONSTER_CACHE
 
 
@@ -169,13 +163,11 @@ def _m(monster_id: str, quantity: int, role: str) -> Dict[str, Any]:
             "quantity": quantity, "role": role}
 
 
-# --- Encounter balance (standard DMG XP-threshold model) -------------------------
+# --- Encounter balance (shared DMG XP-threshold model) ---------------------------
+# The math itself lives in vtt_orchestrator.compendium.encounter_balance; these
+# re-exports keep every existing caller and test import path working.
 
-def _encounter_multiplier(hostile_count: int) -> float:
-    for bound, multiplier in _ENCOUNTER_MULTIPLIERS:
-        if hostile_count <= bound:
-            return multiplier
-    raise ValueError(f"unsupported hostile count: {hostile_count}")
+_encounter_multiplier = _balance._encounter_multiplier
 
 
 def encounter_balance(
@@ -190,45 +182,9 @@ def encounter_balance(
     adjusted total against the level-appropriate threshold table scaled by
     party size. Shipped numbers are recomputed from this at build time.
     """
-    thresholds = {
-        band: value * party_size
-        for band, value in XP_THRESHOLDS[party_level].items()
-    }
-    raw_xp = sum(
-        int(_load_monster_compendium()[ref["monster_id"]]["xp"]) * int(ref["quantity"])
-        for ref in monster_refs
+    return _balance.encounter_balance(
+        monster_refs, party_level=party_level, party_size=party_size
     )
-    hostiles = sum(int(ref["quantity"]) for ref in monster_refs)
-    adjusted_xp = int(raw_xp * _encounter_multiplier(hostiles))
-
-    if adjusted_xp >= thresholds["deadly"]:
-        difficulty = "DEADLY"
-    elif adjusted_xp >= thresholds["hard"]:
-        difficulty = "HARD"
-    elif adjusted_xp >= thresholds["medium"]:
-        difficulty = "MEDIUM"
-    elif adjusted_xp >= thresholds["easy"]:
-        difficulty = "EASY"
-    else:
-        difficulty = "TRIVIAL"
-
-    max_cr = max(
-        float(cr_num := str(_load_monster_compendium()[ref["monster_id"]]
-                            ["challenge_rating"]).partition("/")[0])
-        / float(str(_load_monster_compendium()[ref["monster_id"]]
-                    ["challenge_rating"]).partition("/")[2] or 1)
-        for ref in monster_refs
-    )
-    ceiling = CR_CEILING_FOR_PARTY_LEVEL.get(party_level)
-    return {
-        "model": "dmg_xp_threshold",
-        "party_level": party_level,
-        "party_size": party_size,
-        "raw_xp": raw_xp,
-        "adjusted_xp": adjusted_xp,
-        "difficulty": difficulty,
-        "within_cr_ceiling": ceiling is None or max_cr <= ceiling,
-    }
 
 
 _ADVENTURES: Dict[str, Dict[str, Any]] = {

@@ -50,6 +50,9 @@ from .simulation.safety_gateway import SafetyGateway
 from .simulation.dynasty_engine import global_dynasty_engine, DynastyEngine
 from .simulation.empirical_playtester import EmpiricalPlaytester
 from .compendium.bundle_packager import global_bundle_packager
+from .compendium.encounter_balance import (
+    encounter_balance as compute_encounter_balance,
+)
 from .compendium.starter_adventures import (
     build_starter_bundle_bytes,
     list_starter_adventures,
@@ -2787,6 +2790,90 @@ async def engine_spawn(req: EngineSpawnRequest, token: str = Depends(_require_au
             actor=_caller_actor(token),
         )
     )
+
+
+class EncounterBalanceMonsterLine(BaseModel):
+    """One roster line: a REAL compendium stat block and how many of it."""
+
+    monster_id: str
+    quantity: int = Field(1, ge=1, le=50)
+
+
+class EncounterBalanceRequest(BaseModel):
+    """Body for POST /api/v1/engine/encounter/balance.
+
+    party_level 1..=20 and party_size 1..=8 are enforced by the schema so an
+    out-of-range table never reaches the threshold math; an empty roster is
+    rejected here too (422) — there is no such thing as a zero-monster fight.
+    """
+
+    party_level: int = Field(1, ge=1, le=20)
+    party_size: int = Field(4, ge=1, le=8)
+    monsters: List[EncounterBalanceMonsterLine] = Field(min_length=1)
+
+
+def _balance_compendium():
+    """Compendium lookup for name/xp projection (shared cache)."""
+    from .compendium.encounter_balance import load_monster_compendium
+
+    return load_monster_compendium()
+
+
+@app.post("/api/v1/engine/encounter/balance")
+async def engine_encounter_balance(
+    req: EncounterBalanceRequest, token: str = Depends(_require_auth)
+):
+    """Server-side ENCOUNTER BALANCE preview for encounter composition.
+
+    The EncounterBuilderView composes stat blocks client-side, but until now
+    nothing told the GM the adjusted XP / difficulty tier BEFORE spawning. This
+    route computes the verdict with the SAME shared DMG XP-threshold model the
+    starter-adventure build audit uses
+    (vtt_orchestrator.compendium.encounter_balance) — one source of truth, so
+    the pre-spawn number and the shipped-adventure number can never drift.
+
+    Pure math over the compendium: no engine call, no model spend — hence the
+    default rate bucket (see _bucket_for_path). GM/admin only: balance data is
+    the DM's information; revealing it to players leaks encounter design.
+
+    Honest failures: an unknown monster_id 404s NAMING it (no invented stats,
+    matching the compendium's "monsters are references" rule); an empty roster
+    or out-of-range party bounds are 422 from the schema itself.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="ENCOUNTER_BALANCE_GM_ONLY")
+
+    try:
+        balance = compute_encounter_balance(
+            [line.model_dump() for line in req.monsters],
+            party_level=req.party_level,
+            party_size=req.party_size,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"UNKNOWN_MONSTER_ID:{exc.args[0]}",
+        ) from exc
+
+    compendium = _balance_compendium()
+    return {
+        "raw_xp": balance["raw_xp"],
+        "adjusted_xp": balance["adjusted_xp"],
+        "multiplier": balance["multiplier"],
+        # Wire contract spells the tiers lowercase; the shared model keeps its
+        # historical UPPERCASE labels for shipped adventure payloads.
+        "difficulty": balance["difficulty"].lower(),
+        "per_monster": [
+            {
+                "monster_id": line.monster_id,
+                "name": compendium[line.monster_id]["name"],
+                "xp": int(compendium[line.monster_id]["xp"]),
+                "quantity": line.quantity,
+            }
+            for line in req.monsters
+        ],
+    }
 
 
 @app.post("/api/v1/engine/cast-spell")
