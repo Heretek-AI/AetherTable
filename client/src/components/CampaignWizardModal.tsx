@@ -14,7 +14,28 @@ import {
 import { ModalShell } from './ui/ModalShell';
 import { createLobby, type Lobby } from '../api/lobby_store';
 import { authHeaders } from '../api/auth_headers';
+import {
+  canAdvanceStep,
+  clampPartySize,
+  clientOnlyWizardFields,
+  DEFAULT_PARTY_SIZE,
+  PARTY_SIZE_MAX,
+  PARTY_SIZE_MIN,
+  reviewRows,
+  RULE_VERSION_OPTIONS,
+  ruleVersionLabel,
+  STARTING_LEVEL_OPTIONS,
+  wizardCreateRequestBody,
+  WIZARD_STEPS,
+  type CampaignRuleVersion,
+  type CampaignWizardConfig,
+} from '../api/campaign_wizard_state';
 import { ATMOSPHERE_PRESETS, DEFAULT_ATMOSPHERE_ID } from '../theme/atmospheres';
+
+// Shared wizard types + step/payload logic live in api/campaign_wizard_state.ts
+// (iteration 70) where they are unit-testable; re-exported here for callers
+// that import them from this module (App.tsx does).
+export type { CampaignRuleVersion, CampaignWizardConfig };
 
 /**
  * Guided campaign setup wizard (GOALS.md Pillar 2).
@@ -35,18 +56,6 @@ import { ATMOSPHERE_PRESETS, DEFAULT_ATMOSPHERE_ID } from '../theme/atmospheres'
  *    POST /api/v1/adventures/starter/{key}/export (authenticated). It does not
  *    inject content into the session — bundle import stays in Bundle Manager.
  */
-
-export type CampaignRuleVersion = 'srd_5_1' | 'srd_5_2';
-
-/** Wizard selections carried back to App on completion. */
-export interface CampaignWizardConfig {
-  name: string;
-  /** Atmosphere preset id ('default' = stock obsidian/parchment palette). */
-  atmosphereId: string;
-  ruleVersion: CampaignRuleVersion;
-  partySize: number;
-  startingLevel: number;
-}
 
 /** Catalog entry shape returned by GET /api/v1/adventures/starter. */
 export interface StarterAdventureEntry {
@@ -72,26 +81,9 @@ interface CampaignWizardModalProps {
   ) => void;
 }
 
-const RULE_VERSIONS: Array<{
-  id: CampaignRuleVersion;
-  label: string;
-  blurb: string;
-}> = [
-  {
-    id: 'srd_5_2',
-    label: 'SRD 5.2',
-    blurb:
-      'Full stat blocks, untruncated spells, magic items, feats, origins and glossary from the 5.2 fixtures.',
-  },
-  {
-    id: 'srd_5_1',
-    label: 'SRD 5.1',
-    blurb:
-      'The classic 5.1 compendium extracted from the official SRD markdown.',
-  },
-];
+const RULE_VERSIONS = RULE_VERSION_OPTIONS;
 
-const STEPS = ['Identity', 'Ruleset', 'Party', 'Review'] as const;
+const STEPS = WIZARD_STEPS;
 
 export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
   isOpen,
@@ -102,8 +94,8 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
   const [name, setName] = useState('');
   const [atmosphereId, setAtmosphereId] = useState<string>(DEFAULT_ATMOSPHERE_ID);
   const [ruleVersion, setRuleVersion] = useState<CampaignRuleVersion>('srd_5_2');
-  const [partySize, setPartySize] = useState(4);
-  const [startingLevel, setStartingLevel] = useState(1);
+  const [partySize, setPartySize] = useState(DEFAULT_PARTY_SIZE);
+  const [startingLevel, setStartingLevel] = useState<number>(STARTING_LEVEL_OPTIONS[0]);
 
   // Creation state — the wizard completes only when createLobby resolves with
   // a real backend lobby.
@@ -185,16 +177,18 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
     setName('');
     setAtmosphereId(DEFAULT_ATMOSPHERE_ID);
     setRuleVersion('srd_5_2');
-    setPartySize(4);
-    setStartingLevel(1);
+    setPartySize(DEFAULT_PARTY_SIZE);
+    setStartingLevel(STARTING_LEVEL_OPTIONS[0]);
   }, [isOpen]);
 
-  const canAdvance = step !== 0 || name.trim().length > 0;
+  const canAdvance = canAdvanceStep(step, name);
 
   const handleCreate = async () => {
     setCreating(true);
     setCreateError(null);
-    const lobby = await createLobby(name.trim());
+    // The wire body is exactly { name } — see campaign_wizard_state.ts for the
+    // audited boundary between what is sent and what stays client-side.
+    const lobby = await createLobby(wizardCreateRequestBody(name).name);
     if (!lobby || !lobby.invite_code) {
       setCreating(false);
       setCreateError(
@@ -264,7 +258,26 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
     );
   };
 
-  const ruleLabel = RULE_VERSIONS.find((r) => r.id === ruleVersion)?.label ?? ruleVersion;
+  // Atmosphere display name resolved once so the review ledger shows the
+  // human label, not the raw preset id.
+  const atmosphereLabel =
+    atmosphereId === DEFAULT_ATMOSPHERE_ID
+      ? 'Default Obsidian'
+      : ATMOSPHERE_PRESETS.find((p) => p.id === atmosphereId)?.name ?? atmosphereId;
+  const review = reviewRows({
+    name,
+    atmosphereId: atmosphereLabel,
+    ruleVersion,
+    partySize,
+    startingLevel,
+  });
+  const deferredFields = clientOnlyWizardFields({
+    name,
+    atmosphereId,
+    ruleVersion,
+    partySize,
+    startingLevel,
+  });
 
   return (
     <ModalShell
@@ -497,8 +510,16 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
           </div>
 
           <p className="text-[10px] text-[var(--rp-parchment-300)] leading-relaxed">
-            Note: rule version, party size and starting level were recorded with this campaign but
-            are not yet server-side fields — the lobby API currently persists the table name only.
+            Note: the lobby API persists this campaign's name only. Recorded with your campaign
+            config but not yet sent to the server:
+            {deferredFields.map((f, i) => (
+              <span key={f.field}>
+                {i > 0 && '; '}
+                {' '}
+                <span className="font-bold">{f.field}</span> ({f.value}) — {f.reason}
+              </span>
+            ))}
+            .
           </p>
         </div>
       ) : (
@@ -619,23 +640,23 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={2}
-                  max={8}
+                  min={PARTY_SIZE_MIN}
+                  max={PARTY_SIZE_MAX}
                   step={1}
                   value={partySize}
-                  onChange={(e) => setPartySize(Number(e.target.value))}
+                  onChange={(e) => setPartySize(clampPartySize(e.target.value))}
                   className="w-full accent-amber-500"
                 />
                 <div className="flex justify-between text-[10px] font-mono text-[var(--rp-parchment-300)] mt-1">
-                  <span>2</span>
-                  <span>8</span>
+                  <span>{PARTY_SIZE_MIN}</span>
+                  <span>{PARTY_SIZE_MAX}</span>
                 </div>
               </div>
 
               <div>
                 <div className="font-bold mb-2">Starting level</div>
                 <div className="flex gap-2">
-                  {[1, 2, 3].map((lvl) => (
+                  {STARTING_LEVEL_OPTIONS.map((lvl) => (
                     <button
                       key={lvl}
                       type="button"
@@ -662,18 +683,7 @@ export const CampaignWizardModal: React.FC<CampaignWizardModalProps> = ({
             <div className="space-y-3">
               <div className="font-bold">Review</div>
               <dl className="p-3 rounded-lg border border-tavern-border bg-tavern-bg/60 font-mono space-y-1.5 text-[11px]">
-                {[
-                  ['Campaign', name.trim() || '(unnamed)'],
-                  [
-                    'Atmosphere',
-                    atmosphereId === DEFAULT_ATMOSPHERE_ID
-                      ? 'Default Obsidian'
-                      : ATMOSPHERE_PRESETS.find((p) => p.id === atmosphereId)?.name ?? atmosphereId,
-                  ],
-                  ['Rules', ruleLabel],
-                  ['Party size', `${partySize} player seats`],
-                  ['Starting level', `${startingLevel}`],
-                ].map(([k, v]) => (
+                {review.map(([k, v]) => (
                   <div key={k} className="flex justify-between gap-4">
                     <dt className="text-[var(--rp-parchment-300)]">{k}:</dt>
                     <dd className="text-[var(--rp-parchment-100)] text-right">{v}</dd>
