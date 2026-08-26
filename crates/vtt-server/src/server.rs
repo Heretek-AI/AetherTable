@@ -3064,6 +3064,98 @@ standard_action_route!(resolve_dodge, StandardAction::Dodge);
 standard_action_route!(resolve_dash, StandardAction::Dash);
 standard_action_route!(resolve_disengage, StandardAction::Disengage);
 
+// --- Delay action --------------------------------------------------------------
+//
+// SRD-optional Delay (table-standard QoL): step out of turn order and wait
+// for a better count. Delaying is FREE — no Action is spent — but the
+// combatant's turn arrival is passed over until `/action/delay/resume` re-seats
+// them at the current initiative count. The engine journals DELAY_TAKEN /
+// DELAY_RESUMED itself so rewinds replay exactly who was parked when.
+//
+// RBAC mirrors Dodge/Dash/Disengage: `may_mutate_session` plus ownership of
+// the delaying entity (a player may only delay/resume their OWN combatant;
+// GMs may do it to anyone; spectators are rejected outright).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayMode {
+    Take,
+    Resume,
+}
+
+impl DelayMode {
+    fn status(self) -> &'static str {
+        match self {
+            DelayMode::Take => "DELAY_TAKEN",
+            DelayMode::Resume => "DELAY_RESUMED",
+        }
+    }
+}
+
+macro_rules! delay_action_route {
+    ($name:ident, $mode:expr) => {
+        async fn $name(
+            data: web::Data<AppState>,
+            path: web::Path<Uuid>,
+            req: web::Json<SimpleActionReq>,
+            identity: AuthIdentity,
+        ) -> impl Responder {
+            data.count_request();
+            let session_id = path.into_inner();
+            let role = Role::from_identity(&identity);
+            if !may_mutate_session(&data, session_id, role, &identity.user_id) {
+                return reject(&data, 403, "FORBIDDEN_ROLE", "spectators cannot take actions");
+            }
+            let req = req.into_inner();
+            if let Some(session_lock) = data.sessions.get(&session_id) {
+                let mut session = session_lock.write();
+                if !session.entities.contains_key(&req.entity_id) {
+                    return reject(
+                        &data,
+                        404,
+                        "ENTITY_NOT_FOUND",
+                        "entity does not exist in session",
+                    );
+                }
+                let owner = session
+                    .entities
+                    .get(&req.entity_id)
+                    .and_then(|e| e.owner_player_id.clone());
+                if !may_control_entity(owner.as_ref(), role, &identity.user_id) {
+                    return reject(&data, 403, "ENTITY_NOT_OWNED", "you do not control this entity");
+                }
+                // Engine rejections — NOT_IN_COMBAT / ENTITY_CANNOT_ACT /
+                // ALREADY_DELAYED / NOT_DELAYED — surface as 409 codes verbatim.
+                let sequence_id = match $mode {
+                    DelayMode::Take => session.take_delay(req.entity_id),
+                    DelayMode::Resume => session.resume_delay(req.entity_id),
+                }
+                .map_err(|e| {
+                    reject(&data, 409, &e, "delay rejected by the engine")
+                });
+                let sequence_id = match sequence_id {
+                    Ok(seq) => seq,
+                    Err(response) => return response,
+                };
+                data.count_valid();
+                HttpResponse::Ok().json(serde_json::json!({
+                    "status": $mode.status(),
+                    "entity_id": req.entity_id.to_string(),
+                    "delayed": session.combat.delayed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "round": session.combat.round,
+                    "turn_index": session.combat.turn_index,
+                    "order": session.combat.order.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "event_sequence": sequence_id,
+                }))
+            } else {
+                HttpResponse::NotFound().json(serde_json::json!({"error": "Session not found"}))
+            }
+        }
+    };
+}
+
+delay_action_route!(resolve_delay_action, DelayMode::Take);
+delay_action_route!(resolve_delay_resume_action, DelayMode::Resume);
+
 // --- Ready action --------------------------------------------------------------
 //
 // SRD "Ready": spend your Action to hold a triggered response ("I attack the
@@ -5910,6 +6002,18 @@ fn project_snapshot_for_role(
                 .filter(|(i, _)| visible_positions.contains(i))
                 .map(|(_, v)| v.clone())
                 .collect();
+            // The `delayed` list is a subset of the same initiative sequence
+            // and carries the identical relative-timing leak: seeing WHICH
+            // slot an invisible NPC parked on discloses its position in the
+            // order. Hidden combatants are dropped from it exactly like the
+            // order slots above.
+            if let Some(delayed) = combat.get_mut("delayed").and_then(|d| d.as_array_mut()) {
+                delayed.retain(|id| {
+                    id.as_str()
+                        .map(|s| !hidden_ids.contains(s))
+                        .unwrap_or(true)
+                });
+            }
             let in_combat = combat
                 .get("in_combat")
                 .and_then(|v| v.as_bool())
@@ -6880,6 +6984,11 @@ pub fn configure_app_with(
                         .route("/action/dodge", web::post().to(resolve_dodge))
                         .route("/action/dash", web::post().to(resolve_dash))
                         .route("/action/disengage", web::post().to(resolve_disengage))
+                        .route("/action/delay", web::post().to(resolve_delay_action))
+                        .route(
+                            "/action/delay/resume",
+                            web::post().to(resolve_delay_resume_action),
+                        )
                         .route("/action/ready", web::post().to(resolve_ready_action))
                         .route(
                             "/action/ready/release",

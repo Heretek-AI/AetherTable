@@ -11666,3 +11666,260 @@ async fn move_response_for_non_gm_splits_hidden_and_visible_mixed_provocateurs()
 fn detail_len(body: &serde_json::Value) -> usize {
     body["opportunity_attacks_detail"].as_array().map(|a| a.len()).unwrap_or(0)
 }
+
+// --- Delay action (SRD-optional, table-standard QoL) --------------------------
+
+/// Spawns two combatants (optional owners per combatant), opens combat and
+/// returns (session_id, id_a, id_b).
+async fn delay_fixture(
+    app: test_app_ty!(),
+    gm: &str,
+    owner_a: Option<&str>,
+    owner_b: Option<&str>,
+) -> (Uuid, Uuid, Uuid) {
+    let session_id = create_session_as(app, gm).await;
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    for (id, owner) in [(a, owner_a), (b, owner_b)] {
+        let mut payload = entity_json(id, "Combatant", 20, 14, 5, "1d8");
+        if let Some(o) = owner {
+            payload["owner_player_id"] = serde_json::json!(o);
+        }
+        spawn_entity(app, gm, session_id, payload).await;
+    }
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(bearer(gm))
+        .to_request();
+    assert_eq!(test::call_service(app, req).await.status(), StatusCode::OK);
+    (session_id, a, b)
+}
+
+/// Spawns two combatants WITHOUT opening combat yet.
+async fn delay_spawn_only(
+    app: test_app_ty!(),
+    gm: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let session_id = create_session_as(app, gm).await;
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    for id in [a, b] {
+        spawn_entity(app, gm, session_id, entity_json(id, "Combatant", 20, 14, 5, "1d8")).await;
+    }
+    (session_id, a, b)
+}
+
+async fn post_delay(
+    app: test_app_ty!(),
+    token: &str,
+    session_id: Uuid,
+    entity_id: Uuid,
+    resume: bool,
+) -> (StatusCode, serde_json::Value) {
+    let uri = if resume {
+        format!("/api/v1/sessions/{}/action/delay/resume", session_id)
+    } else {
+        format!("/api/v1/sessions/{}/action/delay", session_id)
+    };
+    let req = test::TestRequest::post()
+        .uri(&uri)
+        .insert_header(bearer(token))
+        .set_json(serde_json::json!({"entity_id": entity_id}))
+        .to_request();
+    let res = test::call_service(app, req).await;
+    let status = res.status();
+    let body: serde_json::Value = test::read_body_json(res).await;
+    (status, body)
+}
+
+#[actix_web::test]
+async fn delay_enforces_spectator_and_ownership_rbac() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-1", "player", TEST_SECRET);
+    let spectator = sign_token_with_role("watcher", "spectator", TEST_SECRET);
+    let (session_id, mine_id, other_id) =
+        delay_fixture(&app, &gm, Some("player-1"), Some("someone-else")).await;
+
+    // Spectators cannot delay anyone.
+    let (status, body) =
+        post_delay(&app, &spectator, session_id, mine_id, false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "FORBIDDEN_ROLE");
+
+    // Players cannot park someone else's combatant.
+    let (status, body) =
+        post_delay(&app, &player, session_id, other_id, false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "ENTITY_NOT_OWNED");
+    // …nor resume them out of a delay.
+    let (status, body) =
+        post_delay(&app, &player, session_id, other_id, true).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "ENTITY_NOT_OWNED");
+
+    // Their own entity delays fine.
+    let (status, _) = post_delay(&app, &player, session_id, mine_id, false).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn delay_take_resume_roundtrip_is_free_and_ledgers_state() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    // Outside combat the engine refuses to park anybody.
+    let (session_id, a, _b) = delay_spawn_only(&app, &gm).await;
+    let (status, body) = post_delay(&app, &gm, session_id, a, false).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "NOT_IN_COMBAT");
+
+    // Now open combat and take the delay for real.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    // Take the delay: free — the Action budget survives untouched.
+    let (status, body) = post_delay(&app, &gm, session_id, a, false).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["status"], "DELAY_TAKEN");
+    assert_eq!(
+        body["delayed"].as_array().unwrap().len(),
+        1,
+        "exactly one combatant parked"
+    );
+    assert!(body["event_sequence"].as_u64().is_some());
+
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["combat"]["delayed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| **v == json_str(&a))
+            .count(),
+        1
+    );
+    assert_eq!(
+        snap["entities"][a.to_string()]["action_budget"]["action"],
+        true,
+        "delaying costs no Action"
+    );
+
+    // Resuming re-seats at the current count and clears the flag everywhere.
+    let (status, body) = post_delay(&app, &gm, session_id, a, true).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["status"], "DELAY_RESUMED");
+    assert_eq!(body["delayed"].as_array().unwrap().len(), 0);
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    assert_eq!(snap["combat"]["delayed"].as_array().unwrap().len(), 0);
+
+    // A second resume has nobody to re-seat.
+    let (status, body) = post_delay(&app, &gm, session_id, a, true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "NOT_DELAYED");
+}
+
+#[actix_web::test]
+async fn xcard_rewind_restores_delayed_state_from_the_ledger() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let (session_id, a, _b) = delay_fixture(&app, &gm, None, None).await;
+
+    let (_, take_body) = post_delay(&app, &gm, session_id, a, false).await;
+    let after_delay_seq = take_body["event_sequence"].as_u64().unwrap();
+    let (_, _) = post_delay(&app, &gm, session_id, a, true).await;
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    assert_eq!(snap["combat"]["delayed"].as_array().unwrap().len(), 0);
+
+    // Rewind between DELAY_TAKEN and DELAY_RESUMED: only the resume dies, so
+    // the surviving DELAY_TAKEN must restore the parked flag live.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "player_id": "gm-1",
+            "topic": "rewind the resume",
+            "target_sequence_id": after_delay_seq
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["combat"]["delayed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| **v == json_str(&a))
+            .count(),
+        1,
+        "rewound resume restores the delay from the ledger"
+    );
+
+    // And rewinding past the delay itself clears it again.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/safety/x-card", session_id))
+        .insert_header(bearer(&gm))
+        .set_json(serde_json::json!({
+            "player_id": "gm-1",
+            "topic": "rewind further",
+            "target_sequence_id": after_delay_seq - 1
+        }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    let snap = session_snapshot(&app, &gm, session_id).await;
+    assert_eq!(
+        snap["combat"]["delayed"].as_array().unwrap().len(),
+        0,
+        "nobody stays parked once the DELAY_TAKEN is rewound"
+    );
+}
+
+#[actix_web::test]
+async fn hidden_delayed_npc_is_dropped_from_non_gm_projection() {
+    let app = test_app().await;
+    let gm = sign_token_with_role("gm-1", "gm", TEST_SECRET);
+    let player = sign_token_with_role("player-9", "player", TEST_SECRET);
+    let session_id = create_session_as(&app, &gm).await;
+
+    let hero_id = Uuid::new_v4();
+    let mut hero = entity_json(hero_id, "Hero", 20, 14, 5, "1d8");
+    hero["owner_player_id"] = serde_json::json!("player-9");
+    spawn_entity(&app, &gm, session_id, hero).await;
+
+    // A HIDDEN NPC also joins the fight and then delays.
+    let lurker_id = Uuid::new_v4();
+    let mut lurker = entity_json(lurker_id, "Lurker", 20, 14, 5, "1d8");
+    lurker["is_visible"] = serde_json::json!(false);
+    spawn_entity(&app, &gm, session_id, lurker).await;
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/combat/begin", session_id))
+        .insert_header(bearer(&gm))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), StatusCode::OK);
+    let (status, _) = post_delay(&app, &gm, session_id, lurker_id, false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GM sees the truth; the player's projection drops the hidden id from
+    // BOTH order and delayed — its position there leaks relative initiative.
+    let gm_snap = session_snapshot(&app, &gm, session_id).await;
+    assert!(gm_snap["combat"]["delayed"]
+        .as_array()
+        .unwrap()
+        .contains(&json_str(&lurker_id)));
+
+    let player_snap = session_snapshot(&app, &player, session_id).await;
+    // Ledger payloads carry ids by gateway policy ("trusted with exact ledger
+    // numbers"), so the disclosure surface under audit is the COMBAT arrays:
+    // hidden slots are dropped from order AND from delayed.
+    let combat = &player_snap["combat"];
+    assert!(
+        !serde_json::to_string(combat).unwrap().contains(&lurker_id.to_string()),
+        "hidden delayed npc id must not appear in a player's combat projection"
+    );
+    assert_eq!(combat["order"].as_array().unwrap().len(), 1, "only the visible hero's slot survives");
+    assert_eq!(combat["delayed"].as_array().unwrap().len(), 0, "the hidden npc's parked flag is dropped");
+}

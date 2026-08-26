@@ -802,6 +802,12 @@ pub struct InitiativeCombatState {
     /// keeps legacy serialized sessions (combat without an order) parsing.
     #[serde(default)]
     pub order: Vec<Uuid>,
+    /// Combatants who declared the SRD-optional Delay and are parked out of
+    /// turn order until they resume. Serde default keeps legacy payloads
+    /// (written before delay existed) parsing. Cleared with the rest of the
+    /// tracker by [`GameSession::end_combat`].
+    #[serde(default)]
+    pub delayed: Vec<Uuid>,
 }
 
 /// One rolled initiative slot, as reported by [`GameSession::begin_combat`].
@@ -820,14 +826,50 @@ impl InitiativeCombatState {
             return (0, self.round, None);
         }
 
-        self.turn_index += 1;
-        if self.turn_index >= self.order.len() {
-            self.turn_index = 0;
-            self.round += 1;
+        // A delayed combatant's slot still exists in `order` (so resuming can
+        // re-seat them), but their turn arriving passes them over. The scan is
+        // bounded by the order length so an all-delayed order terminates
+        // parked on some slot instead of spinning forever.
+        let mut current_actor = None;
+        for _ in 0..self.order.len() {
+            self.turn_index += 1;
+            if self.turn_index >= self.order.len() {
+                self.turn_index = 0;
+                self.round += 1;
+            }
+
+            current_actor = self.order.get(self.turn_index).cloned();
+            match current_actor {
+                Some(id) if !self.delayed.contains(&id) => break,
+                _ => continue,
+            }
         }
 
-        let current_actor = self.order.get(self.turn_index).cloned();
         (self.turn_index, self.round, current_actor)
+    }
+
+    /// Re-inserts a delayed combatant at the CURRENT initiative count: their
+    /// slot moves to just after whoever acts right now, so when the count
+    /// advances they act immediately. Returns false when they were not
+    /// actually delayed (caller surfaces that as a rejection).
+    pub fn resume_delay(&mut self, entity_id: Uuid) -> bool {
+        if !self.delayed.contains(&entity_id) {
+            return false;
+        }
+        self.delayed.retain(|id| *id != entity_id);
+
+        let Some(old_pos) = self.order.iter().position(|id| *id == entity_id) else {
+            // Flag without a slot (defensive): the flag was still cleared.
+            return true;
+        };
+        self.order.remove(old_pos);
+        // Removing a slot before the cursor shifts the current actor left.
+        if old_pos < self.turn_index && self.turn_index > 0 {
+            self.turn_index -= 1;
+        }
+        let insert_at = (self.turn_index + 1).min(self.order.len());
+        self.order.insert(insert_at, entity_id);
+        true
     }
 }
 
@@ -2437,6 +2479,36 @@ impl GameSession {
             Some(true) => {
                 self.combat.in_combat = true;
                 self.combat.order.retain(|id| self.entities.contains_key(id));
+                // Delay replay (audit rewind-consistency class): the delayed
+                // flags are rebuilt from the surviving ledger instead of being
+                // trusted as live state — DELAY_TAKEN parks a combatant,
+                // DELAY_RESUMED re-seats them, applied chronologically so a
+                // rewind that severed only the resume restores the park.
+                self.combat.delayed.clear();
+                for ev in self.ledger.events.iter().filter(|e| !e.is_reverted) {
+                    let Some(id) = ev
+                        .payload
+                        .get("entity_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    else {
+                        continue;
+                    };
+                    match ev.event_type.as_str() {
+                        "DELAY_TAKEN"
+                            if !self.combat.delayed.contains(&id) =>
+                        {
+                            self.combat.delayed.push(id);
+                        }
+                        "DELAY_RESUMED" => {
+                            self.combat.delayed.retain(|d| *d != id);
+                        }
+                        _ => {}
+                    }
+                }
+                // Slots referencing entities the rewind despawned are gone;
+                // nobody can stay parked on a ghost.
+                self.combat.delayed.retain(|id| self.entities.contains_key(id));
             }
         }
 
@@ -2727,6 +2799,72 @@ impl GameSession {
         );
         cleared
     }
+
+    // ----------------------------------------------------------- delay action
+
+    /// SRD-optional Delay (table-standard QoL): the combatant steps out of
+    /// turn order and waits for a better count. Delaying is FREE — no Action,
+    /// bonus action or movement is spent; the cost is forfeiting your slot in
+    /// this round's sequence. Their `next_turn` arrival is passed over until
+    /// [`GameSession::resume_delay`] re-seats them at the current initiative
+    /// count. The declaration journals DELAY_TAKEN so rewinds replay exactly
+    /// who was parked when. Returns the ledger sequence id.
+    pub fn take_delay(&mut self, entity_id: Uuid) -> Result<u64, String> {
+        if !self.combat.in_combat {
+            return Err("NOT_IN_COMBAT".to_string());
+        }
+        let entity = self
+            .entities
+            .get(&entity_id)
+            .ok_or_else(|| "ENTITY_NOT_FOUND".to_string())?;
+        if !entity.can_act() {
+            // Dying, dead or incapacitated combatants cannot volunteer to wait.
+            return Err("ENTITY_CANNOT_ACT".to_string());
+        }
+        if self.combat.delayed.contains(&entity_id) {
+            return Err("ALREADY_DELAYED".to_string());
+        }
+
+        self.combat.delayed.push(entity_id);
+        let round = self.combat.round;
+        let event = self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "DELAY_TAKEN",
+            serde_json::json!({ "entity_id": entity_id, "round": round }),
+        );
+        Ok(event.sequence_id)
+    }
+
+    /// Ends a delay: clears the flag and re-inserts the combatant immediately
+    /// AFTER the current actor — i.e. they act at the current initiative
+    /// count, keeping that position until their next full turn comes around.
+    /// Journals DELAY_RESUMED for rewind replay. Returns the ledger sequence.
+    pub fn resume_delay(&mut self, entity_id: Uuid) -> Result<u64, String> {
+        if !self.combat.in_combat {
+            return Err("NOT_IN_COMBAT".to_string());
+        }
+        if !self.entities.contains_key(&entity_id) {
+            return Err("ENTITY_NOT_FOUND".to_string());
+        }
+        if !self.combat.resume_delay(entity_id) {
+            return Err("NOT_DELAYED".to_string());
+        }
+
+        let event = self.ledger.append_event(
+            self.session_id,
+            self.campaign_id,
+            entity_id,
+            "DELAY_RESUMED",
+            serde_json::json!({
+                "entity_id": entity_id,
+                "round": self.combat.round,
+                "turn_index": self.combat.turn_index,
+            }),
+        );
+        Ok(event.sequence_id)
+    }
 }
 
 /// Parses a `[x, y, z]` payload coordinate array into a position tuple.
@@ -2899,6 +3037,164 @@ mod tests {
         let mut state = InitiativeCombatState::default();
         let (idx, round, actor) = state.next_turn();
         assert_eq!((idx, round, actor), (0, 0, None));
+    }
+
+    // ----------------------------------------------------------- delay action
+
+    #[test]
+    fn test_take_delay_marks_entity_delayed_without_spending_the_action() {
+        let id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(id, "Cautious", 10), None).unwrap();
+        session.begin_combat(&mut DiceEngine::with_seed(5));
+
+        let before = session.entities[&id].action_budget.clone();
+        let seq = session.take_delay(id).expect("delay is legal mid-combat");
+
+        assert!(
+            session.combat.delayed.contains(&id),
+            "the entity is flagged delayed"
+        );
+        assert_eq!(
+            session.entities[&id].action_budget, before,
+            "delaying itself costs nothing"
+        );
+        let event = &session.ledger.events[(seq - 1) as usize];
+        assert_eq!(event.event_type, "DELAY_TAKEN");
+        assert_eq!(event.actor_id, id);
+        assert_eq!(
+            event.payload.get("entity_id").and_then(|v| v.as_str()),
+            Some(id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn test_take_delay_rejects_outside_combat_unknown_and_unconscious() {
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        let id = Uuid::new_v4();
+        session.add_entity(entity(id, "Hero", 10), None).unwrap();
+
+        assert_eq!(session.take_delay(id).unwrap_err(), "NOT_IN_COMBAT");
+
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        assert_eq!(
+            session.take_delay(Uuid::new_v4()).unwrap_err(),
+            "ENTITY_NOT_FOUND"
+        );
+
+        let dying_id = Uuid::new_v4();
+        let mut dying = entity(dying_id, "Dying", 0);
+        dying.is_conscious = false;
+        session.add_entity(dying, None).unwrap();
+        assert_eq!(session.take_delay(dying_id).unwrap_err(), "ENTITY_CANNOT_ACT");
+
+        // Double delay is a no-op rejection, not silent re-flagging.
+        session.take_delay(id).unwrap();
+        assert_eq!(session.take_delay(id).unwrap_err(), "ALREADY_DELAYED");
+    }
+
+    #[test]
+    fn test_next_turn_skips_delayed_actor_until_they_resume() {
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let [a, b, c] = [ids[0], ids[1], ids[2]];
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        for (i, id) in ids.iter().enumerate() {
+            session.add_entity(entity(*id, &format!("E{}", i), 10), None).unwrap();
+        }
+        session.begin_combat(&mut DiceEngine::with_seed(2));
+        // Pin the order so the skip arithmetic below reads deterministically.
+        session.combat.order = vec![a, b, c];
+        session.combat.turn_index = 0;
+
+        session.take_delay(b).unwrap();
+
+        // Advancing off `a` lands on b's slot — skipped — and settles on c.
+        let (idx, round, actor) = session.combat.next_turn();
+        assert_eq!(actor, Some(c), "delayed b is passed over");
+        assert_eq!((idx, round), (2, 1));
+
+        // Wrapping past c reaches a in round 2; b stays parked.
+        let (_, round, actor) = session.combat.next_turn();
+        assert_eq!((round, actor), (2, Some(a)));
+
+        // Resuming re-inserts b right after the current actor (the current
+        // initiative count) and clears the flag.
+        session.resume_delay(b).expect("b is delayed");
+        assert!(!session.combat.delayed.contains(&b));
+        assert_eq!(session.combat.order, vec![a, b, c]);
+        let (_, _, actor) = session.combat.next_turn();
+        assert_eq!(actor, Some(b), "resumed combatant acts at the current count");
+    }
+
+    #[test]
+    fn test_resume_delay_rejects_when_not_delayed_or_out_of_combat() {
+        let id = Uuid::new_v4();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        session.add_entity(entity(id, "Solo", 10), None).unwrap();
+
+        assert_eq!(session.resume_delay(id).unwrap_err(), "NOT_IN_COMBAT");
+
+        session.begin_combat(&mut DiceEngine::with_seed(1));
+        assert_eq!(session.resume_delay(id).unwrap_err(), "NOT_DELAYED");
+        session.take_delay(id).unwrap();
+        // Resuming twice: the second call finds nobody delayed.
+        session.resume_delay(id).unwrap();
+        assert_eq!(session.resume_delay(id).unwrap_err(), "NOT_DELAYED");
+    }
+
+    #[test]
+    fn test_everyone_delayed_still_advances_instead_of_looping_forever() {
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        for (i, id) in ids.iter().enumerate() {
+            session.add_entity(entity(*id, &format!("E{}", i), 10), None).unwrap();
+        }
+        session.begin_combat(&mut DiceEngine::with_seed(2));
+        for id in &ids {
+            session.take_delay(*id).unwrap();
+        }
+        // Must terminate with SOME slot parked rather than spinning.
+        let _ = session.combat.next_turn();
+        assert_eq!(session.combat.turn_index, 0);
+    }
+
+    #[test]
+    fn test_rewind_replays_delay_state_from_the_surviving_ledger() {
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let mut session = GameSession::new(Uuid::new_v4(), Uuid::new_v4(), "t".into());
+        for (i, id) in ids.iter().enumerate() {
+            session.add_entity(entity(*id, &format!("E{}", i), 10), None).unwrap();
+        }
+        session.begin_combat(&mut DiceEngine::with_seed(2));
+
+        let after_delay_seq = session.take_delay(ids[0]).unwrap();
+        session.resume_delay(ids[0]).unwrap();
+        assert!(session.combat.delayed.is_empty());
+
+        // Rewind between DELAY_TAKEN and DELAY_RESUMED: only the resume dies,
+        // so the surviving DELAY_TAKEN must restore the delayed flag.
+        session.safety_rewind(after_delay_seq);
+        assert!(
+            session.combat.delayed.contains(&ids[0]),
+            "rewound resume restores the delay"
+        );
+
+        // Rewinding past the delay itself clears it entirely.
+        session.safety_rewind(after_delay_seq - 1);
+        assert!(
+            !session.combat.delayed.contains(&ids[0]),
+            "rewound delay leaves nobody delayed"
+        );
+    }
+
+    #[test]
+    fn test_legacy_combat_payload_without_delayed_field_parses() {
+        let raw = serde_json::json!({
+            "in_combat": true, "round": 3, "turn_index": 1,
+            "order": [Uuid::new_v4().to_string()]
+        });
+        let state: InitiativeCombatState = serde_json::from_value(raw).expect("legacy payload");
+        assert!(state.delayed.is_empty());
     }
 
     // ------------------------------------------------ standard action options
