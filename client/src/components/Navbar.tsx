@@ -46,7 +46,7 @@ import {
   DEFAULT_ATMOSPHERE_ID,
 } from '../theme/atmospheres';
 
-export type SaaSView = 'landing' | 'tabletop' | 'compendium' | 'builder' | 'encounters' | 'marketplace' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics' | 'admin';
+export type SaaSView = 'landing' | 'tabletop' | 'compendium' | 'builder' | 'my_characters' | 'encounters' | 'marketplace' | 'lobby' | 'dynasty' | 'bundles' | 'quests' | 'wfc' | 'analytics' | 'admin';
 
 interface NavbarProps {
   currentView: SaaSView;
@@ -299,7 +299,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             onClick={() => toggleDropdown('characters')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl font-semibold transition cursor-pointer ${
-              activeDropdown === 'characters' || ['builder', 'encounters', 'lobby'].includes(currentView)
+              activeDropdown === 'characters' || ['builder', 'my_characters', 'encounters', 'lobby'].includes(currentView)
                 ? 'bg-[var(--tavern-surface)] text-[var(--tavern-accent)] border border-[var(--tavern-border)]'
                 : 'text-[var(--rp-parchment-300)] hover:text-[var(--rp-parchment-100)] hover:bg-[var(--tavern-surface)]'
             }`}
@@ -319,6 +319,19 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <div>
                   <div className="font-bold">Character Studio</div>
                   <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">5-Step Wizard & Point Buy</div>
+                </div>
+              </button>
+
+              {/* Iteration 14 (Loop 3): the persisted stable, directly beside
+                  the studio that creates its members. */}
+              <button
+                onClick={() => handleNavClick('my_characters')}
+                className="w-full flex items-center space-x-2.5 p-2 rounded-lg text-left hover:bg-[var(--rp-leather-700)] transition text-[var(--rp-parchment-200)] cursor-pointer"
+              >
+                <Users className="w-4 h-4 text-sky-400 shrink-0" />
+                <div>
+                  <div className="font-bold">My Characters</div>
+                  <div className="text-[10px] text-[var(--rp-parchment-300)] font-sans">Saved Sheets · Deploy & Retire</div>
                 </div>
               </button>
 

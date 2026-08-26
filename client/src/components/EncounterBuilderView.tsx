@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   Swords,
   Skull,
@@ -11,6 +11,7 @@ import {
   Search,
   TrendingUp,
   RefreshCw,
+  Scale,
 } from 'lucide-react';
 import {
   ensureEngineSession,
@@ -26,6 +27,16 @@ import {
   parsePrimarySpeedFeet,
   type CompendiumMonster,
 } from '../api/encounter_store';
+import {
+  BALANCE_DEBOUNCE_MS,
+  balanceEncounter,
+  createDebouncedBalancer,
+  fetchPartyDefaults,
+  unknownMonsterIdsFrom,
+  type DifficultyTier,
+  type EncounterBalanceResult,
+} from '../api/encounter_balance_store';
+import { getStoredToken } from '../api/auth_headers';
 
 interface EncounterBuilderViewProps {
   /**
@@ -41,6 +52,15 @@ interface EncounterBuilderViewProps {
    * reuses/creates this client's session via ensureEngineSession()).
    */
   engineSessionId?: string | null;
+  /**
+   * Whether the signed-in seat is GM/staff. Optional: when omitted the builder
+   * falls back to "a session token exists" and lets the GATEWAY decide — a
+   * 403 ENCOUNTER_BALANCE_GM_ONLY from POST /api/v1/engine/encounter/balance
+   * hides the strip permanently, because balance data leaks encounter design to
+   * any seat that is not gm/admin. A non-GM gets NO balance strip at all rather
+   * than a permanent error banner.
+   */
+  isGM?: boolean | null;
 }
 
 /** One roster line: a real compendium stat block plus how many to spawn. */
@@ -53,7 +73,40 @@ type SpawnRowOutcome =
   | { kind: 'applied'; label: string; entityId?: string }
   | { kind: 'rejected'; label: string; status: number; code: string | null; message: string | null };
 
-export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ engineSessionId }) => {
+/** Parameters that ride one POST /api/v1/engine/encounter/balance call. */
+interface BalanceParams {
+  partyLevel: number;
+  partySize: number;
+  roster: { monster_id: string; quantity: number }[];
+}
+
+/* --- Server balance verdict (iteration 13) ----------------------------------
+ *
+ * The Difficulty Gauge below computes the SAME DMG math locally for instant
+ * feedback. This strip instead asks the authoritative shared model
+ * (POST /api/v1/engine/encounter/balance) so the pre-spawn number comes from
+ * the one table the shipped-adventure audit uses — and any drift between the
+ * two computations is VISIBLE rather than hidden behind a single copy.
+ */
+type BalanceState =
+  | { phase: 'idle' } // nothing to balance yet (empty roster)
+  | { phase: 'loading' }
+  | { phase: 'ok'; data: EncounterBalanceResult }
+  | { phase: 'error'; text: string };
+
+/** Badge styling per difficulty tier (green / yellow / orange / red). */
+const DIFFICULTY_BADGE: Record<DifficultyTier, { label: string; className: string }> = {
+  trivial: { label: 'Trivial', className: 'vtt-badge' },
+  easy: { label: 'Easy', className: 'vtt-badge vtt-badge-success' },
+  medium: { label: 'Medium', className: 'vtt-badge' },
+  hard: { label: 'Hard', className: 'vtt-badge vtt-badge-warning' },
+  deadly: { label: 'Deadly', className: 'vtt-badge vtt-badge-danger font-black tracking-widest' },
+};
+
+export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
+  engineSessionId,
+  isGM = null,
+}) => {
   /* --- Live compendium state -------------------------------------------- */
   const [monsters, setMonsters] = useState<CompendiumMonster[]>([]);
   const [compendiumLoading, setCompendiumLoading] = useState(true);
@@ -125,6 +178,120 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ engi
     if (adjustedXp < thresholds.deadly) return { label: 'Hard', badge: 'vtt-badge vtt-badge-danger' };
     return { label: 'Deadly', badge: 'vtt-badge vtt-badge-danger font-black tracking-widest' };
   }, [adjustedXp, thresholds]);
+
+  /* --- Server-side balance verdict (debounced ~800ms) -----------------------
+   *
+   * Every roster/party change schedules a recompute; the scheduler coalesces a
+   * burst (quantity +/- held down, slider drag, multi-add) into ONE call with
+   * the FINAL parameters after 800ms of quiet — dragging the quantity spinner
+   * must not fire dozens of requests whose answers are stale on arrival.
+   * Errors surface verbatim, including the gateway's UNKNOWN_MONSTER_ID:<id>
+   * naming exactly which compendium id it refused.
+   */
+  const [balanceState, setBalanceState] = useState<BalanceState>({ phase: 'idle' });
+  const balancerRef = useRef<ReturnType<typeof createDebouncedBalancer<BalanceParams>> | null>(null);
+  // Monotonic token so a slow in-flight response can never overwrite a newer
+  // verdict computed from later roster state.
+  const balanceRunRef = useRef(0);
+
+  useEffect(() => {
+    if (!isGM) return;
+    let cancelled = false;
+    void fetchPartyDefaults().then((defaults) => {
+      if (cancelled) return;
+      setPartyLevel(defaults.level);
+      setPartySize(defaults.size);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // Runs once on mount; the sliders stay user-adjustable afterwards.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isGM]);
+
+  useEffect(() => {
+    if (!isGM) return;
+    const balancer = createDebouncedBalancer<BalanceParams>({
+      delayMs: BALANCE_DEBOUNCE_MS,
+      invoke: async (params) => {
+        const run = ++balanceRunRef.current;
+        setBalanceState({ phase: 'loading' });
+        const outcome = await balanceEncounter(params.partyLevel, params.partySize, params.roster);
+        // A newer invocation supersedes this response (stale-answer guard).
+        if (run !== balanceRunRef.current) return;
+        applyBalanceOutcome(outcome);
+      },
+    });
+    balancerRef.current = balancer;
+    function applyBalanceOutcome(outcome: Awaited<ReturnType<typeof balanceEncounter>>): void {
+      switch (outcome.kind) {
+        case 'ok':
+          setBalanceState({ phase: 'ok', data: outcome.data });
+          break;
+        case 'empty_roster':
+          setBalanceState({ phase: 'idle' });
+          break;
+        case 'not_signed_in':
+          setBalanceState({ phase: 'error', text: outcome.message });
+          break;
+        case 'forbidden':
+          // GM-only route answered 403 to this seat: hide the strip rather
+          // than wave an error at a player who was never supposed to see it.
+          setBalanceState({ phase: 'idle' });
+          break;
+        case 'unknown_monster':
+          setBalanceState({
+            phase: 'error',
+            text:
+              outcome.message ??
+              `Unknown monster id${outcome.monsterIds.length === 1 ? '' : 's'}: ${outcome.monsterIds.join(', ')}`,
+          });
+          break;
+        case 'rejected':
+          setBalanceState({
+            phase: 'error',
+            text: `HTTP ${outcome.status}${outcome.message ? ` — ${outcome.message}` : ''}`,
+          });
+          break;
+        case 'unreachable':
+          setBalanceState({
+            phase: 'error',
+            text: 'The gateway did not answer — no balance verdict was produced.',
+          });
+          break;
+      }
+    }
+    return () => {
+      balancer.cancel();
+      balancerRef.current = null;
+    };
+  }, [isGM]);
+
+  // Re-schedule whenever anything that rides the wire changes.
+  const rosterWire = useMemo(
+    () =>
+      roster.map((entry) => ({ monster_id: entry.monster.id, quantity: entry.count })),
+    [roster],
+  );
+
+  useEffect(() => {
+    if (!isGM) return;
+    if (rosterWire.length === 0) {
+      balancerRef.current?.cancel();
+      setBalanceState({ phase: 'idle' });
+      return;
+    }
+    balancerRef.current?.schedule({
+      partyLevel,
+      partySize,
+      roster: rosterWire.map((line) => ({ ...line })),
+    });
+  }, [isGM, partyLevel, partySize, rosterWire]);
+
+  const balanceBadge = useMemo(() => {
+    const tier = balanceState.phase === 'ok' ? balanceState.data.difficulty : undefined;
+    return tier && DIFFICULTY_BADGE[tier] ? DIFFICULTY_BADGE[tier] : null;
+  }, [balanceState]);
 
   /* --- Roster editing ------------------------------------------------------- */
   const handleAddMonster = (monster: CompendiumMonster) => {
@@ -392,6 +559,76 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({ engi
               </div>
             </div>
           </div>
+
+          {/* Server balance verdict — GM-only strip (iteration 13).
+              Non-GM seats render nothing at all: balance data is DM
+              information and the gateway 403s anyone else anyway. */}
+          {isGM && (
+            <div className="vtt-surface rounded-xl p-5 shadow-xl space-y-3">
+              <div className="flex items-center justify-between border-b border-tavern-border pb-3">
+                <h3 className="vtt-section-header text-sm font-bold">
+                  <Scale className="w-4 h-4 text-tavern-accent" />
+                  Balance (Server Model)
+                </h3>
+                {balanceBadge && (
+                  <span className={balanceBadge.className} data-testid="balance-difficulty-badge">
+                    {balanceBadge.label}
+                  </span>
+                )}
+              </div>
+
+              {balanceState.phase === 'idle' && (
+                <p className="text-xs text-parchment-aged/60">
+                  Add a monster to the roster and the authoritative server-side DMG model will weigh this
+                  encounter after ~{BALANCE_DEBOUNCE_MS / 1000}s of quiet.
+                </p>
+              )}
+
+              {balanceState.phase === 'loading' && (
+                <p className="text-xs text-parchment-aged/70 flex items-center gap-2">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  Weighing the encounter against the shared DMG table…
+                </p>
+              )}
+
+              {balanceState.phase === 'ok' && (
+                <div className="space-y-2">
+                  <div className="grid grid-cols-3 gap-2 text-center">
+                    <div className="p-2.5 bg-black/40 border border-tavern-border rounded-lg">
+                      <div className="text-[10px] font-semibold text-parchment-aged/80 uppercase">Raw XP</div>
+                      <div className="text-base font-bold font-mono text-amber-300">
+                        {(balanceState.data.raw_xp ?? 0).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="p-2.5 bg-black/40 border border-tavern-border rounded-lg">
+                      <div className="text-[10px] font-semibold text-parchment-aged/80 uppercase">Adjusted</div>
+                      <div className="text-base font-bold font-mono text-amber-400">
+                        {(balanceState.data.adjusted_xp ?? 0).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="p-2.5 bg-black/40 border border-tavern-border rounded-lg">
+                      <div className="text-[10px] font-semibold text-parchment-aged/80 uppercase">Multiplier</div>
+                      <div className="text-base font-bold font-mono text-parchment-aged">
+                        {balanceState.data.multiplier ?? '?'}×
+                      </div>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-parchment-aged/60">
+                    Verdict from POST /api/v1/engine/encounter/balance (party level {partyLevel}, size{' '}
+                    {partySize}) — the same table the shipped-adventure audit uses. The local gauge above is an
+                    independent computation; any disagreement between them is real drift, not a rendering bug.
+                  </p>
+                </div>
+              )}
+
+              {balanceState.phase === 'error' && (
+                <p className="text-xs text-[color:var(--state-danger)] flex items-start gap-1.5" data-testid="balance-error">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  <span>{balanceState.text}</span>
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Engine confirmation (read-only snapshot result) */}
           {(spawnResults.length > 0 || confirmedEntityCount !== null || snapshotError) && (

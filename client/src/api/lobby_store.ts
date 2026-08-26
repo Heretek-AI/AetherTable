@@ -285,6 +285,31 @@ export async function findCharacterForToken(tokenName: string): Promise<FullStor
   return getCharacter(meta.character_id);
 }
 
+/**
+ * Permanently delete one of the caller's OWN characters. Mirrors the gateway's
+ * DELETE /api/v1/characters/{id} ownership contract: a valid token that does
+ * not own the id gets the same 404 ("not found for this owner") as a
+ * nonexistent id, so both collapse here into `false` — callers show a single
+ * honest "could not delete" message rather than distinguishing them.
+ *
+ * Returns true ONLY on an explicit gateway confirmation; signed-out, offline,
+ * and unmapped failures all resolve false (never throw).
+ */
+export async function deleteCharacter(characterId: string): Promise<boolean> {
+  if (!getToken()) return false;
+  try {
+    const resp = await fetch(
+      `/api/v1/characters/${encodeURIComponent(characterId)}`,
+      { method: 'DELETE', headers: authHeaders() }
+    );
+    if (!resp.ok) return false;
+    const payload = (await resp.json().catch(() => null)) as { status?: unknown } | null;
+    return payload?.status === 'DELETED';
+  } catch {
+    return false;
+  }
+}
+
 export async function deployCharacter(
   characterId: string,
   sessionId: string,

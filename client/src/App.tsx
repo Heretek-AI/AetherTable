@@ -34,6 +34,9 @@ const SafetyModal = lazy(() => import('./components/SafetyModal').then((m) => ({
 const AudioMixerModal = lazy(() => import('./components/AudioMixerModal').then((m) => ({ default: m.AudioMixerModal })));
 const CompendiumView = lazy(() => import('./components/CompendiumView').then((m) => ({ default: m.CompendiumView })));
 const CharacterBuilderView = lazy(() => import('./components/CharacterBuilderView').then((m) => ({ default: m.CharacterBuilderView })));
+// Iteration 14 (Loop 3): the player's persisted stable — gallery of owned
+// sheets with View / Deploy / Delete against the existing gateway routes.
+const MyCharactersView = lazy(() => import('./components/MyCharactersView').then((m) => ({ default: m.MyCharactersView })));
 const EncounterBuilderView = lazy(() => import('./components/EncounterBuilderView').then((m) => ({ default: m.EncounterBuilderView })));
 const LobbyView = lazy(() => import('./components/LobbyView').then((m) => ({ default: m.LobbyView })));
 const DynastyView = lazy(() => import('./components/DynastyView').then((m) => ({ default: m.DynastyView })));
@@ -2387,6 +2390,19 @@ export function App() {
 
         {currentView === 'builder' && (
           <CharacterBuilderView onDeployCharacter={handleDeployFromBuilder} />
+        )}
+
+        {/* Iteration 14 (Loop 3): "My Characters" gallery — the persisted
+            stable behind the builder. Deploy reuses handleDeployFromBuilder's
+            local-canvas path after the real gateway deploy call; the session
+            gate mirrors combatSessionId so a dead table disables the action
+            instead of manufacturing a 422. */}
+        {currentView === 'my_characters' && (
+          <MyCharactersView
+            activeSessionId={combatSessionId}
+            onDeployToTabletop={handleDeployFromBuilder}
+            onOpenBuilder={() => setCurrentView('builder')}
+          />
         )}
 
         {currentView === 'encounters' && (
