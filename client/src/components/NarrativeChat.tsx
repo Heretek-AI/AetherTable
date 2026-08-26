@@ -35,6 +35,7 @@ import {
   resolveSttEngine,
   type SttEngineChoice,
 } from '../api/server_stt';
+import { NarrationPanel } from './NarrationPanel';
 
 export type ChatChannel = 'all' | 'party' | 'gm' | 'combat';
 
@@ -80,6 +81,16 @@ interface NarrativeChatProps {
    * Default false — the seated table keeps every channel.
    */
   publicOnly?: boolean;
+  /**
+   * Loop 3 iteration 8: spoken-narration affordance mounted as a collapsible
+   * strip above the input bar. Any seated seat may narrate its OWN text (the
+   * gateway logs the CALLER's user id), so unlike SfxPanel this renders for
+   * everyone — refusals surface verbatim when they arrive. GM seats get it
+   * expanded by default; others start collapsed.
+   */
+  narrationSessionId?: string | null;
+  /** Seat role, used only to pick the NarrationPanel default collapse state. */
+  userRole?: 'gm' | 'player' | 'spectator';
 }
 
 const CRIMSON_TEXT = 'var(--statblock-header)'; /* --rp-crimson-600 — safe crimson text on parchment */
@@ -115,6 +126,8 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   activePeerTyping = null,
   onBroadcastPing,
   publicOnly = false,
+  narrationSessionId = null,
+  userRole,
 }) => {
   const [activeChannel, setActiveChannel] = useState<ChatChannel>('all');
   const [inputText, setInputText] = useState('');
@@ -554,6 +567,17 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Speak Aloud (iteration 8): collapsible TTS composer. Visible to every
+          seat — the route is own-text narration, not a staff surface. */}
+      {!publicOnly && (
+        <div className="px-2 pt-1.5">
+          <NarrationPanel
+            sessionId={narrationSessionId}
+            defaultOpen={userRole === 'gm' || userRole === undefined}
+          />
         </div>
       )}
 
