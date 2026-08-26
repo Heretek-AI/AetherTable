@@ -132,6 +132,10 @@ class TestProxyAuthRequired:
             "/api/v1/engine/help",
             {"session_id": "s", "helper_id": "h", "target_entity_id": "t"},
         ),
+        "opportunity-attack": (
+            "/api/v1/engine/opportunity-attack",
+            {"session_id": "s", "attacker_id": "a", "target_id": "t"},
+        ),
     }
 
     def test_missing_token_is_401_on_every_narrative_route(self):
@@ -975,6 +979,143 @@ class TestOffhandAndHelpProxies:
             )
             assert resp.status_code == 502, path
             assert "unreachable" in resp.json()["detail"].lower(), path
+
+
+class TestOpportunityAttackProxy:
+    """Identity forwarding + payload contract for the opportunity-attack
+    proxy (POST /api/v1/engine/opportunity-attack -> engine POST
+    /api/v1/sessions/{id}/action/opportunity-attack), iteration 78.
+
+    The engine's OpportunityAttackReq is ids-only ({attacker_id, target_id};
+    optional engine-side action_index defaults to 0). Everything mechanical —
+    pending-trigger liveness, Reaction spend, the roll itself — is engine-owned;
+    the gateway forwards ids plus the caller's verified identity only. The
+    engine's optional deterministic `seed` is deliberately NOT forwardable."""
+
+    @staticmethod
+    def _token(user_id: str = "player-7", role: str = "player") -> str:
+        import time as _time
+
+        from vtt_orchestrator.server import _sign_token
+
+        return _sign_token({"user_id": user_id, "role": role, "exp": _time.time() + 600})
+
+    SESSION_ID = "7b3d5f9a-2c4e-4d6f-8a1b-3e5c7d9f0a2b"
+
+    BODY = {
+        "session_id": SESSION_ID,
+        "attacker_id": "orc-warlord",
+        "target_id": "fleeing-mage",
+    }
+
+    @staticmethod
+    def _capture(monkeypatch, response):
+        captured: dict = {}
+
+        async def fake_engine_request(method, path, payload=None, *, actor=None):
+            captured.update({"method": method, "path": path, "payload": payload})
+            captured["actor"] = actor
+            return response
+
+        monkeypatch.setattr(engine_client, "engine_request", fake_engine_request)
+        return captured
+
+    def test_forwards_identity_path_and_ids_only_payload(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"is_hit": True, "total_damage": 7})
+        resp = client.post(
+            "/api/v1/engine/opportunity-attack",
+            params={"token": self._token("player-7", "player")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"is_hit": True, "total_damage": 7}
+        assert captured["method"] == "POST"
+        assert captured["path"] == (
+            f"/api/v1/sessions/{self.SESSION_ID}/action/opportunity-attack"
+        )
+        # Real caller identity reaches the engine RBAC — the REACTION being
+        # spent belongs to the provoked attacker's controller, not to a
+        # service principal.
+        assert captured["actor"] == {"user_id": "player-7", "role": "player"}
+        # Ids-only payload coerced to UUIDs like every other proxy. The
+        # session reference rides the PATH, not the body.
+        assert captured["payload"] == {
+            "attacker_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "orc-warlord")),
+            "target_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "fleeing-mage")),
+        }
+        assert "seed" not in captured["payload"]
+        assert "session_id" not in captured["payload"]
+
+    def test_gm_identity_is_forwarded(self, monkeypatch):
+        captured = self._capture(monkeypatch, {"is_hit": False})
+        resp = client.post(
+            "/api/v1/engine/opportunity-attack",
+            params={"token": self._token("gm-1", "gm")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 200
+        assert captured["actor"] == {"user_id": "gm-1", "role": "gm"}
+
+    def test_missing_token_is_401_and_invalid_token_is_401(self):
+        assert (
+            client.post("/api/v1/engine/opportunity-attack", json=self.BODY).status_code
+            == 401
+        ), "anonymous access must be refused"
+        assert (
+            client.post(
+                "/api/v1/engine/opportunity-attack",
+                params={"token": "garbage.token.value"},
+                json=self.BODY,
+            ).status_code
+            == 401
+        )
+
+    def test_smuggled_seed_and_extra_fields_are_rejected_422(self):
+        """Trust-inversion regression: no roll pins or math smuggled past the
+        OA proxy."""
+        token = self._token("gm-1", "gm")
+        smuggles = {
+            "seed": {**self.BODY, "seed": 42},
+            "attack_bonus": {**self.BODY, "attack_bonus": 999},
+            "damage_expression": {**self.BODY, "damage_expression": "99d99+99"},
+            "advantage": {**self.BODY, "advantage": True},
+            "action_index": {**self.BODY, "action_index": 3},
+        }
+        for case, body in smuggles.items():
+            resp = client.post(
+                "/api/v1/engine/opportunity-attack", params={"token": token}, json=body
+            )
+            assert resp.status_code == 422, case
+
+    def test_engine_rejection_surfaces_verbatim(self, monkeypatch):
+        async def rejected(method, path, payload=None, *, actor=None):
+            raise engine_client.EngineRejectedError(
+                409,
+                '{"error": "NO_PENDING_OPPORTUNITY", '
+                '"message": "no pending opportunity attack against this mover"}',
+            )
+
+        monkeypatch.setattr(engine_client, "engine_request", rejected)
+        resp = client.post(
+            "/api/v1/engine/opportunity-attack",
+            params={"token": self._token("player-7", "player")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "error": "NO_PENDING_OPPORTUNITY",
+            "message": "no pending opportunity attack against this mover",
+        }
+
+    def test_unreachable_engine_maps_to_502(self, monkeypatch):
+        monkeypatch.setattr(engine_client, "ENGINE_API_URL", "http://localhost:59999")
+        resp = client.post(
+            "/api/v1/engine/opportunity-attack",
+            params={"token": self._token("gm-1", "gm")},
+            json=self.BODY,
+        )
+        assert resp.status_code == 502
+        assert "unreachable" in resp.json()["detail"].lower()
 
 
 class TestInspirationSpendForwarding:

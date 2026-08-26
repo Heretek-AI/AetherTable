@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import math
 import os
 import re
@@ -586,6 +588,8 @@ TOKEN_TTL_SECONDS = 12 * 3600
 
 storage_backend: Any = MemoryStore()
 
+_autosave_log = logging.getLogger("aethertable.autosave")
+
 
 @app.on_event("startup")
 async def _init_storage_backend():
@@ -1069,6 +1073,185 @@ async def campaign_autosave(
         "round": round_number,
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# --- Periodic autosave (iteration 77) -----------------------------------------
+#
+# The audit found that every save path was PULL-based: a human clicking
+# POST /campaign/autosave or a client posting /campaign/save. A crashed
+# browser or an overnight session lost everything after the last manual click.
+# This block adds an opt-IN per-session periodic autosave:
+#
+#   * The GM enables it per engine session via PUT /campaign/autosave/policy;
+#     the policy is persisted in the storage backend, not process memory.
+#   * A lightweight asyncio task in the FastAPI lifespan ticks every
+#     AUTOSAVE_POLL_SECONDS and calls run_autosave_cycle(), which saves each
+#     enabled policy whose interval has elapsed AND whose engine ledger moved
+#     since the previous periodic save (idle campaigns are skipped rather than
+#     rewritten identically).
+#   * One campaign's failure is logged and skipped — it never kills the loop
+#     or the other campaigns' saves.
+#
+# HONEST CONSTRAINT — single worker: this is an in-process asyncio task. Under
+# `uvicorn --workers N` every worker runs its own loop; the saves themselves
+# converge on the same rolling upsert slot so no rows multiply, but workers
+# race on the ledger baseline and duplicate work. Deployments running more
+# than one gateway worker should keep this feature off until the loop grows a
+# cross-worker lease.
+AUTOSAVE_POLL_SECONDS = 30.0
+_autosave_task: Optional["asyncio.Task"] = None
+
+
+class AutosavePolicyRequest(BaseModel):
+    session_id: str
+    enabled: bool = True
+    # Bounded 1..1440 minutes (a day): below 1 the loop would hammer the
+    # engine every poll; above a day "periodic" stops meaning anything.
+    interval_minutes: int = Field(5, ge=1, le=1440)
+
+
+def _policy_role_or_403(token: str) -> Dict[str, str]:
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(status_code=403, detail="AUTOSAVE_POLICY_GM_ONLY")
+    return actor
+
+
+@app.put("/api/v1/campaign/autosave/policy")
+async def set_autosave_policy(
+    req: AutosavePolicyRequest, token: str = Depends(_require_auth)
+):
+    """GM/admin only: opt one engine session into periodic server-side saves.
+
+    Opt-in by design — the gateway silently rewriting a table's canon every N
+    minutes must never be a deployment default. Ownership scopes the row, so
+    another GM enabling a policy for the same session label cannot touch this
+    owner's schedule.
+    """
+    _policy_role_or_403(token)
+    owner = _owner_or_401(token)
+    meta = await storage_backend.upsert_autosave_policy(
+        owner, req.session_id, req.enabled, req.interval_minutes
+    )
+    return {"status": "ok", **meta}
+
+
+@app.get("/api/v1/campaign/autosave/policy")
+async def get_autosave_policy(
+    session_id: str = Query(...), token: str = Depends(_require_auth)
+):
+    """Reads one session's policy for the caller. An absent row reads back as
+    ``enabled=false`` — the default really is off."""
+    _policy_role_or_403(token)
+    owner = _owner_or_401(token)
+    return await storage_backend.get_autosave_policy(owner, session_id)
+
+
+def _periodic_save_name(session_id: str) -> str:
+    """Rolling slot name for periodic saves: upsert-keyed on
+    (owner, save_name), so repeated cycles overwrite the previous checkpoint
+    instead of growing unbounded rows — same convention as the manual
+    autosave route's default name."""
+    return f"Periodic Autosave · {session_id[:8]}"
+
+
+async def run_autosave_cycle(now: float) -> List[Dict[str, Any]]:
+    """One pass over every ENABLED autosave policy.
+
+    Returns what it saved. Per-campaign isolation contract: any failure while
+    saving one campaign is caught and logged, and the remaining campaigns
+    still get their save. Skipped campaigns (interval not elapsed, idle
+    ledger) are absent from the result by design.
+    """
+    saved: List[Dict[str, Any]] = []
+    try:
+        policies = await storage_backend.list_enabled_autosave_policies()
+    except Exception:
+        _autosave_log.exception("autosave cycle could not list policies")
+        return saved
+
+    for policy in policies:
+        owner = policy["owner_user_id"]
+        session_id = policy["engine_session_id"]
+        try:
+            interval = int(policy.get("interval_minutes") or 5) * 60
+            last_saved_at = policy.get("last_saved_at")
+            if last_saved_at is not None and (now - float(last_saved_at)) < interval:
+                continue  # interval not elapsed
+
+            raw = await engine_client.engine_request(
+                "GET",
+                f"/api/v1/sessions/{engine_client._coerce_uuid(str(session_id))}",
+                actor={"user_id": owner, "role": "gm"},
+            )
+            entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
+            ledger = raw.get("ledger") if isinstance(raw, dict) else None
+            events = ledger.get("events", []) if isinstance(ledger, dict) and isinstance(ledger.get("events"), list) else []
+            events_count = len(events)
+
+            previous_events = policy.get("last_events_count")
+            if (
+                previous_events is not None
+                and int(previous_events) >= 0
+                and events_count == int(previous_events)
+            ):
+                continue  # idle: nothing moved since the last periodic save
+
+            combat = raw.get("combat") if isinstance(raw, dict) else None
+            round_number = combat.get("round") if isinstance(combat, dict) else None
+            if not isinstance(round_number, int) or round_number < 1:
+                round_number = 1
+
+            snapshot = {
+                "round": round_number,
+                "entities_count": len(entities),
+                "events_count": events_count,
+                "snapshot": raw,
+                "quest": _quest_slot(),
+                "faction_simulation": _faction_slot(),
+                "periodic": True,
+            }
+            await storage_backend.upsert_campaign_save(
+                owner, _periodic_save_name(str(session_id)),
+                snapshot, round_number,
+            )
+            await storage_backend.record_autosave_run(
+                owner, str(session_id), events_count, now
+            )
+            saved.append({
+                "session_id": session_id,
+                "events_count": events_count,
+                "round": round_number,
+            })
+        except Exception:
+            # Log-and-continue: a single dead engine session or corrupt
+            # payload must not starve the other tables' durability.
+            _autosave_log.exception(
+                "periodic autosave failed for session %s (owner %s); skipping",
+                session_id, owner,
+            )
+    return saved
+
+
+async def _autosave_loop(poll_seconds: float = AUTOSAVE_POLL_SECONDS) -> None:
+    """Background tick. Exceptions from run_autosave_cycle itself (not from
+    individual campaigns, which are already contained inside the cycle) are
+    swallowed so the loop outlives transient storage outages."""
+    while True:
+        await asyncio.sleep(poll_seconds)
+        try:
+            await run_autosave_cycle(now=time.time())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _autosave_log.exception("autosave cycle crashed; continuing")
+
+
+@app.on_event("startup")
+async def _start_autosave_loop():
+    global _autosave_task
+    if _autosave_task is None or _autosave_task.done():
+        _autosave_task = asyncio.create_task(_autosave_loop())
 
 
 class CampaignRestoreRequest(BaseModel):
@@ -2957,6 +3140,38 @@ async def engine_help_action(req: EngineHelpRequest, token: str = Depends(_requi
             "session_id": req.session_id,
             "helper_id": engine_client._coerce_uuid(req.helper_id),
             "target_entity_id": engine_client._coerce_uuid(req.target_entity_id),
+        },
+        _caller_actor(token),
+    )
+
+
+class EngineOpportunityAttackRequest(BaseModel):
+    """Mirrors the engine's OpportunityAttackReq (deny_unknown_fields): the
+    provoked attacker and the mover who left its reach. Whether a pending OA
+    exists for exactly this pairing, whether the Reaction is available, reach,
+    and the roll itself are all engine-owned (`/move` discloses the pending
+    offer; this route spends it). The engine's optional deterministic ``seed``
+    is deliberately NOT forwardable — same trust-inversion rule as every other
+    maneuver proxy."""
+
+    session_id: str
+    attacker_id: str
+    target_id: str
+
+    class Config:
+        extra = "forbid"
+
+
+@app.post("/api/v1/engine/opportunity-attack")
+async def engine_opportunity_attack(
+    req: EngineOpportunityAttackRequest, token: str = Depends(_require_auth)
+):
+    return await _maneuver_proxy(
+        "opportunity-attack",
+        {
+            "session_id": req.session_id,
+            "attacker_id": engine_client._coerce_uuid(req.attacker_id),
+            "target_id": engine_client._coerce_uuid(req.target_id),
         },
         _caller_actor(token),
     )
