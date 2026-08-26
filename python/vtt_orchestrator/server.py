@@ -3333,20 +3333,25 @@ def _project_entities(
     return projected
 
 
-def _project_ledger(ledger: Any, *, redact_numbers: bool) -> Any:
+def _project_ledger(
+    ledger: Any, *, redact_numbers: bool, privileged: bool = False
+) -> Any:
     """Projects a snapshot's ``ledger`` field with the replay-export policy.
 
     Events travel through :func:`_project_ledger_event` exactly as they do in
     the replay export — never as raw payloads. Under ``redact_numbers``
     (spectators and unrecognized roles) summaries additionally strip exact
     HP/damage amounts ("took damage", never "took 7 damage"); trusted roles
-    keep the exact numbers.
+    keep the exact numbers. GM/admin (``privileged``) additionally keep the
+    verbatim raw-payload fallback for unmodeled event types.
     """
     if not isinstance(ledger, dict) or not isinstance(ledger.get("events"), list):
         return ledger  # metadata-only ledger: nothing to project
     projected = dict(ledger)
     projected["events"] = [
-        _project_ledger_event(e, redact_numbers=redact_numbers)
+        _project_ledger_event(
+            e, redact_numbers=redact_numbers, privileged=privileged
+        )
         for e in ledger["events"]
     ]
     return projected
@@ -3398,7 +3403,7 @@ def _project_session_state(
     # stat detail see unredacted ledger numbers.
     redact_numbers = role not in _PLAYER_VISIBLE_ROLES
     state["ledger"] = _project_ledger(
-        state.get("ledger"), redact_numbers=redact_numbers
+        state.get("ledger"), redact_numbers=redact_numbers, privileged=privileged
     )
     return state
 
@@ -3447,7 +3452,12 @@ async def engine_session_state(
 # types pass through with their raw payload as the summary.
 
 def _event_summary(
-    event_type: str, payload: Dict[str, Any], *, redact_numbers: bool = False
+    event_type: str,
+    payload: Dict[str, Any],
+    *,
+    redact_numbers: bool = False,
+    privileged: bool = False,
+    event_actor: Any = None,
 ) -> str:
     """Human-readable one-liner for a ledger event, derived ONLY from fields
     genuinely present in ``payload``. Missing fields are omitted rather than
@@ -3459,6 +3469,16 @@ def _event_summary(
     "took 7 damage"); zero-damage events say nothing rather than claiming
     damage was dealt. Unprojectable payloads render a withholding note rather
     than their raw JSON so no number can leak through the fallback path.
+
+    Iteration 88 (audit F2): payload-heavy event types added by iterations
+    72-78 (OPPORTUNITY_ATTACK_RESOLVED, MOVE_ENTITY, READY_ACTION_SET/RELEASED,
+    INSPIRATION_CHANGED, ITEM_TRANSFERRED) get MODELED fact-line summaries in
+    the PLAYER tier — the tier that used to hit the raw-payload fallback with
+    redaction off. GM/admin (``privileged=True``) keep the verbatim raw-payload
+    fallback; spectators keep the withheld line. ``event_actor`` is the ledger
+    row's actor_id, used to name the mover/actor when the payload itself omits
+    an entity id (the Rust engine journals MOVE_ENTITY under the mover's own
+    actor id).
     """
     parts: List[str] = []
 
@@ -3549,6 +3569,79 @@ def _event_summary(
         if topic is not None:
             parts.append(f"on topic '{topic}'")
 
+    # --- Iteration 88 (audit F2): modeled summaries for payload-heavy types ---
+    #
+    # Players sit inside _PLAYER_VISIBLE_ROLES, so they reach this function with
+    # redact_numbers=False — and before iteration 88 every event type below fell
+    # through to the raw-payload fallback, leaking hidden-campaign secrets:
+    # OPPORTUNITY_ATTACK_RESOLVED's nested resolution carried the target's HP,
+    # MOVE_ENTITY named every hidden adjacent enemy that provoked an OA, and
+    # READY_ACTION_* / INSPIRATION_CHANGED / ITEM_TRANSFERRED rode verbatim.
+    #
+    # PLAYER tier only: fact lines derived ONLY from fields genuinely present
+    # in the payload (same honesty contract as above); missing fields are
+    # omitted, never defaulted. GM/admin keep the VERBATIM raw-payload fallback
+    # they have always had for these types, and spectators keep their withheld
+    # line.
+    modeled_player_tier = not redact_numbers and not privileged
+    if modeled_player_tier and event_type == "OPPORTUNITY_ATTACK_RESOLVED":
+        attacker, mover = opt("attacker_id"), opt("mover_id")
+        resolution = opt("resolution")
+        resolution = resolution if isinstance(resolution, dict) else {}
+        if attacker is not None and mover is not None:
+            verb = {True: "hit", False: "missed"}.get(
+                resolution.get("is_hit"), "attacked"
+            )
+            parts.append(f"{attacker} opportunity-attacked {mover} ({verb})")
+        else:
+            parts.append("an opportunity attack was resolved")
+    elif modeled_player_tier and event_type == "MOVE_ENTITY":
+        mover = opt("entity_id") or opt("mover_id") or event_actor
+        triggers = opt("opportunity_attacks")
+        trigger_count = len(triggers) if isinstance(triggers, list) else 0
+        # Mover id only: the opportunity_attacks array names every armed enemy
+        # adjacent at departure — including ones a player cannot see. A
+        # provocation is reported as a bare COUNT (never attacker ids), because
+        # any one of them may be hidden from this caller.
+        if mover is not None:
+            parts.append(f"{mover} moved")
+        if trigger_count:
+            parts.append(
+                f"(provoked {trigger_count} opportunit"
+                f"{'y' if trigger_count == 1 else 'ies'})"
+            )
+    elif modeled_player_tier and event_type == "READY_ACTION_SET":
+        who = opt("entity_id") or event_actor
+        parts.append(f"{who} readied an action" if who is not None
+                     else "an action was readied")
+    elif modeled_player_tier and event_type == "READY_ACTION_RELEASED":
+        who = opt("entity_id") or event_actor
+        parts.append(f"{who} released a readied action" if who is not None
+                     else "a readied action was released")
+    elif modeled_player_tier and event_type == "INSPIRATION_CHANGED":
+        granted = opt("granted")
+        state = {
+            True: "gained inspiration",
+            False: "spent inspiration",
+        }.get(granted, "inspiration changed")
+        who = opt("entity_id") or event_actor
+        parts.append(f"{who} {state}" if who is not None else state)
+    elif modeled_player_tier and event_type == "ITEM_TRANSFERRED":
+        who = opt("entity_id") or event_actor
+        parts.append(f"{who} moved an item between containers"
+                     if who is not None
+                     else "an item was moved between containers")
+
+    # Known type whose payload carried nothing we can describe, OR an event
+    # type this gateway version does not know: show the raw payload honestly.
+    # Under redaction the fallback withholds instead — a raw dump would leak
+    # exactly the numbers we just stripped from the known branches.
+    if parts:
+        return " ".join(parts)
+    if redact_numbers:
+        return f"{event_type or 'UNKNOWN_EVENT'} occurred (details withheld)"
+    return json.dumps(payload, sort_keys=True)
+
     # Known type whose payload carried nothing we can describe, OR an event
     # type this gateway version does not know: show the raw payload honestly.
     # Under redaction the fallback withholds instead — a raw dump would leak
@@ -3560,9 +3653,23 @@ def _event_summary(
     return json.dumps(payload, sort_keys=True)
 
 
-def _project_ledger_event(event: Any, *, redact_numbers: bool = False) -> Dict[str, Any]:
+def _project_ledger_event(
+    event: Any,
+    *,
+    redact_numbers: bool = False,
+    privileged: bool = False,
+) -> Dict[str, Any]:
     """One GameEvent -> the auditable projection. Fields absent from the
-    engine's event stay absent/null here; nothing is invented."""
+    engine's event stay absent/null here; nothing is invented.
+
+    ``privileged`` (GM/admin) keeps the raw-payload fallback for unmodeled
+    event types; the player tier gets modeled fact-line summaries instead
+    (iteration 88 / audit F2)."""
+    event_dict = event if isinstance(event, dict) else {}
+    event_type = event_dict.get("event_type") or ""
+    payload = event_dict.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
     event_dict = event if isinstance(event, dict) else {}
     event_type = event_dict.get("event_type") or ""
     payload = event_dict.get("payload")
@@ -3574,7 +3681,11 @@ def _project_ledger_event(event: Any, *, redact_numbers: bool = False) -> Dict[s
         "event_type": event_dict.get("event_type"),
         "is_reverted": bool(event_dict.get("is_reverted")),
         "summary": _event_summary(
-            event_type, payload, redact_numbers=redact_numbers
+            event_type,
+            payload,
+            redact_numbers=redact_numbers,
+            privileged=privileged,
+            event_actor=event_dict.get("actor_id"),
         ),
     }
 
@@ -3604,10 +3715,15 @@ async def engine_session_replay(session_id: str = Query(...), token: str = Depen
     )
 
     # Fail closed: only roles trusted with stat detail get unredacted numbers.
-    redact_numbers = actor.get("role", "") not in _PLAYER_VISIBLE_ROLES
+    role = actor.get("role", "")
+    redact_numbers = role not in _PLAYER_VISIBLE_ROLES
+    privileged = role in _PRIVILEGED_ROLES
     events_raw = raw.get("ledger", {}).get("events", []) if isinstance(raw.get("ledger"), dict) else []
     events = [
-        _project_ledger_event(e, redact_numbers=redact_numbers) for e in events_raw
+        _project_ledger_event(
+            e, redact_numbers=redact_numbers, privileged=privileged
+        )
+        for e in events_raw
     ]
 
     combat = raw.get("combat")
@@ -3719,7 +3835,8 @@ def _render_replay_markdown(meta: Dict[str, Any], events: List[Any]) -> str:
             # Full exports carry VERBATIM engine events; the transcript still
             # narrates them through the same derived-summary path (exact
             # numbers kept) so the artifact reads as prose, not raw JSON.
-            narrated = _project_ledger_event(event, redact_numbers=False)
+            narrated = _project_ledger_event(event, redact_numbers=False,
+                                             privileged=True)
         summary = (
             narrated.get("summary")
             if isinstance(narrated.get("summary"), str)
@@ -3814,7 +3931,8 @@ async def session_replay_export(
         # rather than silently reshaped into something that looks authoritative.
     else:
         exported_events = [
-            _project_ledger_event(e, redact_numbers=False) for e in capped
+            _project_ledger_event(e, redact_numbers=False, privileged=False)
+            for e in capped
         ]
 
     combat = raw.get("combat")

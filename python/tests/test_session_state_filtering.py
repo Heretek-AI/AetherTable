@@ -431,3 +431,173 @@ class TestSessionStateLedgerRedaction:
         body = _fetch_state_events(_token("gm-1", "gm"), events, monkeypatch)
         summary = body["ledger"]["events"][0]["summary"]
         assert "healed for 5" in summary and "(HP→18)" in summary
+
+# --- Iteration 88 (audit F2): payload-heavy event types leak to players ----------
+#
+# The player tier sits inside _PLAYER_VISIBLE_ROLES, so redact_numbers is False
+# for players — and every event type WITHOUT an explicit summary handler falls
+# through to the raw-payload fallback (`json.dumps(payload)`). Iterations 72-78
+# added exactly such events, and their payloads carry hidden-campaign secrets:
+#
+#   OPPORTUNITY_ATTACK_RESOLVED -> target_hp_remaining (enemy HP leak)
+#   MOVE_ENTITY                 -> opportunity_attacks[{attacker_id}] (names
+#                                  entities the player cannot see)
+#   READY_ACTION_SET/RELEASED   -> readied trigger text verbatim
+#   INSPIRATION_CHANGED         -> grant reason verbatim
+#   ITEM_TRANSFERRED            -> container/item ids
+#
+# Fix: modeled summaries in the PLAYER tier; GM stays verbatim; spectator keeps
+# its existing withheld line. Nothing is fabricated: segments derive only from
+# fields genuinely present in the payload.
+
+OA_ATTACKER = "cccccccc-0000-0000-0000-000000000003"
+OA_MOVER = "dddddddd-0000-0000-0000-000000000004"
+
+
+def _oa_resolved_event(seq: int = 1) -> dict:
+    """The ledger row the Rust engine actually writes on a resolved OA swing."""
+    return _event(seq, "OPPORTUNITY_ATTACK_RESOLVED", {
+        "attacker_id": OA_ATTACKER,
+        "mover_id": OA_MOVER,
+        "resolution": {
+            "attacker_id": OA_ATTACKER,
+            "target_id": OA_MOVER,
+            "attack_roll": 14,
+            "natural_roll": 11,
+            "target_ac": 13,
+            "is_hit": True,
+            "is_critical_hit": False,
+            "is_critical_miss": False,
+            "total_damage": 7,
+            "target_hp_remaining": 6,
+            "target_is_conscious": True,
+            "target_is_dead": False,
+        },
+        "weapon": "Longsword",
+    })
+
+
+def _move_entity_event(seq: int = 1, attackers: list[str] | None = None) -> dict:
+    triggers = [{"attacker_id": a, "mover_id": OA_MOVER} for a in (attackers or [])]
+    event = _event(seq, "MOVE_ENTITY", {
+        "from": [5.0, 5.0, 0.0],
+        "to": [20.0, 5.0, 0.0],
+        "distance_feet": 15.0,
+        "opportunity_attacks": triggers,
+    })
+    # The Rust engine journals MOVE_ENTITY under the MOVER's own actor id.
+    event["actor_id"] = OA_MOVER
+    return event
+
+
+class TestPlayerLedgerPayloadHeavyEventsModeled:
+    """Players get MODELED summaries for the iteration-72+ event types — never
+    the raw payload dump the unmodeled fallback produces."""
+
+    def test_oa_resolved_names_pairing_but_never_target_hp(self, monkeypatch):
+        events = [_oa_resolved_event(1)]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert OA_ATTACKER in summary and OA_MOVER in summary, (
+            "the pairing must stay auditable for players"
+        )
+        assert "hit" in summary or "missed" in summary
+        # THE FIX: no enemy HP number rides along.
+        assert "6" not in summary.replace("#6", ""), summary
+        assert "hp" not in summary.lower(), summary
+
+    def test_oa_resolved_miss_reports_miss_not_hp(self, monkeypatch):
+        event = _oa_resolved_event(1)
+        event["payload"]["resolution"]["is_hit"] = False
+        event["payload"]["resolution"]["total_damage"] = 0
+        body = _fetch_state_events(
+            _token("player-7", "player"), [event], monkeypatch
+        )
+        summary = body["ledger"]["events"][0]["summary"]
+        assert "missed" in summary
+        assert "hp" not in summary.lower()
+
+    def test_move_entity_summary_drops_opportunity_attack_array_for_players(
+        self, monkeypatch
+    ):
+        hidden_enemy = "eeeeeeee-0000-0000-0000-000000000005"
+        events = [_move_entity_event(1, attackers=[hidden_enemy])]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        event = body["ledger"]["events"][0]
+        summary = event["summary"]
+        assert hidden_enemy not in json.dumps(event), (
+            "a hidden provoking attacker must not be named to a player"
+        )
+        assert "opportunity_attacks" not in summary
+
+    def test_move_entity_without_oas_still_summarizes_the_mover(self, monkeypatch):
+        events = [_move_entity_event(1, attackers=[])]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert OA_MOVER in summary
+        assert "moved" in summary
+
+    def test_ready_action_set_is_modeled_not_raw(self, monkeypatch):
+        events = [_event(1, "READY_ACTION_SET", {
+            "description": "swing at the first goblin that passes",
+            "set_on_round": 4,
+            "trigger": "enemy enters reach",
+        })]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert summary.startswith("{") is False, "raw payload dump leaked"
+        assert "readie" in summary.lower() and "action" in summary.lower()
+        assert json.dumps(events[0]["payload"], sort_keys=True) != summary
+        assert ATTACKER not in summary or "readied an action" in summary
+
+    def test_ready_action_released_is_modeled_not_raw(self, monkeypatch):
+        events = [_event(1, "READY_ACTION_RELEASED", {
+            "description": "swing at the first goblin",
+            "released_on_round": 5,
+            "trigger": "enemy entered reach",
+        })]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert summary.startswith("{") is False
+        assert "ready" in summary.lower() or "release" in summary.lower()
+
+    def test_inspiration_changed_grant_is_a_fact_line(self, monkeypatch):
+        events = [_event(1, "INSPIRATION_CHANGED", {
+            "granted": True, "reason": "heroic roleplay",
+        })]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert summary.startswith("{") is False
+        assert "inspiration" in summary.lower()
+
+    def test_item_transferred_is_a_fact_line_without_container_ids(self, monkeypatch):
+        events = [_event(1, "ITEM_TRANSFERRED", {
+            "item_id": "item-99",
+            "container_id": "container-7",
+            "from_container_id": None,
+        })]
+        body = _fetch_state_events(_token("player-7", "player"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert summary.startswith("{") is False
+        assert "container-7" not in summary
+
+    def test_gm_still_sees_verbatim_payload_facts(self, monkeypatch):
+        """GM tier stays verbatim: exact numbers survive on these events too."""
+        events = [
+            _oa_resolved_event(1),
+            _move_entity_event(2, attackers=[OA_ATTACKER]),
+        ]
+        body = _fetch_state_events(_token("gm-1", "gm"), events, monkeypatch)
+        oa_summary = body["ledger"]["events"][0]["summary"]
+        move_summary = body["ledger"]["events"][1]["summary"]
+        # GM tier stays VERBATIM: the full resolution (with target HP) and the
+        # full opportunity_attacks array survive untouched.
+        assert "target_hp_remaining" in oa_summary and '"is_hit": true' in oa_summary, oa_summary
+        assert OA_ATTACKER in move_summary and OA_MOVER in move_summary, move_summary
+
+    def test_spectator_tier_still_withholds_entirely(self, monkeypatch):
+        events = [_oa_resolved_event(1)]
+        body = _fetch_state_events(_token("watcher-1", "spectator"), events, monkeypatch)
+        summary = body["ledger"]["events"][0]["summary"]
+        assert "withheld" in summary, summary
+        assert OA_MOVER not in summary
