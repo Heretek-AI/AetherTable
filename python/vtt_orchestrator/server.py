@@ -46,6 +46,7 @@ from .auditor.inspector import PreCommitAuditorAgent, DiagnosticRetryController
 from .agents.agent_hierarchy import EncounterDMAgent, DirectorAgent
 from .agents.tool_agent import EngineToolAgent
 from .simulation.faction_simulation import FactionSimulationGOAP
+from .simulation.spotlight_aggregator import SpotlightAggregator, SpotlightReportError
 from .simulation.spotlight_tracker import VoiceSpotlightTracker
 from .simulation.safety_gateway import SafetyGateway
 from .safety import (
@@ -183,6 +184,14 @@ safety_gateway = SafetyGateway()
 # intervention list above — see vtt_orchestrator/safety.py for the honest
 # trade-off discussion of why this state is deliberately not persisted.
 safety_boundaries = SafetyBoundaryRegistry()
+# Server-side speaking-score aggregation (Pillar 11). PROCESS-MEMORY-ONLY by
+# the same documented precedent as safety_boundaries and _NPC_REGISTRY — see
+# vtt_orchestrator/simulation/spotlight_aggregator.py for the honest trade-off
+# discussion (a gateway restart drops the rolling scores until participants
+# self-report again, and N replicas each hold their own table). Deliberately
+# NOT wired to DirectorAgent: the audit flag stands, no unwired component is
+# fabricated this iteration.
+spotlight_scores = SpotlightAggregator()
 # PROCESS-MEMORY-ONLY shared campaign state. Iteration 47 made this durable by
 # riding it inside campaign autosave snapshots (_faction_slot) and restoring it
 # via POST /api/v1/campaign/restore — but between autosaves it still lives only
@@ -528,6 +537,22 @@ def extract_srd_context(
 class UtteranceRecordRequest(BaseModel):
     speaker_id: str
     duration_sec: float
+
+
+class SpotlightReportRequest(BaseModel):
+    """One self-reported VAD burst for the per-session spotlight aggregation.
+
+    The body is deliberately minimal: a seat claims ``duration_ms`` of
+    speaking that ended at ``occurred_at`` (epoch-ms). Range checks that need
+    a machine-readable 422 code (negative/overlong duration, malformed
+    timestamp, blank seat) live in the route so FastAPI's automatic coercion
+    errors and these explicit checks share one 422 surface.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    seat_user_id: str
+    duration_ms: int
+    occurred_at: int
 
 
 class XCardRequest(BaseModel):
@@ -4554,6 +4579,14 @@ def _bucket_for_path(path: str) -> str:
     # also matched before the generic media prefix below.
     if normalized == "/api/v1/media/narrate":
         return "narration"
+    # Per-session spotlight self-reports (POST /api/v1/sessions/{id}/
+    # spotlight/report): each accepted call folds one claimed VAD burst into
+    # the in-process score table, so it meters in its own tight per-IP bucket
+    # (see RATE_LIMITS['spotlight_report']) instead of the loose default.
+    # Only the /report write is metered: GET/DELETE of the same session
+    # spotlight (rolling reads, GM reset) stay on the cheap default bucket.
+    if normalized.startswith("/api/v1/sessions/") and normalized.endswith("/spotlight/report"):
+        return "spotlight_report"
     # Other media surfaces (TTS / STT): model spend, llm bucket.
     if normalized.startswith("/api/v1/media/"):
         return "llm"
@@ -5900,6 +5933,251 @@ def assert_lore(
                 )
 
     return lore_graph.submit_assertion(assertion)
+
+
+# --- Per-session spotlight aggregation (Pillar 11) ---------------------------
+#
+# The honest server-side complement to the client's CRDT speech ledger. Survey
+# verdict (iteration 33): the client ledger (sync/speech_ledger.ts +
+# yjs_doc_client.ts) genuinely converges per-peer Silero-VAD segments
+# room-wide through the Yjs relay, so a CLIENT replica sees real remote
+# speaking — but the python orchestrator has NO read path into that Y.Doc
+# (the relay is a Node process; no python route consumes Yjs state), so the
+# server cannot aggregate from the ledger directly without new transport
+# wiring. The load-bearing honesty gap closed here: today the server's nonzero
+# scores can ONLY come from what participants self-report, so these routes are
+# the stable seam a future iteration can make genuinely remote-aware (a client
+# publishing its converged ledger view, or python wiring into the y-sync
+# relay).
+#
+# Trust decisions (mirrored by tests/test_session_spotlight.py):
+#
+# * Every route requires an authenticated HMAC token (401 otherwise).
+# * Session existence comes from the gateway's OWN membership data — a lobby
+#   bound to the engine session id (host launch writes that binding). An id no
+#   lobby binds is an unknown session -> 404 SESSION_NOT_FOUND for everyone,
+#   including staff (uniform, so the route cannot be probed as an existence
+#   oracle) — exactly the lines & veils rule.
+# * Access is participant-or-staff via ``_caller_is_session_participant``:
+#   gm/admin globally, or any lobby member of the bound session (role-blind,
+#   so spectator seats — which ARE roster members — count). Authenticated
+#   outsiders on a REAL session get 403 SPOTLIGHT_NOT_A_PARTICIPANT.
+# * Reporting: non-staff may only report their OWN seat (403
+#   SPOTLIGHT_SPOOFED_SEAT otherwise — the /spotlight/record precedent; a
+#   player must not credit another seat's voice). GM/admin may report any
+#   roster member.
+# * Validation (422, machine-readable codes): duration_ms must be an integer
+#   in [0, 600000]; occurred_at must be a non-negative integer epoch-ms
+#   timestamp; seat_user_id must be non-blank; AND the seat must be a real
+#   member of the session's roster on disk (422 SPOTLIGHT_SEAT_NOT_A_MEMBER,
+#   staff included).
+# * HONESTY, stated plainly: any nonzero score returned here originates from
+#   a client self-report, which an adversarial client could spoof (pad its
+#   own duration, or — from the GM seat — any member's). The aggregation is
+#   insight tooling for the DM — "which seats held the microphone did the
+#   least, recently" — NOT an authentication or moderation boundary. The GET
+#   route stamps ``observed_at`` (the newest self-reported occurred_at) so
+#   clients can show staleness, and every response carries
+#   ``data_source: "client_self_reports"`` at runtime so the copy and the
+#   data agree.
+# * Reset: DELETE is GM/admin-only (403 SPOTLIGHT_DELETE_FORBIDDEN for a
+#   participant) and clears the session's decayed scores.
+# * The score table is PROCESS-MEMORY-ONLY; a gateway restart drops it (see
+#   vtt_orchestrator/simulation/spotlight_aggregator.py for the trade-off, the
+#   same documented in-process precedent as safety_boundaries).
+# * DirectorAgent is deliberately NOT wired here. Prior audits flagged
+#   "DirectorAgent unwired" as dead/fabricating code; the aggregation is
+#   built so a FUTURE iteration can feed it to the director, but nothing is
+#   fabricated this iteration.
+
+
+def _spotlight_http_error(exc: SpotlightReportError) -> HTTPException:
+    """Map a rejected report to a 422 whose detail exposes the machine-
+    readable code — the same convention as ``_boundary_http_error``."""
+    return HTTPException(
+        status_code=422,
+        detail={"error": exc.code, "message": exc.message},
+    )
+
+
+async def _spotlight_gate(
+    session_id: str, token: str
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Shared auth gate for the per-session spotlight routes: resolves the
+    verified caller and enforces unknown-session/404 vs outsider/403 ordering
+    (mirrors ``_boundary_gate``), returning ``(actor, bound_lobby)``."""
+    actor = _caller_actor(token)  # 401 on missing/expired tokens
+    bound_lobby = await storage_backend.get_lobby_by_engine_session(session_id)
+    if bound_lobby is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "SESSION_NOT_FOUND",
+                "message": (
+                    f"No table is bound to engine session {session_id}; "
+                    "spotlight scores attach to launched sessions."
+                ),
+            },
+        )
+    if actor.get("role", "") not in ("gm", "admin") and not await _caller_is_session_participant(
+        actor["user_id"], session_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "SPOTLIGHT_NOT_A_PARTICIPANT",
+                "message": (
+                    "Spotlight scores are visible only to this session's "
+                    "participants (lobby members) and GM/admin."
+                ),
+            },
+        )
+    return actor, bound_lobby
+
+
+def _roster_of(bound_lobby: Dict[str, Any]) -> List[str]:
+    return [m["user_id"] for m in bound_lobby.get("members", [])]
+
+
+def _validate_spotlight_report(req: SpotlightReportRequest) -> None:
+    """Shape/range validation that needs a machine-readable 422 code. Raises
+    SpotlightReportError; routes map it via ``_spotlight_http_error``."""
+    if isinstance(req.duration_ms, bool) or not (0 <= req.duration_ms <= 600_000):
+        raise SpotlightReportError(
+            "SPOTLIGHT_DURATION_OUT_OF_RANGE",
+            "duration_ms must be an integer from 0 through 600000 "
+            "(0s .. 10min of claimed speaking).",
+        )
+    if isinstance(req.occurred_at, bool) or req.occurred_at < 0:
+        raise SpotlightReportError(
+            "SPOTLIGHT_TIMESTAMP_INVALID",
+            "occurred_at must be a non-negative integer epoch-millisecond "
+            "timestamp.",
+        )
+    if not isinstance(req.seat_user_id, str) or not req.seat_user_id.strip():
+        raise SpotlightReportError(
+            "SPOTLIGHT_SEAT_REQUIRED",
+            "seat_user_id must name the speaking seat.",
+        )
+
+
+@app.post("/api/v1/sessions/{session_id}/spotlight/report")
+async def report_session_spotlight(
+    session_id: str,
+    req: SpotlightReportRequest,
+    token: str = Depends(_require_auth),
+):
+    """Folds one self-reported VAD burst into the session's rolling scores.
+
+    PARTICIPANT-OR-STAFF, and the seat must be a real member of the bound
+    lobby's roster. A non-staff caller may only report their OWN seat; only
+    gm/admin may attribute speaking to another seat.
+
+    HONESTY: every accepted report is a client CLAIM. Any nonzero score this
+    route produces originates from such self-reports, which an adversarial
+    client could spoof (a seat padding its own ``duration_ms``, or a GM
+    crediting any seat). This aggregation is insight tooling for the DM, NOT
+    an authentication boundary — the session's raw logged-in token is what
+    gates it, and nothing server-side listens to any microphone.
+    """
+    actor, bound_lobby = await _spotlight_gate(session_id, token)
+    is_staff = actor.get("role", "") in ("gm", "admin")
+    try:
+        _validate_spotlight_report(req)
+    except SpotlightReportError as exc:
+        raise _spotlight_http_error(exc)
+    # Authorization verdicts are 403s, body-shape verdicts are 422s: a
+    # participant crediting another seat is a role refusal (403), never a
+    # mere schema error — mirrors /spotlight/record's SPOTLIGHT_SPOOFED_SPEAKER.
+    if not is_staff and req.seat_user_id != actor["user_id"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "SPOTLIGHT_SPOOFED_SEAT",
+                "message": (
+                    "A participant may only report their own seat's speaking; "
+                    "ask the GM to attribute other seats."
+                ),
+            },
+        )
+    if req.seat_user_id not in _roster_of(bound_lobby):
+        raise _spotlight_http_error(
+            SpotlightReportError(
+                "SPOTLIGHT_SEAT_NOT_A_MEMBER",
+                f"seat {req.seat_user_id!r} is not a member of session "
+                f"{session_id}'s roster.",
+            )
+        )
+    spotlight_scores.record(
+        session_id,
+        req.seat_user_id,
+        req.duration_ms,
+        req.occurred_at,
+        received_at=time.time() * 1000.0,
+    )
+    return {
+        "status": "recorded",
+        "session_id": session_id,
+        "seat_user_id": req.seat_user_id,
+        "duration_ms": req.duration_ms,
+    }
+
+
+@app.get("/api/v1/sessions/{session_id}/spotlight")
+async def get_session_spotlight(
+    session_id: str, token: str = Depends(_require_auth)
+):
+    """Returns the session's current spotlight rows: one per roster seat, each
+    with a recency-decayed ``score`` (weighted seconds in the rolling window)
+    and an ``is_quiet`` flag (score strictly below the session's mean-minus-
+    one-sigma low-water line — see the aggregator module for the documented
+    degenerate regimes).
+
+    PARTICIPANT-OR-STAFF. Scores are zero until reports arrive, and ANY
+    nonzero value originates from client self-reports, which an adversarial
+    client could spoof — this is insight tooling for the DM, NOT an
+    authentication boundary. ``observed_at`` is the newest self-reported
+    ``occurred_at`` (None when nobody has reported) so clients can render
+    staleness honestly.
+    """
+    actor, bound_lobby = await _spotlight_gate(session_id, token)
+    del actor  # gate already enforced participant-or-staff for the read
+    scores = spotlight_scores.snapshot(
+        session_id,
+        now_ms=time.time() * 1000.0,
+        roster=_roster_of(bound_lobby),
+    )
+    return {
+        "session_id": session_id,
+        "data_source": "client_self_reports",
+        "observed_at": spotlight_scores.latest_occurred_at(session_id),
+        "scores": scores,
+    }
+
+
+@app.delete("/api/v1/sessions/{session_id}/spotlight")
+async def reset_session_spotlight(
+    session_id: str, token: str = Depends(_require_auth)
+):
+    """Clears ALL of a session's rolling speaking scores (GM/admin reset).
+
+    GM/ADMIN ONLY: a participant may read the table but not wipe it, so the
+    GM keeps the one hand that can reset the DM cue. Idempotent — clearing a
+    session with no recorded scores is still a successful clear.
+    """
+    actor, _bound_lobby = await _spotlight_gate(session_id, token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "SPOTLIGHT_DELETE_FORBIDDEN",
+                "message": (
+                    "Only a GM/admin may clear a session's spotlight scores."
+                ),
+            },
+        )
+    spotlight_scores.clear(session_id)
+    return {"status": "cleared", "session_id": session_id}
 
 
 @app.post("/api/v1/spotlight/record")

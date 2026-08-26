@@ -51,6 +51,16 @@ RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     # Empirical benchmark: each accepted call runs 10-1000 encounter
     # simulations in-process. Tightest cap of all.
     "benchmark": (5, 60),
+    # Per-session spotlight self-reports (POST /api/v1/sessions/{id}/
+    # spotlight/report): each accepted call folds one claimed VAD burst into
+    # the in-process score table. Tight per-IP cap like `media` — a wedged
+    # VAD loop or a spoofed-source flood must not grow the table without
+    # bound. One report a burst means a talker closing an interjection every
+    # 2-3s would exceed it: the overflow bursts are dropped before they reach
+    # the aggregator, which undercounts a heavy talker by minutes per hour —
+    # negligible for a DM cue, and the very thing the flag is trying to catch
+    # (non-talkers) can never be the one hitting the cap.
+    "spotlight_report": (10, 60),
     "default": (600, 60),
 }
 
