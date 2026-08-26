@@ -749,3 +749,356 @@ async def test_gm_can_post_on_gm_channel(seeded_lobby, monkeypatch):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["channel"] == "gm"
+
+
+# ---------------------------------------------------------------------------
+# F5 (LOW) — system channel is staff-only (Loop 3, iteration 28)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_player_cannot_post_on_system_channel(seeded_lobby, monkeypatch):
+    """A player posting on the system channel is rejected the same way as
+    posting on gm — only gm/admin may post there."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    resp = client.post(
+        f"/api/v1/sessions/{SESSION_ID}/chat",
+        params={"token": _token("alice", "player")},
+        json={"content": "forging a system line", "channel": "system"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["error"] == "CHAT_CHANNEL_FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_gm_can_post_on_system_channel(seeded_lobby, monkeypatch):
+    """A GM staff token may append on the system channel."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    resp = client.post(
+        f"/api/v1/sessions/{SESSION_ID}/chat",
+        params={"token": _token("gm-1", "gm")},
+        json={"content": "ambient narration", "channel": "system"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["channel"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_player_can_still_post_on_public_and_ooc(seeded_lobby, monkeypatch):
+    """The system-channel gate must not regress the player-visible channels."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    for ch in ("public", "ooc"):
+        resp = client.post(
+            f"/api/v1/sessions/{SESSION_ID}/chat",
+            params={"token": _token("alice", "player")},
+            json={"content": f"hello on {ch}", "channel": ch},
+        )
+        assert resp.status_code == 200, (ch, resp.text)
+        assert resp.json()["channel"] == ch
+
+
+# ---------------------------------------------------------------------------
+# F2 (MED) — hidden-entity collapse redacts UUIDs (Loop 3, iteration 28)
+# ---------------------------------------------------------------------------
+
+
+class TestHiddenCollapseRedaction:
+    """Regression coverage for the F2 fix: when the projection collapses
+    an entry to ``Something happens`` because of a hidden actor or hidden
+    target, the structural identifiers MUST NOT leak the hidden UUID to a
+    non-GM viewer. The placeholder summary, the ``actor_id``, and the
+    ``referenced_entity_ids`` are all in scope.
+
+    The canary invariant on every collapse: the hidden UUID does not
+    appear ANYWHERE in the projected body — not in ``actor_id``, not in
+    ``referenced_entity_ids``, and not in any free-form text. Visible ids
+    survive the filter (only hidden entities are dropped), which is the
+    correct behavior: the roster itself is what the projection protects.
+    """
+
+    def test_hidden_actor_collapses_actor_id_to_none(self, roster):
+        """When the actor is the only referenced entity and it is hidden,
+        ``actor_id`` is ``None`` and ``referenced_entity_ids`` is empty —
+        nothing survives that could identify the hidden entity."""
+        e = _event(
+            1, "DELAY_TAKEN",
+            {"entity_id": GOBLIN, "round": 3},
+            actor_id=GOBLIN,
+        )
+        entry = format_engine_event(e, roster=roster, privileged=False, redact_numbers=False)
+        proj = project_timeline_entry(
+            entry, role="player", viewer_user_id="alice", roster=roster
+        )
+        assert proj["summary"] == _PRIVATE_PLACEHOLDER
+        assert proj["actor_id"] is None
+        assert proj["referenced_entity_ids"] == []
+        import json as _json
+        assert GOBLIN not in _json.dumps(proj, sort_keys=True)
+
+    def test_hidden_target_collapses_referenced_entity_ids(self, roster):
+        """When the TARGET is hidden but the actor is visible, the hidden
+        id is dropped from ``referenced_entity_ids`` while visible ids
+        (the actor) survive — the player can still see who acted, just
+        not against whom."""
+        e = _event(
+            1, "ATTACK_RESOLVED",
+            {"attacker_id": THORIN, "target_id": GOBLIN, "is_hit": True,
+             "total_damage": 7, "target_hp_remaining": 13},
+            actor_id=THORIN,
+        )
+        entry = format_engine_event(e, roster=roster, privileged=False, redact_numbers=False)
+        proj = project_timeline_entry(
+            entry, role="player", viewer_user_id="alice", roster=roster
+        )
+        assert proj["summary"] == _PRIVATE_PLACEHOLDER
+        assert proj["actor_id"] == THORIN
+        assert GOBLIN not in proj["referenced_entity_ids"]
+        assert THORIN in proj["referenced_entity_ids"]
+        # And the hidden UUID does not appear anywhere in the projected body.
+        import json as _json
+        assert GOBLIN not in _json.dumps(proj, sort_keys=True)
+
+    def test_hidden_collapse_no_leaked_uuids_anywhere(self, roster):
+        """Hidden actor + visible target: ``actor_id`` is ``None``; the
+        referenced list drops the hidden actor's id but keeps the visible
+        target's. The whole projected entry, stringified, must contain
+        zero hidden UUIDs — the canary walks every field."""
+        e = _event(
+            1, "CONDITION_APPLIED",
+            {"condition": "Stunned", "source_entity_id": SPECTER},
+            actor_id=GOBLIN,
+        )
+        entry = format_engine_event(e, roster=roster, privileged=False, redact_numbers=False)
+        proj = project_timeline_entry(
+            entry, role="player", viewer_user_id="alice", roster=roster
+        )
+        import json as _json
+        blob = _json.dumps(proj, sort_keys=True)
+        assert GOBLIN not in blob
+        assert proj["summary"] == _PRIVATE_PLACEHOLDER
+        assert proj["actor_id"] is None
+        assert GOBLIN not in proj["referenced_entity_ids"]
+        assert SPECTER in proj["referenced_entity_ids"]
+
+
+@pytest.mark.asyncio
+async def test_no_hidden_uuids_in_timeline_route_for_player(seeded_lobby, monkeypatch):
+    """End-to-end: a non-GM timeline response must not contain any hidden
+    entity UUIDs anywhere in any entry's projected body. Extends the
+    existing hidden-collapse canary to the wire-level surface."""
+    state = {
+        "session_id": SESSION_ID,
+        "entities": {
+            THORIN: _entity("Thorin", entity_id=THORIN, visible=True),
+            GOBLIN: _entity("Goblin Shaman", entity_id=GOBLIN, visible=False),
+        },
+        "combat": {},
+        "ledger": {
+            "current_sequence": 1,
+            "events": [
+                _event(
+                    1, "CONDITION_APPLIED",
+                    {"condition": "Stunned", "source_entity_id": SPECTER},
+                    actor_id=GOBLIN,
+                    timestamp_ms=_ts_ms(2026, 8, 26, 12, 0),
+                ),
+            ],
+        },
+    }
+    _patched_engine(monkeypatch, state=state)
+    resp = client.get(
+        f"/api/v1/sessions/{SESSION_ID}/timeline",
+        params={"token": _token("alice", "player")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["entries"]) == 1
+    entry = body["entries"][0]
+    import json as _json
+    blob = _json.dumps(entry, sort_keys=True)
+    assert GOBLIN not in blob
+    assert entry["actor_id"] is None
+    assert GOBLIN not in entry["referenced_entity_ids"]
+    assert entry["summary"] == _PRIVATE_PLACEHOLDER
+
+
+# ---------------------------------------------------------------------------
+# F1 (HIGH) — chat storage cap and DELETE route (Loop 3, iteration 28)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_cap_is_enforced_on_append(monkeypatch):
+    """Appending beyond CHAT_MESSAGE_CAP auto-trims the oldest rows for the
+    session and leaves the visible log bounded. Runs directly against the
+    storage backend so we can seed the cap cheaply without racing the
+    FastAPI route."""
+    from vtt_orchestrator.storage import CHAT_MESSAGE_CAP
+
+    cap = CHAT_MESSAGE_CAP
+    session_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    # Seed exactly cap rows.
+    for i in range(1, cap + 1):
+        await storage_backend.append_chat_message(
+            session_id, f"user-{i}", f"User {i}", "player", "public", f"msg-{i}",
+        )
+    rows = await storage_backend.list_chat_messages(session_id)
+    assert len(rows) == cap
+    # Two more appends — head should slide forward by two.
+    await storage_backend.append_chat_message(
+        session_id, "user-z", "User Z", "player", "public", "tail-1",
+    )
+    await storage_backend.append_chat_message(
+        session_id, "user-z", "User Z", "player", "public", "tail-2",
+    )
+    rows = await storage_backend.list_chat_messages(session_id)
+    assert len(rows) == cap
+    # The two newest tails are present; the very first msg-1 was trimmed.
+    contents = [r["content"] for r in rows]
+    assert "tail-1" in contents and "tail-2" in contents
+    assert "msg-1" not in contents
+    # Sequence ids remain strictly monotonic and contiguous within the window.
+    seqs = [r["sequence_id"] for r in rows]
+    assert seqs == sorted(seqs)
+    assert seqs[0] >= 2  # msg-1 was the id 1, now trimmed.
+
+
+@pytest.mark.asyncio
+async def test_chat_cap_trim_preserves_newer_rows(monkeypatch):
+    """Auto-trim removes only the head; the rest of the session log is
+    untouched. The test seeds a session, blasts it past the cap, and
+    verifies the boundary between kept and trimmed rows."""
+    from vtt_orchestrator.storage import CHAT_MESSAGE_CAP
+
+    cap = CHAT_MESSAGE_CAP
+    session_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    # Seed cap + 5; expect cap rows retained, ids cap+1..cap+5 dropped from
+    # the head side (sequence ids 1..5 gone), ids 6..cap+5 kept.
+    for i in range(1, cap + 6):
+        await storage_backend.append_chat_message(
+            session_id, f"user-{i}", f"User {i}", "player", "public", f"row-{i}",
+        )
+    rows = await storage_backend.list_chat_messages(session_id)
+    assert len(rows) == cap
+    seqs = sorted(r["sequence_id"] for r in rows)
+    # The lowest kept id is cap - (cap+5 - cap - 5) ... actually it's 6.
+    assert seqs[0] == 6
+    assert seqs[-1] == cap + 5
+    assert "row-5" not in [r["content"] for r in rows]
+    assert "row-6" in [r["content"] for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_by_author(seeded_lobby, monkeypatch):
+    """The author of a message can withdraw it via DELETE — same gate as
+    the append route, with the message_id keyed on the per-session
+    sequence."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    resp = client.post(
+        f"/api/v1/sessions/{SESSION_ID}/chat",
+        params={"token": _token("alice", "player")},
+        json={"content": "oops typo", "channel": "public"},
+    )
+    assert resp.status_code == 200, resp.text
+    seq = resp.json()["sequence_id"]
+    resp2 = client.delete(
+        f"/api/v1/sessions/{SESSION_ID}/chat/{seq}",
+        params={"token": _token("alice", "player")},
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["status"] == "deleted"
+    # And it is gone from storage.
+    row = await storage_backend.get_chat_message(SESSION_ID, seq)
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_by_gm(seeded_lobby, monkeypatch):
+    """A GM may delete ANY participant's chat line — staff override."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    # Alice posts a chat line as a participant.
+    resp = client.post(
+        f"/api/v1/sessions/{SESSION_ID}/chat",
+        params={"token": _token("alice", "player")},
+        json={"content": "please delete me", "channel": "public"},
+    )
+    assert resp.status_code == 200, resp.text
+    seq = resp.json()["sequence_id"]
+    # GM withdraws it.
+    resp2 = client.delete(
+        f"/api/v1/sessions/{SESSION_ID}/chat/{seq}",
+        params={"token": _token("gm-1", "gm")},
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["status"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_by_non_author_non_staff_denied(seeded_lobby, monkeypatch):
+    """A participant cannot withdraw another participant's chat line —
+    403 CHAT_DELETE_FORBIDDEN."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    # Alice posts a line; bob is a co-participant (the lobby seed adds the
+    # host only; bob joins below).
+    resp = client.post(
+        f"/api/v1/sessions/{SESSION_ID}/chat",
+        params={"token": _token("alice", "player")},
+        json={"content": "alice wrote this", "channel": "public"},
+    )
+    assert resp.status_code == 200, resp.text
+    seq = resp.json()["sequence_id"]
+    # Bob joins the lobby so he becomes a participant.
+    lobby = await storage_backend.get_lobby_by_engine_session(SESSION_ID)
+    assert lobby is not None
+    await storage_backend.join_lobby(lobby["lobby_id"], "bob", "Bob", "player")
+    resp2 = client.delete(
+        f"/api/v1/sessions/{SESSION_ID}/chat/{seq}",
+        params={"token": _token("bob", "player")},
+    )
+    assert resp2.status_code == 403
+    assert resp2.json()["detail"]["error"] == "CHAT_DELETE_FORBIDDEN"
+    # And the row is still there.
+    row = await storage_backend.get_chat_message(SESSION_ID, seq)
+    assert row is not None
+    assert row["user_id"] == "alice"
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_missing_id_is_404(seeded_lobby, monkeypatch):
+    """An unknown message_id returns 404 so a caller cannot probe whether
+    a row was once present (cap-trimmed rows look the same as never-
+    written ones)."""
+    state = {"session_id": SESSION_ID, "entities": {},
+             "combat": {}, "ledger": {"current_sequence": 0, "events": []}}
+    _patched_engine(monkeypatch, state=state)
+    resp = client.delete(
+        f"/api/v1/sessions/{SESSION_ID}/chat/999999",
+        params={"token": _token("alice", "player")},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "CHAT_MESSAGE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_unknown_session_is_404(monkeypatch):
+    """An unknown engine session maps to the timeline gate's 404 — the
+    DELETE route cannot be used as an existence oracle."""
+    resp = client.delete(
+        "/api/v1/sessions/99999999-9999-9999-9999-999999999999/chat/1",
+        params={"token": _token("gm-1", "gm")},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "SESSION_NOT_FOUND"

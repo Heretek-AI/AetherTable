@@ -6836,6 +6836,10 @@ class SessionChatAppendRequest(BaseModel):
     """Body for POST /api/v1/sessions/{id}/chat."""
 
     content: str = Field(..., min_length=1, max_length=2000)
+    # ``system`` stays a valid literal so the schema stays forward-
+    # compatible with a future server-internal narrator channel, but the
+    # append route gates it the same way as ``gm``: only staff (gm/admin)
+    # may post on it. Players receive 403 CHAT_CHANNEL_FORBIDDEN.
     channel: Literal["public", "gm", "ooc", "system"] = "public"
 
 
@@ -6901,12 +6905,18 @@ async def append_session_chat_message(
     # Players are never allowed to broadcast on the GM channel — the
     # client may tag local whispers freely, but the server-side anchor
     # refuses them so the timeline cannot be seeded with forged GM lines.
-    if req.channel == "gm" and role not in ("gm", "admin"):
+    # The ``system`` channel is reserved for the same staff tier: only
+    # gm/admin may post on it. The literal stays in the schema so a future
+    # server-internal narrator can use it without a schema bump; until
+    # then, players receive the same 403 CHAT_CHANNEL_FORBIDDEN response.
+    if req.channel in ("gm", "system") and role not in ("gm", "admin"):
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "CHAT_CHANNEL_FORBIDDEN",
-                "message": "Only GM/admin may post on the gm channel.",
+                "message": (
+                    f"Only GM/admin may post on the {req.channel} channel."
+                ),
             },
         )
     display_name = actor.get("user_id")
@@ -6922,6 +6932,69 @@ async def append_session_chat_message(
         req.content,
     )
     return record
+
+
+@app.delete("/api/v1/sessions/{session_id}/chat/{message_id}")
+async def delete_session_chat_message(
+    session_id: str,
+    message_id: int,
+    token: str = Depends(_require_auth),
+):
+    """Withdraw one chat message from a session's narrative log.
+
+    Authorization (Loop 3, iteration 28):
+
+    * Same participant-or-staff gate as the timeline and chat append —
+      unknown session is 404 so the route cannot be used as an existence
+      oracle; an authenticated outsider gets 403 TIMELINE_NOT_A_PARTICIPANT.
+    * On top of that, the author of the row may always delete their own
+      message; gm/admin may delete anyone's. Anyone else (a participant
+      who didn't write the line) gets 403 CHAT_DELETE_FORBIDDEN.
+    * An unknown ``message_id`` returns 404 CHAT_MESSAGE_NOT_FOUND so a
+      caller cannot probe whether a row was once present (cap-trimmed
+      rows are indistinguishable from never-written rows by design).
+    """
+    actor = await _session_timeline_gate(session_id, token)
+    row = await storage_backend.get_chat_message(session_id, int(message_id))
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "CHAT_MESSAGE_NOT_FOUND",
+                "message": (
+                    f"No chat message {message_id} exists for this session."
+                ),
+            },
+        )
+    is_staff = actor.get("role", "") in ("gm", "admin")
+    if row["user_id"] != actor["user_id"] and not is_staff:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "CHAT_DELETE_FORBIDDEN",
+                "message": (
+                    "You may only withdraw your own chat lines; ask the "
+                    "participant who posted it, or a GM/admin."
+                ),
+            },
+        )
+    removed = await storage_backend.delete_chat_message(
+        session_id, int(message_id)
+    )
+    if not removed:
+        # Race: another caller deleted the row between our auth read and
+        # the write. Surface the same 404 so the response shape matches
+        # the "missing id" case and a player cannot distinguish them.
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "CHAT_MESSAGE_NOT_FOUND",
+                "message": (
+                    f"No chat message {message_id} exists for this session."
+                ),
+            },
+        )
+    return {"status": "deleted", "message_id": int(message_id)}
 
 
 @app.get("/api/v1/sessions/{session_id}/timeline")

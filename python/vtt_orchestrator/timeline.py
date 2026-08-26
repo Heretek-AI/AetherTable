@@ -576,6 +576,23 @@ def project_timeline_entry(
             projected["summary"] = _PRIVATE_PLACEHOLDER
             projected["event_type"] = None
             projected["is_private"] = True
+            # Redact the structural identifiers too (iteration 28): a
+            # hidden entity's UUID must NEVER reach a non-GM viewer
+            # through the timeline. ``actor_id`` collapses to ``None``
+            # when the actor itself is hidden; ``referenced_entity_ids``
+            # drops every id that resolves to a hidden entity so a player
+            # cannot scrape the roster from the projection.
+            if hidden_actor:
+                projected["actor_id"] = None
+            hidden_ids = {
+                t for t in target_ids if _is_hidden_entity(t, roster)
+            }
+            referenced = projected.get("referenced_entity_ids")
+            if isinstance(referenced, list):
+                projected["referenced_entity_ids"] = [
+                    r for r in referenced
+                    if str(r) not in hidden_ids
+                ]
             return projected
 
     return entry

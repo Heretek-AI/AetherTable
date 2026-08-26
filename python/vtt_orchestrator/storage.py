@@ -190,6 +190,18 @@ CREATE INDEX IF NOT EXISTS idx_session_chat_messages_session
 #: upstream; only this prefix is persisted for the per-session log.
 NARRATION_SNIPPET_CHARS = 200
 
+#: Per-session cap on retained chat messages (Loop 3, iteration 28). The cap
+#: exists to bound gateway-side storage for marathon sessions — a campaign
+#: that runs thousands of in-character lines cannot bloat ``chat_messages``
+#: indefinitely. When an append pushes a session past the cap, the OLDEST
+#: messages (smallest per-session sequence_id) are trimmed from the head so
+#: the most recent context stays available. Trim is applied at write time
+#: on both backends — the same constant — so the visible log is the same
+#: shape regardless of which persistence layer a deployment happens to
+#: carry. The cap is generous on purpose: a cap of 10 000 messages is
+#: ~10 MB at 1 KB/line and covers any plausible multi-year campaign.
+CHAT_MESSAGE_CAP = 10_000
+
 
 # --- Credential helpers ------------------------------------------------------
 
@@ -614,7 +626,7 @@ class MemoryStore:
         rows.sort(key=lambda n: n["created_at"], reverse=True)
         return [dict(n) for n in rows[:limit]]
 
-    # -- session chat messages (Loop 3, iteration 26) --
+    # -- session chat messages (Loop 3, iteration 26 + 28) --
 
     async def append_chat_message(self, session_id: str, user_id: str,
                                   display_name: str, role: str,
@@ -626,9 +638,30 @@ class MemoryStore:
         can be reused across sessions without colliding on the timeline
         because the timeline key combines session_id (URL-scoped) with the
         per-session sequence.
+
+        Cap enforcement (iteration 28): the in-memory log is bounded at
+        ``CHAT_MESSAGE_CAP`` per session. When the new row pushes a session
+        past the cap, the OLDEST rows for that session (smallest
+        ``sequence_id``) are trimmed from the head BEFORE the append so the
+        post-condition ``len(rows_for_session) <= CHAT_MESSAGE_CAP`` holds
+        for every session. We compute the next sequence id BEFORE the trim
+        so the new row's id keeps ascending — trimming the head never
+        reuses an id that was previously visible on the timeline.
         """
         rows = [m for m in self.chat_messages if m["session_id"] == session_id]
         next_seq = (max((m["sequence_id"] for m in rows), default=0)) + 1
+        # If we are at or above the cap, drop the oldest entries for this
+        # session so the new append leaves us at or below the cap. We sort
+        # once to find the threshold sequence_id, then filter in place.
+        if len(rows) >= CHAT_MESSAGE_CAP:
+            rows.sort(key=lambda m: m["sequence_id"])
+            trim_count = len(rows) - CHAT_MESSAGE_CAP + 1
+            threshold_seq = rows[trim_count - 1]["sequence_id"]
+            self.chat_messages = [
+                m for m in self.chat_messages
+                if not (m["session_id"] == session_id
+                        and m["sequence_id"] <= threshold_seq)
+            ]
         record = {
             "sequence_id": next_seq,
             "session_id": session_id,
@@ -647,6 +680,36 @@ class MemoryStore:
         rows = [m for m in self.chat_messages if m["session_id"] == session_id]
         rows.sort(key=lambda m: m["sequence_id"])
         return [dict(m) for m in rows]
+
+    async def get_chat_message(self, session_id: str,
+                               message_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch one chat row by its per-session sequence id.
+
+        Returns ``None`` when the id does not exist for this session —
+        either it was never written or it was already trimmed by the cap.
+        The DELETE route maps a missing row to 404 so a player cannot
+        probe whether an id was once present.
+        """
+        for m in self.chat_messages:
+            if m["session_id"] == session_id and m["sequence_id"] == int(message_id):
+                return dict(m)
+        return None
+
+    async def delete_chat_message(self, session_id: str, message_id: int) -> bool:
+        """Removes one chat row by its per-session sequence id.
+
+        Returns ``True`` when a row was removed, ``False`` when no row
+        matched. The route layer is responsible for authorization — this
+        helper is the cheap persistence write that runs once auth has been
+        verified.
+        """
+        target = int(message_id)
+        before = len(self.chat_messages)
+        self.chat_messages = [
+            m for m in self.chat_messages
+            if not (m["session_id"] == session_id and m["sequence_id"] == target)
+        ]
+        return len(self.chat_messages) < before
 
 
 class PostgresStore:
@@ -1209,6 +1272,13 @@ class PostgresStore:
                                   channel: str, content: str) -> Dict[str, Any]:
         # Per-session monotonic counter via the BIGSERIAL primary key;
         # list_chat_messages reads them in append order on the same index.
+        #
+        # Cap enforcement (iteration 28) — same constant as MemoryStore so
+        # the two backends keep an identical visible log: after the insert,
+        # count the rows for this session and, if we are over the cap,
+        # delete the oldest surplus rows. The DELETE uses the session
+        # index so the trim is bounded to ``session_id`` and ordered by
+        # ``message_id ASC`` so the surplus is always the head of the log.
         row = await self.pool.fetchrow(
             f"""INSERT INTO narrative_state.session_chat_messages
                     (session_id, user_id, display_name, role, channel, content)
@@ -1216,6 +1286,22 @@ class PostgresStore:
                 RETURNING {self._CHAT_COLUMNS}""",
             session_id, user_id, display_name, role, channel, content,
         )
+        count = await self.pool.fetchval(
+            "SELECT count(*) FROM narrative_state.session_chat_messages WHERE session_id = $1",
+            session_id,
+        )
+        if count is not None and int(count) > CHAT_MESSAGE_CAP:
+            surplus = int(count) - CHAT_MESSAGE_CAP
+            await self.pool.execute(
+                """DELETE FROM narrative_state.session_chat_messages
+                   WHERE message_id IN (
+                       SELECT message_id FROM narrative_state.session_chat_messages
+                       WHERE session_id = $1
+                       ORDER BY message_id ASC
+                       LIMIT $2
+                   )""",
+                session_id, surplus,
+            )
         return self._chat_row(row)
 
     async def list_chat_messages(self, session_id: str) -> List[Dict[str, Any]]:
@@ -1227,6 +1313,42 @@ class PostgresStore:
             session_id,
         )
         return [self._chat_row(r) for r in rows]
+
+    async def get_chat_message(self, session_id: str,
+                               message_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch one chat row by its per-session sequence id.
+
+        Returns ``None`` when the id does not exist for this session —
+        either it was never written or it was already trimmed by the cap.
+        A missing id maps to 404 in the DELETE route so a player cannot
+        probe whether the row was once present.
+        """
+        try:
+            row = await self.pool.fetchrow(
+                f"""SELECT {self._CHAT_COLUMNS}
+                    FROM narrative_state.session_chat_messages
+                    WHERE session_id = $1 AND message_id = $2""",
+                session_id, int(message_id),
+            )
+        except Exception:
+            return None
+        return self._chat_row(row) if row else None
+
+    async def delete_chat_message(self, session_id: str, message_id: int) -> bool:
+        """Removes one chat row by its per-session sequence id.
+
+        The route layer is responsible for authorization; this is the
+        cheap persistence write that runs once auth has been verified.
+        Returns ``True`` when a row was removed, ``False`` otherwise.
+        asyncpg's ``DELETE`` command tag is ``"DELETE <count>"`` and the
+        composite WHERE (session_id, message_id) matches at most one row.
+        """
+        status = await self.pool.execute(
+            """DELETE FROM narrative_state.session_chat_messages
+               WHERE session_id = $1 AND message_id = $2""",
+            session_id, int(message_id),
+        )
+        return status.endswith("1")
 
 
 def json_dumps(value: Any) -> str:
