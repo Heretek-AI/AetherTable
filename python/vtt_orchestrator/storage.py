@@ -130,6 +130,22 @@ ALTER TABLE narrative_state.lobbies
     ADD COLUMN IF NOT EXISTS starting_level INT NOT NULL DEFAULT 1;
 ALTER TABLE narrative_state.lobbies
     ADD COLUMN IF NOT EXISTS party_size INT NOT NULL DEFAULT 4;
+
+-- Periodic autosave policy (iteration 77). One row per (owner, session):
+-- opt-IN only — an absent row means "never autosave this session". Same
+-- idempotent migration approach as the lobby depth columns so volumes
+-- created before iteration 77 are migrated in place at startup.
+CREATE TABLE IF NOT EXISTS narrative_state.autosave_policies (
+    owner_user_id    TEXT NOT NULL REFERENCES narrative_state.users(user_id) ON DELETE CASCADE,
+    engine_session_id TEXT NOT NULL,
+    enabled          BOOLEAN NOT NULL DEFAULT FALSE,
+    interval_minutes INT NOT NULL DEFAULT 5
+                     CHECK (interval_minutes >= 1 AND interval_minutes <= 1440),
+    last_events_count BIGINT NOT NULL DEFAULT -1,
+    last_saved_at    TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_user_id, engine_session_id)
+);
 """
 
 
@@ -156,6 +172,12 @@ class MemoryStore:
         self.lobbies: Dict[str, Dict[str, Any]] = {}           # lobby_id -> record
         self.characters: Dict[str, Dict[str, Any]] = {}        # character_id -> record
         self.handouts: Dict[str, Dict[str, Any]] = {}          # handout_id -> record
+        # Periodic autosave policy + progress (iteration 77), keyed by
+        # (owner_user_id, engine_session_id). Progress is deliberately separate
+        # from the policy so disabling a policy does not erase the movement
+        # baseline and re-enabling does not force an idle rewrite.
+        self.autosave_policies: Dict[Any, Dict[str, Any]] = {}
+        self.autosave_progress: Dict[Any, Dict[str, Any]] = {}
         self._counter = 0
 
     @property
@@ -246,6 +268,49 @@ class MemoryStore:
             "save_name": record["save_name"],
             "round_number": record["round_number"],
             "updated_at": record["updated_at"],
+        }
+
+    # -- periodic autosave policy (iteration 77) --
+
+    async def upsert_autosave_policy(self, owner_user_id: str, session_id: str,
+                                     enabled: bool,
+                                     interval_minutes: int) -> Dict[str, Any]:
+        self.autosave_policies[(owner_user_id, session_id)] = {
+            "enabled": bool(enabled),
+            "interval_minutes": int(interval_minutes),
+        }
+        return {"session_id": session_id, "enabled": bool(enabled),
+                "interval_minutes": int(interval_minutes)}
+
+    async def get_autosave_policy(self, owner_user_id: str,
+                                  session_id: str) -> Dict[str, Any]:
+        row = self.autosave_policies.get((owner_user_id, session_id))
+        if row is None:
+            return {"session_id": session_id, "enabled": False}
+        return {"session_id": session_id, **row}
+
+    async def list_enabled_autosave_policies(self) -> List[Dict[str, Any]]:
+        out = []
+        for (owner, session), row in self.autosave_policies.items():
+            if not row["enabled"]:
+                continue
+            state = self.autosave_progress.get((owner, session))
+            out.append({
+                "owner_user_id": owner,
+                "engine_session_id": session,
+                "interval_minutes": row["interval_minutes"],
+                "last_events_count":
+                    -1 if state is None else state["last_events_count"],
+                "last_saved_at":
+                    None if state is None else state["last_saved_at"],
+            })
+        return out
+
+    async def record_autosave_run(self, owner_user_id: str, session_id: str,
+                                  events_count: int, saved_at: float) -> None:
+        self.autosave_progress[(owner_user_id, session_id)] = {
+            "last_events_count": int(events_count),
+            "last_saved_at": float(saved_at),
         }
 
     # -- engine session snapshots (durability bridge to vtt-server) --
@@ -584,6 +649,73 @@ class PostgresStore:
             owner_user_id, save_id,
         )
         return status.endswith("1")
+
+    # -- periodic autosave policy (iteration 77) --
+
+    async def upsert_autosave_policy(self, owner_user_id: str, session_id: str,
+                                     enabled: bool,
+                                     interval_minutes: int) -> Dict[str, Any]:
+        row = await self.pool.fetchrow(
+            """INSERT INTO narrative_state.autosave_policies
+                   (owner_user_id, engine_session_id, enabled, interval_minutes,
+                    updated_at)
+               VALUES ($1, $2, $3, $4, now())
+               ON CONFLICT (owner_user_id, engine_session_id)
+               DO UPDATE SET enabled = EXCLUDED.enabled,
+                             interval_minutes = EXCLUDED.interval_minutes,
+                             updated_at = now()
+               RETURNING enabled, interval_minutes""",
+            owner_user_id, session_id, bool(enabled), int(interval_minutes),
+        )
+        return {"session_id": session_id, "enabled": row["enabled"],
+                "interval_minutes": row["interval_minutes"]}
+
+    async def get_autosave_policy(self, owner_user_id: str,
+                                  session_id: str) -> Dict[str, Any]:
+        # Absent row => disabled default; the movement baseline is stored on
+        # the same row so it resets with the policy, which is fine (a fresh
+        # policy's first cycle always saves).
+        row = await self.pool.fetchrow(
+            """SELECT enabled, interval_minutes
+               FROM narrative_state.autosave_policies
+               WHERE owner_user_id = $1 AND engine_session_id = $2""",
+            owner_user_id, session_id,
+        )
+        if row is None:
+            return {"session_id": session_id, "enabled": False}
+        return {"session_id": session_id, "enabled": row["enabled"],
+                "interval_minutes": row["interval_minutes"]}
+
+    async def list_enabled_autosave_policies(self) -> List[Dict[str, Any]]:
+        rows = await self.pool.fetch(
+            """SELECT owner_user_id, engine_session_id, interval_minutes,
+                      last_events_count, last_saved_at
+               FROM narrative_state.autosave_policies
+               WHERE enabled""",
+        )
+        return [
+            {
+                "owner_user_id": r["owner_user_id"],
+                "engine_session_id": r["engine_session_id"],
+                "interval_minutes": r["interval_minutes"],
+                "last_events_count": r["last_events_count"],
+                "last_saved_at":
+                    None if r["last_saved_at"] is None
+                    else r["last_saved_at"].timestamp(),
+            }
+            for r in rows
+        ]
+
+    async def record_autosave_run(self, owner_user_id: str, session_id: str,
+                                  events_count: int, saved_at: float) -> None:
+        await self.pool.execute(
+            """UPDATE narrative_state.autosave_policies
+               SET last_events_count = $3,
+                   last_saved_at = to_timestamp($4),
+                   updated_at = now()
+               WHERE owner_user_id = $1 AND engine_session_id = $2""",
+            owner_user_id, session_id, int(events_count), float(saved_at),
+        )
 
     # -- engine session snapshots (durability bridge to vtt-server) --
 
