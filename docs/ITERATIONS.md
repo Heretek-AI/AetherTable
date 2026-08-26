@@ -524,3 +524,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.16 — 7acddad — feat(client): Delay/Resume controls in the initiative tracker — vitest 616
 ### L3.18 — e2a7f98 — feat(client): ambience preset panel in the audio mixer — vitest 642
 ### L3.19 — f9675f0 — feat(engine): Frightened source attribution + movement enforcement — cargo 490
+### L3.20 — effcf00 — feat(gateway): Lines &amp; Veils per-session safety registry — pytest 1217
