@@ -174,7 +174,7 @@ describe('deleteCharacter wire contract', () => {
     store.set('aethertable_token', TOKEN);
     const calls = stubFetch(() => ({ ok: true, json: async () => ({ status: 'DELETED' }) }));
 
-    await expect(deleteCharacter('chr_abc123')).resolves.toBe(true);
+    await expect(deleteCharacter('chr_abc123')).resolves.toEqual({ outcome: 'ok' });
     expect(calls[0].url).toBe('/api/v1/characters/chr_abc123');
     expect(calls[0].init.method).toBe('DELETE');
     expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(
@@ -182,25 +182,29 @@ describe('deleteCharacter wire contract', () => {
     );
   });
 
-  it('collapses a gateway refusal (404 foreign-or-missing sheet) into false', async () => {
+  it('collapses a gateway refusal (404 foreign-or-missing sheet) into not_found', async () => {
     store.set('aethertable_token', TOKEN);
-    stubFetch(() => ({ ok: false, status: 404 }));
-    await expect(deleteCharacter('chr_missing')).resolves.toBe(false);
+    stubFetch(() => ({ ok: false, status: 404, json: async () => ({ detail: 'Character not found' }) }));
+    const result = await deleteCharacter('chr_missing');
+    expect(result).toMatchObject({ outcome: 'not_found', status: 404 });
+    if (result.outcome === 'not_found') {
+      expect(result.detail).toBe('Character not found');
+    }
   });
 
-  it('collapses a malformed success body into false (no unverified confirmation)', async () => {
+  it('collapses a malformed success body into rejected (no unverified confirmation)', async () => {
     store.set('aethertable_token', TOKEN);
     stubFetch(() => ({ ok: true, json: async () => ({}) }));
-    await expect(deleteCharacter('chr_x')).resolves.toBe(false);
+    await expect(deleteCharacter('chr_x')).resolves.toMatchObject({ outcome: 'rejected' });
   });
 
-  it('is false when signed out — no request is made at all', async () => {
+  it('is not_signed_in when signed out — no request is made at all', async () => {
     const calls = stubFetch(() => ({ ok: true }));
-    await expect(deleteCharacter('chr_x')).resolves.toBe(false);
+    await expect(deleteCharacter('chr_x')).resolves.toMatchObject({ outcome: 'not_signed_in' });
     expect(calls).toHaveLength(0);
   });
 
-  it('survives a network failure as false instead of throwing', async () => {
+  it('survives a network failure as unreachable instead of throwing', async () => {
     store.set('aethertable_token', TOKEN);
     vi.stubGlobal(
       'fetch',
@@ -208,6 +212,6 @@ describe('deleteCharacter wire contract', () => {
         throw new TypeError('network down');
       })
     );
-    await expect(deleteCharacter('chr_x')).resolves.toBe(false);
+    await expect(deleteCharacter('chr_x')).resolves.toMatchObject({ outcome: 'unreachable' });
   });
 });

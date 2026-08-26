@@ -30,7 +30,7 @@ interface StreamerHUDModalProps {
    * spectator filtering — it cannot drift out of sync with what TacticalCanvas
    * and NarrativeChat are really receiving.
    */
-  userRole?: 'gm' | 'player' | 'spectator';
+  userRole?: 'gm' | 'admin' | 'player' | 'spectator';
   /** CRDT client backing fog-of-war (same instance the canvas renders from). */
   syncClient?: YjsCrdtClient | null;
   /**

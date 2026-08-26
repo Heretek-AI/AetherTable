@@ -24,9 +24,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ambienceLibrarySize,
   clearAmbienceForTests,
+  clearAmbienceSession,
   getCachedAmbience,
   isAmbienceLoopPlaying,
   listAmbiencePresets,
+  onAmbienceAuthChange,
   playAmbience,
   startAmbienceLoop,
   stopAmbienceLoop,
@@ -386,5 +388,126 @@ describe('loop playback helpers (Web Audio BufferSource + GainNode)', () => {
       expect(result.detail).toMatch(/web audio/i);
     }
     expect(getCachedAmbience('tavern-murmur')).toBeNull();
+  });
+});
+
+/**
+ * Iteration 23 (F10) — sign-out / role-change invalidation. The decoded-
+ * AudioBuffer cache must NOT survive a transition out of the staff posture
+ * (signed-out, demoted to player, or demoted to spectator): those seats have
+ * no gateway-side authority for POST /api/v1/media/ambience/{slug}, so a
+ * cached buffer is effectively leaked scope. The App shell wires
+ * `onAmbienceAuthChange` to its `userRole` effect — verify the contract here.
+ */
+describe('auth-state invalidation (F10)', () => {
+  it('a signed-in GM populates the cache via playAmbience', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    // Seed the auth posture as staff so a subsequent transition (the actual
+    // test scenario) compares against a prior staff state.
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    const first = await playAmbience('tavern-murmur');
+    expect(first).toMatchObject({ outcome: 'OK', cached: false });
+    expect(ambienceLibrarySize()).toBe(1);
+    expect(getCachedAmbience('tavern-murmur')).not.toBeNull();
+  });
+
+  it('transition from GM to player clears library + in-flight + active loop', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    await playAmbience('tavern-murmur');
+    expect(ambienceLibrarySize()).toBe(1);
+    expect(startAmbienceLoop('tavern-murmur')).toBe(true);
+    expect(isAmbienceLoopPlaying()).toBe(true);
+
+    // Sign-out → demotion: cache + in-flight + active loop must be wiped.
+    onAmbienceAuthChange({ signedIn: false, role: null });
+    expect(ambienceLibrarySize()).toBe(0);
+    expect(getCachedAmbience('tavern-murmur')).toBeNull();
+    expect(isAmbienceLoopPlaying()).toBe(false);
+  });
+
+  it('transition from GM to spectator (still signed-in) also clears — staff gate is GM/ADMIN only', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    await playAmbience('campfire');
+    expect(ambienceLibrarySize()).toBe(1);
+
+    onAmbienceAuthChange({ signedIn: true, role: 'spectator' });
+    expect(ambienceLibrarySize()).toBe(0);
+    expect(getCachedAmbience('campfire')).toBeNull();
+  });
+
+  it('a replay after sign-out does NOT hit the cache — it falls through to the wire', async () => {
+    store.set('aethertable_token', TOKEN);
+    let fetchCount = 0;
+    stubFetch(() => {
+      fetchCount += 1;
+      return okWav();
+    });
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    const first = await playAmbience('forest-night');
+    expect(first).toMatchObject({ outcome: 'OK', cached: false });
+    expect(fetchCount).toBe(1);
+
+    // Simulate the App-shell sign-out path: the seat removes the token AND
+    // notifies the store. The store-side cleanup runs synchronously, so the
+    // next playAmbience sees an empty library AND no token — the gate
+    // returns NOT_SIGNED_IN without touching the wire.
+    store.delete('aethertable_token');
+    onAmbienceAuthChange({ signedIn: false, role: null });
+    expect(ambienceLibrarySize()).toBe(0);
+
+    const second = await playAmbience('forest-night');
+    expect(second.outcome).toBe('NOT_SIGNED_IN');
+    expect(fetchCount).toBe(1); // no second fetch — the pre-flight gate caught it
+  });
+
+  it('re-notifying the same staff state is a no-op (cache persists across renders)', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    await playAmbience('thunderstorm');
+    expect(ambienceLibrarySize()).toBe(1);
+
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    expect(ambienceLibrarySize()).toBe(1);
+    expect(getCachedAmbience('thunderstorm')).not.toBeNull();
+  });
+
+  it('initial registration is NOT a transition — no cleanup fired', () => {
+    // No prior state: calling onAmbienceAuthChange must be a pure observation,
+    // not a "wipe everything" event. (Sanity check that the store is safe to
+    // call once at App.tsx mount without nuking any pre-existing cache.)
+    onAmbienceAuthChange({ signedIn: true, role: 'player' });
+    onAmbienceAuthChange({ signedIn: true, role: 'gm' });
+    expect(ambienceLibrarySize()).toBe(0);
+  });
+
+  it('explicit clearAmbienceForTests still wipes the AudioContext (test reset path)', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    await playAmbience('dungeon-drips');
+    expect(ambienceLibrarySize()).toBe(1);
+    clearAmbienceForTests();
+    expect(ambienceLibrarySize()).toBe(0);
+    expect(getCachedAmbience('dungeon-drips')).toBeNull();
+  });
+
+  it('clearAmbienceSession() wipes cache + in-flight + active loop without resetting the AudioContext', async () => {
+    store.set('aethertable_token', TOKEN);
+    stubFetch(() => okWav());
+    await playAmbience('tavern-murmur');
+    expect(startAmbienceLoop('tavern-murmur')).toBe(true);
+    expect(isAmbienceLoopPlaying()).toBe(true);
+    expect(ambienceLibrarySize()).toBe(1);
+
+    clearAmbienceSession();
+    expect(ambienceLibrarySize()).toBe(0);
+    expect(getCachedAmbience('tavern-murmur')).toBeNull();
+    expect(isAmbienceLoopPlaying()).toBe(false);
   });
 });

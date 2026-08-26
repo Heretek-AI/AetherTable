@@ -83,6 +83,7 @@ import {
 } from './api/opportunity_state';
 import { logOutcomeForTier, shapeCheckOutcome } from './api/check_outcome';
 import { authHeaders, getStoredToken } from './api/auth_headers';
+import { onAmbienceAuthChange } from './api/ambience_store';
 import { openNarrativeStream } from './api/narrative_stream';
 import { VttCrdtSyncClient, TokenTransformData } from './sync/yjs_sync_client';
 import { YjsCrdtClient, type RemoteCursor } from './sync/yjs_doc_client';
@@ -211,7 +212,7 @@ export function App() {
   const [isUserSettingsOpen, setIsUserSettingsOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [latencyMs, setLatencyMs] = useState(8);
-  const [userRole, setUserRole] = useState<'gm' | 'player' | 'spectator'>('gm');
+  const [userRole, setUserRole] = useState<'gm' | 'admin' | 'player' | 'spectator'>('gm');
   // Dynamic Thematic Atmosphere (GOALS.md Pillar 2). DUAL-source truth:
   // seeded from this browser's localStorage, then adopted live from the shared
   // Yjs `atmosphere` map whenever the room carries a selection (see
@@ -224,6 +225,22 @@ export function App() {
     storeAtmosphereId(atmosphereId);
     return () => applyAtmosphereToDocument('default');
   }, [atmosphereId]);
+
+  /**
+   * Iteration 23 (F10) — subscribe the ambience store to sign-out / role
+   * change. When the seat transitions from "staff signed-in" to a non-staff
+   * posture (player, spectator, or signed-out), the store wipes its decoded
+   * AudioBuffer library + in-flight queue + active loop so the next replay
+   * falls through to the wire and the gateway re-decides what this seat may
+   * see. Depending on userRole covers demotions (setUserRole is reactive);
+   * currentUser.id covers fast-switch / re-login identity swaps.
+   */
+  useEffect(() => {
+    onAmbienceAuthChange({
+      signedIn: Boolean(getStoredToken()),
+      role: userRole,
+    });
+  }, [userRole, currentUser.id]);
 
   /**
    * Write-through selection used by the GM-gated Navbar picker and the New
@@ -2442,7 +2459,14 @@ export function App() {
         )}
 
         {currentView === 'encounters' && (
-          <EncounterBuilderView onLaunchEncounter={handleLaunchEncounter} />
+          <EncounterBuilderView
+            onLaunchEncounter={handleLaunchEncounter}
+            // Iteration 23 (nit): thread the live role projection so the
+            // builder re-evaluates the strip's eligibility on every userRole
+            // change — a GM-signed-in seat that takes over a previously-403'd
+            // tab regains the strip without a page reload.
+            isGM={userRole === 'gm' || userRole === 'admin'}
+          />
         )}
 
         {currentView === 'marketplace' && (
@@ -2577,6 +2601,10 @@ export function App() {
         onClose={() => setIsAudioMixerOpen(false)}
         tokens={visibleTokens}
         selectedTokenId={spectatorSelectedId}
+        // Iteration 23 (F12): the seat role is plumbed through so Ambience /
+        // SFX panels gate locally — a non-staff seat renders only the lock
+        // notice and issues zero catalog-fetch / generation requests.
+        userRole={userRole}
       />
 
       {/* Hardware Safety X-Card Modal */}

@@ -70,6 +70,72 @@ const library = new Map<string, AudioBuffer>();
 /** Identical concurrent requests share one wire call instead of doubling spend. */
 const inFlight = new Map<string, Promise<AmbiencePlayResult>>();
 
+// ---------------------------------------------------------------------------
+// Auth-state subscription (iteration 23, F10)
+// ---------------------------------------------------------------------------
+
+/**
+ * The seat posture that determines whether this store's cache is *authorised*
+ * to keep serving. A bed decoded while a GM-signed-in identity held the seat
+ * must not keep playing after that seat is signed out OR demoted to a non-staff
+ * role — a non-staff seat has no gateway-side authority for /media/ambience
+ * {slug} (the route 403s `MEDIA_AMBIENCE_FORBIDDEN`), so a cached buffer is
+ * effectively leaked scope. Mirrors the contract used by every other store:
+ * the App shell is the single source of truth for `signedIn` + `role` and is
+ * the only caller of {@link onAmbienceAuthChange}.
+ */
+export type AmbienceAuthState = {
+  signedIn: boolean;
+  /** Lower-case role exactly as `App.userRole` carries it; null when signed-out. */
+  role: 'gm' | 'admin' | 'player' | 'spectator' | null;
+};
+
+/**
+ * Latest posture the store has been told about; `null` until the first call.
+ * A "from-staff to-non-staff" transition is the ONLY event that wipes the
+ * cache, and only between two consecutive notifications — the initial
+ * registration does NOT count as a transition (the store has no prior
+ * identity to clear from).
+ */
+let lastSeenAuthState: AmbienceAuthState | null = null;
+
+function isStaffState(state: AmbienceAuthState): boolean {
+  return state.signedIn && (state.role === 'gm' || state.role === 'admin');
+}
+
+/**
+ * Tell the store the current auth posture. Call this whenever the signed-in
+ * identity OR seat role changes (App.tsx wires this to a `useEffect` on
+ * `signedIn` / `userRole`). A transition out of "staff signed-in" clears the
+ * library + in-flight queue + active loop — the next replay falls through to
+ * the wire and the gateway's authoritative verdict decides what the seat may
+ * see. Other transitions (signed-in → more-privileged-staff, signed-out →
+ * signed-out) are no-ops.
+ */
+export function onAmbienceAuthChange(state: AmbienceAuthState): void {
+  const previous = lastSeenAuthState;
+  lastSeenAuthState = state;
+  if (previous === null) return; // initial registration — nothing to clean
+  const wasStaff = isStaffState(previous);
+  const isStaff = isStaffState(state);
+  if (wasStaff && !isStaff) {
+    clearAmbienceSession();
+  }
+}
+
+/**
+ * Wipe the session cache + in-flight queue + active loop. Production-callable:
+ * invoked by {@link onAmbienceAuthChange} when the seat leaves the staff
+ * posture, and reusable by any future caller that needs the same guarantee
+ * (e.g. a forced re-login flow). The shared AudioContext is intentionally
+ * preserved so the next staff sign-in does not pay an autoplay-policy cost.
+ */
+export function clearAmbienceSession(): void {
+  library.clear();
+  inFlight.clear();
+  stopAmbienceLoop();
+}
+
 /**
  * Lazily-created AudioContext used for BOTH `decodeAudioData` and loop
  * playback (BufferSourceNode → GainNode → destination). Created on first use,
@@ -147,6 +213,7 @@ export function clearAmbienceForTests(): void {
   inFlight.clear();
   stopAmbienceLoop();
   audioCtx = null;
+  lastSeenAuthState = null;
 }
 
 // ---------------------------------------------------------------------------

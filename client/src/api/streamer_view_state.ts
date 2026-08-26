@@ -14,7 +14,7 @@
  */
 
 /** Seats recognized across the app shell (mirrors App.userRole). */
-export type SeatRole = 'gm' | 'player' | 'spectator';
+export type SeatRole = 'gm' | 'admin' | 'player' | 'spectator';
 
 /** The two states the dedicated broadcast surface can be in. */
 export type StreamerViewMode = 'off' | 'live';

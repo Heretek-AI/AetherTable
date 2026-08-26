@@ -32,8 +32,14 @@ import {
 export type SfxSeatRole = 'gm' | 'admin' | 'player' | 'spectator';
 
 interface SfxPanelProps {
-  /** Seat role when App-shell role projection reaches this modal; optional. */
-  userRole?: SfxSeatRole;
+  /**
+   * Seat role from the App-shell role projection. Required: with iteration 23
+   * (F12) the AudioMixerModal plumbs App.tsx's `userRole` straight through so a
+   * non-staff seat renders ONLY the lock notice and the prompt input /
+   * Generate button are absent (the catalog-bucket cleanup on demotion lives
+   * in api/sfx_library.ts; this panel just gates the UI surface).
+   */
+  userRole: SfxSeatRole;
 }
 
 const GENERATION_HINT = 'generating… can take 30-90 s';
@@ -46,7 +52,7 @@ export const SfxPanel: React.FC<SfxPanelProps> = ({ userRole }) => {
   /** Prompts decoded this session, newest last (mirrors the session cache). */
   const [library, setLibrary] = useState<string[]>([]);
 
-  const isStaff = userRole === undefined || userRole === 'gm' || userRole === 'admin';
+  const isStaff = userRole === 'gm' || userRole === 'admin';
 
   const handleGenerate = useCallback(async () => {
     const trimmed = prompt.trim();

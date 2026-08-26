@@ -19,6 +19,13 @@ interface AudioMixerModalProps {
   onClose: () => void;
   tokens: Token[];
   selectedTokenId: string | null;
+  /**
+   * Seat role from the App-shell projection (iteration 23, F12). Plumbed
+   * through to AmbiencePanel + SfxPanel so a non-staff seat renders ONLY the
+   * lock notice — the cache + in-flight queue + active loop cleanup on
+   * demotion lives in api/ambience_store.ts (F10), not duplicated here.
+   */
+  userRole: 'gm' | 'admin' | 'player' | 'spectator';
 }
 
 export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
@@ -26,6 +33,7 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
   onClose,
   tokens,
   selectedTokenId,
+  userRole,
 }) => {
   const [masterVolume, setMasterVolume] = useState(0.8);
   const [isSpatialEnabled, setIsSpatialEnabled] = useState(true);
@@ -284,12 +292,15 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
           </div>
 
           {/* Ambience presets (iteration 17): curated looping soundscapes.
-              Same GM-gating convention as the SFX panel below. */}
-          <AmbiencePanel />
+              GM-gated server-side; with iteration 23 (F12) the App-shell
+              userRole is plumbed straight through so a non-staff seat renders
+              only the lock notice (no catalog fetch, no playback). */}
+          <AmbiencePanel userRole={userRole} />
 
           {/* Generated SFX (GM-gated server-side; panel renders an honest
-              lock notice / 403 copy for non-staff seats). */}
-          <SfxPanel />
+              lock notice / 403 copy for non-staff seats). Same F12 wiring
+              as AmbiencePanel above. */}
+          <SfxPanel userRole={userRole} />
 
           {/* Peer Channels */}
           <div className="space-y-2">

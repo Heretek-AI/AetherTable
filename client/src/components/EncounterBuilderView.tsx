@@ -200,7 +200,41 @@ export const EncounterBuilderView: React.FC<EncounterBuilderViewProps> = ({
     () => typeof getStoredToken() === 'string',
   );
   const effectiveIsGM = typeof isGM === 'boolean' ? isGM : gmSeen;
+  // Per-identity latch: stays set while the current seat holds a 403 from
+  // the GM-only balance route, and is cleared by the false→true transition
+  // effect below so a freshly-GM-eligible seat (sign-in, role promotion)
+  // regains the strip without a page reload.
   const [forbiddenByServer, setForbiddenByServer] = useState(false);
+
+  /**
+   * Re-evaluate the token-derived GM fallback on every render where no prop
+   * was supplied. Without this the no-prop path captures the snapshot taken
+   * at mount only, so a same-tab sign-in never re-enables the strip — this
+   * complements the F10/F11 audit remediation pattern of re-evaluating
+   * identity on every relevant transition.
+   */
+  useEffect(() => {
+    if (typeof isGM === 'boolean') return;
+    setGmSeen(typeof getStoredToken() === 'string');
+  }, [isGM]);
+
+  /**
+   * Iteration 23 (nit) — replace the lifetime `forbiddenByServer` latch with
+   * a transition-only reset. A 403 from the GM-only balance route only
+   * poisons the strip while the offending identity is still held; the moment
+   * `effectiveIsGM` transitions back to TRUE (sign-in, role promotion, fast
+   * switch to a GM seat in the same tab), the strip is eligible again and
+   * the next roster change re-issues a balance call against the new
+   * identity. Spurious 403s against an already-GM seat stay latched.
+   */
+  const previousEffectiveIsGMRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const previous = previousEffectiveIsGMRef.current;
+    previousEffectiveIsGMRef.current = effectiveIsGM;
+    if (effectiveIsGM && previous === false) {
+      setForbiddenByServer(false);
+    }
+  }, [effectiveIsGM]);
 
   useEffect(() => {
     if (!effectiveIsGM || forbiddenByServer) return;

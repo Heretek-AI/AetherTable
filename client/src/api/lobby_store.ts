@@ -286,28 +286,118 @@ export async function findCharacterForToken(tokenName: string): Promise<FullStor
 }
 
 /**
+ * Outcome surface for DELETE /api/v1/characters/{id}. Mirrors the
+ * discriminated-union style used by api/encounter_balance_store.ts so the
+ * view can render every gateway branch verbatim instead of fabricating a
+ * one-sentence "could not delete" disjunction:
+ *  - `ok`               gateway returned 200 with `{"status": "DELETED"}`
+ *  - `not_signed_in`    no session token; nothing was sent on the wire
+ *  - `forbidden`        403 — caller authenticated but does not own the id
+ *  - `not_found`        404 — id is unknown to this owner (the gateway
+ *                       intentionally collapses "not yours" into "not found"
+ *                       so a foreign probe cannot probe ownership via 403/404)
+ *  - `rejected`         any other 4xx (422 schema validation, etc.) — the
+ *                       gateway's verbatim detail is rendered to the user
+ *  - `unreachable`      fetch threw (offline) or 5xx — no verdict was produced
+ */
+export type DeleteCharacterOutcome =
+  | { outcome: 'ok' }
+  | { outcome: 'not_signed_in'; detail: string }
+  | { outcome: 'forbidden'; status: number; detail: string }
+  | { outcome: 'not_found'; status: number; detail: string }
+  | { outcome: 'rejected'; status: number; detail: string }
+  | { outcome: 'unreachable'; detail: string };
+
+/**
+ * Extract the gateway's verbatim error string from a FastAPI
+ * HTTPException-wrapped body. Same shape used by encounter_balance_store
+ * (`VERBATIM_MESSAGE`) and lore_store: a plain string lands verbatim; a
+ * validation array yields its first `.msg`; an object envelope yields
+ * `message` / `error`; everything else returns null so the caller falls
+ * back to the HTTP-status summary.
+ */
+function extractErrorDetail(payload: unknown): string | null {
+  const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) {
+    const first = raw[0] as Record<string, unknown> | undefined;
+    return typeof first?.msg === 'string' ? first.msg : null;
+  }
+  if (raw && typeof raw === 'object') {
+    const d = raw as Record<string, unknown>;
+    if (typeof d.message === 'string') return d.message;
+    if (typeof d.error === 'string') return d.error;
+  }
+  return null;
+}
+
+/**
  * Permanently delete one of the caller's OWN characters. Mirrors the gateway's
  * DELETE /api/v1/characters/{id} ownership contract: a valid token that does
- * not own the id gets the same 404 ("not found for this owner") as a
- * nonexistent id, so both collapse here into `false` — callers show a single
- * honest "could not delete" message rather than distinguishing them.
- *
- * Returns true ONLY on an explicit gateway confirmation; signed-out, offline,
- * and unmapped failures all resolve false (never throw).
+ * not own the id is collapsed into 404 "not found for this owner" server-side
+ * (so foreign probes cannot enumerate via 403/404 distinction). Every branch
+ * surfaces its own discriminated outcome; nothing throws and nothing is
+ * collapsed into a bare boolean.
  */
-export async function deleteCharacter(characterId: string): Promise<boolean> {
-  if (!getToken()) return false;
+export async function deleteCharacter(characterId: string): Promise<DeleteCharacterOutcome> {
+  if (!getToken()) {
+    return {
+      outcome: 'not_signed_in',
+      detail: 'Sign in first — character deletion requires an authenticated seat.',
+    };
+  }
+
+  let resp: Response;
   try {
-    const resp = await fetch(
+    resp = await fetch(
       `/api/v1/characters/${encodeURIComponent(characterId)}`,
       { method: 'DELETE', headers: authHeaders() }
     );
-    if (!resp.ok) return false;
-    const payload = (await resp.json().catch(() => null)) as { status?: unknown } | null;
-    return payload?.status === 'DELETED';
-  } catch {
-    return false;
+  } catch (e) {
+    console.warn('Delete-character endpoint unreachable:', e);
+    return { outcome: 'unreachable', detail: 'Could not reach the gateway.' };
   }
+
+  if (!resp.ok) {
+    const payload = await resp.json().catch(() => null);
+    const verbatim = extractErrorDetail(payload);
+    const fallback = `HTTP ${resp.status}`;
+    if (resp.status === 401) {
+      // Expired / cleared token — collapse to not_signed_in so the view can
+      // route to the same honest "sign in" copy as the pre-flight refusal.
+      return { outcome: 'not_signed_in', detail: verbatim ?? fallback };
+    }
+    if (resp.status === 403) {
+      return { outcome: 'forbidden', status: 403, detail: verbatim ?? fallback };
+    }
+    if (resp.status === 404) {
+      return { outcome: 'not_found', status: 404, detail: verbatim ?? fallback };
+    }
+    if (resp.status >= 500) {
+      return { outcome: 'unreachable', detail: verbatim ?? fallback };
+    }
+    return { outcome: 'rejected', status: resp.status, detail: verbatim ?? fallback };
+  }
+
+  // 200 — only "DELETED" counts; anything else (e.g. an unexpected envelope)
+  // is reported as a rejection so callers don't silently invent a deletion.
+  let payload: { status?: unknown } | null = null;
+  try {
+    payload = (await resp.json()) as { status?: unknown };
+  } catch {
+    payload = null;
+  }
+  if (payload?.status === 'DELETED') {
+    return { outcome: 'ok' };
+  }
+  return {
+    outcome: 'rejected',
+    status: resp.status,
+    detail:
+      payload?.status == null
+        ? 'Gateway did not confirm DELETED.'
+        : `Gateway status: ${String(payload.status)}.`,
+  };
 }
 
 export async function deployCharacter(

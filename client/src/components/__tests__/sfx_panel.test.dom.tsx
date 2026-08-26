@@ -170,7 +170,7 @@ describe('presets + generation flow', () => {
       }) as unknown as Response,
     );
     store.set('aethertable_token', TOKEN);
-    render(<SfxPanel />);
+    render(<SfxPanel userRole="gm" />);
     // No role plumbed → controls render optimistically; the gateway decides.
     fireEvent.change(screen.getByPlaceholderText(/describe the sound/i), {
       target: { value: 'dragon roar' },

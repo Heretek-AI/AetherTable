@@ -16,6 +16,7 @@ import {
   deployCharacter,
   getCharacter,
   listCharacters,
+  type DeleteCharacterOutcome,
   type FullStoredCharacter,
   type StoredCharacter,
 } from '../api/lobby_store';
@@ -204,15 +205,19 @@ export const MyCharactersView: React.FC<MyCharactersViewProps> = ({
     const target = confirmingDelete;
     setDeleteBusy(true);
     setDeleteError(null);
-    const ok = await deleteCharacter(target.id);
+    const result = await deleteCharacter(target.id);
     setDeleteBusy(false);
-    if (!ok) {
-      setDeleteError('The gateway did not confirm this deletion (offline, not found, or not yours).');
+    if (result.outcome === 'ok') {
+      setRoster((prev) => prev?.filter((c) => c.character_id !== target.id) ?? prev);
+      setConfirmingDelete(null);
+      setDeleteError(null);
       return;
     }
-    setRoster((prev) => prev?.filter((c) => c.character_id !== target.id) ?? prev);
-    setConfirmingDelete(null);
-    setDeleteError(null);
+    // Render the gateway's verbatim detail per branch — never guess. The
+    // view never collapses 403/404/network into one fabricated sentence; each
+    // branch keeps its own honest copy from the gateway (or the pre-flight
+    // pre-check when no token was present).
+    setDeleteError(describeDeleteOutcome(result));
   };
 
   // --- Empty / unauthenticated / error states ------------------------------
@@ -484,6 +489,28 @@ function GalleryHeader({
       </div>
     </div>
   );
+}
+
+/**
+ * Render the verbatim gateway copy for every DELETE-character failure branch.
+ * No fabrications: the view's job is to display what the server said and
+ * what the wire situation was. The pre-flight branches (NOT_SIGNED_IN,
+ * UNREACHABLE) carry their own pre-written copy because the gateway never
+ * had a chance to answer.
+ */
+function describeDeleteOutcome(outcome: Exclude<DeleteCharacterOutcome, { outcome: 'ok' }>): string {
+  switch (outcome.outcome) {
+    case 'not_signed_in':
+      return outcome.detail;
+    case 'forbidden':
+      return `The gateway refused: ${outcome.detail}`;
+    case 'not_found':
+      return `The gateway could not find that character for this account: ${outcome.detail}`;
+    case 'rejected':
+      return `The gateway rejected the delete request: ${outcome.detail}`;
+    case 'unreachable':
+      return `Gateway unreachable: ${outcome.detail}`;
+  }
 }
 
 /** Book-style body for the View modal, straight off the stored `data` blob. */

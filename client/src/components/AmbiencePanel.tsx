@@ -32,8 +32,13 @@ import {
 export type AmbienceSeatRole = 'gm' | 'admin' | 'player' | 'spectator';
 
 interface AmbiencePanelProps {
-  /** Seat role when App-shell role projection reaches this modal; optional. */
-  userRole?: AmbienceSeatRole;
+  /**
+   * Seat role from the App-shell role projection. Required: with iteration 23
+   * (F12) the AudioMixerModal plumbs App.tsx's `userRole` straight through, so
+   * a non-staff seat never renders catalog cards and never fetches the catalog
+   * (the cached-buffer cleanup on demotion lives in api/ambience_store.ts).
+   */
+  userRole: AmbienceSeatRole;
 }
 
 /** Fallback art per slug so each card reads differently without image assets. */
@@ -83,7 +88,7 @@ export const AmbiencePanel: React.FC<AmbiencePanelProps> = ({ userRole }) => {
   );
   const [playingSlug, setPlayingSlug] = useState<string | null>(currentAmbienceSlug());
 
-  const isStaff = userRole === undefined || userRole === 'gm' || userRole === 'admin';
+  const isStaff = userRole === 'gm' || userRole === 'admin';
 
 
   useEffect(() => {
