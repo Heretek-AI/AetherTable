@@ -402,3 +402,8 @@ cycle guard, #6 fall elevation bounds, #7 ITEM_TRANSFERRED rewind arm,
 ### Iteration 66 — 7d0fcf2 — feat(engine): full SRD exhaustion ladder enforced (P3) — cargo 399/19
 ### Iteration 67 — 3d03516 — feat(engine): 5e dice notation kh/kl/ro/exploding — cargo 420/20
 ### Iteration 68 — d9cebb9 — feat(client): dedicated GM-only StreamerView (P9) — vitest 344/27
+### Iteration 71 — ccc29f3 — feat(gateway): wizard fields persisted on lobbies + launch propagation (P2) — pytest 940
+### Iteration 72+74 — 76787ff/b093471 — feat(engine): OA resolution + readied-action depth (P3) — cargo 436/20
+### Iteration 73 — 8709f48 — feat(client): wizard sends real wire fields, ledger empty (P2) — vitest 366
+### Iteration 69 — baa2503 — fix(gateway): bundle tokens spawn in world-feet (milestone-gate find) 
+### Iteration 70 — d8d0e35 — test(client): campaign wizard coverage (P2) — vitest 361
