@@ -39,6 +39,10 @@ RATE_LIMITS: Dict[str, Tuple[int, int]] = {
     # every hit can cost model tokens, so the cap sits below the agent bucket
     # — a player mashing "narrate" must not mint a model bill.
     "llm": (30, 60),
+    # Diffusion images (POST /api/v1/media/image): each accepted call holds
+    # the shared GPU through up-to-8 SD-Turbo steps. Tightest of the
+    # always-on buckets so one seat cannot starve the table's media budget.
+    "media": (10, 60),
     # Empirical benchmark: each accepted call runs 10-1000 encounter
     # simulations in-process. Tightest cap of all.
     "benchmark": (5, 60),

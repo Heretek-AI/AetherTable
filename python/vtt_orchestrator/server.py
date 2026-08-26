@@ -4102,6 +4102,13 @@ def _bucket_for_path(path: str) -> str:
     # matched before the generic simulation prefix so it gets its own tight cap.
     if path.startswith("/api/v1/simulation/empirical-benchmark"):
         return "benchmark"
+    # Diffusion images: expensive GPU work per call, tighter than the llm
+    # bucket. Must be matched before the generic media prefix below.
+    if path == "/api/v1/media/image":
+        return "media"
+    # Other Lemonade media surfaces (TTS / STT): model spend, llm bucket.
+    if path.startswith("/api/v1/media/"):
+        return "llm"
     # LLM-spend surfaces: intent classification and every orchestrator
     # narrative path (including the legacy /narrative/* aliases).
     if path.startswith(
@@ -4375,6 +4382,199 @@ async def import_campaign_bundle(req: BundleImportRequest, token: str = Depends(
         "map_walls_applied": len(walls),
         "tokens_spawned": spawned,
     }
+
+
+# --- Lemonade multimedia gateway routes (Loop 3, iteration 2) ------------------
+#
+# Four authenticated surfaces over the self-hosted upstream wired in iteration
+# 1. Shared contract:
+#   * every route requires a session token (header Bearer first, ?token=
+#     fallback) — media generation is never anonymous;
+#   * failures degrade HONESTLY: an unreachable host maps to 502
+#     LEMONADE_UNAVAILABLE and an upstream rejection forwards its status +
+#     detail verbatim; no route ever fabricates placeholder media or masks a
+#     generation failure with canned content;
+#   * rate limiting is bucket-assigned by _bucket_for_path: diffusion images
+#     meter in their own tight `media` bucket (10/min), TTS/STT/SFX share the
+#     `llm` bucket because they all spend model time per call.
+_MEDIA_MAX_TTS_BYTES = 20 * 1024 * 1024          # 20 MB speech response cap
+_MEDIA_MAX_UPLOAD_BYTES = 25 * 1024 * 1024       # 25 MB transcription upload cap
+
+
+class MediaImageRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=500)
+    size: Literal["512x512", "256x256"] = "512x512"
+    steps: int = Field(default=4, ge=1, le=8)
+
+
+class MediaSpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+    voice: str = Field(default="af_sky", min_length=1, max_length=64)
+    fmt: Literal["wav", "mp3"] = "wav"
+
+
+class MediaSfxRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=300)
+
+
+class MediaImageResponse(BaseModel):
+    image_b64: str
+
+
+def _lemonade_error_to_http(exc: Exception) -> HTTPException:
+    """Maps one Lemonade client exception onto the honest HTTP surface."""
+    if isinstance(exc, LemonadeUnavailableError):
+        return HTTPException(
+            status_code=502, detail=f"LEMONADE_UNAVAILABLE: {exc}"
+        )
+    # LemonadeRejectedError: forward the upstream status + detail verbatim so
+    # the client sees exactly what the model host refused (and why).
+    status = getattr(exc, "status_code", 502)
+    if not isinstance(status, int) or not (400 <= status <= 599):
+        status = 502
+    return HTTPException(status_code=status, detail=exc.detail)
+
+
+async def _read_capped_upload(file: UploadFile, cap: int) -> bytes:
+    """Streams one multipart part with a hard byte bound.
+
+    Declared Content-Length cannot be trusted for the real bound (a lying
+    client would otherwise buffer unbounded bytes before rejection), so reads
+    are chunked with a running total that trips 413 mid-stream.
+    """
+    chunks: List[bytes] = []
+    received = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        received += len(chunk)
+        if received > cap:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Upload exceeds the {cap} byte limit "
+                    f"(received at least {received})."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _validate_wav_upload(filename: str, payload: bytes) -> None:
+    """Transcription accepts wav ONLY: extension AND magic must both agree.
+
+    The extension check alone is spoofable (rename anything .wav); the RIFF
+    prologue check alone rejects legitimately-named-but-misencoded files too
+    late for a helpful error. Requiring both gives clients a precise refusal.
+    """
+    if not filename.lower().endswith(".wav"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Only .wav uploads are supported for transcription "
+                f"(got filename {filename!r})."
+            ),
+        )
+    if (
+        len(payload) < 12
+        or payload[0:4] != b"RIFF"
+        or payload[8:12] != b"WAVE"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Not a valid wav file: missing RIFF....WAVE magic bytes.",
+        )
+
+
+@app.post("/api/v1/media/image")
+async def media_image(req: MediaImageRequest, token: str = Depends(_require_auth)):
+    """Generate one diffusion image; any authenticated seat.
+
+    Metered in the dedicated tight `media` bucket (10/min): each accepted
+    call occupies the shared GPU through up-to-8 SD-Turbo steps, which is far
+    more expensive than any llm-bucket call. Returns base64 JSON — raw binary
+    has no place in this route's contract.
+    """
+    _require_user_id(token)
+    try:
+        png_bytes = await lemonade_client.generate_image(
+            req.prompt, size=req.size, steps=req.steps
+        )
+    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
+        raise _lemonade_error_to_http(exc)
+    return MediaImageResponse(image_b64=base64.b64encode(png_bytes).decode())
+
+
+@app.post("/api/v1/media/speech")
+async def media_speech(req: MediaSpeechRequest, token: str = Depends(_require_auth)):
+    """Synthesize speech from text; any authenticated seat, llm bucket.
+
+    Responds with RAW audio bytes (audio/wav or audio/mpeg to match the
+    requested format) capped at 20 MB so a runaway synthesis cannot stream
+    unbounded memory through the JSON-first gateway.
+    """
+    _require_user_id(token)
+    try:
+        audio = await lemonade_client.text_to_speech(
+            req.text, voice=req.voice, fmt=req.fmt
+        )
+    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
+        raise _lemonade_error_to_http(exc)
+    if len(audio) > _MEDIA_MAX_TTS_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Synthesized audio exceeds the {_MEDIA_MAX_TTS_BYTES} byte "
+                f"response cap ({len(audio)} bytes returned upstream)."
+            ),
+        )
+    content_type = "audio/mpeg" if req.fmt == "mp3" else "audio/wav"
+    return Response(content=audio, media_type=content_type)
+
+
+@app.post("/api/v1/media/transcribe")
+async def media_transcribe(
+    file: UploadFile = File(...), token: str = Depends(_require_auth)
+):
+    """Transcribe one uploaded wav recording; any authenticated seat.
+
+    Multipart only, 25 MB cap enforced while streaming (never trusting
+    declared sizes), and BOTH the .wav extension AND the RIFF....WAVE magic
+    bytes must agree before anything reaches the upstream model.
+    """
+    _require_user_id(token)
+    payload = await _read_capped_upload(file, _MEDIA_MAX_UPLOAD_BYTES)
+    _validate_wav_upload(file.filename or "", payload)
+    try:
+        text = await lemonade_client.transcribe(payload, filename=file.filename or "input.wav")
+    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
+        raise _lemonade_error_to_http(exc)
+    return {"text": text}
+
+
+@app.post("/api/v1/media/sfx")
+async def media_sfx(req: MediaSfxRequest, token: str = Depends(_require_auth)):
+    """Generate a table-wide sound effect; GM/admin ONLY.
+
+    SFX plays to everyone at the table, so triggering it is a staff decision
+    the same way lore injection and campaign autosave are — a player firing
+    it could spam the shared soundscape.
+    """
+    actor = _caller_actor(token)
+    if actor.get("role", "") not in ("gm", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "MEDIA_SFX_FORBIDDEN: sound effects play to the whole table; "
+                "only GM or admin seats may trigger them."
+            ),
+        )
+    try:
+        wav_bytes = await lemonade_client.generate_sfx(req.prompt)
+    except (LemonadeUnavailableError, LemonadeRejectedError) as exc:
+        raise _lemonade_error_to_http(exc)
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 def _bundle_token_to_entity(tok: Dict[str, Any]) -> Dict[str, Any]:
