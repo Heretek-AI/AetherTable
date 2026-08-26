@@ -11,6 +11,7 @@ import { globalSpatialAudio } from '../render/spatial_audio';
 import { globalWebRTCMesh, PeerAudioState } from '../render/webrtc_mesh';
 import { Token } from './TacticalCanvas';
 import { ModalShell } from './ui/ModalShell';
+import { SfxPanel } from './SfxPanel';
 
 interface AudioMixerModalProps {
   isOpen: boolean;
@@ -280,6 +281,10 @@ export const AudioMixerModal: React.FC<AudioMixerModalProps> = ({
               />
             </div>
           </div>
+
+          {/* Generated SFX (GM-gated server-side; panel renders an honest
+              lock notice / 403 copy for non-staff seats). */}
+          <SfxPanel />
 
           {/* Peer Channels */}
           <div className="space-y-2">
