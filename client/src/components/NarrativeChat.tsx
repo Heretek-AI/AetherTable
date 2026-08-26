@@ -26,11 +26,15 @@ import {
   MIN_TRANSCRIBABLE_MS,
   AudioSegmentBuffer,
   reduceVoiceTranscription,
-  resolveTranscriptionEngine,
   type VoiceTranscriptionEvent,
   type VoiceUtterance,
 } from '../api/speech_transcription';
 import { BrowserWhisperTranscriber } from '../api/browser_whisper';
+import {
+  ServerWhisperTranscriber,
+  resolveSttEngine,
+  type SttEngineChoice,
+} from '../api/server_stt';
 
 export type ChatChannel = 'all' | 'party' | 'gm' | 'combat';
 
@@ -120,18 +124,23 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const [voiceVolume, setVoiceVolume] = useState(0);
   /** Voice drafts: captured VAD segments moving through transcription. */
   const [voiceUtterances, setVoiceUtterances] = useState<VoiceUtterance[]>([]);
-  /** Whether on-device STT is enabled this session (drives honest titles). */
-  const sttEnabled = useMemo(
-    () => resolveTranscriptionEngine(import.meta.env.VITE_ENABLE_BROWSER_STT) === 'browser-whisper',
+  /**
+   * Which STT engine this session uses (Loop 3 iteration 7). VITE_STT_ENGINE
+   * decides; unset falls back to the legacy VITE_ENABLE_BROWSER_STT flag so
+   * existing deployments keep their behaviour. Default 'off' — honest.
+   */
+  const sttEngine = useMemo<SttEngineChoice>(
+    () => resolveSttEngine(import.meta.env.VITE_STT_ENGINE, import.meta.env.VITE_ENABLE_BROWSER_STT),
     [],
   );
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   /**
-   * Lazily-created engine. Null ⇒ no STT this session (VITE_ENABLE_BROWSER_STT
-   * unset) and the UI says "transcription unavailable" instead of pretending
-   * audio became text.
+   * Lazily-created engine. Null ⇒ no STT this session (both env vars off)
+   * and the UI says "transcription unavailable" instead of pretending audio
+   * became text. The server path never constructs a BrowserWhisperTranscriber,
+   * so no transformers chunk / model download ever happens on that route.
    */
-  const voiceEngineRef = useRef<BrowserWhisperTranscriber | null>(null);
+  const voiceEngineRef = useRef<BrowserWhisperTranscriber | ServerWhisperTranscriber | null>(null);
   /** Retained mic audio for bursts still being transcribed (bounded). */
   const segmentBufferRef = useRef<AudioSegmentBuffer>(new AudioSegmentBuffer());
 
@@ -149,12 +158,19 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
   const applyVoiceEvent: ReduceVoice = (event) =>
     setVoiceUtterances((prev) => reduceVoiceTranscription(prev, event).utterances);
 
-  const ensureVoiceEngine = (): BrowserWhisperTranscriber | null => {
+  const ensureVoiceEngine = (): BrowserWhisperTranscriber | ServerWhisperTranscriber | null => {
     if (!voiceEngineRef.current) {
-      voiceEngineRef.current =
-        resolveTranscriptionEngine(import.meta.env.VITE_ENABLE_BROWSER_STT) === 'browser-whisper'
-          ? new BrowserWhisperTranscriber({ enabled: true })
-          : null;
+      switch (sttEngine) {
+        case 'browser':
+          voiceEngineRef.current = new BrowserWhisperTranscriber({ enabled: true });
+          break;
+        case 'server':
+          // Gateway route: multipart wav upload, no client-side model weights.
+          voiceEngineRef.current = new ServerWhisperTranscriber();
+          break;
+        default:
+          voiceEngineRef.current = null;
+      }
     }
     return voiceEngineRef.current;
   };
@@ -183,8 +199,7 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
       });
       applyVoiceEvent({
         type: 'ENGINE_UNAVAILABLE',
-        reason:
-          'On-device transcription is off (set VITE_ENABLE_BROWSER_STT=true to enable). Audio was counted for spotlight balance only.',
+        reason: `Transcription is off (set VITE_STT_ENGINE='browser' or 'server' to enable). Audio was counted for spotlight balance only.`,
       });
       return;
     }
@@ -474,7 +489,9 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
               <Mic className="w-3 h-3 shrink-0 text-tavern-accent" />
               {u.state === 'pending' && (
                 <>
-                  <span className="flex-1 opacity-70 animate-pulse">Transcribing speech…</span>
+                  <span className="flex-1 opacity-70 animate-pulse">
+                    {sttEngine === 'server' ? 'Transcribing via server…' : 'Transcribing speech…'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => dismissUtterance(u)}
@@ -561,7 +578,13 @@ export const NarrativeChat: React.FC<NarrativeChatProps> = ({
             title={
               isRecording
                 ? vadReady
-                  ? `Stop Recording (Silero VAD active${sttEnabled ? ' · on-device transcription on' : ' · transcription off'})`
+                  ? `Stop Recording (Silero VAD active${
+                      sttEngine === 'browser'
+                        ? ' · on-device transcription on'
+                        : sttEngine === 'server'
+                          ? ' · server transcription'
+                          : ' · transcription off'
+                    })`
                   : 'Stop Recording (amplitude-only mode — no speech detection)'
                 : 'Push-to-Talk (Microphone Ingestion)'
             }

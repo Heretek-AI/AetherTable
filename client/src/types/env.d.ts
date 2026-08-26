@@ -69,6 +69,31 @@ interface ImportMetaEnv {
    * must provide before this flag may turn anything on.
    */
   readonly VITE_ENABLE_GLTF_MINIATURES?: 'true' | 'false';
+
+  /**
+   * Opt-in gate for in-browser Whisper STT (iteration-39). Truthy spellings
+   * (`true`/`1`/`yes`) download ~40-80 MB of quantized ONNX weights from the
+   * Hugging Face CDN on first transcription and run them on WASM in this tab.
+   * Superseded by VITE_STT_ENGINE when that var is set; kept as the fallback
+   * so existing deployments keep their current behaviour. Default OFF.
+   */
+  readonly VITE_ENABLE_BROWSER_STT?: string;
+
+  /**
+   * Which speech-to-text engine this build uses (Loop 3, iteration 7).
+   *
+   * - `'browser'`: transformers.js Whisper fully client-side (same as setting
+   *   VITE_ENABLE_BROWSER_STT truthy).
+   * - `'server'`: each captured VAD burst is encoded to wav and POSTed to
+   *   /api/v1/media/transcribe with auth headers. This ships microphone
+   *   audio off-device, so it is NEVER implied — only an explicit value
+   *   selects it.
+   * - `'off'` / unset: no engine; the mic still feeds spotlight-balance
+   *   accounting, and the UI says "transcription unavailable" instead of
+   *   pretending audio became text. Unset also falls back to
+   *   VITE_ENABLE_BROWSER_STT for backward compatibility.
+   */
+  readonly VITE_STT_ENGINE?: 'browser' | 'server' | 'off';
 }
 
 interface ImportMeta {
