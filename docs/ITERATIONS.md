@@ -527,3 +527,5 @@ TDD red-first → gates → commit → push → row below.
 ### L3.20 — effcf00 — feat(gateway): Lines &amp; Veils per-session safety registry — pytest 1217
 ### L3.21 — aacea1b — fix(engine): audit-sweep F2/F3/F4/F5/F6/F9 — cargo 500
 ### L3.22 — 1e70288 — fix(gateway): audit-sweep F1/F7/F8 — pytest 1232
+### L3.24 — d95fd67 — feat(gateway): safety boundaries summary endpoint — pytest 1248
+### L3.23 — 0dab7eb — fix(client): audit-sweep F10/F11/F12 + EncounterBuilderView latch — vitest 666
