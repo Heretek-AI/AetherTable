@@ -37,16 +37,27 @@ import {
   EngineEscapeGrappleResult,
   EngineGrappleResult,
   EngineHealResult,
+  EngineHelpResult,
+  EngineReleaseReadyResult,
+  EngineReadyResult,
   EngineShoveResult,
   EngineStandardActionResult,
   EngineStabilizeResult,
+  HELP_REACH_FEET,
+  READY_TRIGGER_OPTIONS,
+  ReadyTriggerId,
+  composeReadyDescription,
   ensureEngineSession,
+  entitiesWithinReach,
   engineDash,
   engineDisengage,
   engineDodge,
   engineEscapeGrapple,
   engineGrapple,
   engineHeal,
+  engineHelp,
+  engineReadyAction,
+  engineReleaseReadyAction,
   engineRest,
   engineSessionEntities,
   engineShove,
@@ -236,7 +247,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   const [defenderSkill, setDefenderSkill] = useState<'athletics' | 'acrobatics'>('athletics');
   const [shoveEffect, setShoveEffect] = useState<'prone' | 'push_5ft'>('prone');
   const [maneuverBusy, setManeuverBusy] = useState<
-    'grapple' | 'shove' | 'dodge' | 'dash' | 'disengage' | 'stabilize' | 'escape-grapple' | null
+    'grapple' | 'shove' | 'dodge' | 'dash' | 'disengage' | 'stabilize' | 'escape-grapple' | 'help' | null
   >(null);
   const [maneuverFeedback, setManeuverFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
 
@@ -340,7 +351,7 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   /** One flight per panel; every button disables while any maneuver is busy. */
   const runManeuver = async (
     kind: Exclude<typeof maneuverBusy, null>,
-    fire: () => Promise<EngineActionOutcome<EngineGrappleResult | EngineShoveResult | EngineStandardActionResult | EngineStabilizeResult | EngineEscapeGrappleResult>>,
+    fire: () => Promise<EngineActionOutcome<EngineGrappleResult | EngineShoveResult | EngineStandardActionResult | EngineStabilizeResult | EngineEscapeGrappleResult | EngineHelpResult>>,
     describe: (data: never) => string,
   ): Promise<void> => {
     if (!activeToken || maneuverBusy) return;
@@ -488,7 +499,10 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
    */
   const [readiedDescription, setReadiedDescription] = useState<string | null>(null);
   const [readyInput, setReadyInput] = useState('');
+  const [readyTrigger, setReadyTrigger] = useState<ReadyTriggerId>('enemy_enters_reach');
+  const [readyFreeformTrigger, setReadyFreeformTrigger] = useState('');
   const [readyBusy, setReadyBusy] = useState(false);
+  const [releaseReadyBusy, setReleaseReadyBusy] = useState(false);
   const [readyFeedback, setReadyFeedback] = useState<{ tone: 'ok' | 'error'; text: string } | null>(
     null,
   );
@@ -524,66 +538,77 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
     void refreshReadiedAction();
   }, [refreshReadiedAction]);
 
-  /** Quotes the engine's rejection verbatim, mirroring the maneuver helpers. */
-  const describeReadyRejection = (
-    status: number,
-    payload: unknown,
-  ): { tone: 'ok' | 'error'; text: string } => {
-    const raw = (payload as { detail?: unknown } | null)?.detail ??
-      (payload as { error?: unknown } | null)?.error ??
-      payload;
-    const label =
-      typeof raw === 'string'
-        ? raw
-        : raw && typeof raw === 'object'
-        ? String((raw as Record<string, unknown>).message ?? `HTTP ${status}`)
-        : `HTTP ${status}`;
-    return { tone: 'error', text: `Rejected by the engine — ${label}` };
+  /**
+   * SRD Help (combat use, iteration-54 engine route): spend your Action so an
+   * ALLY gains Advantage on their next attack against an enemy within YOUR 5 ft
+   * reach — i.e. you distract that enemy. The target_entity_id is therefore the
+   * ENEMY both of you are engaged with; the ally only picks WHO benefits.
+   * Reach, liveness and Action economy are re-verified engine-side.
+   */
+  const handleHelp = () =>
+    void runManeuver(
+      'help',
+      () =>
+        engineHelp({
+          sessionId: maneuverSessionId!,
+          helperId: activeToken!.id,
+          targetEntityId: helpTargetEnemyId || targetId,
+        }),
+      (d: EngineHelpResult) =>
+        `Engine Help confirmed — the next attacker gains Advantage against ${
+          maneuverTargets?.find((t) => t.id === d.next_attacker_has_advantage_against)?.name ||
+          d.next_attacker_has_advantage_against
+        } · event_sequence ${d.event_sequence ?? '?'}.`,
+    );
+
+  /** Verbatim summary of a release response; renders only what the engine sent. */
+  const releaseReadyFeedback = (r: EngineReleaseReadyResult): string =>
+    `Engine confirms the readied action was released${
+      r.released_action?.description ? ` — “${r.released_action.description}”` : ''
+    }, reaction spent · event_sequence ${r.event_sequence ?? '?'}.`;
+
+  /** Release the held declaration early, spending this entity's Reaction. */
+  const handleReleaseReady = async (): Promise<void> => {
+    if (!activeToken || releaseReadyBusy || maneuverBusy || !maneuverSessionId) return;
+    setReleaseReadyBusy(true);
+    try {
+      const outcome = await engineReleaseReadyAction({
+        sessionId: maneuverSessionId,
+        entityId: activeToken.id,
+      });
+      if (outcome.kind !== 'applied') {
+        setReadyFeedback(describeManeuverRejection(outcome));
+        return;
+      }
+      setReadyFeedback({ tone: 'ok', text: releaseReadyFeedback(outcome.data) });
+      await refreshReadiedAction();
+    } finally {
+      setReleaseReadyBusy(false);
+    }
   };
 
   const handleReady = async (): Promise<void> => {
     if (!activeToken || readyBusy || maneuverBusy) return;
-    const description = readyInput.trim();
+    const description = composeReadyDescription(readyInput, readyTrigger, readyFreeformTrigger);
     if (!description || !maneuverSessionId) return;
     setReadyBusy(true);
     try {
-      const token = getStoredToken();
-      if (!token) {
-        setReadyFeedback({
-          tone: 'error',
-          text: 'Rejected by the engine — NOT_AUTHENTICATED: sign in to act through the authoritative engine.',
-        });
+      const outcome = await engineReadyAction({
+        sessionId: maneuverSessionId,
+        entityId: activeToken.id,
+        description,
+      });
+      if (outcome.kind !== 'applied') {
+        setReadyFeedback(describeManeuverRejection(outcome));
         return;
       }
-      let resp: Response;
-      try {
-        resp = await fetch('/api/v1/engine/ready', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({
-            session_id: maneuverSessionId,
-            entity_id: activeToken.id,
-            description,
-          }),
-        });
-      } catch {
-        setReadyFeedback({
-          tone: 'error',
-          text: 'Rules engine unreachable — nothing was readied.',
-        });
-        return;
-      }
-      const payload: unknown = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        setReadyFeedback(describeReadyRejection(resp.status, payload));
-        return;
-      }
-      const body = payload as { readied_action?: { description?: string }; event_sequence?: number };
+      const body = outcome.data as EngineReadyResult;
       setReadyFeedback({
         tone: 'ok',
         text: `Engine confirms your readied action — “${body.readied_action?.description ?? description}” is held until your next turn · event_sequence ${body.event_sequence ?? '?'}.`,
       });
       setReadyInput('');
+      setReadyFreeformTrigger('');
       await refreshReadiedAction();
     } finally {
       setReadyBusy(false);
@@ -772,6 +797,30 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
   const grappleHolderName = grappleHolderId
     ? maneuverTargets?.find((t) => t.id === grappleHolderId)?.name || grappleHolderId
     : null;
+
+  /**
+   * SRD Help (combat use): the enemy you are distracting — it must sit within
+   * HELP_REACH_FEET of THIS token per the engine's own convention. Computed
+   * only from PROJECTED positions; an entity whose position the projection did
+   * not expose is treated as out of reach (absence means unknown, never "in").
+   */
+  const helpTargetEnemyId = useMemo(() => {
+    if (!activeToken) return '';
+    const inReach = entitiesWithinReach(
+      (maneuverTargets ?? []).filter((t) => !t.is_player && !t.is_dead),
+      [activeToken.x, activeToken.y],
+      HELP_REACH_FEET,
+    );
+    return inReach.find((id) => id === targetId) ?? inReach[0] ?? '';
+  }, [maneuverTargets, activeToken, targetId]);
+
+  /** Allies available for the Help action's ability-check use: living players
+   * OTHER than this token that the projection exposed. Reach for the check
+   * variant is adjudicated by the GM/engine, so no distance filter here. */
+  const helpAllies = useMemo(
+    () => (maneuverTargets ?? []).filter((t) => t.is_player && !t.is_dead && t.id !== activeToken?.id),
+    [maneuverTargets, activeToken?.id],
+  );
 
 
   /** Explicit empty state — replaces every hardcoded stat when no record binds. */
@@ -1213,21 +1262,68 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
               ))}
             </div>
 
+            {/* SRD Help (iteration-54 engine route). Combat use: you distract an
+                enemy within YOUR reach so the NEXT attacker against it (usually
+                an ally) rolls with Advantage — engine-verified, Action spent
+                engine-side. Offered only when a projected enemy actually sits
+                within HELP_REACH_FEET; no position from the projection means no
+                button, not a guessed one. */}
+            {helpTargetEnemyId && (
+              <button
+                type="button"
+                onClick={handleHelp}
+                disabled={maneuverBusy !== null}
+                data-testid="sheet-help-action"
+                title={`Spend your Action distracting ${
+                  maneuverTargets?.find((t) => t.id === helpTargetEnemyId)?.name ||
+                  helpTargetEnemyId
+                } (within ${HELP_REACH_FEET} ft) — the next attack roll against it has Advantage`}
+                className="vtt-btn vtt-btn-secondary w-full text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Hand className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                  {maneuverBusy === 'help'
+                    ? 'Helping…'
+                    : `Help vs ${maneuverTargets?.find((t) => t.id === helpTargetEnemyId)?.name || helpTargetEnemyId}`}
+                </span>
+              </button>
+            )}
+
             {/* SRD Ready — hold a triggered response until your next turn.
-                The engine stores/surfaces/clears the declaration; matching the
-                trigger and resolving the held action is GM adjudication. */}
+                The structured picker mirrors vtt-core's ReadiedTrigger
+                shorthands but rides in the DESCRIPTION prose on the wire: the
+                gateway's optional trigger_hint passthrough would be rejected by
+                the engine's deny_unknown_fields (see composeReadyDescription).
+                Matching the trigger and resolving the held action is GM
+                adjudication either way. */}
             <div className="pt-2 space-y-1.5 border-t" style={{ borderColor: LEATHER_HAIRLINE }}>
               <span className="text-[10px] font-display uppercase tracking-widest" style={{ color: CRIMSON_TEXT }}>
                 Readied Action
               </span>
               {readiedDescription ? (
-                <p
-                  className="text-[11px] font-prose leading-snug break-words"
-                  style={{ color: 'var(--state-success)' }}
-                  title="Held until your next turn — the GM adjudicates when your trigger fires"
-                >
-                  Holding: “{readiedDescription}”
-                </p>
+                <>
+                  <p
+                    data-testid="sheet-readied-description"
+                    className="text-[11px] font-prose leading-snug break-words"
+                    style={{ color: 'var(--state-success)' }}
+                    title="Held until your next turn — the GM adjudicates when your trigger fires"
+                  >
+                    Holding: “{readiedDescription}”
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void handleReleaseReady()}
+                    disabled={releaseReadyBusy || maneuverBusy !== null}
+                    data-testid="sheet-release-ready"
+                    title="Release the held action NOW and spend your Reaction on it (engine-side)"
+                    className="vtt-btn vtt-btn-secondary w-full text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                      <Zap className="w-3.5 h-3.5" style={{ color: 'var(--tavern-accent-deep)' }} />
+                      {releaseReadyBusy ? 'Releasing…' : 'Release Readied Action'}
+                    </span>
+                  </button>
+                </>
               ) : (
                 <p
                   className="text-[10px] font-prose leading-snug"
@@ -1236,34 +1332,67 @@ export const CharacterSheet: React.FC<CharacterSheetProps> = ({
                   Nothing readied. Ready spends your Action; it clears at your next turn.
                 </p>
               )}
-              <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={readyInput}
+                maxLength={200}
+                disabled={readyBusy || maneuverBusy !== null}
+                onChange={(e) => setReadyInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && readyInput.trim()) void handleReady();
+                }}
+                aria-label="Readied action description"
+                placeholder="I attack the goblin when it moves"
+                className="vtt-input w-full px-1.5 py-1 text-xs font-prose"
+                style={{ color: INK }}
+              />
+              <div className="flex flex-wrap items-center gap-1.5">
+                {READY_TRIGGER_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setReadyTrigger(opt.id)}
+                    aria-pressed={readyTrigger === opt.id}
+                    data-testid={`sheet-ready-trigger-${opt.id}`}
+                    title={`Declared trigger: ${opt.label} — stored in the readied description for GM adjudication`}
+                    className={`transition cursor-pointer text-[10px] ${
+                      readyTrigger === opt.id ? 'vtt-badge-danger' : 'vtt-badge'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {readyTrigger === 'freeform' && (
                 <input
                   type="text"
-                  value={readyInput}
-                  maxLength={200}
+                  value={readyFreeformTrigger}
+                  maxLength={120}
                   disabled={readyBusy || maneuverBusy !== null}
-                  onChange={(e) => setReadyInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && readyInput.trim()) void handleReady();
-                  }}
-                  aria-label="Readied action description"
-                  placeholder="I attack the goblin when it moves"
-                  className="vtt-input flex-1 px-1.5 py-1 text-xs font-prose"
+                  onChange={(e) => setReadyFreeformTrigger(e.target.value)}
+                  aria-label="Custom trigger text"
+                  placeholder="…when the door opens"
+                  className="vtt-input w-full px-1.5 py-1 text-xs font-prose"
                   style={{ color: INK }}
                 />
-                <button
-                  type="button"
-                  onClick={() => void handleReady()}
-                  disabled={readyBusy || maneuverBusy !== null || !readyInput.trim()}
-                  title="Spend your Action to hold a triggered response until your next turn (resolved by the GM)"
-                  className="vtt-btn vtt-btn-secondary shrink-0 text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
-                    <Hand className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
-                    {readyBusy ? 'Readying…' : 'Ready'}
-                  </span>
-                </button>
-              </div>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleReady()}
+                disabled={
+                  readyBusy ||
+                  maneuverBusy !== null ||
+                  !readyInput.trim() ||
+                  (readyTrigger === 'freeform' && !readyFreeformTrigger.trim())
+                }
+                title="Spend your Action to hold a triggered response until your next turn (resolved by the GM)"
+                className="vtt-btn vtt-btn-secondary w-full text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="flex items-center justify-center gap-1.5" style={{ color: INK }}>
+                  <Hand className="w-3.5 h-3.5" style={{ color: CRIMSON_TEXT }} />
+                  {readyBusy ? 'Readying…' : 'Ready'}
+                </span>
+              </button>
               {/* Honest result / rejection readout — verbatim engine verdicts */}
               <div aria-live="polite" className="min-h-[0.75rem]">
                 {readyFeedback && (

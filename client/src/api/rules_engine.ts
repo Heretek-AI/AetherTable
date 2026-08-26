@@ -613,6 +613,126 @@ export async function engineHelp(params: {
   );
 }
 
+/* --- Ready action + Release (iterations 54-56 engine routes) ---------------
+ *
+ * SRD "Ready": spend your Action to hold a triggered response ("I attack the
+ * goblin when it moves"). The engine stores/surfaces/clears the declaration;
+ * matching the trigger and resolving the held action stays GM adjudication.
+ * Releasing early spends your REACTION through /action/ready/release.
+ */
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/ready. */
+export interface EngineReadyResult {
+  status?: string;
+  entity_id?: string;
+  readied_action?: {
+    description?: string;
+    set_on_round?: number;
+    trigger?: Record<string, unknown>;
+  };
+  event_sequence?: number;
+}
+
+/** Verbatim body of POST /api/v1/sessions/{id}/action/ready/release. */
+export interface EngineReleaseReadyResult {
+  status?: string;
+  entity_id?: string;
+  released_action?: { description?: string; set_on_round?: number };
+  reaction_spent?: boolean;
+  event_sequence?: number;
+}
+
+/**
+ * The structured trigger picker's options, mirroring vtt-core's
+ * `ReadiedTrigger` mechanical shorthands plus freeform adjudication.
+ */
+export const READY_TRIGGER_OPTIONS = [
+  { id: 'enemy_enters_reach', label: 'Enemy enters reach' },
+  { id: 'enemy_attacks', label: 'Enemy attacks an ally' },
+  { id: 'turn_start', label: 'Start of my next turn' },
+  { id: 'freeform', label: 'Custom trigger…' },
+] as const;
+
+export type ReadyTriggerId = (typeof READY_TRIGGER_OPTIONS)[number]['id'];
+
+const READY_TRIGGER_PHRASES: Record<Exclude<ReadyTriggerId, 'freeform'>, string> = {
+  enemy_enters_reach: 'when an enemy enters my reach',
+  enemy_attacks: 'when an enemy attacks an ally',
+  turn_start: 'at the start of my next turn',
+};
+
+/**
+ * Fold a structured trigger into the readied-action DESCRIPTION.
+ *
+ * WIRE HONESTY NOTE: the gateway's EngineReadyActionRequest declares an
+ * optional `trigger_hint`, but its handler forwards that key verbatim to the
+ * engine — whose ReadyActionReq is `deny_unknown_fields` with a field named
+ * `trigger`. Any request carrying trigger_hint is therefore rejected 422
+ * upstream, so the client must NEVER send it. Instead the trigger rides in
+ * prose (which the engine stores verbatim for display/GM adjudication):
+ * shorthands map to their canonical SRD phrase, freeform appends the player's
+ * own words verbatim, and empty freeform text leaves the description alone.
+ */
+export function composeReadyDescription(
+  description: string,
+  trigger: ReadyTriggerId,
+  freeformText?: string,
+): string {
+  const trimmed = description.trim();
+  if (trigger === 'freeform') {
+    const custom = (freeformText ?? '').trim();
+    return custom ? `${trimmed} (trigger: ${custom})` : trimmed;
+  }
+  return `${trimmed} (trigger: ${READY_TRIGGER_PHRASES[trigger]})`;
+}
+
+/**
+ * Spend your Action to hold a triggered response until your next turn. The
+ * engine re-verifies ownership, liveness and Action economy and refuses with
+ * EMPTY_DESCRIPTION / ENTITY_NOT_OWNED / ACTION_ECONOMY_EXHAUSTED /
+ * ENTITY_CANNOT_ACT otherwise. The payload is deliberately ids-plus-
+ * description only — see composeReadyDescription for why trigger_hint is
+ * never sent despite existing on the gateway model.
+ */
+export async function engineReadyAction(params: {
+  sessionId: string;
+  entityId: string;
+  /** Trigger already folded into prose via composeReadyDescription. */
+  description: string;
+}): Promise<EngineActionOutcome<EngineReadyResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineReadyResult>(`/api/v1/engine/ready`, {
+    session_id: params.sessionId,
+    entity_id: params.entityId,
+    description: params.description.trim(),
+  });
+}
+
+/**
+ * Release a held readied action NOW, spending this entity's Reaction (the
+ * engine clears the declaration and ledgers READY_ACTION_RELEASED itself).
+ *
+ * GATEWAY STATUS (honest note for the python owner): the ENGINE route exists
+ * (POST /api/v1/sessions/{id}/action/ready/release) but the orchestrator does
+ * NOT yet expose an `/api/v1/engine/ready/release` proxy. This module dials
+ * that documented future path anyway; until the proxy lands the gateway
+ * answers 404/405, which surfaces here as a plain {kind:'rejected'} — the same
+ * honest pending-gateway treatment as iteration 76's opportunity-attack
+ * surface. Never fabricated into a success.
+ */
+export async function engineReleaseReadyAction(params: {
+  sessionId: string;
+  entityId: string;
+}): Promise<EngineActionOutcome<EngineReleaseReadyResult>> {
+  const token = getStoredToken();
+  if (!token) return NOT_SIGNED_IN;
+  return engineActionPost<EngineReleaseReadyResult>(`/api/v1/engine/ready/release`, {
+    session_id: params.sessionId,
+    entity_id: params.entityId,
+  });
+}
+
 /* --- Spellbook: live compendium + authoritative cast-spell pipeline -------
  *
  * The grimoire list is read from the gateway's SRD compendium
@@ -1024,4 +1144,38 @@ export async function engineSessionEntities(
     return { kind: 'applied', data: list };
   }
   return outcome;
+}
+
+/* --- Reach gating (Help action targeting) ---------------------------------
+ *
+ * The engine's Help route (iteration 54) requires the helped-against enemy to
+ * sit within HELP_REACH_FEET (5 ft) of the HELPER and re-verifies it from the
+ * authoritative positions. The client uses the SAME convention purely to gate
+ * which allies are offered a Help button — a refusal here is a UX nicety, an
+ * engine rejection is the truth.
+ */
+
+/** Engine world units ARE feet (see EntityState::distance_to_feet). */
+export const HELP_REACH_FEET = 5;
+
+/**
+ * Ids of `targets` within `reachFeet` straight-line distance of the actor's
+ * position. Entities whose position the projection did not expose (and an
+ * actor with no known position) are excluded — absence means "unknown", never
+ * "in reach".
+ */
+export function entitiesWithinReach(
+  targets: Array<{ id: string; position?: number[] }>,
+  actorPosition: number[] | undefined,
+  reachFeet: number,
+): string[] {
+  if (!actorPosition || actorPosition.length < 2) return [];
+  const [ax, ay] = actorPosition;
+  const inReach: string[] = [];
+  for (const t of targets) {
+    if (!Array.isArray(t.position) || t.position.length < 2) continue;
+    const [tx, ty] = t.position;
+    if (Math.hypot(tx - ax, ty - ay) <= reachFeet) inReach.push(t.id);
+  }
+  return inReach;
 }
