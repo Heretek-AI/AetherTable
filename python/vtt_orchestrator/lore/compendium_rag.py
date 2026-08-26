@@ -72,6 +72,13 @@ DEFAULT_QDRANT_HOST = "http://localhost:6333"
 QDRANT_EMBEDDINGS_ENV = "QDRANT_EMBEDDINGS"
 FASTEMBED_DENSE_MODEL_ENV = "FASTEMBED_DENSE_MODEL"
 FASTEMBED_SPARSE_MODEL_ENV = "FASTEMBED_SPARSE_MODEL"
+# Remote OpenAI-compatible embeddings server (e.g. self-hosted Lemonade
+# serving harrier-oss GGUF). When REMOTE_EMBEDDINGS_BASE_URL is set it
+# takes precedence over fastembed — no model download, no ONNX runtime.
+REMOTE_EMBEDDINGS_BASE_URL_ENV = "REMOTE_EMBEDDINGS_BASE_URL"
+REMOTE_EMBEDDINGS_API_KEY_ENV = "REMOTE_EMBEDDINGS_API_KEY"
+REMOTE_EMBEDDINGS_MODEL_ENV = "REMOTE_EMBEDDINGS_MODEL"
+DEFAULT_REMOTE_API_KEY = "lemonade"
 
 # fastembed models (see https://github.com/qdrant/fastembed): bge-small-en-v1.5
 # is 384 dims / ~67 MB ONNX and runs comfortably on CPU; Qdrant/bm25 is the
@@ -217,6 +224,74 @@ def _sparse_to_rest(sparse_embedding) -> Dict[str, Any]:
     }
 
 
+class OpenAICompatibleEmbeddingBackend:
+    """Real embeddings from any OpenAI-compatible /v1/embeddings server.
+
+    Used to reach self-hosted servers (e.g. a Lemonade instance serving
+    harrier-oss GGUF) directly, bypassing proxy gateways that may not
+    route embedding providers. Dense-only: sparse legs stay on fastembed
+    or degrade the collection to dense-only with honest provenance.
+    """
+
+    named_vectors = True
+    supports_sparse = False
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        dim: int = DEFAULT_EMBED_DIM,
+    ):
+        import os as _os
+
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.dense_model_name = model
+        self.sparse_model_name = None
+        self.dim = dim
+        # Dimension consistency contract: probe once at init so collection
+        # creation uses the true server dimensionality, not a guess.
+        probe = self._request(["dimension probe"])
+        if len(probe[0]) != dim:
+            logger.info(
+                "compendium rag: remote embeddings %r report dim %d "
+                "(configured %d) — adopting server dimension",
+                model, len(probe[0]), dim,
+            )
+            self.dim = len(probe[0])
+        self.label = f"remote-embeddings:{model}"
+
+    def _request(self, texts: Sequence[str]) -> List[List[float]]:
+        resp = httpx.post(
+            f"{self.base_url}/v1/embeddings",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={"model": self.dense_model_name, "input": list(texts)},
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            raise QdrantRequestError(
+                f"remote embeddings {resp.status_code}: {resp.text[:200]}"
+            )
+        data = sorted(resp.json().get("data", []), key=lambda d: d.get("index", 0))
+        return [[float(x) for x in item["embedding"]] for item in data]
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        out: List[List[float]] = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            out.extend(self._request(list(texts[i:i + BATCH_SIZE])))
+        return out
+
+    def embed_query(self, query: str) -> List[float]:
+        return self._request([query])[0]
+
+    def embed_sparse_documents(self, texts):
+        return None
+
+    def embed_sparse_query(self):
+        return None
+
+
 class FastEmbedBackend:
     """Real embeddings via qdrant/fastembed (optional dependency).
 
@@ -301,8 +376,33 @@ def build_embedding_backend(
     ``qdrant-hash-fallback`` label.
     """
     environment = os.environ if env is None else env
-    if str(environment.get(QDRANT_EMBEDDINGS_ENV, "")).strip().lower() \
-            not in {"1", "true", "yes", "on"}:
+    remote_base = environment.get(REMOTE_EMBEDDINGS_BASE_URL_ENV, "").strip()
+    try:
+        if remote_base:
+            # Remote server wins over fastembed: no model download, no ONNX.
+            backend = OpenAICompatibleEmbeddingBackend(
+                base_url=remote_base,
+                api_key=environment.get(
+                    REMOTE_EMBEDDINGS_API_KEY_ENV, DEFAULT_REMOTE_API_KEY),
+                model=environment.get(REMOTE_EMBEDDINGS_MODEL_ENV, ""),
+            )
+            logger.info(
+                "compendium rag: real embeddings active via remote server "
+                "%s (model=%s, dim=%d), provenance %r",
+                remote_base, backend.dense_model_name, backend.dim,
+                backend.label,
+            )
+            return backend
+        if str(environment.get(QDRANT_EMBEDDINGS_ENV, "")).strip().lower() \
+                not in {"1", "true", "yes", "on"}:
+            return HashEmbeddingBackend()
+    except Exception as exc:  # noqa: BLE001 - offline/unreachable is expected
+        logger.warning(
+            "compendium rag: embedding backend unavailable (%s); falling back "
+            "to the deterministic lexical-hash embedder with provenance %r — "
+            "these are NOT semantic embeddings",
+            exc, PROVENANCE_HASH_FALLBACK,
+        )
         return HashEmbeddingBackend()
     try:
         backend = FastEmbedBackend(
