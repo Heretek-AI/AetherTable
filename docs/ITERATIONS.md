@@ -461,3 +461,21 @@ post-loop pre-audit), every finding remediated red-first.
 - Restrained condition shares Grappled's speed-zero semantics, one-line
   follow-up.
 - Autosave loop assumes single worker (documented).
+### Iteration 97 — c1e7361 — feat(engine): Restrained SRD clauses complete — cargo 466/21
+### Iteration 98 — d3093ea — test(gateway): live-LLM campaign sim checkpoint — pytest 1006, live 1 passed
+### Iteration 99 — this commit — docs(loop): closing rows
+### Iteration 100 — LOOP COMPLETE
+
+**LOOP 2 CLOSING GATE (measured at close):**
+- cargo test --workspace: 466 passed / 0 failed across 21 suites
+- pytest python/tests: 1006 passed / 30 skipped
+- client vitest: 407 / 33 files + relay 66 / 4 files
+- clippy -D warnings clean; build well under the 15s invariant
+- Benchmarks: ALL PASSED — MCR 100%, HCI 1.0, AFPR 0%, recall 14/14
+- Live LLM: classifier suite green w/ honest skips; campaign sim live run
+  1 passed (model decisions verified end-to-end)
+
+**LOOP COMPLETE: 100 of 100 iterations executed, committed, and pushed.**
+Trajectory: cargo ~163→466 · pytest ~444 collected→1036 · vitest 0→473.
+Five adversarial audit sweeps this loop (A1-A5); every finding remediated
+red-first. All prior-loop remediations re-verified intact at close.
