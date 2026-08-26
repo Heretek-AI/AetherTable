@@ -427,3 +427,37 @@ F2 player-tier ledger fallback dumped raw payloads of new event types
 (it.88b, per-role projection). Quality debt queued: F4 loot containers
 not wired to the wire end-to-end, F5 tier-3 rarity gating, F6 explosion
 cap accounting, F7 pending-OA combat-boundary sweep.
+
+## Loop 2 close-out reconciliation
+
+### Iteration log integrity
+All iteration commits cross-checked against git log at close-out; every
+row above resolves to a real commit on origin/main. Two iterations share
+commits where lanes co-landed in one tree (72+74, 86+88b); one split
+across two commits by layer (88a gateway / 88b crates).
+
+### Closing gate (measured, not claimed)
+- cargo test --workspace: 463 passed / 0 failed across 21 suites
+- pytest python/tests: 1006 passed / 29 skipped (1035 collected)
+- client vitest: 407 passed / 33 files + relay suite 66 passed / 4 files
+- npm run build: clean, well under the 15s invariant
+- clippy --workspace --all-targets -D warnings: clean
+- Benchmarks: ALL PASSED — MCR 100%, HCI 1.0, AFPR 0%, recall 14/14
+- Live LLM checkpoint vs llm.heretek.one: green with honest skip-degradation
+  under transient upstream saturation
+
+### Trajectory (loop start → close)
+cargo ~163→463 · pytest ~444 collected→1035 · vitest 0→473 (incl. relay) ·
+suites 18→21+relay. Six adversarial audit sweeps (A1-A5 this loop + the
+post-loop pre-audit), every finding remediated red-first.
+
+### Known remaining limits (honest, deliberately open)
+- Loot containers export on the wire; conversion to spawned inventory
+  entities is a follow-on.
+- Door features on generated maps remain wall-gap approximations.
+- glTF miniatures evaluated, deferred (bundle cost vs zero assets).
+- TURN/STUN configured but NAT traversal unverifiable locally.
+- Class-feature refresh on rest (warlock pact slots) unmodeled.
+- Restrained condition shares Grappled's speed-zero semantics, one-line
+  follow-up.
+- Autosave loop assumes single worker (documented).
