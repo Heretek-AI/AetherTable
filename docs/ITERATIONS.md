@@ -520,3 +520,4 @@ TDD red-first → gates → commit → push → row below.
 ### L3.14 — bae055f — feat(client): character vault gallery with deploy/delete — vitest 588
 ### L3.13 — d1ff6c5 — feat(client): GM-visibility hardening for balance strip — vitest 588
 ### L3.15 — 4f7b365 — feat(engine): SRD-optional Delay action, rewind-consistent — cargo 477
+### L3.17 — 6f1c03a — feat(gateway): curated ambience presets, bounded LRU + coalescing — pytest 1190
