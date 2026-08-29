@@ -28,6 +28,7 @@
  */
 
 import { authHeaders, getStoredToken } from './auth_headers';
+import { rejectionFrom } from './engine_errors';
 
 export interface PendingOpportunityAttack {
   /** Entity whose armed reaction was triggered (the one who gets to swing). */
@@ -132,28 +133,6 @@ export type OpportunityAttackOutcome =
   | { kind: 'applied'; data: OpportunityAttackResult }
   | { kind: 'rejected'; status: number; code: string | null; message: string | null }
   | { kind: 'unreachable' };
-
-function rejectionFrom(status: number, payload: unknown): OpportunityAttackOutcome {
-  const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
-  if (Array.isArray(raw)) {
-    const first = raw[0] as Record<string, unknown> | undefined;
-    const msg = typeof first?.msg === 'string' ? first.msg : 'invalid request';
-    return { kind: 'rejected', status, code: null, message: msg };
-  }
-  if (typeof raw === 'string') {
-    return { kind: 'rejected', status, code: null, message: raw };
-  }
-  if (raw && typeof raw === 'object') {
-    const d = raw as Record<string, unknown>;
-    return {
-      kind: 'rejected',
-      status,
-      code: typeof d.error === 'string' ? d.error : null,
-      message: typeof d.message === 'string' ? d.message : null,
-    };
-  }
-  return { kind: 'rejected', status, code: null, message: `HTTP ${status}` };
-}
 
 /**
  * Resolve ONE pending opportunity attack through the reaction economy. Same

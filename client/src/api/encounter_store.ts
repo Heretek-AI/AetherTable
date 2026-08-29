@@ -20,6 +20,7 @@
  */
 
 import { authHeaders, getStoredToken } from './auth_headers';
+import { rejectionFrom } from './engine_errors';
 
 /* --- Live compendium ------------------------------------------------------ */
 
@@ -401,22 +402,7 @@ export async function spawnMonsterToEngine(params: {
     const payload: unknown = await resp.json().catch(() => null);
     if (!resp.ok) {
       if (resp.status >= 500) return { kind: 'unreachable' };
-      const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
-      if (typeof raw === 'object' && raw !== null) {
-        const d = raw as Record<string, unknown>;
-        return {
-          kind: 'rejected',
-          status: resp.status,
-          code: typeof d.error === 'string' ? d.error : null,
-          message: typeof d.message === 'string' ? d.message : null,
-        };
-      }
-      return {
-        kind: 'rejected',
-        status: resp.status,
-        code: null,
-        message: typeof raw === 'string' ? raw : `HTTP ${resp.status}`,
-      };
+      return rejectionFrom(resp.status, payload);
     }
     return { kind: 'applied', data: (payload ?? {}) as EngineSpawnResult, warnings: built.warnings };
   } catch {

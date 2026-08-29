@@ -23,6 +23,7 @@
 
 import { authHeaders, getStoredToken } from './auth_headers';
 import type { EngineCheckComplication } from './check_outcome';
+import { rejectionFrom } from './engine_errors';
 
 export interface EngineAttackResult {
   attack_roll: number;
@@ -186,30 +187,6 @@ export interface EngineRestResult {
   entities?: Array<{ entity_id: string; hp_remaining: number }>;
   hook?: string;
   note?: string;
-}
-
-function rejectionFrom(status: number, payload: unknown): EngineActionOutcome<never> {
-  // FastAPI wraps handler detail in {detail}; the gateway already unwraps the
-  // engine JSON there, but 422 validation failures arrive as an array instead.
-  const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
-  if (Array.isArray(raw)) {
-    const first = raw[0] as Record<string, unknown> | undefined;
-    const msg = typeof first?.msg === 'string' ? first.msg : 'invalid request';
-    return { kind: 'rejected', status, code: null, message: msg };
-  }
-  if (typeof raw === 'string') {
-    return { kind: 'rejected', status, code: null, message: raw };
-  }
-  if (raw && typeof raw === 'object') {
-    const d = raw as Record<string, unknown>;
-    return {
-      kind: 'rejected',
-      status,
-      code: typeof d.error === 'string' ? d.error : null,
-      message: typeof d.message === 'string' ? d.message : null,
-    };
-  }
-  return { kind: 'rejected', status, code: null, message: `HTTP ${status}` };
 }
 
 /**

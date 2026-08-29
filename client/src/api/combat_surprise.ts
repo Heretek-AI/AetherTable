@@ -29,6 +29,7 @@
 
 import { authHeaders, getStoredToken } from './auth_headers';
 import type { EngineActionOutcome } from './rules_engine';
+import { rejectionFrom } from './engine_errors';
 
 /** Verbatim body of POST /api/v1/sessions/{id}/combat/surprise. */
 export interface EngineSurpriseResult {
@@ -78,33 +79,6 @@ async function surprisePost<T extends EngineSurpriseResult>(
     console.warn('Rules engine unreachable; the surprise was not applied.');
     return { kind: 'unreachable' };
   }
-}
-
-function rejectionFrom(
-  status: number,
-  payload: unknown,
-): EngineActionOutcome<never> {
-  // FastAPI wraps handler detail in {detail}; the gateway already unwraps the
-  // engine JSON there, but 422 validation failures arrive as an array instead.
-  const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
-  if (Array.isArray(raw)) {
-    const first = raw[0] as Record<string, unknown> | undefined;
-    const msg = typeof first?.msg === 'string' ? first.msg : 'invalid request';
-    return { kind: 'rejected', status, code: null, message: msg };
-  }
-  if (typeof raw === 'string') {
-    return { kind: 'rejected', status, code: null, message: raw };
-  }
-  if (raw && typeof raw === 'object') {
-    const d = raw as Record<string, unknown>;
-    return {
-      kind: 'rejected',
-      status,
-      code: typeof d.error === 'string' ? d.error : null,
-      message: typeof d.message === 'string' ? d.message : null,
-    };
-  }
-  return { kind: 'rejected', status, code: null, message: `HTTP ${status}` };
 }
 
 /**
