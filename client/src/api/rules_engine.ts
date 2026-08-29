@@ -23,7 +23,7 @@
 
 import { authHeaders, getStoredToken } from './auth_headers';
 import type { EngineCheckComplication } from './check_outcome';
-import { rejectionFrom } from './engine_errors';
+import { engineRejectionDetail, rejectionFrom } from './engine_errors';
 
 export interface EngineAttackResult {
   attack_roll: number;
@@ -1028,29 +1028,15 @@ export async function engineGenerateMap(params: {
     });
     const payload: unknown = await resp.json().catch(() => null);
     if (!resp.ok) {
-      const raw = (payload as { detail?: unknown } | null)?.detail ?? payload;
-      const d = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
-      const code = typeof d?.error === 'string' ? d.error : null;
-      if (code) {
-        return {
-          kind: 'rejected',
-          status: resp.status,
-          code,
-          message: typeof d?.message === 'string' ? d.message : null,
-        };
+      // Shared parser supplies code + sentence. The code-first ordering is
+      // preserved deliberately: a 5xx that names an engine code is a
+      // rejection, not a network failure, so the code is checked before the
+      // status class.
+      const detail = engineRejectionDetail(payload);
+      if (detail.code !== null || resp.status < 500) {
+        return { kind: 'rejected', status: resp.status, ...detail };
       }
-      if (resp.status >= 500) return { kind: 'unreachable' };
-      return {
-        kind: 'rejected',
-        status: resp.status,
-        code: null,
-        message:
-          typeof raw === 'string'
-            ? raw
-            : typeof d?.message === 'string'
-              ? d.message
-              : `HTTP ${resp.status}`,
-      };
+      return { kind: 'unreachable' };
     }
     const m = payload as Partial<EngineGeneratedMap> | null;
     const tilesOk =
