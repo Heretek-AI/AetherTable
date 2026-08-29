@@ -1818,6 +1818,24 @@ impl GameSession {
             })
     }
 
+    /// SRD Charmed: "The creature can't attack the charmer." True iff `attacker`
+    /// carries the Charmed condition AND the session's ledger records `target`
+    /// as the source of that charm. Mirrors the Frightened approach-rule honesty:
+    /// a charmed creature with no attributed source — the charm was applied
+    /// without naming one, or the source has since left the ledger — can attack
+    /// anyone, because a clause that names no one cannot be violated by anyone.
+    /// The condition must still be present (an expired charm is not enforced
+    /// against the live board).
+    pub fn charm_blocks_attack(&self, attacker_id: &Uuid, target_id: &Uuid) -> bool {
+        self.entities
+            .get(attacker_id)
+            .map(|a| a.has_condition(&Condition::Charmed))
+            .unwrap_or(false)
+            && self
+                .condition_source(attacker_id, &Condition::Charmed)
+                .is_some_and(|src| &src == target_id)
+    }
+
     /// Withholds a surprised combatant's skip-turn and releases the SRD
     /// Surprise penalty: the whole action/movement/bonus-action budget is
     /// spent (the creature can do nothing on its first turn), the entity is
@@ -5258,9 +5276,90 @@ mod tests {
         );
     }
 
+    // ---- SRD Charmed: a charmed creature can't attack the charmer -----------
 
+    #[test]
+    fn charm_blocks_attack_only_for_the_attributed_charmer() {
+        let charmer = Uuid::from_u128(0x1);
+        let charmed = Uuid::from_u128(0x2);
+        let bystander = Uuid::from_u128(0x3);
+        let mut session = GameSession::new(
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            "charm-test".into(),
+        );
+        session.add_entity(entity(charmer, "Charmer", 10), None).unwrap();
+        session.add_entity(entity(charmed, "Charmed", 10), None).unwrap();
+        session.add_entity(entity(bystander, "Bystander", 10), None).unwrap();
 
+        // Charmed is applied with its source attributed to the charmer.
+        session
+            .apply_timed_condition_from(charmed, Condition::Charmed, 10, Some(charmer), None)
+            .expect("charm with named source applies");
 
+        // The one SRD prohibition: the charmed creature cannot attack the
+        // charmer specifically.
+        assert!(
+            session.charm_blocks_attack(&charmed, &charmer),
+            "a charmed creature must not be able to attack its charmer"
+        );
+        // But it may still attack anyone else — charm does not incapacitate.
+        assert!(
+            !session.charm_blocks_attack(&charmed, &bystander),
+            "charm only bars attacks on the charmer, not on others"
+        );
+        // The reverse direction is never blocked.
+        assert!(!session.charm_blocks_attack(&charmer, &charmed));
+    }
 
+    #[test]
+    fn charm_with_unattributed_source_blocks_nothing() {
+        let charmer = Uuid::from_u128(0x1);
+        let charmed = Uuid::from_u128(0x2);
+        let mut session = GameSession::new(
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            "charm-unattributed".into(),
+        );
+        session.add_entity(entity(charmer, "Charmer", 10), None).unwrap();
+        session.add_entity(entity(charmed, "Charmed", 10), None).unwrap();
+
+        // A charm applied without naming its source (e.g. a lingering effect
+        // whose origin has left the ledger) cannot single out any attacker —
+        // "a clause that names no one cannot be violated by anyone."
+        session
+            .apply_timed_condition_from(charmed, Condition::Charmed, 10, None, None)
+            .expect("charm without source applies");
+
+        assert!(
+            !session.charm_blocks_attack(&charmed, &charmer),
+            "an unattributed charm must not fabricate a prohibited target"
+        );
+    }
+
+    #[test]
+    fn charm_blocked_state_cleared_when_condition_removed() {
+        let charmer = Uuid::from_u128(0x1);
+        let charmed = Uuid::from_u128(0x2);
+        let mut session = GameSession::new(
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            "charm-cleared".into(),
+        );
+        session.add_entity(entity(charmer, "Charmer", 10), None).unwrap();
+        session.add_entity(entity(charmed, "Charmed", 10), None).unwrap();
+        session
+            .apply_timed_condition_from(charmed, Condition::Charmed, 10, Some(charmer), None)
+            .expect("charm applies");
+        assert!(session.charm_blocks_attack(&charmed, &charmer));
+
+        // Once the charm is stripped the prohibition is lifted even though the
+        // ledger still remembers the historical grant.
+        session.entities.get_mut(&charmed).unwrap().remove_condition(&Condition::Charmed);
+        assert!(
+            !session.charm_blocks_attack(&charmed, &charmer),
+            "an expired/removed charm must no longer block the attack"
+        );
+    }
 
 }

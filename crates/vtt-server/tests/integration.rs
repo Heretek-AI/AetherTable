@@ -12083,6 +12083,151 @@ async fn frightened_victim_may_move_away_or_sideways() {
     assert_eq!(st, StatusCode::OK, "retreat must be legal: {}", String::from_utf8_lossy(&raw));
 }
 
+// --- SRD Charmed: a charmed creature can't attack the charmer (iter 40) ----
+
+#[actix_web::test]
+async fn charmed_cannot_attack_the_charmer_but_may_attack_others() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-charm", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let charmer_id = Uuid::new_v4();
+    let charmed_id = Uuid::new_v4();
+    let bystander_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(charmer_id, "Charmcaster", 30, 14, 4, "1d8"), 2.5, 2.5),
+    )
+    .await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(charmed_id, "Charmed", 30, 14, 4, "1d8"), 7.5, 2.5),
+    )
+    .await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(bystander_id, "Bystander", 30, 14, 4, "1d8"), 12.5, 2.5),
+    )
+    .await;
+
+    // Charm the victim and attribute its source to the charmcaster.
+    let (status, body) = apply_condition(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({
+            "entity_id": charmed_id,
+            "condition": "charmed",
+            "duration_rounds": 10,
+            "source_entity_id": charmer_id
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "charm must apply: {}",
+        body
+    );
+
+    // 1. The charmed creature cannot attack the charmer — 409 CHARMED_CANNOT_ATTACK.
+    let (st, body) = attack(&app, &token, session_id, charmed_id, charmer_id, 1).await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "attacking the charmer must be a 409, got {}: {}",
+        st,
+        body
+    );
+    assert_eq!(body["error"], "CHARMED_CANNOT_ATTACK", "{}", body);
+
+    // 2. The blocked swing consumed NOTHING — the victim's Action is intact,
+    //    so the prohibition is a pure validation, not a spent turn.
+    let snap = snapshot_as(&app, &token, session_id).await;
+    assert_eq!(
+        snap["entities"][charmed_id.to_string()]["action_budget"]["action"],
+        serde_json::json!(true),
+        "a refused charm attack must not spend the victim's Action"
+    );
+
+    // 3. The same victim may attack a NON-charmer: the block is specific to the
+    //    attributed source, never a blanket incapacitation.
+    let (st, body) = attack(&app, &token, session_id, charmed_id, bystander_id, 1).await;
+    assert_ne!(
+        body.get("error").and_then(|e| e.as_str()),
+        Some("CHARMED_CANNOT_ATTACK"),
+        "charm must only bar the charmer, not every target: {}: {}",
+        st,
+        body
+    );
+}
+
+#[actix_web::test]
+async fn unattributed_charm_blocks_no_attacks() {
+    let app = test_app().await;
+    let token = sign_token_with_role("gm-charm2", "gm", TEST_SECRET);
+    let session_id = create_session_as(&app, &token).await;
+
+    let would_be_charmer = Uuid::new_v4();
+    let charmed_id = Uuid::new_v4();
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(would_be_charmer, "Charmer", 30, 14, 4, "1d8"), 2.5, 2.5),
+    )
+    .await;
+    spawn(
+        &app,
+        &token,
+        session_id,
+        entity_at(entity_json(charmed_id, "Charmed", 30, 14, 4, "1d8"), 7.5, 2.5),
+    )
+    .await;
+
+    // Charm applied WITHOUT naming a source: the SRD clause "can't attack the
+    // charmer" names no one, so it cannot be violated by anyone.
+    let (status, body) = apply_condition(
+        &app,
+        &token,
+        session_id,
+        serde_json::json!({
+            "entity_id": charmed_id,
+            "condition": "charmed",
+            "duration_rounds": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unattributed charm must apply: {}", body);
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/v1/sessions/{}/action/attack", session_id))
+        .insert_header(bearer(&token))
+        .set_json(serde_json::json!({
+            "attacker_id": charmed_id,
+            "target_id": would_be_charmer,
+            "action_index": 0
+        }))
+        .to_request();
+    let res = test::call_service(&app, req).await;
+    let st = res.status();
+    let raw = test::read_body(res).await.to_vec();
+    let val: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::json!(null));
+    assert_ne!(
+        val.get("error").and_then(|e| e.as_str()),
+        Some("CHARMED_CANNOT_ATTACK"),
+        "an unattributed charm must not fabricate a prohibited target: {}: {}",
+        st,
+        val
+    );
+}
+
 #[actix_web::test]
 async fn x_card_rewind_past_a_condition_grant_un_frightens_the_victim() {
     let app = test_app().await;

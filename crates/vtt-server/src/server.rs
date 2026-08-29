@@ -1627,6 +1627,18 @@ async fn resolve_attack(
             return reject(&data, 422, "SELF_ATTACK_INVALID", "attacker and target coincide");
         }
 
+        // SRD Charmed: "The creature can't attack the charmer." The source is
+        // resolved from the live ledger attribution (see Frightened's approach
+        // rule); an unattributed or since-removed charm blocks nothing.
+        if session.charm_blocks_attack(&attacker.id, &target.id) {
+            return reject(
+                &data,
+                409,
+                "CHARMED_CANNOT_ATTACK",
+                "a charmed creature can't attack the creature that charmed it",
+            );
+        }
+
         // Action economy is checked now but spent only AFTER every other
         // validation passes — an illegal attack must not consume the turn.
         if !attacker.action_budget.action {
