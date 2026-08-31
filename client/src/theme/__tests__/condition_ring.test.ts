@@ -6,8 +6,9 @@
  * (crates/vtt-core/src/types.rs `pub enum Condition`). Central disciplines:
  *
  *   - unknown conditions are dropped silently (engine-only names like
- *     `incapacitated`, `invisible`, `petrified`, `exhaustion` flow
- *     through the wire but never invent a colour);
+ *     `incapacitated`, `exhaustion` flow through the wire but never
+ *     invent a colour); `invisible` and `petrified` ARE themed (iteration
+ *     42) now that the engine wires both mechanically;
  *   - the priority order is documented and stable;
  *   - WCAG-AA contrast against `--tavern-bg` is never below 4.5:1.
  */
@@ -34,12 +35,16 @@ describe('condition_ring THEMED_CONDITIONS / PRIORITY tables', () => {
   it('the priority order matches the documented rationale', () => {
     // Documented severity order — first element is "what the table
     // notices first" when an entity wears multiple conditions.
+    // Iteration 42 adds petrified (top tier, after paralyzed) and
+    // invisible (after blinded) now that the engine wires both.
     expect([...CONDITION_PRIORITY]).toEqual([
       'unconscious',
       'paralyzed',
+      'petrified',
       'stunned',
       'restrained',
       'blinded',
+      'invisible',
       'frightened',
       'charmed',
       'grappled',
@@ -76,10 +81,15 @@ describe('themedConditions (wire filter)', () => {
     expect(themedConditions([])).toEqual([]);
   });
 
-  it('drops engine-only names (incapacitated / invisible / petrified)', () => {
-    expect(
-      themedConditions(['incapacitated', 'invisible', 'petrified']),
-    ).toEqual([]);
+  it('drops engine-only names (incapacitated / exhaustion)', () => {
+    expect(themedConditions(['incapacitated', 'exhaustion'])).toEqual([]);
+  });
+
+  it('keeps invisible and petrified (themed since iteration 42)', () => {
+    expect(themedConditions(['invisible', 'petrified'])).toEqual([
+      'invisible',
+      'petrified',
+    ]);
   });
 
   it('keeps known names verbatim and ignores any unknown entries', () => {
@@ -100,7 +110,16 @@ describe('resolveConditionRingStyle (single ring colour)', () => {
     expect(resolveConditionRingStyle(null)).toBeNull();
     expect(resolveConditionRingStyle([])).toBeNull();
     expect(resolveConditionRingStyle(['incapacitated'])).toBeNull();
-    expect(resolveConditionRingStyle(['invisible', 'exhaustion'])).toBeNull();
+    expect(resolveConditionRingStyle(['exhaustion'])).toBeNull();
+  });
+
+  it('themes invisible and petrified (iteration 42)', () => {
+    expect(resolveConditionRingStyle(['invisible'])?.label).toBe('Invisible');
+    expect(resolveConditionRingStyle(['petrified'])?.label).toBe('Petrified');
+    // petrified outranks invisible (top tier vs mid tier).
+    expect(
+      resolveConditionRingStyle(['invisible', 'petrified'])?.label,
+    ).toBe('Petrified');
   });
 
   it('returns the matching theme for a single themed condition', () => {
@@ -136,7 +155,7 @@ describe('resolveConditionRingStyle (single ring colour)', () => {
       resolveConditionRingStyle(['incapacitated', 'poisoned'])?.label,
     ).toBe('Poisoned');
     expect(
-      resolveConditionRingStyle(['invisible', 'exhaustion', 'frightened'])?.label,
+      resolveConditionRingStyle(['exhaustion', 'frightened'])?.label,
     ).toBe('Frightened');
   });
 
@@ -223,16 +242,18 @@ describe('WCAG-AA contrast contract against --tavern-bg', () => {
     }
   });
 
-  it('covers all 11 themed conditions', () => {
+  it('covers all 13 themed conditions', () => {
     const expectedNames: ThemedConditionName[] = [
       'poisoned',
       'stunned',
       'frightened',
       'restrained',
       'paralyzed',
+      'petrified',
       'prone',
       'charmed',
       'blinded',
+      'invisible',
       'deafened',
       'grappled',
       'unconscious',

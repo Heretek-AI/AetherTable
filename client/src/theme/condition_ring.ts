@@ -20,13 +20,19 @@
  * so the board wash and the token ring agree — never a second copy of
  * the palette duplicated here.
  *
- * WIRE-DISCIPLINE NOTE: the engine also exposes `incapacitated`,
- * `invisible`, `petrified` and `exhaustion(u8)`. We deliberately do NOT
- * ring-colour those — they have no map entry, so the renderer falls
- * through to the fallback token ring. Their presence in the wire form
- * still passes the badge list (we only colour what we have a key for).
- * This keeps "is this thing on fire?" reading consistent with the
- * existing `entity_status_state` parser, which never invents a value.
+ * WIRE-DISCIPLINE NOTE: the engine also exposes `incapacitated` and
+ * `exhaustion(u8)`. We deliberately do NOT ring-colour those — they have
+ * no map entry, so the renderer falls through to the fallback token ring.
+ * Their presence in the wire form still passes the badge list (we only
+ * colour what we have a key for). This keeps "is this thing on fire?"
+ * reading consistent with the existing `entity_status_state` parser,
+ * which never invents a value.
+ *
+ * `invisible` and `petrified` ARE themed (iteration 42): the engine now
+ * wires both mechanically (Invisible grants advantage on its own attacks
+ * and disadvantage on attacks against it; Petrified is incapacitated,
+ * auto-fails STR/DEX saves, and grants advantage to attackers), so the
+ * table should see them on the token.
  *
  * A11Y: every colour below is checked against `--tavern-bg`
  * (`--rp-iron-900`, #2c241d — index.css line 49) at 4.5:1 or better,
@@ -47,6 +53,8 @@ import {
   Lock,
   Eye,
   Swords,
+  Gem,
+  ScanEye,
 } from 'lucide-react';
 
 /** Every condition name we surface a colour or badge for. */
@@ -56,9 +64,11 @@ export type ThemedConditionName =
   | 'frightened'
   | 'restrained'
   | 'paralyzed'
+  | 'petrified'
   | 'prone'
   | 'charmed'
   | 'blinded'
+  | 'invisible'
   | 'deafened'
   | 'grappled'
   | 'unconscious';
@@ -70,9 +80,11 @@ export const THEMED_CONDITIONS = [
   'frightened',
   'restrained',
   'paralyzed',
+  'petrified',
   'prone',
   'charmed',
   'blinded',
+  'invisible',
   'deafened',
   'grappled',
   'unconscious',
@@ -124,6 +136,9 @@ export interface ConditionRingTheme {
  *   - restrained = slate (drained colour, also matches the "iron band"
  *     imagery used by the SRD restrained iconography).
  *   - paralyzed = crimson (severe, "pinned in place" = blood red).
+ *   - petrified = stone-grey (zinc-300 — the "turned to stone" colour;
+ *     the gem icon reads as crystalline).
+ *   - invisible = cyan (the "you can't see it" shimmer; ScanEye icon).
  *   - prone = amber (laid-down warning sign, lower-priority colour).
  *   - charmed = pink (charmed = "heart eyes" iconography, pink reads
  *     softer than red so it never collides with paralyzed).
@@ -187,6 +202,15 @@ export const CONDITION_RING_THEMES: Record<
     icon: Lock,
     contrastRatioVsTavernBg: 4.8,
   },
+  petrified: {
+    label: 'Petrified',
+    ringBorderClass: 'border-zinc-300',
+    ringBoxShadow: '0 0 8px rgba(212, 212, 224, 0.6)',
+    badgeBgClass: 'bg-zinc-900/90',
+    badgeTextClass: 'text-zinc-200',
+    icon: Gem,
+    contrastRatioVsTavernBg: 10.3,
+  },
   prone: {
     label: 'Prone',
     ringBorderClass: 'border-amber-600',
@@ -213,6 +237,15 @@ export const CONDITION_RING_THEMES: Record<
     badgeTextClass: 'text-zinc-100',
     icon: EyeOff,
     contrastRatioVsTavernBg: 12.5,
+  },
+  invisible: {
+    label: 'Invisible',
+    ringBorderClass: 'border-cyan-300',
+    ringBoxShadow: '0 0 10px rgba(103, 232, 249, 0.7)',
+    badgeBgClass: 'bg-cyan-950/90',
+    badgeTextClass: 'text-cyan-100',
+    icon: ScanEye,
+    contrastRatioVsTavernBg: 10.5,
   },
   deafened: {
     label: 'Deafened',
@@ -254,36 +287,46 @@ export const CONDITION_RING_THEMES: Record<
  *      creature cannot act at all. The textbook "drop everything" state.
  *   2. paralyzed   — same severity band as unconscious (auto-fails,
  *      grants crits), kept distinct because their remedies differ.
- *   3. stunned     — auto-fails STR/DEX saves, can't act, but does not
+ *   3. petrified  — iteration 42: same "incapacitated" band as
+ *      paralyzed (auto-fails STR/DEX saves, grants advantage to
+ *      attackers, cannot act), ranked just below paralyzed because
+ *      petrification is rarer at the table.
+ *   4. stunned     — auto-fails STR/DEX saves, can't act, but does not
  *      grant automatic crits to melee attackers (a small but real
  *      distinction vs unconscious/paralyzed).
- *   4. restrained  — speed 0, disadvantage on DEX saves, grants
+ *   5. restrained  — speed 0, disadvantage on DEX saves, grants
  *      advantage to attackers (most punishing crowd-control effect
  *      outside the "I cannot act" tier).
- *   5. blinded     — attacks vs the creature have advantage; the
+ *   6. blinded     — attacks vs the creature have advantage; the
  *      creature's own attacks have disadvantage. Heavy debuff, no
  *      movement penalty.
- *   6. frightened  — disadvantage on attacks/ability checks while
+ *   7. invisible   — iteration 42: the creature's own attacks have
+ *      advantage and attacks against it have disadvantage. A strong
+ *      tactical edge, ranked below blinded because it HELPS the
+ *      creature (the table notices the debuff first).
+ *   8. frightened  — disadvantage on attacks/ability checks while
  *      source is in line of sight; cannot move closer to source.
- *   7. charmed     — cannot attack charmer; charmer has advantage on
+ *   9. charmed     — cannot attack charmer; charmer has advantage on
  *      social checks against the creature. Significant but context-
  *      dependent (no source = no real effect).
- *   8. grappled    — speed becomes 0 (exactly as Restrained minus the
+ *  10. grappled    — speed becomes 0 (exactly as Restrained minus the
  *      save disadvantage / attacker-advantage clauses).
- *   9. deafened    — cannot hear, fails ability checks that need
+ *  11. deafened    — cannot hear, fails ability checks that need
  *      hearing. Real but narrow impact.
- *  10. prone       — only meaningful in melee: disadvantage on
+ *  12. prone       — only meaningful in melee: disadvantage on
  *      attacks, grants advantage to melee attackers within 5 ft.
- *  11. poisoned    — disadvantage on attacks and ability checks.
+ *  13. poisoned    — disadvantage on attacks and ability checks.
  *      Lowest severity in this set because it has no movement or
  *      action-economy effect on its own.
  */
 export const CONDITION_PRIORITY: readonly ThemedConditionName[] = [
   'unconscious',
   'paralyzed',
+  'petrified',
   'stunned',
   'restrained',
   'blinded',
+  'invisible',
   'frightened',
   'charmed',
   'grappled',
@@ -297,10 +340,10 @@ export const CONDITION_BADGE_MAX = 3;
 
 /**
  * Filter the wire-form condition list to just the entries this module
- * knows how to colour. Engine-only names (incapacitated, invisible,
- * petrified, exhaustion) are dropped silently — they are still on the
- * wire, the table just doesn't paint a special ring for them. Order
- * is preserved so the badge list shows conditions in engine order.
+ * knows how to colour. Engine-only names (incapacitated, exhaustion)
+ * are dropped silently — they are still on the wire, the table just
+ * doesn't paint a special ring for them. Order is preserved so the
+ * badge list shows conditions in engine order.
  */
 export function themedConditions(conditions: readonly string[] | null | undefined): ThemedConditionName[] {
   if (!Array.isArray(conditions)) return [];
@@ -383,8 +426,8 @@ export function conditionBadgeStack(
 /**
  * Whether ANY condition on the list would change the ring colour. Used
  * by callers that need to skip rendering the ring altogether for an
- * entity with only engine-only conditions (incapacitated, invisible,
- * petrified, exhaustion). Returns false for null/empty input.
+ * entity with only engine-only conditions (incapacitated, exhaustion).
+ * Returns false for null/empty input.
  */
 export function hasThemedCondition(
   conditions: readonly string[] | null | undefined,

@@ -1020,9 +1020,9 @@ export const TacticalCanvas: React.FC<TacticalCanvasProps> = ({
                     it never reads as the spinning engine-only indicator
                     that lived here before. Only painted when at least one
                     themed condition is on the wire; entities with only
-                    engine-only conditions (incapacitated / invisible /
-                    petrified / exhaustion) and entities with no conditions
-                    at all simply get no condition ring — the InitiativeTracker
+                    engine-only conditions (incapacitated / exhaustion)
+                    and entities with no conditions at all simply get no
+                    condition ring — the InitiativeTracker
                     and CharacterSheet still surface those statuses, and the
                     unconditional fallback would have meant a bare-bordered
                     ring on tokens we have no theme for. prefers-reduced-

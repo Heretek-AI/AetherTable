@@ -133,13 +133,47 @@ describe('TacticalCanvas — priority order', () => {
         tokens={[
           tokenOf({
             id: 't-priority-3',
-            conditions: ['invisible', 'incapacitated', 'frightened'],
+            conditions: ['incapacitated', 'exhaustion', 'frightened'],
           }),
         ]}
       />,
     );
     const ring = screen.getByTestId('token-condition-ring');
     expect(ring.getAttribute('data-condition')).toBe('frightened');
+  });
+
+  it('themes invisible (iteration 42)', () => {
+    render(
+      <TacticalCanvas
+        {...baseProps}
+        tokens={[
+          tokenOf({
+            id: 't-invisible',
+            conditions: ['invisible'],
+          }),
+        ]}
+      />,
+    );
+    const ring = screen.getByTestId('token-condition-ring');
+    expect(ring.getAttribute('data-condition')).toBe('invisible');
+    expect(ring.className).toContain('border-cyan-300');
+  });
+
+  it('themes petrified (iteration 42)', () => {
+    render(
+      <TacticalCanvas
+        {...baseProps}
+        tokens={[
+          tokenOf({
+            id: 't-petrified',
+            conditions: ['petrified'],
+          }),
+        ]}
+      />,
+    );
+    const ring = screen.getByTestId('token-condition-ring');
+    expect(ring.getAttribute('data-condition')).toBe('petrified');
+    expect(ring.className).toContain('border-zinc-300');
   });
 });
 
@@ -159,7 +193,7 @@ describe('TacticalCanvas — no conditions fallback', () => {
         tokens={[
           tokenOf({
             id: 't-engine-only',
-            conditions: ['invisible', 'incapacitated', 'petrified'],
+            conditions: ['incapacitated', 'exhaustion'],
           }),
         ]}
       />,
