@@ -196,7 +196,9 @@ fn clamp_damage_expression(expr: &str) -> Result<String, String> {
     }
     let (dice_part, modifier) = match expr.find(['+', '-']) {
         Some(idx) => {
-            let m = expr[idx..].parse::<i32>().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+            let m = expr[idx..]
+                .parse::<i32>()
+                .map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
             (&expr[..idx], m)
         }
         None => (expr.as_str(), 0),
@@ -204,8 +206,12 @@ fn clamp_damage_expression(expr: &str) -> Result<String, String> {
     let (count_str, sides_str) = dice_part
         .split_once('d')
         .ok_or_else(|| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
-    let count: u32 = count_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
-    let sides: u32 = sides_str.parse().map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+    let count: u32 = count_str
+        .parse()
+        .map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
+    let sides: u32 = sides_str
+        .parse()
+        .map_err(|_| format!("BAD_DAMAGE_EXPRESSION: {}", expr))?;
     // Tier 2 — implausible math is refused outright, never silently reshaped.
     let reject_count = MAX_SPELL_DICE_COUNT * MAX_SPELL_DICE_HARD_REJECT_FACTOR;
     let reject_sides = MAX_SPELL_DIE_SIDES * MAX_SPELL_DICE_HARD_REJECT_FACTOR;
@@ -218,7 +224,16 @@ fn clamp_damage_expression(expr: &str) -> Result<String, String> {
     // Tier 1 — modest overshoot is homebrew generosity: clamp gently.
     let capped_count = count.min(MAX_SPELL_DICE_COUNT);
     let capped_sides = sides.clamp(1, MAX_SPELL_DIE_SIDES);
-    Ok(format!("{}d{}{}", capped_count, capped_sides, if modifier >= 0 { format!("+{}", modifier) } else { format!("{}", modifier) }))
+    Ok(format!(
+        "{}d{}{}",
+        capped_count,
+        capped_sides,
+        if modifier >= 0 {
+            format!("+{}", modifier)
+        } else {
+            format!("{}", modifier)
+        }
+    ))
 }
 
 pub struct RulesEvaluator;
@@ -233,6 +248,8 @@ impl RulesEvaluator {
     ///   unconscious; prone only within 5 ft).
     /// - Target conditions that impose disadvantage on the attacker (invisible;
     ///   prone beyond 5 ft).
+    /// - Attacker conditions that grant advantage on the attacker's own attacks
+    ///   (invisible — the other half of the SRD Invisible entry).
     /// - A target that took the Dodge action imposes disadvantage until its
     ///   next-turn refresh clears the flag (see
     ///   [`crate::state::EntityState::take_dodge`]).
@@ -252,7 +269,11 @@ impl RulesEvaluator {
         let mut advantage = target
             .conditions
             .iter()
-            .any(|c| c.grants_advantage_to_attacker(distance_feet));
+            .any(|c| c.grants_advantage_to_attacker(distance_feet))
+            || attacker
+                .conditions
+                .iter()
+                .any(|c| c.grants_advantage_on_own_attacks());
         let disadvantage = attacker
             .conditions
             .iter()
@@ -521,12 +542,8 @@ impl RulesEvaluator {
             base_dmg
         };
 
-        let (hp_rem, _temp_rem, is_dead) = Self::apply_damage_to_hp(
-            target_current_hp,
-            target_max_hp,
-            target_temp_hp,
-            final_dmg,
-        );
+        let (hp_rem, _temp_rem, is_dead) =
+            Self::apply_damage_to_hp(target_current_hp, target_max_hp, target_temp_hp, final_dmg);
 
         Ok(AttackRollResult {
             attacker_id,
@@ -604,13 +621,22 @@ impl RulesEvaluator {
         // 2. Slot availability: exact level first, then upcast ladder.
         let mut slot_level_used: Option<u8> = None;
         for level in spell.level..=9 {
-            if caster.spell_slots_remaining.get(&level).copied().unwrap_or(0) > 0 {
+            if caster
+                .spell_slots_remaining
+                .get(&level)
+                .copied()
+                .unwrap_or(0)
+                > 0
+            {
                 slot_level_used = Some(level);
                 break;
             }
         }
         let slot_level_used = slot_level_used.ok_or_else(|| {
-            format!("NO_SPELL_SLOTS: no unexpended slot at level {} or higher", spell.level)
+            format!(
+                "NO_SPELL_SLOTS: no unexpended slot at level {} or higher",
+                spell.level
+            )
         })?;
         *caster
             .spell_slots_remaining
@@ -689,7 +715,8 @@ impl RulesEvaluator {
         })
     }
 
-    pub fn apply_damage_to_hp(        current_hp: i32,
+    pub fn apply_damage_to_hp(
+        current_hp: i32,
         max_hp: i32,
         temp_hp: i32,
         damage: i32,
@@ -743,7 +770,11 @@ impl RulesEvaluator {
         let dmg_taken = if let (Some(expr), Some(dtype)) = (damage_expression, damage_type) {
             let roll = dice.roll_expression(expr)?;
             let raw_dmg = if passed {
-                if half_on_save { roll.total / 2 } else { 0 }
+                if half_on_save {
+                    roll.total / 2
+                } else {
+                    0
+                }
             } else {
                 roll.total
             };
@@ -761,12 +792,8 @@ impl RulesEvaluator {
             0
         };
 
-        let (hp_rem, _, is_dead) = Self::apply_damage_to_hp(
-            target_current_hp,
-            target_max_hp,
-            target_temp_hp,
-            dmg_taken,
-        );
+        let (hp_rem, _, is_dead) =
+            Self::apply_damage_to_hp(target_current_hp, target_max_hp, target_temp_hp, dmg_taken);
 
         Ok(SavingThrowResult {
             target_id,
@@ -820,5 +847,4 @@ impl RulesEvaluator {
             0
         }
     }
-
-    }
+}

@@ -21,7 +21,6 @@ fn dummy_entity(name: &str) -> EntityState {
     )
 }
 
-
 #[test]
 fn test_srd_ability_modifier_floored_formula() {
     assert_eq!(calculate_ability_modifier(1), -5);
@@ -154,7 +153,10 @@ fn test_srd_restrained_condition_clauses() {
         restrained.inflicts_disadvantage_on_dex_saves(),
         "Restrained imposes disadvantage on Dex saves"
     );
-    assert!(!restrained.fails_str_dex_saves(), "disadvantage != auto-fail");
+    assert!(
+        !restrained.fails_str_dex_saves(),
+        "disadvantage != auto-fail"
+    );
 
     // No other condition carries the Dex-save disadvantage.
     for c in [
@@ -194,14 +196,8 @@ fn test_srd_attack_resolution() {
     assert_eq!(hit_res.damage_dice_multiplier, 1);
 
     // 4. Attack vs Unconscious target within 5ft -> Auto Crit
-    let auto_crit_res = ActionResolver::resolve_attack(
-        10,
-        5,
-        14,
-        &[],
-        &[Condition::Unconscious],
-        5.0,
-    );
+    let auto_crit_res =
+        ActionResolver::resolve_attack(10, 5, 14, &[], &[Condition::Unconscious], 5.0);
     assert!(auto_crit_res.is_hit);
     assert!(auto_crit_res.is_critical);
     assert_eq!(auto_crit_res.damage_dice_multiplier, 2);
@@ -226,13 +222,22 @@ fn test_srd_concentration_and_death_saving_throws() {
 
     // Death Save State Progression:
     let mut death_state = DeathSaveState::default();
-    assert_eq!(ActionResolver::resolve_death_save(&mut death_state, 12), "PENDING");
+    assert_eq!(
+        ActionResolver::resolve_death_save(&mut death_state, 12),
+        "PENDING"
+    );
     assert_eq!(death_state.successes, 1);
 
-    assert_eq!(ActionResolver::resolve_death_save(&mut death_state, 1), "PENDING"); // +2 failures
+    assert_eq!(
+        ActionResolver::resolve_death_save(&mut death_state, 1),
+        "PENDING"
+    ); // +2 failures
     assert_eq!(death_state.failures, 2);
 
-    assert_eq!(ActionResolver::resolve_death_save(&mut death_state, 8), "DEAD"); // 3rd failure
+    assert_eq!(
+        ActionResolver::resolve_death_save(&mut death_state, 8),
+        "DEAD"
+    ); // 3rd failure
     assert!(death_state.is_dead);
 }
 
@@ -241,17 +246,25 @@ fn test_srd_3d_elevation_and_fall_damage() {
     let mut dice = vtt_core::dice::DiceEngine::with_seed(42);
 
     // Falling 30ft results in 3d6 bludgeoning damage
-    let (dmg_30ft, is_prone) = vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 30.0, None);
+    let (dmg_30ft, is_prone) =
+        vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 30.0, None);
     assert!((3..=18).contains(&dmg_30ft));
     assert!(is_prone);
 
     // Acrobatics save DC 15 lands on feet (not prone)
-    let (_, lands_on_feet) = vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 20.0, Some(16));
+    let (_, lands_on_feet) =
+        vtt_core::rules::RulesEvaluator::calculate_fall_damage(&mut dice, 20.0, Some(16));
     assert!(!lands_on_feet); // is_prone = false
 
     // High ground advantage (+2 to hit when >= 10ft higher)
-    assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(20.0, 0.0), 2);
-    assert_eq!(vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(5.0, 0.0), 0);
+    assert_eq!(
+        vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(20.0, 0.0),
+        2
+    );
+    assert_eq!(
+        vtt_core::rules::RulesEvaluator::calculate_high_ground_attack_bonus(5.0, 0.0),
+        0
+    );
 }
 
 #[test]
@@ -274,7 +287,11 @@ fn test_srd_concentration_state_machine() {
     let noop = RulesEvaluator::apply_damage_to_concentration(&mut caster, 0, 5, -1);
     assert_eq!(
         noop,
-        ConcentrationBreakResult { dc: 0, total: 4, maintained: true }
+        ConcentrationBreakResult {
+            dc: 0,
+            total: 4,
+            maintained: true
+        }
     );
     assert_eq!(
         caster.concentration.as_ref().expect("kept").spell_id,
@@ -300,9 +317,63 @@ fn test_srd_concentration_state_machine() {
     );
 
     // Voluntary end reports whether a spell was actually dropped
-    assert!(RulesEvaluator::end_concentration(&mut caster, "SPELL_ENDED"));
+    assert!(RulesEvaluator::end_concentration(
+        &mut caster,
+        "SPELL_ENDED"
+    ));
     assert!(caster.concentration.is_none());
-    assert!(!RulesEvaluator::end_concentration(&mut caster, "SPELL_ENDED"));
+    assert!(!RulesEvaluator::end_concentration(
+        &mut caster,
+        "SPELL_ENDED"
+    ));
+}
+
+#[test]
+fn test_srd_invisible_attacker_gains_advantage() {
+    // SRD 5.1 Invisible: "Attacks against the creature have disadvantage, and
+    // the creature's attacks have advantage." The target-side clause is already
+    // wired (inflicts_disadvantage_on_attacker); this pins the attacker-side
+    // clause.
+    let mut invisible_attacker = dummy_entity("shadow_dancer");
+    invisible_attacker.conditions.push(Condition::Invisible);
+    let visible_target = dummy_entity("watchman");
+
+    let (adv, dis) =
+        RulesEvaluator::edge_from_conditions(&invisible_attacker, &visible_target, 30.0, 0.0, 0.0);
+    assert!(adv, "invisible creature's own attacks have advantage");
+    assert!(
+        !dis,
+        "invisibility alone imposes no disadvantage on the attacker"
+    );
+
+    // Symmetric: the invisible creature as TARGET still imposes disadvantage on
+    // the attacker (existing clause, must not regress).
+    let visible_attacker = dummy_entity("swordsman");
+    let mut invisible_target = dummy_entity("phantom");
+    invisible_target.conditions.push(Condition::Invisible);
+    let (adv_t, dis_t) =
+        RulesEvaluator::edge_from_conditions(&visible_attacker, &invisible_target, 30.0, 0.0, 0.0);
+    assert!(
+        !adv_t,
+        "an invisible target grants no advantage to the attacker"
+    );
+    assert!(
+        dis_t,
+        "attacks against an invisible target have disadvantage"
+    );
+
+    // Cancellation: an invisible attacker who is ALSO blinded — the SRD
+    // disadvantage from blindness cancels the invisibility advantage into a
+    // straight d20 (both flags set, resolved in resolve_attack).
+    let mut blind_invisible = dummy_entity("cursed_wraith");
+    blind_invisible.conditions.push(Condition::Invisible);
+    blind_invisible.conditions.push(Condition::Blinded);
+    let (adv_c, dis_c) =
+        RulesEvaluator::edge_from_conditions(&blind_invisible, &visible_target, 30.0, 0.0, 0.0);
+    assert!(
+        adv_c && dis_c,
+        "blindness cancels invisibility advantage into a straight roll"
+    );
 }
 
 #[test]
@@ -337,7 +408,8 @@ fn test_srd_edge_from_conditions_cancellation() {
     let mut exhausted = dummy_entity("exhausted_ranger");
     exhausted.conditions.push(Condition::Exhaustion(3));
     let fresh_target = dummy_entity("orc");
-    let (adv_ex, dis_ex) = RulesEvaluator::edge_from_conditions(&exhausted, &fresh_target, 30.0, 0.0, 0.0);
+    let (adv_ex, dis_ex) =
+        RulesEvaluator::edge_from_conditions(&exhausted, &fresh_target, 30.0, 0.0, 0.0);
     assert!(!adv_ex && dis_ex);
 
     // High ground only counts when the existing bonus is > 0 (+2 requires >= 10 ft).
@@ -369,8 +441,8 @@ fn test_srd_edge_from_conditions_cancellation() {
         &[],
         &[],
         &[],
-        true,  // advantage
-        true,  // disadvantage — cancels to straight roll
+        true, // advantage
+        true, // disadvantage — cancels to straight roll
     )
     .expect("attack resolves");
     assert_eq!(result.natural_roll, expected);
@@ -451,7 +523,6 @@ fn test_srd_concentration_state_serialization_roundtrip() {
     assert_eq!(conc.spell_id, "spell_hunters_mark");
     assert_eq!(conc.started_round, 3);
 }
-
 
 // --- Contested checks: Grapple & Shove (SRD 5e melee attack alternatives) -----
 //
@@ -577,5 +648,8 @@ fn test_srd_blinded_target_grants_attacker_advantage() {
     let (adv, dis) =
         RulesEvaluator::edge_from_conditions(&attacker, &blinded_target, 30.0, 0.0, 0.0);
     assert!(adv, "attacks against a blinded target roll with advantage");
-    assert!(!dis, "blindness of the TARGET never disadvantages the attacker");
+    assert!(
+        !dis,
+        "blindness of the TARGET never disadvantages the attacker"
+    );
 }

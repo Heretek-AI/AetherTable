@@ -126,6 +126,13 @@ impl Condition {
         }
     }
 
+    /// SRD Invisible: "the creature's attacks have advantage." The attacker-side
+    /// half of the Invisible entry, distinct from
+    /// [`Self::inflicts_disadvantage_on_attacker`] (the target-side half).
+    pub fn grants_advantage_on_own_attacks(&self) -> bool {
+        matches!(self, Condition::Invisible)
+    }
+
     pub fn inflicts_disadvantage_on_attacks(&self) -> bool {
         match self {
             Condition::Blinded
@@ -141,7 +148,10 @@ impl Condition {
     pub fn fails_str_dex_saves(&self) -> bool {
         matches!(
             self,
-            Condition::Paralyzed | Condition::Petrified | Condition::Stunned | Condition::Unconscious
+            Condition::Paralyzed
+                | Condition::Petrified
+                | Condition::Stunned
+                | Condition::Unconscious
         )
     }
 
@@ -348,10 +358,22 @@ mod senses_tests {
 
     #[test]
     fn test_vision_mode_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&VisionMode::Normal).unwrap(), "\"normal\"");
-        assert_eq!(serde_json::to_string(&VisionMode::Darkvision).unwrap(), "\"darkvision\"");
-        assert_eq!(serde_json::to_string(&VisionMode::Blindsight).unwrap(), "\"blindsight\"");
-        assert_eq!(serde_json::to_string(&VisionMode::Truesight).unwrap(), "\"truesight\"");
+        assert_eq!(
+            serde_json::to_string(&VisionMode::Normal).unwrap(),
+            "\"normal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VisionMode::Darkvision).unwrap(),
+            "\"darkvision\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VisionMode::Blindsight).unwrap(),
+            "\"blindsight\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VisionMode::Truesight).unwrap(),
+            "\"truesight\""
+        );
 
         let mode: VisionMode = serde_json::from_str("\"truesight\"").unwrap();
         assert_eq!(mode, VisionMode::Truesight);
@@ -361,9 +383,18 @@ mod senses_tests {
 
     #[test]
     fn test_lighting_zone_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&LightingZone::Bright).unwrap(), "\"bright\"");
-        assert_eq!(serde_json::to_string(&LightingZone::Dim).unwrap(), "\"dim\"");
-        assert_eq!(serde_json::to_string(&LightingZone::Darkness).unwrap(), "\"darkness\"");
+        assert_eq!(
+            serde_json::to_string(&LightingZone::Bright).unwrap(),
+            "\"bright\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LightingZone::Dim).unwrap(),
+            "\"dim\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LightingZone::Darkness).unwrap(),
+            "\"darkness\""
+        );
         assert_eq!(
             serde_json::to_string(&LightingZone::MagicalDarkness).unwrap(),
             "\"magical_darkness\""
